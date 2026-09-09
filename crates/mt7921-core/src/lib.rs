@@ -59,6 +59,290 @@ mod mcu_rx {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct DuplicateFirmwareResponse;
 
+    pub const MT7921_WM_RX_IRQ_BIT: u32 = 1 << 0;
+    pub const MT7921_DATA_RX_IRQ_BIT: u32 = 1 << 2;
+    pub const MT7921_WM2_RX_IRQ_BIT: u32 = 1 << 22;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxTopologyError {
+        Wm,
+        Wm2,
+        Data,
+        MissingWm2,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct McuRxDataRing(());
+
+    impl McuRxDataRing {
+        pub fn validate(
+            index: usize,
+            count: usize,
+            irq_bit: u32,
+        ) -> Result<Self, McuRxTopologyError> {
+            if (index, count, irq_bit) == (2, 64, MT7921_DATA_RX_IRQ_BIT) {
+                Ok(Self(()))
+            } else {
+                Err(McuRxTopologyError::Data)
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct McuRxIrqTopology {
+        has_wm2: bool,
+        data: Option<McuRxDataRing>,
+    }
+
+    impl McuRxIrqTopology {
+        pub const fn firmware() -> Self {
+            Self {
+                has_wm2: true,
+                data: None,
+            }
+        }
+
+        pub fn validate(
+            wm: (usize, usize, u32),
+            wm2: Option<(usize, usize, u32)>,
+        ) -> Result<Self, McuRxTopologyError> {
+            if wm != (0, 8, MT7921_WM_RX_IRQ_BIT) {
+                return Err(McuRxTopologyError::Wm);
+            }
+            if wm2.is_some_and(|identity| identity != (4, 8, MT7921_WM2_RX_IRQ_BIT)) {
+                return Err(McuRxTopologyError::Wm2);
+            }
+            Ok(Self {
+                has_wm2: wm2.is_some(),
+                data: None,
+            })
+        }
+
+        pub fn set_data(&mut self, data: Option<McuRxDataRing>) {
+            self.data = data;
+        }
+
+        pub const fn mask(self) -> u32 {
+            MT7921_WM_RX_IRQ_BIT
+                | if self.has_wm2 {
+                    MT7921_WM2_RX_IRQ_BIT
+                } else {
+                    0
+                }
+                | if self.data.is_some() {
+                    MT7921_DATA_RX_IRQ_BIT
+                } else {
+                    0
+                }
+        }
+
+        pub fn require_post_n9(self) -> Result<(), McuRxTopologyError> {
+            if self.has_wm2 {
+                Ok(())
+            } else {
+                Err(McuRxTopologyError::MissingWm2)
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxIrqRing {
+        Wm,
+        Wm2,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxIrqTerminal {
+        None,
+        Wm,
+        Wm2,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxIrqActionKind {
+        MaskHost,
+        ReadHostStatus,
+        Acknowledge(u32),
+        Drain(McuRxIrqRing),
+        Unmask(u32),
+        Done(McuRxIrqTerminal),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct McuRxIrqAction {
+        step: u8,
+        kind: McuRxIrqActionKind,
+    }
+
+    impl McuRxIrqAction {
+        pub const fn step(self) -> u8 {
+            self.step
+        }
+        pub const fn kind(self) -> McuRxIrqActionKind {
+            self.kind
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxIrqReport {
+        Masked,
+        HostStatus(u32),
+        Acknowledged,
+        Drained { ring: McuRxIrqRing, matched: bool },
+        Unmasked,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxMaskState {
+        Unknown,
+        KnownMasked,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum McuRxIrqMachineError {
+        Skipped { expected: u8, actual: u8 },
+        Stale { expected: u8, actual: u8 },
+        WrongReport,
+        WrongRing,
+        DuplicateMatch,
+        PostTerminal,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum McuRxIrqState {
+        Mask,
+        Read,
+        Ack(u32),
+        DrainWm,
+        DrainWm2,
+        Unmask,
+        Done,
+        Discarded,
+    }
+
+    pub struct McuRxIrqMachine {
+        topology: McuRxIrqTopology,
+        state: McuRxIrqState,
+        step: u8,
+        matched: McuRxIrqTerminal,
+    }
+
+    impl McuRxIrqMachine {
+        /// Begin only after the physical interrupt poll reports an event.
+        pub const fn begin(topology: McuRxIrqTopology) -> Self {
+            Self {
+                topology,
+                state: McuRxIrqState::Mask,
+                step: 0,
+                matched: McuRxIrqTerminal::None,
+            }
+        }
+
+        pub const fn action(&self) -> McuRxIrqAction {
+            let kind = match self.state {
+                McuRxIrqState::Mask => McuRxIrqActionKind::MaskHost,
+                McuRxIrqState::Read => McuRxIrqActionKind::ReadHostStatus,
+                McuRxIrqState::Ack(value) => McuRxIrqActionKind::Acknowledge(value),
+                McuRxIrqState::DrainWm => McuRxIrqActionKind::Drain(McuRxIrqRing::Wm),
+                McuRxIrqState::DrainWm2 => McuRxIrqActionKind::Drain(McuRxIrqRing::Wm2),
+                McuRxIrqState::Unmask => McuRxIrqActionKind::Unmask(self.topology.mask()),
+                McuRxIrqState::Done | McuRxIrqState::Discarded => {
+                    McuRxIrqActionKind::Done(self.matched)
+                }
+            };
+            McuRxIrqAction {
+                step: self.step,
+                kind,
+            }
+        }
+
+        pub fn report(
+            &mut self,
+            step: u8,
+            report: McuRxIrqReport,
+        ) -> Result<(), McuRxIrqMachineError> {
+            if matches!(self.state, McuRxIrqState::Done | McuRxIrqState::Discarded) {
+                return Err(McuRxIrqMachineError::PostTerminal);
+            }
+            if step < self.step {
+                return Err(McuRxIrqMachineError::Stale {
+                    expected: self.step,
+                    actual: step,
+                });
+            }
+            if step > self.step {
+                return Err(McuRxIrqMachineError::Skipped {
+                    expected: self.step,
+                    actual: step,
+                });
+            }
+            self.state = match (self.state, report) {
+                (McuRxIrqState::Mask, McuRxIrqReport::Masked) => McuRxIrqState::Read,
+                (McuRxIrqState::Read, McuRxIrqReport::HostStatus(status)) => {
+                    let acknowledged = status & self.topology.mask();
+                    if acknowledged == 0 {
+                        McuRxIrqState::DrainWm
+                    } else {
+                        McuRxIrqState::Ack(acknowledged)
+                    }
+                }
+                (McuRxIrqState::Ack(_), McuRxIrqReport::Acknowledged) => McuRxIrqState::DrainWm,
+                (
+                    McuRxIrqState::DrainWm,
+                    McuRxIrqReport::Drained {
+                        ring: McuRxIrqRing::Wm,
+                        matched,
+                    },
+                ) => {
+                    if matched {
+                        self.matched = McuRxIrqTerminal::Wm;
+                    }
+                    if self.topology.has_wm2 {
+                        McuRxIrqState::DrainWm2
+                    } else {
+                        McuRxIrqState::Unmask
+                    }
+                }
+                (
+                    McuRxIrqState::DrainWm2,
+                    McuRxIrqReport::Drained {
+                        ring: McuRxIrqRing::Wm2,
+                        matched,
+                    },
+                ) => {
+                    if matched {
+                        if self.matched != McuRxIrqTerminal::None {
+                            self.state = McuRxIrqState::Discarded;
+                            self.step = self.step.saturating_add(1);
+                            return Err(McuRxIrqMachineError::DuplicateMatch);
+                        }
+                        self.matched = McuRxIrqTerminal::Wm2;
+                    }
+                    McuRxIrqState::Unmask
+                }
+                (
+                    McuRxIrqState::DrainWm | McuRxIrqState::DrainWm2,
+                    McuRxIrqReport::Drained { .. },
+                ) => return Err(McuRxIrqMachineError::WrongRing),
+                (McuRxIrqState::Unmask, McuRxIrqReport::Unmasked) => McuRxIrqState::Done,
+                _ => return Err(McuRxIrqMachineError::WrongReport),
+            };
+            self.step = self.step.saturating_add(1);
+            Ok(())
+        }
+
+        pub fn discard(&mut self) -> McuRxMaskState {
+            let mask = if self.state == McuRxIrqState::Mask {
+                McuRxMaskState::Unknown
+            } else {
+                McuRxMaskState::KnownMasked
+            };
+            self.state = McuRxIrqState::Discarded;
+            self.step = self.step.saturating_add(1);
+            mask
+        }
+    }
+
     fn error(ring: u8, slot: u16, control: u32, parser: McuRxParserKind) -> McuRxRouteError {
         McuRxRouteError {
             ring,
@@ -288,6 +572,344 @@ mod mcu_rx {
                 Err(DuplicateFirmwareResponse)
             );
             assert_eq!(matched, Some(original));
+        }
+
+        fn report(machine: &mut McuRxIrqMachine, report: McuRxIrqReport) {
+            let step = machine.action().step();
+            machine.report(step, report).unwrap();
+        }
+
+        #[test]
+        fn irq_topology_is_exact_and_data_is_typed() {
+            for wm in [
+                (1, 8, MT7921_WM_RX_IRQ_BIT),
+                (0, 7, MT7921_WM_RX_IRQ_BIT),
+                (0, 8, MT7921_DATA_RX_IRQ_BIT),
+            ] {
+                assert_eq!(
+                    McuRxIrqTopology::validate(wm, None),
+                    Err(McuRxTopologyError::Wm)
+                );
+            }
+            assert_eq!(
+                McuRxIrqTopology::validate((1, 8, MT7921_WM_RX_IRQ_BIT), None),
+                Err(McuRxTopologyError::Wm)
+            );
+            assert_eq!(
+                McuRxIrqTopology::validate(
+                    (0, 8, MT7921_WM_RX_IRQ_BIT),
+                    Some((4, 7, MT7921_WM2_RX_IRQ_BIT))
+                ),
+                Err(McuRxTopologyError::Wm2)
+            );
+            for wm2 in [
+                (3, 8, MT7921_WM2_RX_IRQ_BIT),
+                (4, 7, MT7921_WM2_RX_IRQ_BIT),
+                (4, 8, MT7921_DATA_RX_IRQ_BIT),
+            ] {
+                assert_eq!(
+                    McuRxIrqTopology::validate((0, 8, MT7921_WM_RX_IRQ_BIT), Some(wm2)),
+                    Err(McuRxTopologyError::Wm2)
+                );
+            }
+            assert_eq!(
+                McuRxDataRing::validate(2, 63, MT7921_DATA_RX_IRQ_BIT),
+                Err(McuRxTopologyError::Data)
+            );
+            for data in [
+                (1, 64, MT7921_DATA_RX_IRQ_BIT),
+                (2, 63, MT7921_DATA_RX_IRQ_BIT),
+                (2, 64, MT7921_WM_RX_IRQ_BIT),
+            ] {
+                assert_eq!(
+                    McuRxDataRing::validate(data.0, data.1, data.2),
+                    Err(McuRxTopologyError::Data)
+                );
+            }
+            let mut topology = McuRxIrqTopology::validate(
+                (0, 8, MT7921_WM_RX_IRQ_BIT),
+                Some((4, 8, MT7921_WM2_RX_IRQ_BIT)),
+            )
+            .unwrap();
+            topology.set_data(Some(
+                McuRxDataRing::validate(2, 64, MT7921_DATA_RX_IRQ_BIT).unwrap(),
+            ));
+            assert_eq!(
+                topology.mask(),
+                MT7921_WM_RX_IRQ_BIT | MT7921_DATA_RX_IRQ_BIT | MT7921_WM2_RX_IRQ_BIT
+            );
+            assert_eq!(topology.require_post_n9(), Ok(()));
+            assert_eq!(
+                McuRxIrqTopology::validate((0, 8, MT7921_WM_RX_IRQ_BIT), None)
+                    .unwrap()
+                    .require_post_n9(),
+                Err(McuRxTopologyError::MissingWm2)
+            );
+        }
+
+        #[test]
+        fn irq_machine_acknowledges_known_bits_and_drains_both_rings() {
+            let topology = McuRxIrqTopology::firmware();
+            let mut machine = McuRxIrqMachine::begin(topology);
+            assert_eq!(machine.action().kind(), McuRxIrqActionKind::MaskHost);
+            report(&mut machine, McuRxIrqReport::Masked);
+            assert_eq!(machine.action().kind(), McuRxIrqActionKind::ReadHostStatus);
+            report(
+                &mut machine,
+                McuRxIrqReport::HostStatus(topology.mask() | (1 << 27)),
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Acknowledge(topology.mask())
+            );
+            report(&mut machine, McuRxIrqReport::Acknowledged);
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)
+            );
+            report(
+                &mut machine,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm,
+                    matched: false,
+                },
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Drain(McuRxIrqRing::Wm2)
+            );
+            report(
+                &mut machine,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm2,
+                    matched: true,
+                },
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Unmask(topology.mask())
+            );
+            report(&mut machine, McuRxIrqReport::Unmasked);
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Done(McuRxIrqTerminal::Wm2)
+            );
+        }
+
+        #[test]
+        fn irq_machine_status_matrix_only_acknowledges_known_bits() {
+            let topology = McuRxIrqTopology::firmware();
+            for (status, expected) in [
+                (0, McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)),
+                (1 << 27, McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)),
+                (
+                    MT7921_WM_RX_IRQ_BIT,
+                    McuRxIrqActionKind::Acknowledge(MT7921_WM_RX_IRQ_BIT),
+                ),
+                (
+                    MT7921_WM_RX_IRQ_BIT | (1 << 27),
+                    McuRxIrqActionKind::Acknowledge(MT7921_WM_RX_IRQ_BIT),
+                ),
+            ] {
+                let mut machine = McuRxIrqMachine::begin(topology);
+                report(&mut machine, McuRxIrqReport::Masked);
+                report(&mut machine, McuRxIrqReport::HostStatus(status));
+                assert_eq!(machine.action().kind(), expected, "status={status:#x}");
+            }
+
+            let mut with_data = topology;
+            with_data.set_data(Some(
+                McuRxDataRing::validate(2, 64, MT7921_DATA_RX_IRQ_BIT).unwrap(),
+            ));
+            let mut machine = McuRxIrqMachine::begin(with_data);
+            report(&mut machine, McuRxIrqReport::Masked);
+            report(
+                &mut machine,
+                McuRxIrqReport::HostStatus(MT7921_DATA_RX_IRQ_BIT | (1 << 27)),
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Acknowledge(MT7921_DATA_RX_IRQ_BIT)
+            );
+        }
+
+        #[test]
+        fn irq_machine_zero_status_still_drains_and_duplicate_is_terminal() {
+            let mut machine = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            report(&mut machine, McuRxIrqReport::Masked);
+            report(&mut machine, McuRxIrqReport::HostStatus(0));
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)
+            );
+            report(
+                &mut machine,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm,
+                    matched: true,
+                },
+            );
+            let action = machine.action();
+            assert_eq!(
+                machine.report(
+                    action.step(),
+                    McuRxIrqReport::Drained {
+                        ring: McuRxIrqRing::Wm2,
+                        matched: true,
+                    }
+                ),
+                Err(McuRxIrqMachineError::DuplicateMatch)
+            );
+            assert_eq!(
+                machine.report(action.step(), McuRxIrqReport::Unmasked),
+                Err(McuRxIrqMachineError::PostTerminal)
+            );
+        }
+
+        #[test]
+        fn irq_machine_terminal_matrix_and_reuse_are_exact() {
+            for (has_wm2, wm, wm2, terminal) in [
+                (false, false, false, McuRxIrqTerminal::None),
+                (false, true, false, McuRxIrqTerminal::Wm),
+                (true, false, false, McuRxIrqTerminal::None),
+                (true, true, false, McuRxIrqTerminal::Wm),
+                (true, false, true, McuRxIrqTerminal::Wm2),
+            ] {
+                let topology = McuRxIrqTopology::validate(
+                    (0, 8, MT7921_WM_RX_IRQ_BIT),
+                    has_wm2.then_some((4, 8, MT7921_WM2_RX_IRQ_BIT)),
+                )
+                .unwrap();
+                let mut machine = McuRxIrqMachine::begin(topology);
+                report(&mut machine, McuRxIrqReport::Masked);
+                report(&mut machine, McuRxIrqReport::HostStatus(0));
+                report(
+                    &mut machine,
+                    McuRxIrqReport::Drained {
+                        ring: McuRxIrqRing::Wm,
+                        matched: wm,
+                    },
+                );
+                if has_wm2 {
+                    report(
+                        &mut machine,
+                        McuRxIrqReport::Drained {
+                            ring: McuRxIrqRing::Wm2,
+                            matched: wm2,
+                        },
+                    );
+                }
+                report(&mut machine, McuRxIrqReport::Unmasked);
+                let done = machine.action();
+                assert_eq!(done.kind(), McuRxIrqActionKind::Done(terminal));
+                assert_eq!(
+                    machine.report(done.step(), McuRxIrqReport::Unmasked),
+                    Err(McuRxIrqMachineError::PostTerminal)
+                );
+                assert_eq!(machine.action().kind(), McuRxIrqActionKind::Done(terminal));
+            }
+        }
+
+        #[test]
+        fn irq_machine_data_bit_is_only_acknowledged_and_unmasked() {
+            let mut topology = McuRxIrqTopology::firmware();
+            topology.set_data(Some(
+                McuRxDataRing::validate(2, 64, MT7921_DATA_RX_IRQ_BIT).unwrap(),
+            ));
+            let mut machine = McuRxIrqMachine::begin(topology);
+            report(&mut machine, McuRxIrqReport::Masked);
+            report(
+                &mut machine,
+                McuRxIrqReport::HostStatus(MT7921_DATA_RX_IRQ_BIT),
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Acknowledge(MT7921_DATA_RX_IRQ_BIT)
+            );
+            report(&mut machine, McuRxIrqReport::Acknowledged);
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)
+            );
+            report(
+                &mut machine,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm,
+                    matched: false,
+                },
+            );
+            report(
+                &mut machine,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm2,
+                    matched: false,
+                },
+            );
+            assert_eq!(
+                machine.action().kind(),
+                McuRxIrqActionKind::Unmask(topology.mask())
+            );
+        }
+
+        #[test]
+        fn irq_machine_failure_mask_state_is_known_after_mask_succeeds() {
+            let mut after_mask = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            report(&mut after_mask, McuRxIrqReport::Masked);
+            assert_eq!(after_mask.discard(), McuRxMaskState::KnownMasked);
+
+            let mut after_status = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            report(&mut after_status, McuRxIrqReport::Masked);
+            report(&mut after_status, McuRxIrqReport::HostStatus(0));
+            assert_eq!(after_status.discard(), McuRxMaskState::KnownMasked);
+
+            let mut after_drain = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            report(&mut after_drain, McuRxIrqReport::Masked);
+            report(&mut after_drain, McuRxIrqReport::HostStatus(0));
+            report(
+                &mut after_drain,
+                McuRxIrqReport::Drained {
+                    ring: McuRxIrqRing::Wm,
+                    matched: false,
+                },
+            );
+            assert_eq!(after_drain.discard(), McuRxMaskState::KnownMasked);
+        }
+
+        #[test]
+        fn irq_machine_rejects_skipped_stale_wrong_and_postterminal_reports() {
+            let mut machine = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            assert!(matches!(
+                machine.report(1, McuRxIrqReport::Masked),
+                Err(McuRxIrqMachineError::Skipped { .. })
+            ));
+            assert_eq!(
+                machine.report(0, McuRxIrqReport::Acknowledged),
+                Err(McuRxIrqMachineError::WrongReport)
+            );
+            report(&mut machine, McuRxIrqReport::Masked);
+            assert!(matches!(
+                machine.report(0, McuRxIrqReport::HostStatus(0)),
+                Err(McuRxIrqMachineError::Stale { .. })
+            ));
+            report(&mut machine, McuRxIrqReport::HostStatus(0));
+            let step = machine.action().step();
+            assert_eq!(
+                machine.report(
+                    step,
+                    McuRxIrqReport::Drained {
+                        ring: McuRxIrqRing::Wm2,
+                        matched: false,
+                    }
+                ),
+                Err(McuRxIrqMachineError::WrongRing)
+            );
+            assert_eq!(machine.discard(), McuRxMaskState::KnownMasked);
+            assert_eq!(
+                machine.report(step, McuRxIrqReport::Unmasked),
+                Err(McuRxIrqMachineError::PostTerminal)
+            );
+            let mut before_mask = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+            assert_eq!(before_mask.discard(), McuRxMaskState::Unknown);
         }
     }
 }

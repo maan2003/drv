@@ -68,7 +68,11 @@ use mt7921_port_spike::{
     FirmwareRxDisposition, GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport,
     IrqLifecycle, IrqResetCleanupStep,
     IrqResetEvent, IrqResetTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
-    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, McuRxParserKind,
+    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_DATA_RX_IRQ_BIT as DATA_RX_IRQ_BIT,
+    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, MT7921_WM2_RX_IRQ_BIT as WM2_RX_IRQ_BIT,
+    MT7921_WM_RX_IRQ_BIT as WM_RX_IRQ_BIT, McuRxDataRing, McuRxIrqActionKind, McuRxIrqMachine,
+    McuRxIrqMachineError, McuRxIrqReport, McuRxIrqRing, McuRxIrqTerminal, McuRxIrqTopology,
+    McuRxMaskState, McuRxParserKind,
     McuRxRegisters, McuRxRoute,
     Mt7921TxFree, Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
     OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
@@ -1496,7 +1500,7 @@ fn run_contained_dma_resource_round_trip(
             | (1 << 30);
         pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
         wfdma.write_active_wfdma(0xd4208, enabled)?;
-        wfdma.write_active_wfdma(0xd4204, firmware_bootstrap_rx_irq_mask())?;
+        wfdma.write_active_wfdma(0xd4204, McuRxIrqTopology::firmware().mask())?;
         let mut top = VfioTopOwnership {
             selector: active.selector_page.as_ref().expect("mapped"),
             window: active.dynamic_window.as_ref().expect("mapped"),
@@ -1515,7 +1519,7 @@ fn run_contained_dma_resource_round_trip(
         let active_host_irq = wfdma.read(0xd4204)?;
         let active_mac_irq = pcie_mac.read(0x10188)?;
         if active_global & 0x5 != 0x5
-            || active_host_irq != firmware_bootstrap_rx_irq_mask()
+            || active_host_irq != McuRxIrqTopology::firmware().mask()
             || active_mac_irq != 0xff
         {
             return Err(format!(
@@ -1571,7 +1575,11 @@ fn run_contained_dma_resource_round_trip(
                     authenticator_m1_total: 0,
                     irq_bit: WM2_RX_IRQ_BIT,
                 }),
-                extra_irq_mask: 0,
+                irq_topology: McuRxIrqTopology::validate(
+                    (0, 8, WM_RX_IRQ_BIT),
+                    Some((4, 8, WM2_RX_IRQ_BIT)),
+                )
+                .expect("static MCU RX topology"),
                 unsolicited: Vec::new(),
                 normal_rx_frames: VecDeque::new(),
                 tx_completions: Vec::new(),
@@ -6579,7 +6587,7 @@ fn run() -> Result<(), String> {
             pcie_mac.write_pcie_mac_interrupt_enable(0xff)?;
             wfdma.write_active_wfdma(0xd4208, global)?;
             let response_irq_mask = if operation.loads_firmware() {
-                firmware_bootstrap_rx_irq_mask()
+                McuRxIrqTopology::firmware().mask()
             } else {
                 1 << 0
             };
@@ -6655,7 +6663,11 @@ fn run() -> Result<(), String> {
                         authenticator_m1_total: 0,
                         irq_bit: WM2_RX_IRQ_BIT,
                     }),
-                    extra_irq_mask: 0,
+                    irq_topology: McuRxIrqTopology::validate(
+                        (0, 8, WM_RX_IRQ_BIT),
+                        Some((4, 8, WM2_RX_IRQ_BIT)),
+                    )
+                    .expect("static MCU RX topology"),
                     unsolicited: Vec::new(),
                     normal_rx_frames: VecDeque::new(),
                     tx_completions: Vec::new(),
@@ -7433,7 +7445,7 @@ fn run() -> Result<(), String> {
                                     &mut mechanics.tx_completions,
                                     None,
                                 )?;
-                                mechanics.loader.mcu.extra_irq_mask = 0;
+                                mechanics.loader.mcu.irq_topology.set_data(None);
                                 mechanics.loader.mcu.wfdma.write_active_wfdma(
                                     0xd4204,
                                     mechanics.loader.mcu.rx_irq_mask(),
@@ -7573,7 +7585,8 @@ fn run() -> Result<(), String> {
                     irq_bit: WM_RX_IRQ_BIT,
                 },
                 wm2: None,
-                extra_irq_mask: 0,
+                irq_topology: McuRxIrqTopology::validate((0, 8, WM_RX_IRQ_BIT), None)
+                    .expect("static MCU RX topology"),
                 unsolicited: Vec::new(),
                 normal_rx_frames: VecDeque::new(),
                 tx_completions: Vec::new(),
@@ -9636,7 +9649,7 @@ struct ActiveMcuIo<'a> {
     payload: &'a mut DmaArena,
     wm: ActiveMcuRx<'a>,
     wm2: Option<ActiveMcuRx<'a>>,
-    extra_irq_mask: u32,
+    irq_topology: McuRxIrqTopology,
     unsolicited: Vec<ReceivedMcuResponse>,
     normal_rx_frames: VecDeque<PrivateRawFrameCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
@@ -10482,22 +10495,11 @@ where
     errors
 }
 
-const WM_RX_IRQ_BIT: u32 = 1 << 0;
-const DATA_RX_IRQ_BIT: u32 = 1 << 2;
-const WM2_RX_IRQ_BIT: u32 = 1 << 22;
 #[cfg(feature = "fuchsia-passive")]
 const PASSIVE_MAC_BAR_PAGES: [usize; 13] = [
     0x08000, 0x09000, 0x0c000, 0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0x38000, 0x39000,
     0xa1000, 0xa3000, 0xa4000,
 ];
-
-const fn firmware_bootstrap_rx_irq_mask() -> u32 {
-    WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT
-}
-
-const fn rx_irq_acknowledge(status: u32, mask: u32) -> u32 {
-    status & mask
-}
 
 const fn active_wfdma_write_allowed(offset: usize, value: u32, rx_irq_mask: u32) -> bool {
     match offset {
@@ -10931,9 +10933,216 @@ fn drain_rx_queue(
     result
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum McuRxIrqExecutionCause {
+    Physical(String),
+    State(McuRxIrqMachineError),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct McuRxIrqExecutionError {
+    mask_state: McuRxMaskState,
+    cause: McuRxIrqExecutionCause,
+}
+
+impl McuRxIrqExecutionError {
+    fn into_string(self) -> String {
+        match self.cause {
+            McuRxIrqExecutionCause::Physical(error) => {
+                format!("MCU RX IRQ physical failure ({:?}): {error}", self.mask_state)
+            }
+            McuRxIrqExecutionCause::State(McuRxIrqMachineError::DuplicateMatch) => {
+                "matching MCU sequence appeared on both receive rings".into()
+            }
+            McuRxIrqExecutionCause::State(error) => format!(
+                "MCU RX IRQ state diverged ({:?}): {error:?}",
+                self.mask_state
+            ),
+        }
+    }
+}
+
+trait McuRxIrqOps {
+    fn poll(&mut self) -> Result<Option<u64>, String>;
+    fn mask_host(&mut self) -> Result<(), String>;
+    fn read_host_status(&mut self) -> Result<u32, String>;
+    fn acknowledge(&mut self, value: u32) -> Result<(), String>;
+    fn record_observed(&mut self, count: u64, status: u32);
+    fn drain(&mut self, ring: McuRxIrqRing) -> Result<bool, String>;
+    fn unmask(&mut self, mask: u32) -> Result<(), String>;
+    fn revoke(&mut self) -> Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McuRxIrqExecution {
+    NoInterrupt,
+    Complete(McuRxIrqTerminal),
+}
+
+fn irq_action_failure(
+    machine: &mut McuRxIrqMachine,
+    error: String,
+) -> McuRxIrqExecutionError {
+    McuRxIrqExecutionError {
+        mask_state: machine.discard(),
+        cause: McuRxIrqExecutionCause::Physical(error),
+    }
+}
+
+fn irq_state_failure(
+    machine: &mut McuRxIrqMachine,
+    error: McuRxIrqMachineError,
+) -> McuRxIrqExecutionError {
+    McuRxIrqExecutionError {
+        mask_state: machine.discard(),
+        cause: McuRxIrqExecutionCause::State(error),
+    }
+}
+
+fn execute_mcu_rx_irq_actions(
+    topology: McuRxIrqTopology,
+    ops: &mut impl McuRxIrqOps,
+) -> Result<McuRxIrqExecution, McuRxIrqExecutionError> {
+    let Some(count) = ops.poll().map_err(|error| McuRxIrqExecutionError {
+        mask_state: McuRxMaskState::Unknown,
+        cause: McuRxIrqExecutionCause::Physical(error),
+    })? else {
+        return Ok(McuRxIrqExecution::NoInterrupt);
+    };
+    let mut machine = McuRxIrqMachine::begin(topology);
+    let mut status = None;
+    loop {
+        let action = machine.action();
+        let step = action.step();
+        let report = match action.kind() {
+            McuRxIrqActionKind::MaskHost => ops
+                .mask_host()
+                .map(|()| McuRxIrqReport::Masked)
+                .map_err(|error| irq_action_failure(&mut machine, error))?,
+            McuRxIrqActionKind::ReadHostStatus => {
+                let value = ops
+                    .read_host_status()
+                    .map_err(|error| irq_action_failure(&mut machine, error))?;
+                status = Some(value);
+                McuRxIrqReport::HostStatus(value)
+            }
+            McuRxIrqActionKind::Acknowledge(value) => ops
+                .acknowledge(value)
+                .map(|()| McuRxIrqReport::Acknowledged)
+                .map_err(|error| irq_action_failure(&mut machine, error))?,
+            McuRxIrqActionKind::Drain(ring) => {
+                if ring == McuRxIrqRing::Wm {
+                    ops.record_observed(count, status.expect("status action precedes WM drain"));
+                }
+                let matched = ops
+                    .drain(ring)
+                    .map_err(|error| irq_action_failure(&mut machine, error))?;
+                McuRxIrqReport::Drained { ring, matched }
+            }
+            McuRxIrqActionKind::Unmask(mask) => ops
+                .unmask(mask)
+                .map(|()| McuRxIrqReport::Unmasked)
+                .map_err(|error| irq_action_failure(&mut machine, error))?,
+            McuRxIrqActionKind::Done(terminal) => {
+                return Ok(McuRxIrqExecution::Complete(terminal));
+            }
+        };
+        machine
+            .report(step, report)
+            .map_err(|error| irq_state_failure(&mut machine, error))?;
+    }
+}
+
+fn execute_mcu_rx_irq(
+    topology: McuRxIrqTopology,
+    ops: &mut impl McuRxIrqOps,
+) -> Result<McuRxIrqExecution, McuRxIrqExecutionError> {
+    match execute_mcu_rx_irq_actions(topology, ops) {
+        Ok(execution) => Ok(execution),
+        Err(error) => match ops.revoke() {
+            Ok(()) => Err(error),
+            Err(revoke) => Err(McuRxIrqExecutionError {
+                mask_state: error.mask_state,
+                cause: McuRxIrqExecutionCause::Physical(format!(
+                    "{:?}; revoke failed: {revoke}",
+                    error.cause
+                )),
+            }),
+        },
+    }
+}
+
+struct ActiveMcuRxIrqOps<'a, 'b> {
+    mcu: &'a mut ActiveMcuIo<'b>,
+    expected_sequence: Option<u8>,
+    wm_match: Option<ReceivedMcuResponse>,
+    wm2_match: Option<ReceivedMcuResponse>,
+}
+
+impl McuRxIrqOps for ActiveMcuRxIrqOps<'_, '_> {
+    fn poll(&mut self) -> Result<Option<u64>, String> {
+        self.mcu.irq.try_read()
+    }
+
+    fn mask_host(&mut self) -> Result<(), String> {
+        self.mcu.wfdma.write_active_wfdma(0xd4204, 0)
+    }
+
+    fn read_host_status(&mut self) -> Result<u32, String> {
+        self.mcu.wfdma.read(0xd4200)
+    }
+
+    fn acknowledge(&mut self, value: u32) -> Result<(), String> {
+        self.mcu.wfdma.write_active_wfdma(0xd4200, value)
+    }
+
+    fn record_observed(&mut self, count: u64, status: u32) {
+        println!(
+            "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{status:#010x}\"}}"
+        );
+    }
+
+    fn drain(&mut self, ring: McuRxIrqRing) -> Result<bool, String> {
+        let queue = match ring {
+            McuRxIrqRing::Wm => &mut self.mcu.wm,
+            McuRxIrqRing::Wm2 => self
+                .mcu
+                .wm2
+                .as_mut()
+                .ok_or("validated WM2 route disappeared")?,
+        };
+        let matched = drain_rx_queue(
+            self.mcu.wfdma,
+            queue,
+            self.expected_sequence,
+            &mut self.mcu.unsolicited,
+            &mut self.mcu.normal_rx_frames,
+            &mut self.mcu.tx_completions,
+            &mut self.mcu.descriptor_provenance,
+        )?;
+        let present = matched.is_some();
+        match ring {
+            McuRxIrqRing::Wm => self.wm_match = matched,
+            McuRxIrqRing::Wm2 => self.wm2_match = matched,
+        }
+        Ok(present)
+    }
+
+    fn unmask(&mut self, mask: u32) -> Result<(), String> {
+        self.mcu.wfdma.write_active_wfdma(0xd4204, mask)
+    }
+
+    fn revoke(&mut self) -> Result<(), String> {
+        revoke_before_local_frame_release(
+            &mut self.mcu.descriptor_provenance,
+            &mut self.mcu.normal_rx_frames,
+        )
+    }
+}
+
 impl ActiveMcuIo<'_> {
     fn rx_irq_mask(&self) -> u32 {
-        self.wm.irq_bit | self.wm2.as_ref().map_or(0, |queue| queue.irq_bit) | self.extra_irq_mask
+        self.irq_topology.mask()
     }
 
     fn cancelled(&mut self) -> Result<(), String> {
@@ -10947,6 +11156,9 @@ impl ActiveMcuIo<'_> {
     }
 
     fn verify_post_n9_dual_rx(&self) -> Result<(), String> {
+        self.irq_topology
+            .require_post_n9()
+            .map_err(|error| format!("post-N9 MCU RX topology: {error:?}"))?;
         let Some(wm2) = self.wm2.as_ref() else {
             return Err("post-N9 MCU receive requires WM2 ring 4".into());
         };
@@ -10962,6 +11174,15 @@ impl ActiveMcuIo<'_> {
         Ok(())
     }
 
+    fn verify_and_record_post_n9_dual_rx(&self) -> Result<(), String> {
+        self.verify_post_n9_dual_rx()?;
+        println!(
+            "{{\"active_mcu_event\":\"post_n9_dual_rx_verified\",\"rings\":[0,4],\"irq_mask\":\"{:#010x}\"}}",
+            self.rx_irq_mask()
+        );
+        Ok(())
+    }
+
     fn handle_irq(
         &mut self,
         expected_sequence: Option<u8>,
@@ -10970,52 +11191,23 @@ impl ActiveMcuIo<'_> {
             &mut self.descriptor_provenance,
             self.signal.stop_requested(),
         )?;
-        let result = (|| -> Result<Option<ReceivedMcuResponse>, String> {
-            let Some(count) = self.irq.try_read()? else {
-                return Ok(None);
-            };
-            self.wfdma.write_active_wfdma(0xd4204, 0)?;
-            let interrupt_status = self.wfdma.read(0xd4200)?;
-            let irq_mask = self.rx_irq_mask();
-            let acknowledged = rx_irq_acknowledge(interrupt_status, irq_mask);
-            if acknowledged != 0 {
-                self.wfdma.write_active_wfdma(0xd4200, acknowledged)?;
-            }
-            println!(
-                "{{\"active_mcu_event\":\"irq_observed\",\"count\":{count},\"interrupt_status\":\"{interrupt_status:#010x}\"}}"
-            );
-            let mut matched = drain_rx_queue(
-                self.wfdma,
-                &mut self.wm,
-                expected_sequence,
-                &mut self.unsolicited,
-                &mut self.normal_rx_frames,
-                &mut self.tx_completions,
-                &mut self.descriptor_provenance,
-            )?;
-            if let Some(wm2) = self.wm2.as_mut() {
-                let wm2_match = drain_rx_queue(
-                    self.wfdma,
-                    wm2,
-                    expected_sequence,
-                    &mut self.unsolicited,
-                    &mut self.normal_rx_frames,
-                    &mut self.tx_completions,
-                    &mut self.descriptor_provenance,
-                )?;
-                merge_matching_firmware_response(&mut matched, wm2_match)
-                    .map_err(|_| "matching MCU sequence appeared on both receive rings".to_string())?;
-            }
-            self.wfdma.write_active_wfdma(0xd4204, irq_mask)?;
-            Ok(matched)
-        })();
-        if result.is_err() {
-            revoke_before_local_frame_release(
-                &mut self.descriptor_provenance,
-                &mut self.normal_rx_frames,
-            )?;
+        let topology = self.irq_topology;
+        let mut ops = ActiveMcuRxIrqOps {
+            mcu: self,
+            expected_sequence,
+            wm_match: None,
+            wm2_match: None,
+        };
+        let execution = execute_mcu_rx_irq(topology, &mut ops);
+        match execution {
+            Ok(McuRxIrqExecution::NoInterrupt) => Ok(None),
+            Ok(McuRxIrqExecution::Complete(terminal)) => Ok(match terminal {
+                McuRxIrqTerminal::None => None,
+                McuRxIrqTerminal::Wm => ops.wm_match.take(),
+                McuRxIrqTerminal::Wm2 => ops.wm2_match.take(),
+            }),
+            Err(error) => Err(error.into_string()),
         }
-        result
     }
 
     fn wait_tx_consumed(&mut self, expected_dma_index: u32) -> Result<(), String> {
@@ -11824,11 +12016,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
         if command == DownloadCommand::GetNicCapability {
-            self.mcu.verify_post_n9_dual_rx()?;
-            println!(
-                "{{\"active_mcu_event\":\"post_n9_dual_rx_verified\",\"rings\":[0,4],\"irq_mask\":\"{:#010x}\"}}",
-                self.mcu.rx_irq_mask()
-            );
+            self.mcu.verify_and_record_post_n9_dual_rx()?;
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
@@ -11934,7 +12122,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             return Err("SET_CLC escaped the world/indoor allowlist".into());
         }
         if command.expects_response() {
-            self.mcu.verify_post_n9_dual_rx()?;
+            self.mcu.verify_and_record_post_n9_dual_rx()?;
         }
         let descriptor_index = self.command_index;
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
@@ -15241,7 +15429,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         if self.data.rx_ring_index != 2
             || self.data.irq_bit != DATA_RX_IRQ_BIT
             || self.data.rx_count != MT7921_DATA_RX_RING_COUNT
-            || self.loader.mcu.extra_irq_mask != 0
+            || self.loader.mcu.irq_topology.mask() != McuRxIrqTopology::firmware().mask()
         {
             return Err(PhysicalPassiveError(
                 "data RX ring 2 identity mismatch".into(),
@@ -15275,7 +15463,18 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                     .authorize_passive_data_rx_irq()
                     .map_err(PhysicalPassiveError)?,
                 PassivePrepareStep::EnableDataIrq => {
-                    self.loader.mcu.extra_irq_mask = DATA_RX_IRQ_BIT;
+                    self.loader.mcu.irq_topology.set_data(Some(
+                        McuRxDataRing::validate(
+                            self.data.rx_ring_index,
+                            self.data.rx_count,
+                            self.data.irq_bit,
+                        )
+                        .map_err(|error| {
+                            PhysicalPassiveError(format!(
+                                "invalid data RX IRQ topology: {error:?}"
+                            ))
+                        })?,
+                    ));
                     self.loader
                         .mcu
                         .wfdma
@@ -17588,8 +17787,19 @@ mod tests {
             option: 0,
             extended_event_id: 0,
         };
-        assert!(response_for_sequence(Some(10), envelope(9), vec![9]).is_none());
-        let matching = response_for_sequence(Some(10), envelope(10), vec![10]).unwrap();
+        assert_eq!(
+            classify_firmware_rx(Some(10), &envelope(9)),
+            FirmwareRxDisposition::Unrelated
+        );
+        assert_eq!(
+            classify_firmware_rx(Some(10), &envelope(10)),
+            FirmwareRxDisposition::Matched
+        );
+        let matching = ReceivedMcuResponse {
+            event_id: 1,
+            option: 0,
+            bytes: vec![10],
+        };
         let mut bytes = vec![0; 44];
         bytes[36] = 2;
         let wrong_cid = ReceivedMcuResponse { bytes, ..matching };
@@ -19755,12 +19965,12 @@ mod tests {
         assert!(active_wfdma_write_allowed(
             0xd4688,
             0x0040_0004,
-            firmware_bootstrap_rx_irq_mask()
+            McuRxIrqTopology::firmware().mask()
         ));
         assert!(!active_wfdma_write_allowed(
             0xd4688,
             0,
-            firmware_bootstrap_rx_irq_mask()
+            McuRxIrqTopology::firmware().mask()
         ));
 
         let accepts = |writes: &[(usize, u32)]| writes.contains(&(0xd4688, 0x0040_0004));
@@ -23371,11 +23581,226 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestMcuRxIrqOps {
+        poll: Option<u64>,
+        status: u32,
+        wm_match: bool,
+        wm2_match: bool,
+        fail: Option<&'static str>,
+        transcript: Vec<String>,
+    }
+
+    impl TestMcuRxIrqOps {
+        fn step(&mut self, name: &'static str) -> Result<(), String> {
+            self.transcript.push(name.into());
+            if self.fail == Some(name) {
+                Err(format!("{name} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl McuRxIrqOps for TestMcuRxIrqOps {
+        fn poll(&mut self) -> Result<Option<u64>, String> {
+            self.step("poll")?;
+            Ok(self.poll)
+        }
+
+        fn mask_host(&mut self) -> Result<(), String> {
+            self.step("mask")
+        }
+
+        fn read_host_status(&mut self) -> Result<u32, String> {
+            self.step("status")?;
+            Ok(self.status)
+        }
+
+        fn acknowledge(&mut self, value: u32) -> Result<(), String> {
+            self.transcript.push(format!("ack:{value:#x}"));
+            if self.fail == Some("ack") {
+                Err("ack failed".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record_observed(&mut self, count: u64, status: u32) {
+            self.transcript
+                .push(format!("observed:{count}:{status:#x}"));
+        }
+
+        fn drain(&mut self, ring: McuRxIrqRing) -> Result<bool, String> {
+            let name = match ring {
+                McuRxIrqRing::Wm => "wm",
+                McuRxIrqRing::Wm2 => "wm2",
+            };
+            self.step(name)?;
+            Ok(match ring {
+                McuRxIrqRing::Wm => self.wm_match,
+                McuRxIrqRing::Wm2 => self.wm2_match,
+            })
+        }
+
+        fn unmask(&mut self, mask: u32) -> Result<(), String> {
+            self.transcript.push(format!("unmask:{mask:#x}"));
+            if self.fail == Some("unmask") {
+                Err("unmask failed".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn revoke(&mut self) -> Result<(), String> {
+            self.step("revoke")
+        }
+    }
+
+    fn test_irq_ops(status: u32) -> TestMcuRxIrqOps {
+        TestMcuRxIrqOps {
+            poll: Some(3),
+            status,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mcu_rx_irq_executor_poll_none_and_physical_failures_are_bounded() {
+        let topology = McuRxIrqTopology::firmware();
+        let mut none = TestMcuRxIrqOps::default();
+        assert_eq!(
+            execute_mcu_rx_irq(topology, &mut none),
+            Ok(McuRxIrqExecution::NoInterrupt)
+        );
+        assert_eq!(none.transcript, ["poll"]);
+
+        for (failure, mask_state) in [
+            ("poll", McuRxMaskState::Unknown),
+            ("mask", McuRxMaskState::Unknown),
+            ("status", McuRxMaskState::KnownMasked),
+            ("ack", McuRxMaskState::KnownMasked),
+            ("wm", McuRxMaskState::KnownMasked),
+            ("wm2", McuRxMaskState::KnownMasked),
+            ("unmask", McuRxMaskState::KnownMasked),
+        ] {
+            let mut ops = test_irq_ops(topology.mask());
+            ops.fail = Some(failure);
+            let error = execute_mcu_rx_irq(topology, &mut ops).unwrap_err();
+            assert_eq!(error.mask_state, mask_state, "{failure}");
+            assert_eq!(ops.transcript.last().map(String::as_str), Some("revoke"));
+            assert_eq!(
+                ops.transcript.iter().filter(|step| *step == "revoke").count(),
+                1,
+                "{failure}"
+            );
+            if failure != "unmask" {
+                assert!(
+                    !ops.transcript.iter().any(|step| step.starts_with("unmask:")),
+                    "{failure}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcu_rx_irq_executor_transcripts_cover_topologies_statuses_and_terminals() {
+        let firmware = McuRxIrqTopology::firmware();
+        let mut none = test_irq_ops(0);
+        assert_eq!(
+            execute_mcu_rx_irq(firmware, &mut none),
+            Ok(McuRxIrqExecution::Complete(McuRxIrqTerminal::None))
+        );
+        assert_eq!(
+            none.transcript,
+            ["poll", "mask", "status", "observed:3:0x0", "wm", "wm2", "unmask:0x400001"]
+        );
+
+        let wm_only =
+            McuRxIrqTopology::validate((0, 8, WM_RX_IRQ_BIT), None).unwrap();
+        let mut wm = test_irq_ops((1 << 27) | WM_RX_IRQ_BIT);
+        wm.wm_match = true;
+        assert_eq!(
+            execute_mcu_rx_irq(wm_only, &mut wm),
+            Ok(McuRxIrqExecution::Complete(McuRxIrqTerminal::Wm))
+        );
+        assert_eq!(
+            wm.transcript,
+            ["poll", "mask", "status", "ack:0x1", "observed:3:0x8000001", "wm", "unmask:0x1"]
+        );
+
+        let mut wm2 = test_irq_ops((1 << 27) | firmware.mask());
+        wm2.wm2_match = true;
+        assert_eq!(
+            execute_mcu_rx_irq(firmware, &mut wm2),
+            Ok(McuRxIrqExecution::Complete(McuRxIrqTerminal::Wm2))
+        );
+        assert_eq!(
+            wm2.transcript,
+            ["poll", "mask", "status", "ack:0x400001", "observed:3:0x8400001", "wm", "wm2", "unmask:0x400001"]
+        );
+
+        let mut duplicate = test_irq_ops(firmware.mask());
+        duplicate.wm_match = true;
+        duplicate.wm2_match = true;
+        let error = execute_mcu_rx_irq(firmware, &mut duplicate).unwrap_err();
+        assert_eq!(error.mask_state, McuRxMaskState::KnownMasked);
+        assert_eq!(
+            error.cause,
+            McuRxIrqExecutionCause::State(McuRxIrqMachineError::DuplicateMatch)
+        );
+        assert_eq!(duplicate.transcript.last().unwrap(), "revoke");
+        assert!(!duplicate.transcript.iter().any(|step| step.starts_with("unmask:")));
+
+        let mut data_topology = firmware;
+        data_topology.set_data(Some(
+            McuRxDataRing::validate(2, 64, DATA_RX_IRQ_BIT).unwrap(),
+        ));
+        let mut data = test_irq_ops(DATA_RX_IRQ_BIT | (1 << 27));
+        execute_mcu_rx_irq(data_topology, &mut data).unwrap();
+        assert!(data.transcript.contains(&"ack:0x4".into()));
+        assert_eq!(
+            data.transcript
+                .iter()
+                .filter(|step| step.as_str() == "wm" || step.as_str() == "wm2")
+                .count(),
+            2
+        );
+        assert!(!data.transcript.iter().any(|step| step == "data"));
+    }
+
     #[test]
     fn dual_rx_irq_ack_and_wait_deadline_are_bounded() {
         let mask = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
-        assert_eq!(rx_irq_acknowledge(mask | (1 << 27), mask), mask);
-        assert_eq!(rx_irq_acknowledge(1 << 27, mask), 0);
+        let mut machine = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+        let action = machine.action();
+        machine
+            .report(action.step(), McuRxIrqReport::Masked)
+            .unwrap();
+        let action = machine.action();
+        machine
+            .report(
+                action.step(),
+                McuRxIrqReport::HostStatus(mask | (1 << 27)),
+            )
+            .unwrap();
+        assert_eq!(
+            machine.action().kind(),
+            McuRxIrqActionKind::Acknowledge(mask)
+        );
+        let mut unknown_only = McuRxIrqMachine::begin(McuRxIrqTopology::firmware());
+        let action = unknown_only.action();
+        unknown_only
+            .report(action.step(), McuRxIrqReport::Masked)
+            .unwrap();
+        let action = unknown_only.action();
+        unknown_only
+            .report(action.step(), McuRxIrqReport::HostStatus(1 << 27))
+            .unwrap();
+        assert_eq!(
+            unknown_only.action().kind(),
+            McuRxIrqActionKind::Drain(McuRxIrqRing::Wm)
+        );
         assert!(active_wfdma_write_allowed(0xd4200, mask, mask));
         assert!(active_wfdma_write_allowed(0xd4204, mask, mask));
         assert!(active_wfdma_write_allowed(0xd4204, WM2_RX_IRQ_BIT, mask));
@@ -23397,13 +23822,49 @@ mod tests {
         assert!(response_wait_timed_out(deadline, deadline));
     }
 
+    #[test]
+    fn active_irq_and_post_n9_source_boundaries_remain_ordered() {
+        let source = include_str!("vfio_read.rs");
+        let handle = &source[source.find("    fn handle_irq(").unwrap()
+            ..source.find("    fn wait_tx_consumed(").unwrap()];
+        let cancellation = handle.find("observe_signal_cancellation(").unwrap();
+        let execute = handle.find("execute_mcu_rx_irq(").unwrap();
+        assert!(cancellation < execute);
+        assert!(!handle[..execute].contains("self.cancelled()?"));
+
+        let actions = &source[source.find("fn execute_mcu_rx_irq_actions(").unwrap()
+            ..source.find("struct ActiveMcuRxIrqOps").unwrap()];
+        assert!(actions.find("ops.poll()").unwrap() < actions.find("McuRxIrqMachine::begin").unwrap());
+        assert!(
+            actions.find("McuRxIrqActionKind::Acknowledge").unwrap()
+                < actions.find("ops.record_observed").unwrap()
+        );
+
+        let command = &source[source
+            .find("impl FirmwareLoaderTransport for VfioFirmwareLoader")
+            .unwrap()..];
+        let capability = &command[command
+            .find("if command == DownloadCommand::GetNicCapability")
+            .unwrap()..];
+        assert!(capability.find("verify_and_record_post_n9_dual_rx").unwrap()
+            < capability.find("publish_mcu_bytes(").unwrap());
+        let set_clc = &command[command.find("    fn set_clc(").unwrap()..];
+        assert!(set_clc.find("verify_and_record_post_n9_dual_rx").unwrap()
+            < set_clc.find("publish_mcu_bytes(").unwrap());
+        let record = &source[source
+            .find("fn verify_and_record_post_n9_dual_rx")
+            .unwrap()..source.find("    fn handle_irq(").unwrap()];
+        assert!(record.find("verify_post_n9_dual_rx()?").unwrap()
+            < record.find("post_n9_dual_rx_verified").unwrap());
+    }
+
     #[cfg(feature = "fuchsia-passive")]
     #[test]
     fn passive_rx_irq_and_mac_pages_are_exactly_gated() {
         let base = WM_RX_IRQ_BIT | WM2_RX_IRQ_BIT;
         let passive = base | DATA_RX_IRQ_BIT;
-        assert_eq!(firmware_bootstrap_rx_irq_mask(), base);
-        assert_ne!(firmware_bootstrap_rx_irq_mask(), passive);
+        assert_eq!(McuRxIrqTopology::firmware().mask(), base);
+        assert_ne!(McuRxIrqTopology::firmware().mask(), passive);
         assert!(!active_wfdma_write_allowed(
             0xd4204,
             DATA_RX_IRQ_BIT,
