@@ -32,7 +32,10 @@ impl<T: HtcServiceTransport> Transport for HtcWmiTransport<T> {
         payload.extend_from_slice(command.tlvs());
         self.endpoint
             .send_payload(&payload)
-            .map_err(|_| WmiError::Transport)
+            .map_err(|error| match error {
+                ath11k_ce::CeError::NoCredits => WmiError::NoCredits,
+                _ => WmiError::Transport,
+            })
     }
 
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<Event>, WmiError> {

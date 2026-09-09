@@ -497,9 +497,16 @@ where
         &mut self,
         request: &R,
     ) -> Result<(), CoreError> {
-        Self::protocol(self.wmi.as_mut())?
-            .send(request)
-            .map_err(|_| CoreError::Protocol)
+        match Self::protocol(self.wmi.as_mut())?.send(request) {
+            Ok(()) => Ok(()),
+            Err(WmiError::NoCredits) => {
+                self.pump()?;
+                Self::protocol(self.wmi.as_mut())?
+                    .send(request)
+                    .map_err(|_| CoreError::Protocol)
+            }
+            Err(_) => Err(CoreError::Protocol),
+        }
     }
 
     fn qmi_config() -> WlanConfigRequest {

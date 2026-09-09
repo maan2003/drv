@@ -45,7 +45,9 @@ pub trait EncodeCommand {
                     reason: match error {
                         WmiError::UnalignedTlv => RejectReason::Unaligned,
                         WmiError::Malformed => RejectReason::InvalidArgument,
-                        WmiError::Timeout | WmiError::Transport => RejectReason::Protocol,
+                        WmiError::Timeout | WmiError::NoCredits | WmiError::Transport => {
+                            RejectReason::Protocol
+                        }
                     },
                     offset: 0,
                 });

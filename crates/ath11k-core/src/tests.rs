@@ -787,7 +787,7 @@ fn actual_wmi_and_htt_share_one_htc_router() {
             hardware_mode: None,
             bands: Vec::new(),
         }),
-        Err(WmiError::Transport)
+        Err(WmiError::NoCredits)
     );
 
     let outgoing = outgoing.borrow();

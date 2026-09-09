@@ -50,6 +50,7 @@ pub enum WmiError {
     UnalignedTlv,
     Malformed,
     Timeout,
+    NoCredits,
     Transport,
 }
 pub trait Transport {
