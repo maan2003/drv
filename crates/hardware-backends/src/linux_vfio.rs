@@ -3,11 +3,11 @@
 use crate::{PciConfigSnapshot, PciControl, PciControlError};
 use drv_hardware::{Backend, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     path::Path,
     sync::{
         Arc,
@@ -76,6 +76,28 @@ pub struct LinuxVfioPciCapabilities {
     device: Arc<File>,
     iommu: Arc<File>,
     irq_event: OwnedFd,
+}
+
+/// Inert, pre-opened authority for one VFIO platform device.
+///
+/// Adoption performs no ioctl, mmap, or device access. Interrupt eventfds are
+/// supplied up front so post-lockdown activation never creates descriptors.
+pub struct LinuxVfioPlatformCapabilities {
+    device: Arc<File>,
+    dma: PlatformDmaCapabilities,
+    irq_events: VecDeque<OwnedFd>,
+}
+
+enum PlatformDmaCapabilities {
+    Coherent { iommu: Arc<File> },
+    Broker,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxVfioPlatformFdIdentities {
+    pub vfio: RawFd,
+    pub iommufd: Option<RawFd>,
+    pub irq_eventfds: Vec<RawFd>,
 }
 
 /// The same inert authority after the exact MT7921 sandbox profile is active.
@@ -294,6 +316,76 @@ impl LinuxVfioPciCapabilities {
     }
 }
 
+impl LinuxVfioPlatformCapabilities {
+    /// Adopt a VFIO platform cdev, iommufd, and already-created IRQ eventfds.
+    /// The caller is responsible for descriptor provenance and access mode.
+    pub fn adopt_coherent(device: File, iommu: File, irq_events: Vec<OwnedFd>) -> Self {
+        Self {
+            device: Arc::new(device),
+            dma: PlatformDmaCapabilities::Coherent {
+                iommu: Arc::new(iommu),
+            },
+            irq_events: irq_events.into(),
+        }
+    }
+
+    /// Adopt a broker-backed VFIO platform cdev and precreated IRQ eventfds.
+    pub fn adopt_broker(device: File, irq_events: Vec<OwnedFd>) -> Self {
+        Self {
+            device: Arc::new(device),
+            dma: PlatformDmaCapabilities::Broker,
+            irq_events: irq_events.into(),
+        }
+    }
+
+    /// Open inert coherent platform capabilities without issuing device ioctls.
+    pub fn open_coherent(
+        path: impl AsRef<Path>,
+        irq_count: usize,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let device = open_device(path)?;
+        let iommu = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/iommu")
+            .map_err(LinuxVfioError::OpenIommufd)?;
+        Ok(Self::adopt_coherent(
+            device,
+            iommu,
+            create_irq_events(irq_count)?,
+        ))
+    }
+
+    /// Open inert broker-backed capabilities without probing the broker.
+    pub fn open_broker(
+        path: impl AsRef<Path>,
+        irq_count: usize,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        Ok(Self::adopt_broker(
+            open_device(path)?,
+            create_irq_events(irq_count)?,
+        ))
+    }
+
+    /// Exact descriptor identities for the caller's fd-bound sandbox policy.
+    pub fn fd_identities(&self) -> LinuxVfioPlatformFdIdentities {
+        LinuxVfioPlatformFdIdentities {
+            vfio: self.device.as_raw_fd(),
+            iommufd: match &self.dma {
+                PlatformDmaCapabilities::Coherent { iommu } => Some(iommu.as_raw_fd()),
+                PlatformDmaCapabilities::Broker => None,
+            },
+            irq_eventfds: self.irq_events.iter().map(AsRawFd::as_raw_fd).collect(),
+        }
+    }
+}
+
+fn create_irq_events(count: usize) -> std::result::Result<Vec<OwnedFd>, LinuxVfioError> {
+    (0..count)
+        .map(|_| userspace_vfio::create_irq_eventfd().map_err(LinuxVfioError::Setup))
+        .collect()
+}
+
 impl OpenedPciCoherent {
     pub fn into_parts(self) -> (LinuxVfio, PciControl, PciConfigSnapshot) {
         (self.backend, self.pci, self.config)
@@ -338,7 +430,7 @@ pub struct LinuxVfio {
     interrupts: HashMap<u64, (u32, VfioIrq)>,
     ambiguous_irq_indices: HashSet<u32>,
     dma_trace: bool,
-    prepared_irq: Option<OwnedFd>,
+    prepared_irqs: Option<VecDeque<OwnedFd>>,
 }
 
 impl LinuxVfio {
@@ -367,6 +459,25 @@ impl LinuxVfio {
     pub fn open_broker(path: impl AsRef<Path>) -> std::result::Result<Self, LinuxVfioError> {
         let device = Arc::new(open_device(path)?);
         Self::initialize_broker(device, userspace_vfio::probe_dma_broker)
+    }
+
+    /// Activate pre-opened platform capabilities after the caller's lockdown.
+    pub fn activate_platform(
+        capabilities: LinuxVfioPlatformCapabilities,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let LinuxVfioPlatformCapabilities {
+            device,
+            dma,
+            irq_events,
+        } = capabilities;
+        match dma {
+            PlatformDmaCapabilities::Coherent { iommu } => {
+                Self::initialize_coherent_with_irqs(device, iommu, Some(irq_events))
+            }
+            PlatformDmaCapabilities::Broker => {
+                Self::initialize_broker_with_irqs(device, Some(irq_events))
+            }
+        }
     }
 
     pub fn validate_wcn6750_resources(
@@ -508,6 +619,28 @@ impl LinuxVfio {
         ))
     }
 
+    fn initialize_coherent_with_irqs(
+        device: Arc<File>,
+        iommu: Arc<File>,
+        prepared_irqs: Option<VecDeque<OwnedFd>>,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let ioas = userspace_vfio::bind_iommufd(&device, &iommu)
+            .and_then(|_| userspace_vfio::allocate_ioas(&iommu))
+            .and_then(|ioas| {
+                userspace_vfio::attach_ioas(&device, ioas.id())?;
+                Ok(ioas)
+            })
+            .map_err(LinuxVfioError::Setup)?;
+        Ok(Self::new(
+            device,
+            Flavor::Coherent,
+            Some(iommu),
+            Some(ioas),
+            None,
+            prepared_irqs,
+        ))
+    }
+
     fn initialize_pci_coherent(
         device: Arc<File>,
         iommu: Arc<File>,
@@ -534,7 +667,7 @@ impl LinuxVfio {
             Some(iommu),
             Some(ioas),
             Some(irq),
-            Some(irq_event),
+            Some(VecDeque::from([irq_event])),
         ))
     }
 
@@ -546,13 +679,28 @@ impl LinuxVfio {
         Ok(Self::new(device, Flavor::Broker, None, None, None, None))
     }
 
+    fn initialize_broker_with_irqs(
+        device: Arc<File>,
+        prepared_irqs: Option<VecDeque<OwnedFd>>,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        userspace_vfio::probe_dma_broker(&device).map_err(LinuxVfioError::DmaBrokerUnavailable)?;
+        Ok(Self::new(
+            device,
+            Flavor::Broker,
+            None,
+            None,
+            None,
+            prepared_irqs,
+        ))
+    }
+
     fn new(
         device: Arc<File>,
         flavor: Flavor,
         iommu: Option<Arc<File>>,
         ioas: Option<Ioas>,
         pci_irq: Option<IrqCapability>,
-        prepared_irq: Option<OwnedFd>,
+        prepared_irqs: Option<VecDeque<OwnedFd>>,
     ) -> Self {
         Self {
             device,
@@ -569,7 +717,7 @@ impl LinuxVfio {
             interrupts: HashMap::new(),
             ambiguous_irq_indices: HashSet::new(),
             dma_trace: false,
-            prepared_irq,
+            prepared_irqs,
         }
     }
 
@@ -1055,12 +1203,16 @@ impl Backend for LinuxVfio {
                 0,
             )
         };
+        let prepared_event = match self.prepared_irqs.as_mut() {
+            Some(prepared) => Some(prepared.pop_front().ok_or(Error::Limit)?),
+            None => None,
+        };
         self.ambiguous_irq_indices.insert(capability.index);
-        let interrupt = if self.flavor == Flavor::PciCoherent {
-            let event_fd = self.prepared_irq.take().ok_or(Error::Limit)?;
-            VfioIrq::install_prepared_at(&self.device, capability, start, event_fd)
-        } else {
-            VfioIrq::install_at(&self.device, capability, start)
+        let interrupt = match prepared_event {
+            Some(event_fd) => {
+                VfioIrq::install_prepared_at(&self.device, capability, start, event_fd)
+            }
+            None => VfioIrq::install_at(&self.device, capability, start),
         }
         .map_err(|_| Error::DeviceFault)?;
         let id = self.id()?;
@@ -1333,6 +1485,80 @@ mod tests {
             Record::DestroyIoas(7),
         ]);
         assert_eq!(records, expected);
+    }
+
+    #[test]
+    fn platform_capability_adoption_is_inert_and_activation_consumes_irq_pool() {
+        let (device, path) = fake_device();
+        let device = Arc::try_unwrap(device).unwrap();
+        let iommu = File::open("/dev/null").unwrap();
+        let irq_event = userspace_vfio::create_irq_eventfd().unwrap();
+        let expected = LinuxVfioPlatformFdIdentities {
+            vfio: device.as_raw_fd(),
+            iommufd: Some(iommu.as_raw_fd()),
+            irq_eventfds: vec![irq_event.as_raw_fd()],
+        };
+
+        let (capabilities, adoption_records) = with_fake_io(false, || {
+            LinuxVfioPlatformCapabilities::adopt_coherent(device, iommu, vec![irq_event])
+        });
+        assert!(adoption_records.is_empty());
+        assert_eq!(capabilities.fd_identities(), expected);
+        std::fs::remove_file(path).unwrap();
+
+        let (_, activation_records) = with_fake_io(false, || {
+            let mut backend = LinuxVfio::activate_platform(capabilities).unwrap();
+            let interrupt = backend.open_interrupt(3).unwrap();
+            backend.release_interrupt(interrupt);
+            assert_eq!(backend.open_interrupt(4), Err(Error::Limit));
+        });
+        assert!(activation_records.starts_with(&[
+            Record::Bind,
+            Record::AllocateIoas,
+            Record::AttachIoas(7),
+            Record::QueryIrq(3),
+            Record::InstallIrq(3),
+        ]));
+        assert_eq!(
+            activation_records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    Record::InstallIrq(_) | Record::InstallIrqAt { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn broker_capability_adoption_succeeds_before_activation_fails() {
+        let (device, path) = fake_device();
+        let device = Arc::try_unwrap(device).unwrap();
+        let expected_fd = device.as_raw_fd();
+        let (capabilities, adoption_records) = with_fake_io(false, || {
+            LinuxVfioPlatformCapabilities::adopt_broker(device, Vec::new())
+        });
+        assert!(adoption_records.is_empty());
+        assert_eq!(
+            capabilities.fd_identities(),
+            LinuxVfioPlatformFdIdentities {
+                vfio: expected_fd,
+                iommufd: None,
+                irq_eventfds: Vec::new(),
+            }
+        );
+        std::fs::remove_file(path).unwrap();
+
+        let (result, activation_records) =
+            with_fake_io(false, || LinuxVfio::activate_platform(capabilities));
+        assert!(matches!(
+            result,
+            Err(LinuxVfioError::DmaBrokerUnavailable(_))
+        ));
+        // The fake kernel rejects the broker probe before recording a
+        // successful probe; importantly, adoption itself already succeeded.
+        assert!(activation_records.is_empty());
     }
 
     #[test]

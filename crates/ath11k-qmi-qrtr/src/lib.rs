@@ -52,7 +52,12 @@ pub struct QrtrTransport<S = QrtrSocket> {
 
 impl QrtrTransport<QrtrSocket> {
     pub fn open() -> io::Result<Self> {
-        Ok(Self::with_socket(QrtrSocket::open()?))
+        Ok(Self::from_socket(QrtrSocket::open()?))
+    }
+
+    /// Constructs a transport from an already-open, adopted QRTR socket.
+    pub fn from_socket(socket: QrtrSocket) -> Self {
+        Self::with_socket(socket)
     }
 }
 
@@ -232,7 +237,7 @@ mod tests {
     use ath11k_qmi::{
         FirmwareAssets, Handshake, HandshakeConfig, MemoryProvider, MemoryRegion, Wcn6750Handshake,
     };
-    use std::cell::RefCell;
+    use std::{cell::RefCell, os::fd::AsRawFd, os::unix::net::UnixDatagram};
 
     struct FakeSocket {
         sent: RefCell<Vec<(Vec<u8>, QrtrAddr)>>,
@@ -312,6 +317,15 @@ mod tests {
         fn map_device_bar(&mut self, _: u64, _: u32) -> Result<(), QmiError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn constructs_from_an_adopted_socket_without_operating_on_it() {
+        let (socket, _peer) = UnixDatagram::pair().unwrap();
+        let expected = socket.as_raw_fd();
+        let transport = QrtrTransport::from_socket(QrtrSocket::adopt(socket.into()));
+
+        assert_eq!(transport.socket.as_ref().unwrap().raw_fd(), expected);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Safe, owned access to Linux Qualcomm IPC Router datagram sockets.
-//! Raw descriptors and raw socket-address layouts deliberately remain private.
+//! Raw socket-address layouts deliberately remain private.
 
 use std::{
     io, mem,
@@ -145,6 +145,14 @@ impl SockAddrQrtr {
 }
 
 impl QrtrSocket {
+    /// Adopts an already-open socket without inspecting or operating on it.
+    ///
+    /// The caller is responsible for ensuring that `fd` is an appropriate
+    /// `AF_QIPCRTR`, datagram-mode socket with the desired descriptor flags.
+    pub fn adopt(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     /// Opens an owned close-on-exec QRTR datagram socket.
     pub fn open() -> io::Result<Self> {
         // SAFETY: socket takes no pointer arguments; success returns a new fd
@@ -155,7 +163,12 @@ impl QrtrSocket {
         }
         // SAFETY: the successful socket call returned a fresh owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Self { fd })
+        Ok(Self::adopt(fd))
+    }
+
+    /// Returns the descriptor identity for an fd-bound sandbox policy.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 
     /// Binds locally. `addr.node` must equal `local_addr()?.node`; port zero
@@ -556,6 +569,18 @@ mod tests {
         assert_eq!(&packet[4..8], &[0x44, 0x33, 0x22, 0x11]);
         assert_eq!(&packet[8..12], &[0x88, 0x77, 0x66, 0x55]);
         assert_eq!(&packet[12..], &[0; 8]);
+    }
+
+    #[test]
+    fn adoption_is_inert_and_preserves_descriptor_identity() {
+        let (socket, _peer) = UnixDatagram::pair().unwrap();
+        let expected = socket.as_raw_fd();
+        let socket = QrtrSocket::adopt(socket.into());
+
+        assert_eq!(socket.raw_fd(), expected);
+        // Adoption accepts ownership without querying or validating the fd;
+        // an operation is where the non-QRTR descriptor is rejected.
+        assert!(socket.local_addr().is_err());
     }
 
     #[test]
