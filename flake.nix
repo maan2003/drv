@@ -103,13 +103,16 @@
         pkgs.rustPlatform.buildRustPackage {
           pname = "linux-self-sandbox-check";
           version = "0.1.0";
-          src = ./crates/linux-self-sandbox;
+          src = ./.;
+          cargoRoot = "crates/linux-self-sandbox";
+          buildAndTestSubdir = "crates/linux-self-sandbox";
           cargoLock.lockFile = ./crates/linux-self-sandbox/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
+            cd crates/linux-self-sandbox
             cargo test --locked --offline -- --nocapture
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
