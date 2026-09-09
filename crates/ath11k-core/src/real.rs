@@ -443,8 +443,18 @@ where
         let deadline = (self.deadline)();
         let raw = Self::protocol(self.packet_io.as_mut())?
             .receive_htc(deadline)
-            .map_err(CoreError::HtcControlReceive)?
-            .ok_or(CoreError::HtcControlTimeout)?;
+            .map_err(CoreError::HtcControlReceive)?;
+        let raw = match raw {
+            Some(raw) => raw,
+            None => {
+                let ce0_source_progress = Self::protocol(self.packet_io.as_mut())?
+                    .source_progress(0)
+                    .ok();
+                return Err(CoreError::HtcControlTimeout {
+                    ce0_source_progress,
+                });
+            }
+        };
         let frame = Self::protocol(self.htc.as_mut())?
             .receive(&raw)
             .map_err(|_| CoreError::Protocol)?

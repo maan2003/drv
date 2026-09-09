@@ -390,6 +390,17 @@ pub struct SrngCursor {
 }
 
 impl<B: Backend> Srng<B> {
+    /// Returns the host-owned pointer and the last observed hardware-owned
+    /// pointer. Call `access_begin_remote` first when fresh hardware progress
+    /// is required.
+    pub const fn progress(&self) -> (u32, u32) {
+        let host = match self.direction {
+            RingDirection::Source => self.head,
+            RingDirection::Destination => self.tail,
+        };
+        (host, self.cached_hardware_pointer)
+    }
+
     pub fn checkpoint(&self) -> SrngCursor {
         SrngCursor {
             head: self.head,

@@ -51,7 +51,9 @@ pub enum CoreError {
     },
     HtcControlSend(ath11k_ce::CeError),
     HtcControlReceive(ath11k_ce::CeError),
-    HtcControlTimeout,
+    HtcControlTimeout {
+        ce0_source_progress: Option<(u32, u32)>,
+    },
     Protocol,
     DeviceFault,
     DeviceFaultAt(Operation),

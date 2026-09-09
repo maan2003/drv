@@ -716,6 +716,10 @@ impl<B: Backend, W: CeCompletionWait> CePipesPacketIo<B, W> {
     pub fn pipes_mut(&mut self) -> &mut CePipes<B> {
         &mut self.pipes
     }
+    pub fn source_progress(&mut self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.pipes
+            .source_progress(&mut self.remote_read_pointers, pipe)
+    }
     pub fn into_parts_with_waiter(self) -> (CePipesPacketIoParts<B>, W) {
         (
             (
@@ -1507,6 +1511,18 @@ impl<B: Backend> CePipes<B> {
             .get(pipe)
             .map(|p| p.config.flags)
             .ok_or(CeError::InvalidFrame)
+    }
+
+    /// Refresh and return `(host_head, target_tail)` for a source ring.
+    pub fn source_progress(
+        &mut self,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+        pipe: usize,
+    ) -> Result<(u32, u32), CeError> {
+        let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
+        let ring = pipe.source.as_mut().ok_or(CeError::DeviceFault)?;
+        ring.access_begin_remote(remote_read_pointers)?;
+        Ok(ring.progress())
     }
 
     pub fn send(
@@ -2682,8 +2698,10 @@ mod tests {
             )
         };
         assert!(descriptor_write < packet_sync && packet_sync < head_write);
+        assert_eq!(packet_io.source_progress(0), Ok((4, 0)));
         state.borrow_mut().dmas.get_mut(&1).unwrap()[128..132]
             .copy_from_slice(&4_u32.to_le_bytes());
+        assert_eq!(packet_io.source_progress(0), Ok((4, 4)));
         assert!(
             packet_io
                 .pipes
