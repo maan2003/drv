@@ -7,7 +7,6 @@ compile_error!("ath11k-bringup is Linux-only");
 use ath11k_qmi_qrtr::QrtrTransport;
 use drv_hardware::Device as HardwareDevice;
 use drv_hardware_backends::LinuxVfio;
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -19,16 +18,6 @@ use std::time::Instant;
 
 pub const DEFAULT_BOARD: &str = "/run/current-system/firmware/ath11k/WCN6750/hw1.0/board.bin";
 pub const DEFAULT_REGDB: &str = "/run/current-system/firmware/ath11k/WCN6750/hw1.0/regdb.bin";
-pub const BOARD_BYTES: usize = 59_924;
-pub const REGDB_BYTES: usize = 24_278;
-const BOARD_SHA256: [u8; 32] = [
-    0xb4, 0x5a, 0x60, 0xf0, 0x7e, 0x4c, 0x83, 0x8b, 0x6f, 0x52, 0x2a, 0xb5, 0x87, 0x22, 0x9c, 0x4a,
-    0x9f, 0xee, 0xfd, 0x53, 0xe7, 0xe0, 0x40, 0xbd, 0xe1, 0x82, 0x0a, 0x9e, 0x94, 0x06, 0xbf, 0xd1,
-];
-const REGDB_SHA256: [u8; 32] = [
-    0x2f, 0xe6, 0xb7, 0x9e, 0x6d, 0x36, 0xe1, 0x90, 0xf3, 0x9e, 0x89, 0x16, 0xbe, 0xe5, 0xae, 0x4c,
-    0xf9, 0x7a, 0xb5, 0xe7, 0x15, 0x19, 0xaf, 0x5a, 0xf8, 0x92, 0x0b, 0xb7, 0x57, 0x74, 0x0d, 0xd9,
-];
 const EXPECTED_VFIO_DEVICE: &str = "17a10040.wifi";
 const EXPECTED_VFIO_DRIVER: &str = "vfio-platform";
 pub const LAB_WATCHDOG_ARMED: &str = "/run/redwood-lab-watchdog/armed";
@@ -1254,14 +1243,10 @@ impl Host for RealHost {
             action: "read regdb.bin",
             source,
         })?;
-        validate_asset("board.bin", &board, BOARD_BYTES, BOARD_SHA256)?;
-        validate_asset("regdb.bin", &regdb, REGDB_BYTES, REGDB_SHA256)?;
-        self.firmware = Some(ath11k_core::Wcn6750FirmwareAssets {
-            board,
-            calibration: None,
-            regulatory: Some(regdb),
-            m3: None,
-        });
+        self.firmware = Some(
+            ath11k_core::Wcn6750FirmwareAssets::new_redwood(board, regdb)
+                .map_err(map_firmware_asset_error)?,
+        );
         Ok(())
     }
 
@@ -1464,25 +1449,15 @@ impl Drop for RealHost {
     }
 }
 
-fn validate_asset(
-    name: &'static str,
-    bytes: &[u8],
-    expected_len: usize,
-    expected_sha256: [u8; 32],
-) -> Result<(), Error> {
-    if bytes.len() != expected_len {
-        return Err(Error::InvalidAsset(match name {
-            "board.bin" => "board.bin length is not the pinned Redwood m20in asset",
-            _ => "regdb.bin length is not the pinned Redwood asset",
-        }));
-    }
-    if Sha256::digest(bytes).as_slice() != expected_sha256 {
-        return Err(Error::InvalidAsset(match name {
-            "board.bin" => "board.bin SHA-256 is not the pinned Redwood m20in asset",
-            _ => "regdb.bin SHA-256 is not the pinned Redwood asset",
-        }));
-    }
-    Ok(())
+fn map_firmware_asset_error(error: ath11k_core::Wcn6750FirmwareAssetError) -> Error {
+    use ath11k_core::Wcn6750FirmwareAssetError::*;
+
+    Error::InvalidAsset(match error {
+        BoardLength => "board.bin length is not the pinned Redwood m20in asset",
+        BoardSha256 => "board.bin SHA-256 is not the pinned Redwood m20in asset",
+        RegulatoryLength => "regdb.bin length is not the pinned Redwood asset",
+        RegulatorySha256 => "regdb.bin SHA-256 is not the pinned Redwood asset",
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

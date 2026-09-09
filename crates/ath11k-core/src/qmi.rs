@@ -4,6 +4,26 @@ use ath11k_qmi::{
     FirmwareAssets, MemoryProvider, MemoryRegion, QmiError,
     wire::{MemorySegment, MemorySegmentResponse},
 };
+use sha2::{Digest, Sha256};
+
+const REDWOOD_BOARD_BYTES: usize = 59_924;
+const REDWOOD_REGDB_BYTES: usize = 24_278;
+const REDWOOD_BOARD_SHA256: [u8; 32] = [
+    0xb4, 0x5a, 0x60, 0xf0, 0x7e, 0x4c, 0x83, 0x8b, 0x6f, 0x52, 0x2a, 0xb5, 0x87, 0x22, 0x9c, 0x4a,
+    0x9f, 0xee, 0xfd, 0x53, 0xe7, 0xe0, 0x40, 0xbd, 0xe1, 0x82, 0x0a, 0x9e, 0x94, 0x06, 0xbf, 0xd1,
+];
+const REDWOOD_REGDB_SHA256: [u8; 32] = [
+    0x2f, 0xe6, 0xb7, 0x9e, 0x6d, 0x36, 0xe1, 0x90, 0xf3, 0x9e, 0x89, 0x16, 0xbe, 0xe5, 0xae, 0x4c,
+    0xf9, 0x7a, 0xb5, 0xe7, 0x15, 0x19, 0xaf, 0x5a, 0xf8, 0x92, 0x0b, 0xb7, 0x57, 0x74, 0x0d, 0xd9,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Wcn6750FirmwareAssetError {
+    BoardLength,
+    BoardSha256,
+    RegulatoryLength,
+    RegulatorySha256,
+}
 
 /// Firmware blobs selected by the host before it drops filesystem access.
 pub struct Wcn6750FirmwareAssets {
@@ -11,6 +31,51 @@ pub struct Wcn6750FirmwareAssets {
     pub calibration: Option<Vec<u8>>,
     pub regulatory: Option<Vec<u8>>,
     pub m3: Option<Vec<u8>>,
+}
+
+impl Wcn6750FirmwareAssets {
+    /// Validate and bind the exact board and regulatory assets selected for Redwood.
+    pub fn new_redwood(
+        board: Vec<u8>,
+        regulatory: Vec<u8>,
+    ) -> Result<Self, Wcn6750FirmwareAssetError> {
+        validate_asset(
+            &board,
+            REDWOOD_BOARD_BYTES,
+            REDWOOD_BOARD_SHA256,
+            Wcn6750FirmwareAssetError::BoardLength,
+            Wcn6750FirmwareAssetError::BoardSha256,
+        )?;
+        validate_asset(
+            &regulatory,
+            REDWOOD_REGDB_BYTES,
+            REDWOOD_REGDB_SHA256,
+            Wcn6750FirmwareAssetError::RegulatoryLength,
+            Wcn6750FirmwareAssetError::RegulatorySha256,
+        )?;
+        Ok(Self {
+            board,
+            calibration: None,
+            regulatory: Some(regulatory),
+            m3: None,
+        })
+    }
+}
+
+fn validate_asset(
+    bytes: &[u8],
+    expected_len: usize,
+    expected_sha256: [u8; 32],
+    length_error: Wcn6750FirmwareAssetError,
+    hash_error: Wcn6750FirmwareAssetError,
+) -> Result<(), Wcn6750FirmwareAssetError> {
+    if bytes.len() != expected_len {
+        return Err(length_error);
+    }
+    if Sha256::digest(bytes).as_slice() != expected_sha256 {
+        return Err(hash_error);
+    }
+    Ok(())
 }
 
 impl FirmwareAssets for Wcn6750FirmwareAssets {
@@ -257,5 +322,46 @@ where
     /// Transfer the exact QMI-validated register aperture to the HIF owner.
     pub fn take_device_bar(&mut self) -> Option<MmioRegion<B>> {
         self.handshake.memory_mut().take_device_bar()
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    const SHA256_ABC: [u8; 32] = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
+        0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
+        0x15, 0xad,
+    ];
+
+    #[test]
+    fn exact_asset_is_accepted() {
+        assert_eq!(
+            validate_asset(
+                b"abc",
+                3,
+                SHA256_ABC,
+                Wcn6750FirmwareAssetError::BoardLength,
+                Wcn6750FirmwareAssetError::BoardSha256,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn wrong_asset_length_is_typed() {
+        assert!(matches!(
+            Wcn6750FirmwareAssets::new_redwood(Vec::new(), Vec::new()),
+            Err(Wcn6750FirmwareAssetError::BoardLength)
+        ));
+    }
+
+    #[test]
+    fn wrong_asset_hash_is_typed() {
+        assert!(matches!(
+            Wcn6750FirmwareAssets::new_redwood(alloc::vec![0; REDWOOD_BOARD_BYTES], Vec::new()),
+            Err(Wcn6750FirmwareAssetError::BoardSha256)
+        ));
     }
 }

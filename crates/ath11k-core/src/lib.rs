@@ -29,7 +29,9 @@ pub use operation::{
     RegulatoryDomain, ScanConfig, ScanId, Subsystems, VdevStartFailure, WmmAccessCategory,
     WmmConfig,
 };
-pub use qmi::{HardwareMemoryProvider, Wcn6750FirmwareAssets, Wcn6750QmiSession};
+pub use qmi::{
+    HardwareMemoryProvider, Wcn6750FirmwareAssetError, Wcn6750FirmwareAssets, Wcn6750QmiSession,
+};
 pub use real::{NoWmiTrace, Wcn6750Subsystems, WmiTraceSink, wcn6750_scan_start};
 
 use alloc::vec::Vec;

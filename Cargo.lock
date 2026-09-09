@@ -60,7 +60,6 @@ dependencies = [
  "ath11k-wmi",
  "drv-hardware",
  "drv-hardware-backends",
- "sha2 0.10.9",
  "userspace-vfio",
 ]
 
@@ -85,6 +84,7 @@ dependencies = [
  "ath11k-qmi",
  "ath11k-wmi",
  "drv-hardware-backends",
+ "sha2 0.10.9",
 ]
 
 [[package]]
