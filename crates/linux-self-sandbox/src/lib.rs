@@ -757,7 +757,6 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
         libc::SYS_write,
         libc::SYS_close,
         libc::SYS_fstat,
-        libc::SYS_poll,
         libc::SYS_ppoll,
         // MT7921's mmap/mprotect and lseek have argument filters above.
         libc::SYS_munmap,
@@ -788,6 +787,9 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
         libc::SYS_exit,
         libc::SYS_exit_group,
     ];
+    // aarch64 has no legacy poll syscall; libc implements poll through ppoll.
+    #[cfg(target_arch = "x86_64")]
+    calls.push(libc::SYS_poll);
     if !matches!(profile, Profile::Mt7921Vfio { .. }) {
         calls.extend([
             libc::SYS_recvmsg,
