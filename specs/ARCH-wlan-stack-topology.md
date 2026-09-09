@@ -12,8 +12,14 @@ frame channel. The netstack process has an empty filesystem root, a private
 network namespace, no capabilities or device-backed mappings, and a seccomp
 allowlist; its run-state descriptors are only standard streams, the frame
 channel, the pre-bound SOCKS listener, and accepted clients. The separate DNS
-and wlancfg policy processes in the mature topology below remain future work,
-as does full Wi-Fi process sandboxing. The typed hardware-resource migration
+process in the mature topology below remains future work. A separate,
+self-sandboxing wlancfg daemon now owns durable saved networks and drives the
+pinned Fuchsia selector and client state machine over bounded, fd-free policy
+IPC to a separate simulated Wi-Fi service. Deterministic process tests cover
+selection, exact retry classification and timing, connection events, and
+persistence across policy restart. The production launcher and physical Wi-Fi
+service composition remain future work, as does physical Wi-Fi process
+sandboxing. The typed hardware-resource migration
 is incomplete; production mechanics still share the lab runner. The
 current MT7921 path deliberately leaves BCNFT disabled, retains
 `MT_WF_RFCR_DROP_OTHER_BEACON`, and keeps the MLME's host lost-BSS monitor
@@ -22,13 +28,12 @@ MLME teardown. This temporarily diverges from current Linux mt7921, which
 enables BCNFT at association. The tracked destination is to complete the `0x13`
 event route, enable BCNFT and firmware connection-monitor offload, and suppress
 the host monitor as Linux `IEEE80211_HW_CONNECTION_MONITOR` does; those changes
-must land together. The selected-connection command boundary exists, but a
-separate wlancfg process does not yet. Failed connections currently revoke the
-runtime unless the SME is idle and the driver certifies per-attempt cleanup and
-callback quiescence. MT7921 implements that retry contract while preserving
+must land together. Failed physical connections currently revoke the runtime
+unless the SME is idle and the driver certifies per-attempt cleanup and callback
+quiescence. MT7921 implements that retry contract while preserving
 selected-BSS authority; timeouts and device/containment faults remain terminal.
-The production policy loop does not yet drive retries, and the corrected retry
-path still needs renewed physical acceptance.
+The policy daemon drives the corrected retry path in the simulated process
+slice; renewed physical acceptance still waits on production composition.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
