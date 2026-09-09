@@ -235,7 +235,11 @@ pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart
         },
         control_flags: ScanControlFlags {
             passive: !scan.active,
-            strict_passive: !scan.active,
+            // ath11k_mac_op_hw_scan sets ordinary passive mode when no SSID
+            // is supplied; strict-passive is a distinct optional contract.
+            channel_stat_event: true,
+            // WCN6750 is single-pdev-only, so Linux filters probe requests.
+            filter_probe_request: true,
             ..Default::default()
         },
         control_flags_ext: 0,
@@ -1364,6 +1368,21 @@ mod tests {
         assert_eq!(command.channel.info, channel.info);
         assert_eq!(command.channel.reg_info_1, channel.reg_info_1);
         assert_eq!(command.channel.reg_info_2, channel.reg_info_2);
+    }
+
+    #[test]
+    fn passive_scan_uses_wcn6750_linux_control_flags() {
+        let command = wcn6750_scan_start(crate::ScanConfig {
+            vdev: crate::VdevId(0),
+            id: crate::ScanId(0xa000),
+            active: false,
+            channels_mhz: alloc::vec![2412, 2437, 2462],
+            ssids: Vec::new(),
+        });
+        assert!(command.control_flags.passive);
+        assert!(command.control_flags.channel_stat_event);
+        assert!(command.control_flags.filter_probe_request);
+        assert!(!command.control_flags.strict_passive);
     }
 
     struct DummyQmi;
