@@ -75,9 +75,11 @@ dependencies = [
  "ath11k-qmi",
  "drv-hardware",
  "drv-hardware-backends",
+ "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-softmac",
  "proptest",
+ "wlan-mlme",
  "wlan-softmac-host",
  "zx",
 ]

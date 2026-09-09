@@ -11,6 +11,7 @@ resolver = "3"
 [dependencies]
 ath11k-core = { path = "../ath11k-core" }
 ath11k-dp = { path = "../ath11k-dp" }
+fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
 wlan-softmac-host = { path = "../wlan-softmac-host" }
@@ -21,6 +22,7 @@ ath11k-qmi = { path = "../ath11k-qmi" }
 drv-hardware = { path = "../hardware-api" }
 drv-hardware-backends = { path = "../hardware-backends" }
 proptest = "1"
+wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 wlan-softmac-host = { path = "../wlan-softmac-host", features = ["conformance"] }
 
 [patch.crates-io]

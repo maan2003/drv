@@ -8,9 +8,11 @@ use ath11k_core::{
     RadioControl as _, ScanConfig, ScanId, Subsystems, VdevId, WCN6750, WlanEvent,
     WmmAccessCategory, WmmConfig,
 };
+use fidl_fuchsia_wlan_common::WlanMacRole;
 use fidl_fuchsia_wlan_ieee80211::{
     BssType, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
 };
+use fidl_fuchsia_wlan_softmac::WlanSoftmacBandCapability;
 use wlan_softmac_host::{
     ClientRuntimeDriver, DiscoverySupport, JoinBssRequest, MacSublayerSupport, SecuritySupport,
     SpectrumManagementSupport, WlanAssociationConfig, WlanKeyConfiguration, WlanRxInfo,
@@ -25,6 +27,8 @@ const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
 const DP_WORK_BUDGET: usize = 64;
 const DP_RECEIVE_BUDGET: usize = 1;
 const MGMT_TX_PENDING_MAX: u32 = 512;
+const TWO_GHZ_RATES: &[u8] = &[2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+const FIVE_GHZ_RATES: &[u8] = &[12, 18, 24, 36, 48, 72, 96, 108];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingAssociationSecurity {
@@ -179,6 +183,21 @@ fn frequency_channel(frequency: u16) -> ChannelNumber {
     }
 }
 
+fn regulatory_frequency_channel(frequency: u16) -> Option<ChannelNumber> {
+    let channel = frequency_channel(frequency);
+    let valid = match channel.band {
+        WlanBand::TwoGhz => {
+            frequency == 2484
+                || ((2412..=2472).contains(&frequency) && (frequency - 2407).is_multiple_of(5))
+        }
+        WlanBand::FiveGhz => {
+            (5180..=5825).contains(&frequency) && (frequency - 5000).is_multiple_of(5)
+        }
+        _ => false,
+    };
+    valid.then_some(channel)
+}
+
 /// Owns an ath11k client device and its installed host callbacks.
 ///
 /// The same type composes the deterministic [`ModelSubsystems`] and the real
@@ -197,7 +216,7 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     pending_mgmt_tx: Vec<(u32, [u8; 6])>,
     deferred_mgmt_rx: Option<DeferredManagementRx>,
     deterministic_scan_completion: bool,
-    regulatory_channels: Vec<ath11k_core::RegulatoryChannel>,
+    regulatory_domain: Option<ath11k_core::RegulatoryDomain>,
     pending_association_security: Option<PendingAssociationSecurity>,
 }
 
@@ -217,17 +236,14 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             pending_mgmt_tx: Vec::new(),
             deferred_mgmt_rx: None,
             deterministic_scan_completion: false,
-            regulatory_channels: Vec::new(),
+            regulatory_domain: None,
             pending_association_security: None,
         }
     }
 
-    /// Install channel facts projected from the platform regulatory table.
-    pub fn with_regulatory_channels(
-        mut self,
-        channels: Vec<ath11k_core::RegulatoryChannel>,
-    ) -> Self {
-        self.regulatory_channels = channels;
+    /// Install the regulatory domain that startup programs before vdev creation.
+    pub fn with_regulatory_domain(mut self, domain: ath11k_core::RegulatoryDomain) -> Self {
+        self.regulatory_domain = Some(domain);
         self
     }
 
@@ -270,9 +286,9 @@ impl Ath11kClientDevice<ModelSubsystems> {
     pub fn deterministic(mac: [u8; 6]) -> Self {
         let mut device = Self::new(WCN6750.device(ModelSubsystems::default()), mac);
         device.deterministic_scan_completion = true;
-        device
-            .regulatory_channels
-            .push(ath11k_core::RegulatoryChannel {
+        device.regulatory_domain = Some(ath11k_core::RegulatoryDomain {
+            alpha2: *b"00",
+            channels: vec![ath11k_core::RegulatoryChannel {
                 frequency_mhz: 2437,
                 max_power_dbm: 0,
                 max_reg_power_dbm: 0,
@@ -282,7 +298,8 @@ impl Ath11kClientDevice<ModelSubsystems> {
                 allow_ht: true,
                 allow_vht: true,
                 allow_he: true,
-            });
+            }],
+        });
         device
     }
 }
@@ -301,6 +318,12 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
             return Err(status(error));
         }
         if let Err(error) = self.device.start_radio() {
+            self.device.abort_startup();
+            return Err(status(error));
+        }
+        if let Some(domain) = self.regulatory_domain.clone()
+            && let Err(error) = self.device.set_regulatory_domain(domain)
+        {
             self.device.abort_startup();
             return Err(status(error));
         }
@@ -534,9 +557,41 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
 
 impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     fn query(&mut self) -> Result<WlanSoftmacQueryResponse, zx::Status> {
+        let mut band_caps = Vec::new();
+        for band in [WlanBand::TwoGhz, WlanBand::FiveGhz] {
+            let primary_channels = self
+                .regulatory_domain
+                .as_ref()
+                .into_iter()
+                .flat_map(|domain| &domain.channels)
+                .filter_map(|channel| regulatory_frequency_channel(channel.frequency_mhz))
+                .filter(|channel| channel.band == band)
+                .collect::<Vec<_>>();
+            if !primary_channels.is_empty() {
+                band_caps.push(WlanSoftmacBandCapability {
+                    band: Some(band),
+                    basic_rates: Some(
+                        match band {
+                            WlanBand::TwoGhz => TWO_GHZ_RATES,
+                            WlanBand::FiveGhz => FIVE_GHZ_RATES,
+                            _ => unreachable!(),
+                        }
+                        .to_vec(),
+                    ),
+                    primary_channels: Some(primary_channels),
+                    // The adapter currently implements only Cbw20.
+                    ht_caps: None,
+                    vht_caps: None,
+                });
+            }
+        }
         Ok(WlanSoftmacQueryResponse {
             sta_addr: Some(self.mac),
-            ..Default::default()
+            factory_addr: Some(self.mac),
+            mac_role: Some(WlanMacRole::Client),
+            supported_phys: Some(vec![WlanPhyType::Ofdm]),
+            hardware_capability: Some(0),
+            band_caps: Some(band_caps),
         })
     }
     fn query_discovery_support(&mut self) -> Result<DiscoverySupport, zx::Status> {
@@ -564,8 +619,10 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         let vdev = self.ready_vdev()?;
         let frequency = channel_frequency(primary)?;
         let channel = self
-            .regulatory_channels
-            .iter()
+            .regulatory_domain
+            .as_ref()
+            .into_iter()
+            .flat_map(|domain| &domain.channels)
             .find(|channel| channel.frequency_mhz == frequency)
             .copied()
             .ok_or(zx::Status::NOT_FOUND)?;
@@ -722,8 +779,8 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             return Err(zx::Status::INVALID_ARGS);
         }
         let allowed: &[u8] = match primary.band {
-            WlanBand::TwoGhz => &[2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108],
-            WlanBand::FiveGhz => &[12, 18, 24, 36, 48, 72, 96, 108],
+            WlanBand::TwoGhz => TWO_GHZ_RATES,
+            WlanBand::FiveGhz => FIVE_GHZ_RATES,
             _ => return Err(zx::Status::NOT_SUPPORTED),
         };
         if rates.iter().any(|rate| !allowed.contains(&(rate & 0x7f))) {
@@ -1058,6 +1115,150 @@ mod tests {
         let mut adapter = Ath11kClientDevice::new(WCN6750.device(backend), CLIENT);
         assert!(adapter.start(Box::new(NoopUpcalls)).is_err());
         adapter.into_device()
+    }
+
+    #[test]
+    fn query_converts_to_mlme_device_info_from_installed_channels() {
+        let channel = |frequency_mhz| ath11k_core::RegulatoryChannel {
+            frequency_mhz,
+            max_power_dbm: 20,
+            max_reg_power_dbm: 20,
+            max_antenna_gain_dbi: 0,
+            passive: false,
+            radar: false,
+            allow_ht: true,
+            allow_vht: true,
+            allow_he: true,
+        };
+        let mut adapter =
+            Ath11kClientDevice::new(WCN6750.device(ModelSubsystems::default()), CLIENT)
+                .with_regulatory_domain(ath11k_core::RegulatoryDomain {
+                    alpha2: *b"US",
+                    channels: vec![
+                        channel(2400),
+                        channel(2437),
+                        channel(5955),
+                        channel(5180),
+                        channel(2462),
+                    ],
+                });
+
+        let query = adapter.query().unwrap();
+        assert_eq!(query.sta_addr, Some(CLIENT));
+        assert_eq!(query.factory_addr, Some(CLIENT));
+        assert_eq!(query.mac_role, Some(WlanMacRole::Client));
+        assert_eq!(query.supported_phys, Some(vec![WlanPhyType::Ofdm]));
+        assert_eq!(query.hardware_capability, Some(0));
+        assert_eq!(
+            query.band_caps,
+            Some(vec![
+                WlanSoftmacBandCapability {
+                    band: Some(WlanBand::TwoGhz),
+                    basic_rates: Some(TWO_GHZ_RATES.to_vec()),
+                    primary_channels: Some(vec![
+                        ChannelNumber {
+                            band: WlanBand::TwoGhz,
+                            number: 6
+                        },
+                        ChannelNumber {
+                            band: WlanBand::TwoGhz,
+                            number: 11
+                        },
+                    ]),
+                    ht_caps: None,
+                    vht_caps: None,
+                },
+                WlanSoftmacBandCapability {
+                    band: Some(WlanBand::FiveGhz),
+                    basic_rates: Some(FIVE_GHZ_RATES.to_vec()),
+                    primary_channels: Some(vec![ChannelNumber {
+                        band: WlanBand::FiveGhz,
+                        number: 36,
+                    }]),
+                    ht_caps: None,
+                    vht_caps: None,
+                },
+            ])
+        );
+
+        let info = wlan_mlme::mlme_device_info_from_softmac(query).unwrap();
+        assert_eq!(info.sta_addr, CLIENT);
+        assert_eq!(info.factory_addr, CLIENT);
+        assert_eq!(info.role, WlanMacRole::Client);
+        assert_eq!(info.softmac_hardware_capability, 0);
+        assert_eq!(info.bands.len(), 2);
+        assert_eq!(info.bands[0].basic_rates, TWO_GHZ_RATES);
+        assert_eq!(info.bands[1].basic_rates, FIVE_GHZ_RATES);
+        assert_eq!(info.bands[0].ht_cap, None);
+        assert_eq!(info.bands[0].vht_cap, None);
+        assert_eq!(info.bands[1].ht_cap, None);
+        assert_eq!(info.bands[1].vht_cap, None);
+        assert_eq!(
+            adapter.query_security_support().unwrap(),
+            Default::default()
+        );
+        assert_eq!(
+            adapter.query_spectrum_management_support().unwrap(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn startup_programs_regulatory_domain_before_vdev_creation() {
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(NoopUpcalls)).unwrap();
+        let operations = adapter.device.backend().operations();
+        let radio = operations
+            .iter()
+            .position(|operation| operation == &Operation::RadioStart)
+            .unwrap();
+        let country = operations
+            .iter()
+            .position(|operation| operation == &Operation::WmiSetCurrentCountry { alpha2: *b"00" })
+            .unwrap();
+        let channels = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::WmiScanChannelList { .. }))
+            .unwrap();
+        let vdev = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::WmiVdevCreate { .. }))
+            .unwrap();
+        assert!(radio < country && country < channels && channels < vdev);
+    }
+
+    #[test]
+    fn regulatory_programming_failure_aborts_startup_before_vdev_creation() {
+        let mut backend = ModelSubsystems::default();
+        backend.fail_once(Operation::WaitRegulatoryUpdate {
+            pdev: ath11k_core::PdevId(0),
+        });
+        let mut adapter = Ath11kClientDevice::new(WCN6750.device(backend), CLIENT)
+            .with_regulatory_domain(ath11k_core::RegulatoryDomain {
+                alpha2: *b"00",
+                channels: vec![ath11k_core::RegulatoryChannel {
+                    frequency_mhz: 2437,
+                    max_power_dbm: 20,
+                    max_reg_power_dbm: 20,
+                    max_antenna_gain_dbi: 0,
+                    passive: false,
+                    radar: false,
+                    allow_ht: true,
+                    allow_vht: true,
+                    allow_he: true,
+                }],
+            });
+
+        assert_eq!(adapter.start(Box::new(NoopUpcalls)), Err(zx::Status::IO));
+        assert_eq!(adapter.device.state(), DeviceState::Stopped);
+        assert!(
+            !adapter
+                .device
+                .backend()
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation, Operation::WmiVdevCreate { .. }))
+        );
     }
 
     const PEER: [u8; 6] = [2, 0, 0, 0, 0, 2];
