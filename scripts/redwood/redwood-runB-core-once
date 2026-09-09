@@ -1,0 +1,88 @@
+#!/bin/sh
+# One-shot Redwood Run B payload. Invoke only through redwood-wifi-transaction:
+#   redwood-wifi-transaction --run /path/to/redwood-runB-core-once
+set -eu
+
+[ "$#" -eq 0 ] || {
+    echo "usage: $0" >&2
+    exit 2
+}
+
+PATH=/run/current-system/sw/bin:/bin:/sbin
+export PATH
+
+RUN=${REDWOOD_RUN_DIR:-/var/lib/ath11k-redwood-lab/runs/runB-core-region1-orderly}
+P=/sys/bus/platform/devices/17a10040.wifi
+RPROC=/sys/class/remoteproc/remoteproc2
+PARAM=/sys/module/iommufd/parameters/allow_unsafe_interrupts
+RUNNER=${REDWOOD_RUNNER:-/var/lib/ath11k-redwood-lab/stage10/ath11k-bringup-runB}
+WATCHDOG=${REDWOOD_WATCHDOG:-/var/lib/ath11k-redwood-lab/watchdog-acceptance/redwood-lab-watchdog}
+MODULES=${REDWOOD_VFIO_MODULES:-/var/lib/ath11k-redwood-lab/stage7/modules}
+MANIFEST=${REDWOOD_RUNB_MANIFEST:-/var/lib/ath11k-redwood-lab/stage12/SHA256SUMS}
+EXPECTED_FDT_SIZE=${REDWOOD_EXPECTED_FDT_SIZE:-146776}
+EXPECTED_FDT_SHA256=${REDWOOD_EXPECTED_FDT_SHA256:-99b5b3161106ac79a06f252607598e1de995610b72095044ff914f9f99365cfb}
+
+if [ "${REDWOOD_RUNB_VALIDATE_ONLY:-0}" = 1 ]; then
+    printf '%s\n' "validated single executable payload: $0"
+    exit 0
+fi
+
+mkdir -p "$RUN"
+exec >>"$RUN/setup.log" 2>&1
+echo "PAYLOAD_ENTER=$(date -u +%FT%TZ)"
+cat /proc/version
+test -f "$MANIFEST"
+sha256sum -c "$MANIFEST"
+cp "$MANIFEST" "$RUN/input-SHA256SUMS"
+
+# Fail before any device mutation unless this is the validated candidate boot.
+test ! -e /run/redwood-lab-watchdog/armed
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
+test "$(wc -c </sys/firmware/fdt)" = "$EXPECTED_FDT_SIZE"
+test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = "$EXPECTED_FDT_SHA256"
+test -e "$PARAM"
+test -e "$P/driver_override"
+test ! -e "$P/driver"
+test -x "$RUNNER"
+test -x "$WATCHDOG"
+test -f "$MODULES/vfio-platform-base.ko"
+test -f "$MODULES/vfio-platform.ko"
+
+# WPSS must be running before RealHost validates remoteproc containment.
+test "$(cat "$RPROC/name")" = wpss
+test "$(cat "$RPROC/firmware")" = qcom/sm7325/xiaomi/redwood/wpss.mbn
+test -d /run/current-system/firmware
+echo "REMOTEPROC_START_ENTER=$(date -u +%FT%TZ)"
+if [ "$(cat "$RPROC/state")" = offline ]; then
+    printf start >"$RPROC/state"
+fi
+i=0
+while [ "$(cat "$RPROC/state")" != running ] && [ "$i" -lt 20 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+test "$(cat "$RPROC/state")" = running
+echo "REMOTEPROC_RUNNING=$(date -u +%FT%TZ)"
+
+echo "VFIO_SETUP_ENTER=$(date -u +%FT%TZ)"
+printf 1 >"$PARAM"
+insmod "$MODULES/vfio-platform-base.ko"
+insmod "$MODULES/vfio-platform.ko" reset_required=0
+printf %s vfio-platform >"$P/driver_override"
+printf %s 17a10040.wifi >/sys/bus/platform/drivers/vfio-platform/bind
+CDEV_NAME=$(find "$P/vfio-dev" -maxdepth 1 -mindepth 1 -printf '%f\n' | head -n1)
+test -n "$CDEV_NAME"
+CDEV=/dev/vfio/devices/$CDEV_NAME
+test -c "$CDEV"
+printf '%s\n' "$CDEV" >"$RUN/vfio-cdev"
+
+echo "WATCHDOG_ARM_ENTER=$(date -u +%FT%TZ)"
+"$WATCHDOG" arm "$RUN"
+"$RUNNER" preflight --vfio-device "$CDEV" >"$RUN/preflight.log" 2>&1
+touch /run/redwood-lab-watchdog/run
+
+echo "RUNNER_ENTER=$(date -u +%FT%TZ)"
+exec "$RUNNER" --vfio-device "$CDEV" \
+    --containment remoteproc:remoteproc2 --register-region 1 \
+    --stop-after core --wmi-log "$RUN/runB.wmi.jsonl" \
+    >"$RUN/runB.log" 2>&1

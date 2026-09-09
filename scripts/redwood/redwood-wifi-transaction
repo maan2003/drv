@@ -56,12 +56,18 @@ SH
       "$t/report/recovery.log"
     test "$(cat "$t/sysrq-trigger")" = b
     : >"$t/sysrq-trigger"
+    cat >"$t/payload" <<'SH'
+#!/bin/sh
+printf 'argc=%s\n' "$#" >"$REDWOOD_TEST_PAYLOAD_RESULT"
+SH
+    chmod +x "$t/payload"
     REDWOOD_REPORT_DIR="$t/report" REDWOOD_SYSTEMD_RUN="$t/bin/systemd-run" \
       REDWOOD_SYSTEMD_INHIBIT="$t/bin/systemd-inhibit" REDWOOD_TIMEOUT=timeout \
       REDWOOD_SYSRQ_TRIGGER="$t/sysrq-trigger" REDWOOD_REBOOT=false \
       REDWOOD_DEADLINE_SECONDS=5 REDWOOD_TEST_ACTIONS="$t/actions" \
-      REDWOOD_TEST_MODE=1 \
-      "$0" --run true
+      REDWOOD_TEST_MODE=1 REDWOOD_TEST_PAYLOAD_RESULT="$t/payload-result" \
+      "$0" --run "$t/payload"
+    test "$(cat "$t/payload-result")" = argc=0
     grep -q 'RECOVERY_BEGIN reason=runner_exit_0 action=forced_reboot' \
       "$t/report/recovery.log"
     test "$(cat "$t/sysrq-trigger")" = b
