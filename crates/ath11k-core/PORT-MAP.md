@@ -68,7 +68,7 @@ misreported as replaced code.
 | `ath11k_mac_op_hw_scan` | `mac.c:4183-4338` | `ClientRadioControl::start_scan` | ported | Typed request/channel/SSID data. |
 | `ath11k_mac_op_cancel_hw_scan` | `mac.c:4340-4350` | `ClientRadioControl::stop_scan` | ported | WMI scan stop effect. |
 | `ath11k_mac_mgmt_tx_wmi` | `mac.c:6174-6254` | `ClientRadioControl::transmit_management` | ported | Buffer identity retained for completion. |
-| `ath11k_reg_set_cc` | `reg.c:1062-1068` | `ClientRadioControl::set_regulatory_domain` | ported | Current-country command precedes channel list. |
+| `ath11k_reg_set_cc` | `reg.c:1062-1068` | `ClientRadioControl::set_regulatory_domain` | ported | Current-country command is followed by its fresh regulatory event before the channel list is installed. |
 | `ath11k_reg_update_chan_list` | `reg.c:118-222` | `RegulatoryDomain` / `RegulatoryChannel` | ported | Empty-list check is the native check. |
 | WMI/HTC receive events | `wmi.c:6507-7950` | `events::WlanEvent` | ported | Actual typed decoders; only roam reason 2 becomes beacon loss. |
 | mac80211 scan/association/rate-control policy | `mac.c:1-10878` | Fuchsia wlan-mlme/SME | replaced-by-fuchsia-mlme | Hardware-effect spans above are excluded from this classification. |

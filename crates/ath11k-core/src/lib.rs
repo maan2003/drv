@@ -654,11 +654,11 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         self.op(Operation::WmiSetCurrentCountry {
             alpha2: domain.alpha2,
         })?;
+        self.op(Operation::WaitRegulatoryUpdate { pdev: PdevId(0) })?;
         self.op(Operation::WmiScanChannelList {
             pdev: PdevId(0),
             channels: domain.channels,
-        })?;
-        self.op(Operation::WaitRegulatoryUpdate { pdev: PdevId(0) })
+        })
     }
 }
 

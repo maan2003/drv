@@ -83,6 +83,6 @@ touch /run/redwood-lab-watchdog/run
 
 echo "RUNNER_ENTER=$(date -u +%FT%TZ)"
 exec "$RUNNER" --vfio-device "$CDEV" \
-    --containment remoteproc:remoteproc2 --register-region 1 \
+    --containment remoteproc:remoteproc2 --stop-remoteproc-on-exit --register-region 1 \
     --stop-after core --wmi-log "$RUN/runB.wmi.jsonl" \
     >"$RUN/runB.log" 2>&1

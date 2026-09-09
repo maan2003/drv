@@ -1140,6 +1140,23 @@ where
     read_state().map(|observed| observed.trim() == "offline")
 }
 
+fn quiesce_remoteproc_then_release<W, R, D>(
+    write_stop: W,
+    read_state: R,
+    release_device: D,
+) -> io::Result<bool>
+where
+    W: FnMut() -> io::Result<()>,
+    R: FnMut() -> io::Result<String>,
+    D: FnOnce(),
+{
+    let offline = stop_and_verify_remoteproc(write_stop, read_state)?;
+    if offline {
+        release_device();
+    }
+    Ok(offline)
+}
+
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
         let vfio = if config.broker {
@@ -1399,21 +1416,24 @@ impl RealHost {
     pub fn quiesce_before_release(&mut self) {
         use ath11k_core::Lifecycle as _;
 
-        if let Some(device) = self.device.as_mut()
-            && matches!(
-                device.state(),
-                ath11k_core::DeviceState::Ready | ath11k_core::DeviceState::Recovering
-            )
-        {
-            let _ = device.stop();
-        }
         let Some(name) = self.stop_remoteproc_on_exit.take() else {
             return;
         };
         let state = Path::new(REMOTEPROC_CLASS).join(&name).join("state");
-        let stopped = stop_and_verify_remoteproc(
+        let stopped = quiesce_remoteproc_then_release(
             || fs::write(&state, "stop\n"),
             || fs::read_to_string(&state),
+            || {
+                eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
+                if let Some(device) = self.device.as_mut()
+                    && matches!(
+                        device.state(),
+                        ath11k_core::DeviceState::Ready | ath11k_core::DeviceState::Recovering
+                    )
+                {
+                    let _ = device.stop();
+                }
+            },
         );
         if !matches!(stopped, Ok(true)) {
             eprintln!("remoteproc_quiesce_failed_holding_vfio name={name:?} result={stopped:?}");
@@ -1421,7 +1441,6 @@ impl RealHost {
                 std::thread::park();
             }
         }
-        eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
     }
 
     pub fn scan_summary(&self) -> Option<&ScanSummary> {
@@ -1775,6 +1794,47 @@ mod tests {
         );
         assert!(!*read_called.borrow());
         assert!(!stop_and_verify_remoteproc(|| Ok(()), || Ok("running".into())).unwrap());
+    }
+
+    #[test]
+    fn remoteproc_must_be_offline_before_device_release() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let write_operations = operations.clone();
+        let read_operations = operations.clone();
+        let release_operations = operations.clone();
+        assert!(
+            quiesce_remoteproc_then_release(
+                move || {
+                    write_operations.borrow_mut().push("write-stop");
+                    Ok(())
+                },
+                move || {
+                    read_operations.borrow_mut().push("read-offline");
+                    Ok("offline\n".into())
+                },
+                move || release_operations.borrow_mut().push("release-device"),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            &*operations.borrow(),
+            &["write-stop", "read-offline", "release-device"]
+        );
+
+        let released = Rc::new(RefCell::new(false));
+        let released_inner = released.clone();
+        assert!(
+            !quiesce_remoteproc_then_release(
+                || Ok(()),
+                || Ok("running".into()),
+                move || *released_inner.borrow_mut() = true,
+            )
+            .unwrap()
+        );
+        assert!(!*released.borrow());
     }
 
     #[test]

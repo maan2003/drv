@@ -356,6 +356,42 @@ fn client_sequence_preserves_mac_c_wmi_order() {
 }
 
 #[test]
+fn regulatory_channels_follow_the_fresh_country_event() {
+    let mut device = ready_device();
+    device.backend_mut().log.clear();
+    let channels = vec![RegulatoryChannel {
+        frequency_mhz: 2412,
+        max_power_dbm: 23,
+        max_reg_power_dbm: 23,
+        max_antenna_gain_dbi: 0,
+        passive: true,
+        radar: false,
+        allow_ht: true,
+        allow_vht: false,
+        allow_he: true,
+    }];
+
+    device
+        .set_regulatory_domain(RegulatoryDomain {
+            alpha2: *b"00",
+            channels: channels.clone(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        device.backend().log,
+        vec![
+            Operation::WmiSetCurrentCountry { alpha2: *b"00" },
+            Operation::WaitRegulatoryUpdate { pdev: PdevId(0) },
+            Operation::WmiScanChannelList {
+                pdev: PdevId(0),
+                channels,
+            },
+        ]
+    );
+}
+
+#[test]
 fn repeated_channel_set_uses_vdev_restart_only_after_completed_start() {
     let mut device = ready_device();
     let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
