@@ -279,7 +279,7 @@ fn wlancfg_child() -> anyhow::Result<()> {
     let state = unsafe { OwnedFd::from_raw_fd(4) };
     let prepared =
         wlancfg_service::PreparedHostControlClient::from_inherited_socket(control, GENERATION)?;
-    let parked = prepared.park_owner_before_lockdown()?;
+    let parked = prepared.spawn_parked_after_setup()?;
     // TEST FIXTURE ONLY: kernel namespace enforcement is not claimed here.
     wlancfg_service::policy::serve_one_generation(parked, state)
 }

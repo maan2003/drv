@@ -99,7 +99,7 @@ pub fn serve_one_generation(
             // Start the first possible IPC receive only after persistence metadata,
             // stale-temp cleanup, load, and parsing have all completed.
             let control = parked
-                .start_after_lockdown()
+                .activate_after_persistence()
                 .context("start WLAN control owner")?;
 
             let scan: Arc<dyn ScanRequestApi> = Arc::new(ControlScan {

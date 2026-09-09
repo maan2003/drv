@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     // Thread creation is setup-only. The owner blocks on a private start gate
     // and cannot poll or receive the policy socket before TSYNC lockdown.
     let parked = prepared
-        .park_owner_before_lockdown()
+        .spawn_parked_after_setup()
         .context("park WLAN control owner before lockdown")?;
     let locked = setup
         .lockdown(Profile::Wlancfg {

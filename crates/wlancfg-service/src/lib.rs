@@ -108,7 +108,7 @@ impl PreparedHostControlClient {
     /// available, but parks it before it can poll or receive from the socket.
     /// Call after namespace/capability setup and before seccomp lockdown so the
     /// runtime profile needs no process-creation syscall.
-    pub fn park_owner_before_lockdown(self) -> anyhow::Result<ParkedHostControlClient> {
+    pub fn spawn_parked_after_setup(self) -> anyhow::Result<ParkedHostControlClient> {
         HostControlClient::park(self.fd, self.generation)
     }
 }
@@ -118,29 +118,41 @@ impl PreparedHostControlClient {
 pub struct ParkedHostControlClient {
     client: HostControlClient,
     start: Option<sync_mpsc::SyncSender<()>>,
+    owner: Option<thread::JoinHandle<()>>,
 }
 
 impl ParkedHostControlClient {
     /// Releases the already-confined owner thread into its poll/receive loop.
     /// Call only from the service's locked-down run phase.
-    pub fn start_after_lockdown(mut self) -> anyhow::Result<HostControlClient> {
+    pub fn activate_after_persistence(mut self) -> anyhow::Result<HostControlClient> {
         self.start
             .take()
             .expect("parked owner start is single-use")
             .send(())
             .map_err(|_| anyhow!("WLAN control owner ended before lockdown opened"))?;
+        // Dropping a JoinHandle detaches the active owner. ClientInner's
+        // command/wake handles retain its normal shutdown ownership.
+        drop(self.owner.take());
         Ok(self.client.clone())
     }
 }
 
+impl Drop for ParkedHostControlClient {
+    fn drop(&mut self) {
+        // Closing the one-shot start channel cancels a never-activated owner.
+        self.start.take();
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.join();
+        }
+    }
+}
+
 impl HostControlClient {
-    /// Convenience constructor for already-confined callers and tests.
-    /// Service startup should use [`PreparedHostControlClient`] so the type
-    /// boundary preserves the no-receive-before-lockdown invariant.
-    pub fn from_inherited_socket(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
+    #[cfg(test)]
+    fn from_inherited_socket(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
         PreparedHostControlClient::from_inherited_socket(fd, generation)?
-            .park_owner_before_lockdown()?
-            .start_after_lockdown()
+            .spawn_parked_after_setup()?
+            .activate_after_persistence()
     }
 
     fn park(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<ParkedHostControlClient> {
@@ -154,15 +166,22 @@ impl HostControlClient {
         let owner_terminal = force_terminal.clone();
         let owner_wake = wake.clone();
         let (start_tx, start_rx) = sync_mpsc::sync_channel(0);
-        thread::Builder::new()
+        let (ready_tx, ready_rx) = sync_mpsc::sync_channel(0);
+        let owner = thread::Builder::new()
             .name("wlancfg-control-io".into())
             .spawn(move || {
+                let owner = Owner::new(fd, owner_wake, generation, command_rx, event_tx);
+                if ready_tx.send(()).is_err() {
+                    return;
+                }
                 if start_rx.recv().is_ok() {
-                    Owner::new(fd, owner_wake, generation, command_rx, event_tx)
-                        .run(owner_terminal);
+                    owner.run(owner_terminal);
                 }
             })
             .context("spawn WLAN control I/O owner")?;
+        ready_rx
+            .recv()
+            .map_err(|_| anyhow!("WLAN control owner ended before reaching start gate"))?;
 
         let client = Self(Arc::new(ClientInner {
             commands: command_tx,
@@ -173,6 +192,7 @@ impl HostControlClient {
         Ok(ParkedHostControlClient {
             client,
             start: Some(start_tx),
+            owner: Some(owner),
         })
     }
 
@@ -621,12 +641,33 @@ mod tests {
         // A setup-phase prepared endpoint has no worker and cannot consume the
         // queued untrusted packet. Starting the owner later observes it and
         // terminates the generation.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let parked = prepared.park_owner_before_lockdown().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let client = parked.start_after_lockdown().unwrap();
+        let parked = prepared.spawn_parked_after_setup().unwrap();
+        let client = parked.activate_after_persistence().unwrap();
         let mut liveness = client.take_event_stream();
         assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
+    }
+
+    #[test]
+    fn dropping_parked_client_cancels_and_joins_owner() {
+        let (client_fd, server_fd) = sockets();
+        let parked = PreparedHostControlClient::from_inherited_socket(client_fd, GENERATION)
+            .unwrap()
+            .spawn_parked_after_setup()
+            .unwrap();
+        drop(parked);
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    server_fd.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    0,
+                )
+            },
+            0,
+            "cancelled parked owner retained the control socket"
+        );
     }
 
     fn send_packet(fd: RawFd, sequence: u64, message: Message, rights: &[RawFd]) {
