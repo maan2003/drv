@@ -195,6 +195,13 @@ state, USB carrier, and watchdog control-peer reachability. It also syncs the
 runner and WMI logs. This is diagnostic evidence only: it does not renew,
 disarm, or replace either recovery deadline.
 
+Set `REDWOOD_MANUAL_RECOVERY=1` only for an operator-attended diagnostic where
+manual reboot is explicitly accepted. That mode verifies no lab watchdog is
+armed, starts no automatic reboot deadline, and passes `--manual-recovery` to
+the runner and its preflight. The runner still stops WPSS before releasing any
+VFIO mapping; if quiescence cannot be proved it retains those owners and the
+operator must reboot manually. The session sleep inhibitor remains active.
+
 This is evidence for repeated failure at the currently tested
 `DpHttConnect` boundary, not a universal reset proof for arbitrary later DMA
 states. The retained physical run

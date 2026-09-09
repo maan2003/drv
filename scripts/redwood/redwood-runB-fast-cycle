@@ -15,6 +15,7 @@ RUNNER=$LAB/stage10/ath11k-bringup-runB
 TRANSACTION=$LAB/stage10/redwood-wifi-transaction
 CYCLES=${REDWOOD_FAST_CYCLES:-2}
 STOP_AFTER=${REDWOOD_STOP_AFTER:-core}
+MANUAL_RECOVERY=${REDWOOD_MANUAL_RECOVERY:-0}
 
 mkdir -p "$RUN"
 exec >>"$RUN/fast-cycle.log" 2>&1
@@ -27,6 +28,10 @@ test "$CYCLES" -ge 1
 case "$STOP_AFTER" in
   core|passive-scan|scan-results) ;;
   *) echo "unsupported REDWOOD_STOP_AFTER=$STOP_AFTER"; exit 2 ;;
+esac
+case "$MANUAL_RECOVERY" in
+  0|1) ;;
+  *) echo "unsupported REDWOOD_MANUAL_RECOVERY=$MANUAL_RECOVERY"; exit 2 ;;
 esac
 
 # Keep USB control reachable after the clean final cycle leaves this candidate
@@ -41,14 +46,26 @@ if ! systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service; then
 fi
 systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
 
-"$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
-systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=300s \
-  "$TRANSACTION" --recover fast_cycle_deadline
+if test "$MANUAL_RECOVERY" = 1; then
+  test ! -e /run/redwood-lab-watchdog/armed
+  test ! -e /dev/watchdog0
+  for unit in redwood-lab-watchdog.service boot-watchdog.service \
+    ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service; do
+    ! systemctl is-active --quiet "$unit"
+  done
+  echo "RECOVERY_MODE=manual automatic_watchdog=disabled hardware_watchdog=absent automatic_deadline=disabled"
+  sync -f "$RUN/fast-cycle.log"
+else
+  "$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
+  systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=300s \
+    "$TRANSACTION" --recover fast_cycle_deadline
+fi
 
 # Keep the smallest useful evidence durable across an abrupt reboot. The
-# watchdog checks both the runner heartbeat and ICMP control reachability; this
-# independent recorder captures those exact inputs and syncs the existing run
-# logs without depending on the runner making forward progress.
+# automatic mode's watchdog checks both the runner heartbeat and ICMP control
+# reachability; this independent recorder captures those same inputs in either
+# recovery mode and syncs the existing run logs without depending on the runner
+# making forward progress.
 record_flight_state() {
   uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo unavailable)
   runner_pid=$(cat /run/redwood-lab-watchdog/runner.pid 2>/dev/null || echo absent)
@@ -105,8 +122,14 @@ while test "$i" -le "$CYCLES"; do
   cdev_name=$(find "$P/vfio-dev" -maxdepth 1 -mindepth 1 -printf '%f\n' | head -n1)
   cdev=/dev/vfio/devices/$cdev_name
   test -c "$cdev"
-  "$RUNNER" preflight --vfio-device "$cdev" >"$RUN/preflight-$i.log" 2>&1
-  touch /run/redwood-lab-watchdog/run
+  manual_arg=
+  if test "$MANUAL_RECOVERY" = 1; then
+    manual_arg=--manual-recovery
+  fi
+  "$RUNNER" preflight --vfio-device "$cdev" $manual_arg >"$RUN/preflight-$i.log" 2>&1
+  if test "$MANUAL_RECOVERY" = 0; then
+    touch /run/redwood-lab-watchdog/run
+  fi
   launch_ns=$(date +%s%N)
   echo "CYCLE_${i}_RUNNER_LAUNCH_NS=$launch_ns"
   sync -f "$RUN/fast-cycle.log"
@@ -114,7 +137,7 @@ while test "$i" -le "$CYCLES"; do
   set +e
   "$RUNNER" --vfio-device "$cdev" --containment remoteproc:remoteproc2 \
     --stop-remoteproc-on-exit --register-region 1 --stop-after "$STOP_AFTER" \
-    --wmi-log "$RUN/runB-$i.wmi.jsonl" >"$RUN/runB-$i.log" 2>&1
+    --wmi-log "$RUN/runB-$i.wmi.jsonl" $manual_arg >"$RUN/runB-$i.log" 2>&1
   rc=$?
   set -e
   record_flight_state
@@ -142,9 +165,11 @@ echo "FAST_COMPLETE=$(date -u +%FT%TZ)"
 # Every child is reaped, WPSS is offline, and VFIO is unbound. Only at this
 # proved inert boundary may the emergency fallbacks be disarmed; keep the
 # candidate kernel alive for the next userspace iteration.
-"$LAB/watchdog-acceptance/redwood-lab-watchdog" stop
-systemctl stop ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service \
-  2>/dev/null || true
-systemctl reset-failed ath11k-fast-cycle-deadline.timer \
-  ath11k-fast-cycle-deadline.service 2>/dev/null || true
+if test "$MANUAL_RECOVERY" = 0; then
+  "$LAB/watchdog-acceptance/redwood-lab-watchdog" stop
+  systemctl stop ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service \
+    2>/dev/null || true
+  systemctl reset-failed ath11k-fast-cycle-deadline.timer \
+    ath11k-fast-cycle-deadline.service 2>/dev/null || true
+fi
 echo "FAST_INERT_CANDIDATE_RETAINED=$(date -u +%FT%TZ)"

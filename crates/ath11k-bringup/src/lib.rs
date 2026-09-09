@@ -96,6 +96,7 @@ pub struct Cli {
     pub ssid: Option<Vec<u8>>,
     pub containment_remoteproc: Option<String>,
     pub stop_remoteproc_on_exit: bool,
+    pub manual_recovery: bool,
 }
 
 impl Default for Cli {
@@ -113,6 +114,7 @@ impl Default for Cli {
             ssid: None,
             containment_remoteproc: None,
             stop_remoteproc_on_exit: false,
+            manual_recovery: false,
         }
     }
 }
@@ -168,6 +170,7 @@ impl Cli {
                     cli.containment_remoteproc = Some(name.into());
                 }
                 "--stop-remoteproc-on-exit" => cli.stop_remoteproc_on_exit = true,
+                "--manual-recovery" => cli.manual_recovery = true,
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -201,7 +204,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--manual-recovery] [--broker]"
 }
 
 #[derive(Debug)]
@@ -421,7 +424,13 @@ pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
         ));
     }
 
-    if !Path::new(LAB_WATCHDOG_ARMED).is_file() {
+    let watchdog_armed = Path::new(LAB_WATCHDOG_ARMED).is_file();
+    if config.manual_recovery && watchdog_armed {
+        return Err(Error::Preflight(
+            "manual recovery requires the Redwood userspace watchdog to be disarmed".into(),
+        ));
+    }
+    if !config.manual_recovery && !watchdog_armed {
         return Err(Error::Preflight(
             "Redwood userspace watchdog is not armed".into(),
         ));
@@ -448,7 +457,11 @@ pub fn preflight(config: &Cli) -> Result<Vec<String>, Error> {
         format!("wifi_spi_irqs={irq_count}"),
         format!("wifi_irqs_edge_rising={irqs_edge_rising}"),
         "iommu_open=true".into(),
-        "userspace_watchdog=armed".into(),
+        if config.manual_recovery {
+            "recovery=manual".into()
+        } else {
+            "userspace_watchdog=armed".into()
+        },
     ])
 }
 
@@ -1553,9 +1566,15 @@ mod tests {
             Cli::parse(["--dry-run", "--register-region", "1", "--stop-after", "qmi"]).unwrap();
         assert_eq!(selected.register_region, Some(1));
         assert!(Cli::parse(["--dry-run", "--register-region", "256"]).is_err());
-        let preflight =
-            Cli::parse(["preflight", "--vfio-device", "/dev/vfio/devices/vfio7"]).unwrap();
+        let preflight = Cli::parse([
+            "preflight",
+            "--vfio-device",
+            "/dev/vfio/devices/vfio7",
+            "--manual-recovery",
+        ])
+        .unwrap();
         assert!(preflight.preflight);
+        assert!(preflight.manual_recovery);
     }
 
     #[test]

@@ -13,7 +13,7 @@ struct RunnerHeartbeat {
 }
 
 impl RunnerHeartbeat {
-    fn start() -> Result<Self, String> {
+    fn start(manual_recovery: bool) -> Result<Self, String> {
         let directory = std::path::Path::new("/run/redwood-lab-watchdog");
         fs::create_dir_all(directory)
             .map_err(|error| format!("prepare watchdog runtime directory: {error}"))?;
@@ -36,6 +36,9 @@ impl RunnerHeartbeat {
             stop,
             thread: Some(worker),
         };
+        if manual_recovery {
+            return Ok(heartbeat);
+        }
         for _ in 0..150 {
             if directory.join("armed").is_file() && directory.join("run").is_file() {
                 return Ok(heartbeat);
@@ -86,7 +89,7 @@ fn main() {
             host.dp_poll_log().to_vec(),
         )
     } else {
-        let heartbeat = match RunnerHeartbeat::start() {
+        let heartbeat = match RunnerHeartbeat::start(config.manual_recovery) {
             Ok(heartbeat) => heartbeat,
             Err(message) => {
                 eprintln!("ath11k-bringup: {message}");

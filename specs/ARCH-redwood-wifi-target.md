@@ -69,18 +69,19 @@ and coordinate exclusive hardware access through no-plastic (`np`). Wi-Fi loss
 is expected. Preserve reports locally and retrieve them over USB; restoring
 `wlan0` is not a prerequisite for recovery or evidence collection.
 
-Each experiment has a bounded duration and automatic recovery to a reachable,
-known state on ordinary runner failure, timeout, or control-session loss. Use
-the smallest mechanism that covers those failures. There is no requirement for
-a particular number of timers or for rebinding ath11k/iwd. At the current
-proved core and passive-scan stages, the runner retains all VFIO authority while it
-stops WPSS and verifies `offline`; the wrapper then verifies the child is reaped
-and no cdev descriptor remains before unbinding VFIO. A stop or verification
-failure holds that authority rather than dropping live DMA mappings, leaving an
-independent deadline and hardware watchdog to reboot. After normal verified
-cleanup, the wrapper disarms those emergency fallbacks and retains the inert
-candidate for another userspace cycle. A session-lifetime sleep inhibitor keeps
-USB control available while that candidate is idle.
+Experiments normally have a bounded duration and automatic recovery to a
+reachable, known state on ordinary runner failure, timeout, or control-session
+loss. Operator-attended diagnostics may instead select explicit manual recovery
+when automatic reboot is itself under investigation and the operator accepts a
+manual reboot. At the current proved core and passive-scan stages, the runner
+retains all VFIO authority while it stops WPSS and verifies `offline`; the
+wrapper then verifies the child is reaped and no cdev descriptor remains before
+unbinding VFIO. A stop or verification failure holds that authority rather than
+dropping live DMA mappings. Automatic mode leaves its independent reboot
+fallbacks armed; manual mode leaves recovery to the operator. After normal
+verified cleanup, the wrapper retains the inert candidate for another userspace
+cycle. A session-lifetime sleep inhibitor keeps USB control available while
+that candidate is idle.
 
 The current initrd userspace watchdog can recover process/control-path loss,
 not a hung kernel. An independently ticking runner heartbeat is not evidence
