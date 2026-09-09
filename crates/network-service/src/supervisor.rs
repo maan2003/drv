@@ -13,10 +13,37 @@ use std::time::Duration;
 const FRAME_FD: RawFd = 3;
 const LISTENER_FD: RawFd = 4;
 const BOOTSTRAP_FD: RawFd = 5;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
 
 unsafe extern "C" {
     fn dup2(old: i32, new: i32) -> i32;
     fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
+}
+
+fn capability_revoked(frame: &OwnedFd) -> Result<bool, String> {
+    let mut descriptor = PollFd {
+        fd: frame.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    let result = unsafe { poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(format!(
+            "inspect network-service Ethernet generation: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0)
 }
 
 fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
@@ -90,6 +117,8 @@ pub struct NetworkServiceSupervisor {
     fixture: bool,
     #[cfg(test)]
     fixture_exit_after_start: bool,
+    #[cfg(test)]
+    fixture_echo_frames: bool,
 }
 
 impl NetworkServiceSupervisor {
@@ -123,6 +152,8 @@ impl NetworkServiceSupervisor {
             fixture: false,
             #[cfg(test)]
             fixture_exit_after_start: false,
+            #[cfg(test)]
+            fixture_echo_frames: false,
         })
     }
 
@@ -159,6 +190,10 @@ impl NetworkServiceSupervisor {
             .is_some_and(|installed| installed.running.is_some())
         {
             return Err("network-service generation is still running".into());
+        }
+        if capability_revoked(&self.installed.as_ref().unwrap().frame)? {
+            self.installed = None;
+            return Err("network-service Ethernet generation is revoked".into());
         }
         self.start_installed()?;
         Ok(generation)
@@ -199,6 +234,9 @@ impl NetworkServiceSupervisor {
             }
             if self.fixture_exit_after_start {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT", "1");
+            }
+            if self.fixture_echo_frames {
+                command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO", "1");
             }
         }
         unsafe {
@@ -318,6 +356,22 @@ mod tests {
         }
     }
 
+    fn wait_for_transmit(
+        driver: &mut wlan_softmac_host::ethernet::DriverEthernetPort,
+    ) -> netstack3_port_spike::EthernetFrame {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(frame) = driver.take_transmit().unwrap() {
+                return frame;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "network-service fixture did not return a frame"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn supervisor_fixture_child() {
         if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE").is_none() {
@@ -342,11 +396,13 @@ mod tests {
         }
 
         let mut frame = unsafe { File::from_raw_fd(FRAME_FD) };
-        let mut byte = [0];
+        let mut bytes = [0; 1514];
+        let echo = std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO").is_some();
         loop {
-            match frame.read(&mut byte) {
+            match frame.read(&mut bytes) {
                 Ok(0) => break,
-                Ok(_) => panic!("fixture received an unexpected frame byte"),
+                Ok(read) if echo => frame.write_all(&bytes[..read]).unwrap(),
+                Ok(_) => panic!("fixture received an unexpected frame"),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -497,5 +553,58 @@ mod tests {
         assert_eq!(restarted_exit.generation, 1);
         assert!(restarted_exit.success);
         supervisor.terminate().unwrap();
+    }
+
+    #[test]
+    fn wifi_capability_revocation_requires_a_fresh_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new(
+            std::env::current_exe().unwrap(),
+            listener,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+        supervisor.fixture_echo_frames = true;
+
+        let (first, mut first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        first_driver.set_link(true);
+        assert_eq!(supervisor.install_generation(first.into_frame_fd()), Ok(1));
+        let first_frame = [0xa5; 14];
+        first_driver.deliver(&first_frame).unwrap();
+        assert_eq!(wait_for_transmit(&mut first_driver).as_bytes(), first_frame);
+
+        // Production Wi-Fi DOWN closes its driver-side peer. Once the child
+        // observes that generation end, the supervisor must not restart the
+        // retained-but-revoked endpoint.
+        first_driver.set_link(false);
+        drop(first_driver);
+        assert_eq!(wait_for_exit(&mut supervisor).generation, 1);
+        assert_eq!(
+            supervisor.restart_generation(),
+            Err("network-service Ethernet generation is revoked".into())
+        );
+
+        let (second, mut second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        second_driver.set_link(true);
+        assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
+        let second_frame = [0x5a; 14];
+        second_driver.deliver(&second_frame).unwrap();
+        assert_eq!(
+            wait_for_transmit(&mut second_driver).as_bytes(),
+            second_frame
+        );
+        supervisor.terminate().unwrap();
+        assert_eq!(
+            second_driver.deliver(&second_frame),
+            Err(EthernetIngressError::Closed)
+        );
     }
 }
