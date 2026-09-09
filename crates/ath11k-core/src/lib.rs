@@ -57,6 +57,7 @@ pub enum CoreError {
         ce2_status_progress: Option<(u32, u32)>,
     },
     Protocol,
+    ProtocolAt(Operation),
     DeviceFault,
     DeviceFaultAt(Operation),
     NoResources,
@@ -227,6 +228,7 @@ impl<B: Subsystems> Device<B> {
         let failed_operation = operation.clone();
         self.backend.execute(operation).map_err(|error| match error {
             CoreError::DeviceFault => CoreError::DeviceFaultAt(failed_operation),
+            CoreError::Protocol => CoreError::ProtocolAt(failed_operation),
             error => error,
         })
     }

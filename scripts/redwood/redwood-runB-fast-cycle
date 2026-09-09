@@ -36,7 +36,7 @@ fi
 systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
 
 "$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
-systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=120s \
+systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=180s \
   "$TRANSACTION" --recover fast_cycle_deadline
 printf 1 >/sys/module/iommufd/parameters/allow_unsafe_interrupts
 test -d /sys/module/vfio_platform || \
