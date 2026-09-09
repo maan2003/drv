@@ -4,12 +4,13 @@
 
 Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
 association, DHCP, and proved Internet connectivity before production
-hardening. Physical bring-up currently reaches `DpHttConnect`: QMI discovers
-and maps the 2 MiB VFIO region 1 at BAR `0x61e00000`, CE receives HTC target
-ready, and firmware consumes the first CE0 HTC service-connect descriptor, but
-no service response arrives before timeout. Two same-kernel cycles proved the
-normal cleanup path described below in about 20.3 seconds each. That proof is
-specific to this current failure boundary, not arbitrary later DMA states.
+hardening. Physical bring-up now completes QMI and the full core lifecycle,
+including client-vdev creation, and firmware accepts a passive-scan command.
+Two same-kernel core cycles proved the normal cleanup path described below in
+about 120.3 seconds each. A subsequent scan-result collection attempt lost the
+candidate before producing a result and recovered through the armed fallback,
+so observed BSS results are not yet proved. Cleanup proof applies through the
+successful core/passive-scan terminal paths, not arbitrary later DMA states.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
@@ -38,7 +39,8 @@ the device driver above them:
   it still owns every VFIO mapping. The privileged authentication and stop
   implementation remain kernel-owned in remoteproc/PIL; userspace owns the
   experiment's lifecycle policy. Production still requires a proved
-  remoteproc restart/reset ownership contract beyond the current failure stage.
+  remoteproc restart/reset ownership contract beyond the currently proved
+  terminal paths.
 
 Everything ath11k-specific moves to userspace: QMI WLAN handshake, WMI, HTC/CE,
 HTT, HAL descriptors/registers/SRNG, TCL/REO/WBM data path, and hardware-facing
@@ -71,7 +73,7 @@ Each experiment has a bounded duration and automatic recovery to a reachable,
 known state on ordinary runner failure, timeout, or control-session loss. Use
 the smallest mechanism that covers those failures. There is no requirement for
 a particular number of timers or for rebinding ath11k/iwd. At the current
-`DpHttConnect` failure stage, the runner retains all VFIO authority while it
+proved core and passive-scan stages, the runner retains all VFIO authority while it
 stops WPSS and verifies `offline`; the wrapper then verifies the child is reaped
 and no cdev descriptor remains before unbinding VFIO. A stop or verification
 failure holds that authority rather than dropping live DMA mappings, leaving an
