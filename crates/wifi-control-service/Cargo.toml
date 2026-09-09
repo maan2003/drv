@@ -1,0 +1,21 @@
+[package]
+name = "wifi-control-service"
+description = "Bounded Wi-Fi runtime control service over Unix seqpacket"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+fidl-fuchsia-wlan-sme = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.sme" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.ieee80211" }
+futures = "=0.3.31"
+libc = "=0.2.183"
+wlan-control-wire = { path = "../wlan-control-wire" }
+wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
+
+[dev-dependencies]
+fidl-fuchsia-wlan-common = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-internal = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.internal" }
