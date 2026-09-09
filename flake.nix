@@ -158,7 +158,7 @@
           cargoRoot = "crates/wlancfg-service";
           buildAndTestSubdir = "crates/wlancfg-service";
           cargoLock.lockFile = ./crates/wlancfg-service/Cargo.lock;
-          nativeBuildInputs = [ pkgs.clippy ];
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
