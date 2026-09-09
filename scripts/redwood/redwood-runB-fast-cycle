@@ -24,7 +24,7 @@ test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 test "$(cat "$RPROC/state")" = offline
 test "$CYCLES" -ge 1
 case "$STOP_AFTER" in
-  core|passive-scan) ;;
+  core|passive-scan|scan-results) ;;
   *) echo "unsupported REDWOOD_STOP_AFTER=$STOP_AFTER"; exit 2 ;;
 esac
 
