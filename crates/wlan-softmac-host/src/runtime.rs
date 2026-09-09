@@ -394,6 +394,7 @@ pub enum DriverError {
     ConnectTransactionClosed,
     ConnectStateMismatch,
     AlreadyConnected,
+    NotConnected,
     ConnectInProgress,
     NoConnectInProgress,
     RetryCleanup,
@@ -850,6 +851,23 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             Ok(result) => Ok(result),
             Err(error) => Err(self.finish_connect_error(error)),
         }
+    }
+
+    /// Submit one policy-selected roam to the pinned SME. Completion remains
+    /// ordered on the retained connection transaction and is returned by
+    /// [`Self::next_connection_event`].
+    pub fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connect_attempt.is_some() {
+            return Err(ConnectError::Driver(DriverError::ConnectInProgress));
+        }
+        if self.connection.is_none() || !self.sme.status().is_connected() {
+            return Err(ConnectError::Driver(DriverError::NotConnected));
+        }
+        self.sme.on_roam_command(request);
+        Ok(())
     }
 
     /// Request a policy-owned disconnect and drive the pinned SME/MLME until
@@ -1983,6 +2001,35 @@ mod tests {
             runtime.next_connection_event(),
             Err(ConnectError::Driver(DriverError::Stopped))
         );
+    }
+
+    #[test]
+    fn roam_is_owned_by_the_connected_runtime_transaction() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().simulate_ap = true;
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        assert_eq!(
+            runtime.roam(fidl_sme::RoamRequest {
+                bss_description: connect_request().bss_description,
+            }),
+            Err(ConnectError::Driver(DriverError::NotConnected))
+        );
+        futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        runtime
+            .roam(fidl_sme::RoamRequest {
+                bss_description: connect_request().bss_description,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime.sme().status(),
+            wlan_sme::client::ClientSmeStatus::Roaming(_)
+        ));
+        assert!(runtime.connection.is_some());
     }
 
     #[test]

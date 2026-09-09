@@ -31,6 +31,7 @@ trait RuntimeOwner {
         reason: fidl_sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>;
+    fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError>;
     fn connect<'a>(
         &'a mut self,
         request: fidl_sme::ConnectRequest,
@@ -82,6 +83,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<fidl_sme::ConnectResult, PinnedConnectError>> + '_>>
     {
         Box::pin(self.cancel_connect(reason, deadline))
+    }
+
+    fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError> {
+        self.roam(request)
     }
 
     fn next_connection_event(
@@ -217,6 +222,12 @@ impl<'hardware> Mt7921ProductionClient<'hardware> {
         self.runtime.cancel_connect(reason, deadline).await
     }
 
+    /// Submit one policy-selected roam. Its exact result is delivered through
+    /// [`Self::next_connection_event`].
+    pub fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError> {
+        self.runtime.roam(request)
+    }
+
     pub async fn drive_once(&mut self) -> Result<bool, PinnedConnectError> {
         self.runtime.drive_once().await
     }
@@ -291,6 +302,10 @@ mod tests {
                     is_reconnect: false,
                 })
             })
+        }
+        fn roam(&mut self, _: fidl_sme::RoamRequest) -> Result<(), PinnedConnectError> {
+            self.calls.push("roam");
+            Ok(())
         }
         fn connect<'a>(
             &'a mut self,
