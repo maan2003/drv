@@ -155,6 +155,18 @@ impl<T: Transport> Wmi<T> {
     }
 }
 
+impl<T: Transport> Transport for Wmi<T> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = T::SEND_ERROR_IS_NON_VISIBLE;
+
+    fn send(&mut self, command: crate::Command) -> Result<(), crate::WmiError> {
+        self.events.transport_mut().send(command)
+    }
+
+    fn receive(&mut self, deadline_ns: u64) -> Result<Option<crate::Event>, crate::WmiError> {
+        self.next_event(deadline_ns)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

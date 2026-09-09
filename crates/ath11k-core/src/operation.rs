@@ -70,6 +70,9 @@ pub struct PeerAssociation {
     pub ht_capabilities: Option<[u8; 26]>,
     pub vht_capabilities: Option<[u8; 12]>,
     pub wmm: Option<WmmConfig>,
+    pub need_ptk_4_way: bool,
+    pub need_gtk_2_way: bool,
+    pub pmf: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +231,15 @@ pub enum Operation {
     DpVdevTxAttach {
         vdev: VdevId,
     },
+    DpPeerSetup {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    DpPeerCleanup {
+        vdev: VdevId,
+        address: [u8; 6],
+    },
+    DpInstallPeerKey(KeyConfig),
     WmiVdevStart {
         vdev: VdevId,
         restart: bool,
@@ -351,7 +363,10 @@ impl Operation {
             | DpReoSetup
             | DpReoCleanup
             | DpHttVersionRequest
-            | DpVdevTxAttach { .. } => OperationTarget::DpHtt,
+            | DpVdevTxAttach { .. }
+            | DpPeerSetup { .. }
+            | DpPeerCleanup { .. }
+            | DpInstallPeerKey(_) => OperationTarget::DpHtt,
             MacAllocate | MacDestroy | MacRegister | MacUnregister | RadioStart => {
                 OperationTarget::MacMlme
             }

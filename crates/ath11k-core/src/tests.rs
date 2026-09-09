@@ -266,6 +266,9 @@ fn client_sequence_preserves_mac_c_wmi_order() {
         ht_capabilities: None,
         vht_capabilities: None,
         wmm: None,
+        need_ptk_4_way: false,
+        need_gtk_2_way: false,
+        pmf: false,
     };
     device.associate_peer(association.clone()).unwrap();
     device.up_vdev(vdev, bssid, 42).unwrap();
@@ -323,6 +326,10 @@ fn client_sequence_preserves_mac_c_wmi_order() {
                 vdev,
                 address: bssid
             },
+            Operation::DpPeerSetup {
+                vdev,
+                address: bssid
+            },
             Operation::WmiPeerAssociate(association),
             Operation::WaitPeerAssociated {
                 vdev,
@@ -346,6 +353,16 @@ fn client_sequence_preserves_mac_c_wmi_order() {
                 bytes: vec![0x55; 16],
             }),
             Operation::WaitKeyInstalled { vdev, key_index: 0 },
+            Operation::DpInstallPeerKey(KeyConfig {
+                vdev,
+                peer: bssid,
+                index: 0,
+                cipher: Cipher::Ccmp128,
+                kind: KeyKind::Pairwise,
+                protection: KeyProtection::RxTx,
+                receive_sequence_counter: 0,
+                bytes: vec![0x55; 16],
+            }),
             Operation::WmiPeerAuthorize {
                 vdev,
                 address: bssid,
@@ -353,6 +370,36 @@ fn client_sequence_preserves_mac_c_wmi_order() {
             },
         ]
     );
+}
+
+#[test]
+fn completed_key_retry_is_idempotent_and_uncertain_dp_failure_is_quarantined() {
+    let mut device = ready_device();
+    let vdev = device.create_client_vdev([2, 0, 0, 0, 0, 1]).unwrap();
+    let peer = [2, 0, 0, 0, 0, 2];
+    device.create_peer(vdev, peer).unwrap();
+    let key = KeyConfig {
+        vdev,
+        peer,
+        index: 0,
+        cipher: Cipher::Ccmp128,
+        kind: KeyKind::Pairwise,
+        protection: KeyProtection::RxTx,
+        receive_sequence_counter: 0x0102_0304_0506,
+        bytes: vec![0x55; 16],
+    };
+    device.install_key(key.clone()).unwrap();
+    let completed = device.backend().log.len();
+    device.install_key(key.clone()).unwrap();
+    assert_eq!(device.backend().log.len(), completed);
+
+    let rekey = KeyConfig {
+        bytes: vec![0x66; 16],
+        ..key
+    };
+    device.backend_mut().fail = Some(Operation::DpInstallPeerKey(rekey.clone()));
+    assert!(device.install_key(rekey.clone()).is_err());
+    assert_eq!(device.install_key(rekey), Err(CoreError::WrongState));
 }
 
 #[test]

@@ -119,7 +119,12 @@ fn wcn6750_peer_assoc(association: PeerAssociation, local_nss: u8) -> PeerAssoc 
         },
         is_wme_set: association.qos,
         qos_flag: association.qos,
-        auth_flag: true,
+        // Pinned WMI clears AUTH while hardware crypto still needs the PTK
+        // handshake; authorization is a later controlled-port operation.
+        auth_flag: !association.need_ptk_4_way,
+        need_ptk_4_way: association.need_ptk_4_way,
+        need_gtk_2_way: association.need_gtk_2_way,
+        is_pmf_enabled: association.pmf,
         is_assoc: true,
         ..Default::default()
     };
@@ -535,6 +540,74 @@ where
 
     fn pump(&mut self) -> Result<(), CoreError> {
         self.pump_bounded(usize::MAX).map(|_| ())
+    }
+
+    fn wait_for_htt_peer_map(
+        &mut self,
+        vdev: crate::VdevId,
+        address: [u8; 6],
+    ) -> Result<(), CoreError> {
+        loop {
+            while let Some(message) = Self::protocol(self.htt.as_mut())?
+                .receive(0)
+                .map_err(Self::dp_error)?
+            {
+                match message.decode().map_err(Self::dp_error)? {
+                    HttEvent::PeerMap(map) => {
+                        let matched =
+                            u32::from(map.vdev_id) == u32::from(vdev.0) && map.address == address;
+                        Self::protocol(self.dp.as_mut())?
+                            .register_peer_map(map)
+                            .map_err(Self::dp_error)?;
+                        if matched {
+                            return Ok(());
+                        }
+                    }
+                    HttEvent::PeerUnmap { peer_id, .. } => Self::protocol(self.dp.as_mut())?
+                        .unregister_peer_map(peer_id)
+                        .map_err(Self::dp_error)?,
+                    _ => {}
+                }
+            }
+            if self.pump_bounded(1)? == 0 {
+                return Err(CoreError::Protocol);
+            }
+        }
+    }
+
+    fn wait_for_htt_peer_unmap(
+        &mut self,
+        vdev: crate::VdevId,
+        address: [u8; 6],
+    ) -> Result<(), CoreError> {
+        let expected = Self::protocol(self.dp.as_ref())?
+            .peer_security(u32::from(vdev.0), address)
+            .and_then(|security| security.peer_id)
+            .ok_or(CoreError::Protocol)?;
+        loop {
+            while let Some(message) = Self::protocol(self.htt.as_mut())?
+                .receive(0)
+                .map_err(Self::dp_error)?
+            {
+                match message.decode().map_err(Self::dp_error)? {
+                    HttEvent::PeerUnmap { peer_id, .. } => {
+                        Self::protocol(self.dp.as_mut())?
+                            .unregister_peer_map(peer_id)
+                            .map_err(Self::dp_error)?;
+                        if peer_id == expected {
+                            return Ok(());
+                        }
+                    }
+                    HttEvent::PeerMap(map) => Self::protocol(self.dp.as_mut())?
+                        .register_peer_map(map)
+                        .map_err(Self::dp_error)?,
+                    _ => {}
+                }
+            }
+            if self.pump_bounded(1)? == 0 {
+                return Err(CoreError::Protocol);
+            }
+        }
     }
 
     fn wmi_send<R: ath11k_wmi::cmd::EncodeCommand>(
@@ -1101,7 +1174,7 @@ where
                     .wait_for_peer_created(deadline, u32::from(vdev.0), address)
                     .map_err(|_| CoreError::Protocol)?;
                 if response.status == 0 {
-                    Ok(())
+                    self.wait_for_htt_peer_map(vdev, address)
                 } else {
                     Err(CoreError::Protocol)
                 }
@@ -1111,8 +1184,8 @@ where
                 let deadline = (self.deadline)();
                 Self::protocol(self.wmi.as_mut())?
                     .wait_for_peer_deleted(deadline, u32::from(vdev.0), address)
-                    .map(|_| ())
-                    .map_err(|_| CoreError::Protocol)
+                    .map_err(|_| CoreError::Protocol)?;
+                self.wait_for_htt_peer_unmap(vdev, address)
             }
             Operation::WaitPeerAssociated { vdev, address } => {
                 self.pump()?;
@@ -1257,6 +1330,41 @@ where
             // The first client vdev is fixed at zero and was used to build
             // the DP TX metadata when the aggregate was allocated.
             Operation::DpVdevTxAttach { vdev } if vdev.0 == 0 => Ok(()),
+            Operation::DpPeerSetup { vdev, address } => {
+                self.wmi_send(&PeerSetParam {
+                    vdev_id: u32::from(vdev.0),
+                    peer_addr: address,
+                    param_id: 0x13,
+                    // WCN6750 mac_id 0 uses REO destination ring 1.
+                    param_value: 1 | (1 << 1),
+                })?;
+                let (dp, wmi) = (self.dp.as_mut(), self.wmi.as_mut());
+                Self::protocol(dp)?
+                    .setup_peer(Self::protocol(wmi)?, u32::from(vdev.0), address)
+                    .map_err(Self::dp_error)
+            }
+            Operation::DpPeerCleanup { vdev, address } => Self::protocol(self.dp.as_mut())?
+                .cleanup_peer(u32::from(vdev.0), address)
+                .map_err(Self::dp_error),
+            Operation::DpInstallPeerKey(key) => {
+                let security_type = match key.cipher {
+                    Cipher::Ccmp128 => ath11k_dp::reo::PeerSecurityType::Ccmp128,
+                    Cipher::Ccmp256 => ath11k_dp::reo::PeerSecurityType::Ccmp256,
+                    Cipher::Tkip => ath11k_dp::reo::PeerSecurityType::TkipMic,
+                    Cipher::Gcmp128 => ath11k_dp::reo::PeerSecurityType::Gcmp128,
+                    Cipher::Gcmp256 => ath11k_dp::reo::PeerSecurityType::Gcmp256,
+                    _ => return Err(CoreError::Protocol),
+                };
+                Self::protocol(self.dp.as_mut())?
+                    .install_peer_key(
+                        u32::from(key.vdev.0),
+                        key.peer,
+                        key.kind == KeyKind::Pairwise,
+                        key.index,
+                        security_type,
+                    )
+                    .map_err(Self::dp_error)
+            }
             Operation::HifStop
             | Operation::MacAllocate
             | Operation::MacRegister
@@ -1310,6 +1418,9 @@ mod tests {
                 ht_capabilities: None,
                 vht_capabilities: None,
                 wmm: None,
+                need_ptk_4_way: false,
+                need_gtk_2_way: false,
+                pmf: false,
             },
             2,
         );
@@ -1339,6 +1450,9 @@ mod tests {
                 ht_capabilities: Some(ht),
                 vht_capabilities: None,
                 wmm: None,
+                need_ptk_4_way: false,
+                need_gtk_2_way: false,
+                pmf: false,
             },
             2,
         );
@@ -1374,6 +1488,9 @@ mod tests {
                 ht_capabilities: Some(ht),
                 vht_capabilities: None,
                 wmm: None,
+                need_ptk_4_way: false,
+                need_gtk_2_way: false,
+                pmf: false,
             },
             2,
         );

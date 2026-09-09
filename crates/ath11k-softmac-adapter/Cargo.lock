@@ -281,6 +281,7 @@ name = "drv-hardware-backends"
 version = "0.1.0"
 dependencies = [
  "drv-hardware",
+ "linux-self-sandbox",
  "userspace-vfio",
 ]
 
@@ -412,6 +413,8 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 name = "fuchsia-async"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "tokio",
  "zx",
 ]
 
@@ -626,6 +629,14 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "linux-self-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "userspace-vfio",
+]
 
 [[package]]
 name = "lock_api"
@@ -1380,6 +1391,7 @@ dependencies = [
  "futures",
  "netstack3-port-spike",
  "tokio",
+ "wlan-common",
  "wlan-mlme",
  "wlan-sme",
  "zx",

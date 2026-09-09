@@ -12,7 +12,7 @@ use dma_pool::DmaPool;
 use crate::dma::{RxBuffer, TxBuffer};
 use crate::htt::TxCompletion;
 use crate::lifecycle::{DpAllocationError, DpRingOps, Wcn6750DpRings};
-use crate::reo::ReoController;
+use crate::reo::{PeerRxTids, PeerSecurity, PeerSecurityType, ReoController};
 use crate::rx::{RxDescriptorStatus, WCN6750_RX_DESCRIPTOR_BYTES, Wcn6750RxDescriptor};
 use crate::{DataPath, DataRings, DpError, RxPacket, TxPacket};
 
@@ -251,6 +251,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     next_monitor_cookie: u32,
     ring_resources: Wcn6750DpRings,
     reo: Option<ReoController>,
+    peer_rx_tids: PeerRxTids<B>,
     htt_setup_index: usize,
     host_rx_first: bool,
 }
@@ -273,8 +274,14 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         if let Err(error) = ring_resources.allocate_common(&device, &mut rings) {
             return Err(DpAllocationError::new(error, device, rings, ring_resources));
         }
+        let peer_rx_tids = match PeerRxTids::new(device.clone()) {
+            Ok(peers) => peers,
+            Err(error) => {
+                return Err(DpAllocationError::new(error, device, rings, ring_resources));
+            }
+        };
         Ok(Self {
-            device,
+            device: device.clone(),
             rings,
             data_rings: None,
             tx,
@@ -289,14 +296,91 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             next_monitor_cookie: 1,
             ring_resources,
             reo: None,
+            peer_rx_tids,
             htt_setup_index: 0,
             host_rx_first: true,
         })
     }
 
+    pub fn register_peer_map(&mut self, map: crate::htt::PeerMap) -> Result<(), DpError> {
+        self.peer_rx_tids.register_peer_map(map)
+    }
+
+    pub fn unregister_peer_map(&mut self, peer_id: crate::PeerId) -> Result<(), DpError> {
+        self.peer_rx_tids.unregister_peer_map(peer_id)
+    }
+
+    /// Complete the source peer setup transaction after HTT peer-map
+    /// publication. All 17 initial receive queues become active or the peer
+    /// remains teardown-only.
+    pub fn setup_peer<T: crate::reo::ReorderSetupControl>(
+        &mut self,
+        wmi: &mut T,
+        vdev_id: u32,
+        peer_addr: [u8; 6],
+    ) -> Result<(), DpError> {
+        let reo = self.reo.as_mut().ok_or(DpError::WrongState)?;
+        for tid in 0..=16 {
+            if let Err(error) = self.peer_rx_tids.ath11k_peer_rx_tid_setup(
+                reo,
+                &mut self.rings,
+                wmi,
+                vdev_id,
+                peer_addr,
+                tid,
+                1,
+                0,
+                ath11k_hal::PacketNumberType::None,
+            ) {
+                let _ = self.peer_rx_tids.ath11k_peer_rx_tid_cleanup(
+                    reo,
+                    &mut self.rings,
+                    vdev_id,
+                    peer_addr,
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn install_peer_key(
+        &mut self,
+        vdev_id: u32,
+        peer_addr: [u8; 6],
+        pairwise: bool,
+        key_index: u8,
+        security_type: PeerSecurityType,
+    ) -> Result<(), DpError> {
+        self.peer_rx_tids.install_peer_key(
+            self.reo.as_mut().ok_or(DpError::WrongState)?,
+            &mut self.rings,
+            vdev_id,
+            peer_addr,
+            pairwise,
+            key_index,
+            security_type,
+        )
+    }
+
+    pub fn cleanup_peer(&mut self, vdev_id: u32, peer_addr: [u8; 6]) -> Result<(), DpError> {
+        self.peer_rx_tids.ath11k_peer_rx_tid_cleanup(
+            self.reo.as_mut().ok_or(DpError::WrongState)?,
+            &mut self.rings,
+            vdev_id,
+            peer_addr,
+        )
+    }
+
+    pub fn peer_security(&self, vdev_id: u32, peer_addr: [u8; 6]) -> Option<PeerSecurity> {
+        self.peer_rx_tids.peer_security(vdev_id, peer_addr)
+    }
+
     #[cfg(test)]
     fn without_allocated_rings(device: Device<B>, rings: R, tx: ClientTxConfig) -> Self {
         let rx_pool = make_rx_pool(device.clone()).expect("static RX pool configuration is valid");
+        let peer_rx_tids =
+            PeerRxTids::new(device.clone()).expect("static peer pool configuration is valid");
         Self {
             device,
             rings,
@@ -313,6 +397,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             next_monitor_cookie: 1,
             ring_resources: Wcn6750DpRings::default(),
             reo: None,
+            peer_rx_tids,
             htt_setup_index: 0,
             host_rx_first: true,
         }

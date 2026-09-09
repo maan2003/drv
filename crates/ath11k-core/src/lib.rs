@@ -147,6 +147,8 @@ pub struct Device<B: Subsystems> {
     vdevs: Vec<Vdev>,
     uncertain_vdev_starts: Vec<VdevId>,
     peers: Vec<(VdevId, [u8; 6])>,
+    installed_keys: Vec<KeyConfig>,
+    uncertain_key_peers: Vec<(VdevId, [u8; 6])>,
     crash_count: u32,
 }
 
@@ -159,6 +161,8 @@ impl Wcn6750 {
             vdevs: Vec::new(),
             uncertain_vdev_starts: Vec::new(),
             peers: Vec::new(),
+            installed_keys: Vec::new(),
+            uncertain_key_peers: Vec::new(),
             crash_count: 0,
         }
     }
@@ -309,6 +313,8 @@ impl<B: Subsystems> Device<B> {
         self.vdevs.clear();
         self.uncertain_vdev_starts.clear();
         self.peers.clear();
+        self.installed_keys.clear();
+        self.uncertain_key_peers.clear();
         self.attach_firmware()
     }
 }
@@ -390,6 +396,8 @@ impl<B: Subsystems> Lifecycle for Device<B> {
         let _ = self.op(Operation::QmiDeinitService);
         self.vdevs.clear();
         self.peers.clear();
+        self.installed_keys.clear();
+        self.uncertain_key_peers.clear();
         self.state = DeviceState::Stopped;
         Ok(())
     }
@@ -486,6 +494,12 @@ impl<B: Subsystems> RadioControl for Device<B> {
         }
         self.op(Operation::WmiPeerCreate { vdev, address })?;
         self.op(Operation::WaitPeerCreated { vdev, address })?;
+        if let Err(error) = self.op(Operation::DpPeerSetup { vdev, address }) {
+            let _ = self.op(Operation::DpPeerCleanup { vdev, address });
+            let _ = self.op(Operation::WmiPeerDelete { vdev, address });
+            let _ = self.op(Operation::WaitPeerDeleted { vdev, address });
+            return Err(error);
+        }
         self.peers.push((vdev, address));
         Ok(())
     }
@@ -496,9 +510,15 @@ impl<B: Subsystems> RadioControl for Device<B> {
             .iter()
             .position(|peer| *peer == (vdev, address))
             .ok_or(CoreError::NotFound)?;
+        let cleanup = self.op(Operation::DpPeerCleanup { vdev, address });
         self.op(Operation::WmiPeerDelete { vdev, address })?;
         self.op(Operation::WaitPeerDeleted { vdev, address })?;
+        cleanup?;
         self.peers.remove(index);
+        self.installed_keys
+            .retain(|key| key.vdev != vdev || key.peer != address);
+        self.uncertain_key_peers
+            .retain(|peer| *peer != (vdev, address));
         Ok(())
     }
 }
@@ -539,6 +559,8 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         self.op(Operation::WaitVdevDeleted { vdev })?;
         self.vdevs.remove(index);
         self.peers.retain(|peer| peer.0 != vdev);
+        self.installed_keys.retain(|key| key.vdev != vdev);
+        self.uncertain_key_peers.retain(|peer| peer.0 != vdev);
         Ok(())
     }
     fn associate_peer(&mut self, association: PeerAssociation) -> Result<(), CoreError> {
@@ -583,6 +605,17 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         if !self.has_vdev(key.vdev) {
             return Err(CoreError::NotFound);
         }
+        if !self.peers.contains(&(key.vdev, key.peer)) {
+            return Err(CoreError::NotFound);
+        }
+        if self.uncertain_key_peers.contains(&(key.vdev, key.peer)) {
+            return Err(CoreError::WrongState);
+        }
+        if self.installed_keys.contains(&key) {
+            // A completed synchronous retry must not reset the hardware replay
+            // counter by reissuing the REO PN update.
+            return Ok(());
+        }
         if matches!(
             key.cipher,
             Cipher::BipCmac128 | Cipher::BipGmac128 | Cipher::BipGmac256
@@ -599,15 +632,26 @@ impl<B: Subsystems> ClientRadioControl for Device<B> {
         };
         if key.index > 3
             || key.bytes.len() != expected_len
-            || (key.kind == KeyKind::Pairwise && key.receive_sequence_counter != 0)
+            || key.receive_sequence_counter > 0x0000_ffff_ffff_ffff
         {
             return Err(CoreError::Protocol);
         }
         self.op(Operation::WmiInstallKey(key.clone()))?;
-        self.op(Operation::WaitKeyInstalled {
+        if let Err(error) = self.op(Operation::WaitKeyInstalled {
             vdev: key.vdev,
             key_index: key.index,
-        })
+        }) {
+            self.uncertain_key_peers.push((key.vdev, key.peer));
+            return Err(error);
+        }
+        if let Err(error) = self.op(Operation::DpInstallPeerKey(key.clone())) {
+            self.uncertain_key_peers.push((key.vdev, key.peer));
+            return Err(error);
+        }
+        self.installed_keys
+            .retain(|installed| !(installed.vdev == key.vdev && installed.kind == key.kind));
+        self.installed_keys.push(key);
+        Ok(())
     }
     fn set_peer_authorized(
         &mut self,

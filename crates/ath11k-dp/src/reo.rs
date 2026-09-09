@@ -13,6 +13,20 @@ use dma_pool::{DmaPool, DmaSegment};
 
 use crate::DpError;
 
+pub trait ReorderSetupControl {
+    const SEND_ERROR_IS_NON_VISIBLE: bool;
+    fn send_reorder_setup(&mut self, request: &PeerReorderQueueSetup) -> Result<(), DpError>;
+}
+
+impl<T: Transport> ReorderSetupControl for T {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = T::SEND_ERROR_IS_NON_VISIBLE;
+
+    fn send_reorder_setup(&mut self, request: &PeerReorderQueueSetup) -> Result<(), DpError> {
+        self.send(request.encode_command().map_err(|_| DpError::DeviceFault)?)
+            .map_err(|_| DpError::DeviceFault)
+    }
+}
+
 /// Non-coherent REO queue descriptor owned by one peer/TID.
 pub struct ReoTid<B: Backend> {
     pub tid: u8,
@@ -75,6 +89,36 @@ const UPDATE_BA_WINDOW_SIZE: u32 = 1 << 18;
 const UPDATE_START_SEQUENCE: u32 = 1 << 26;
 const START_SEQUENCE_SHIFT: u32 = 11;
 const RX_FRAGMENT_TIMEOUT_MS: u64 = 2_000;
+const UPDATE_PN_CHECK: u32 = 1 << 19;
+const UPDATE_PN_SIZE: u32 = 1 << 23;
+const UPDATE_SVLD: u32 = 1 << 25;
+const UPDATE_PN_VALID: u32 = 1 << 29;
+const UPDATE_PN: u32 = 1 << 30;
+const VALUE_PN_CHECK: u32 = 1 << 27;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum PeerSecurityType {
+    TkipMic = 4,
+    Ccmp128 = 6,
+    Ccmp256 = 8,
+    Gcmp128 = 9,
+    Gcmp256 = 10,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerSecurity {
+    pub peer_id: Option<crate::PeerId>,
+    pub unicast_key_index: u8,
+    pub multicast_key_index: u8,
+    pub unicast_type: Option<PeerSecurityType>,
+    pub multicast_type: Option<PeerSecurityType>,
+}
+
+struct SecurityPeer {
+    key: PeerKey,
+    state: PeerSecurity,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "a fragment link descriptor must be returned or retained exactly once"]
@@ -212,6 +256,8 @@ pub struct PeerRxTids<B: Backend> {
     fragments: Vec<FragmentState>,
     pending_fragment_links: Vec<PendingFragmentLink>,
     peers: Vec<PeerKey>,
+    security: Vec<SecurityPeer>,
+    uncertain_security: Vec<PeerKey>,
 }
 
 impl<B: Backend> PeerRxTids<B> {
@@ -235,6 +281,8 @@ impl<B: Backend> PeerRxTids<B> {
             fragments: Vec::new(),
             pending_fragment_links: Vec::new(),
             peers: Vec::new(),
+            security: Vec::new(),
+            uncertain_security: Vec::new(),
         })
     }
 
@@ -252,12 +300,142 @@ impl<B: Backend> PeerRxTids<B> {
         }
         if !self.peers.contains(&key) {
             self.peers.push(key);
+            self.security.push(SecurityPeer {
+                key,
+                state: PeerSecurity {
+                    peer_id: None,
+                    unicast_key_index: 0,
+                    multicast_key_index: 0,
+                    unicast_type: None,
+                    multicast_type: None,
+                },
+            });
         }
         Ok(())
     }
 
+    /// Publish the source HTT peer-map identity before any per-peer queue is
+    /// created. Repeated identical maps are harmless; conflicting maps fail
+    /// closed because address and peer-id lookup would otherwise diverge.
+    pub fn register_peer_map(&mut self, map: crate::htt::PeerMap) -> Result<(), DpError> {
+        let key = PeerKey {
+            vdev_id: u32::from(map.vdev_id),
+            peer_addr: map.address,
+        };
+        if self.security.iter().any(|peer| {
+            (peer.key == key && peer.state.peer_id.is_some_and(|id| id != map.peer_id))
+                || (peer.key != key && peer.state.peer_id == Some(map.peer_id))
+        }) {
+            return Err(DpError::WrongState);
+        }
+        self.register_peer_after_firmware_create(key.vdev_id, key.peer_addr)?;
+        self.security
+            .iter_mut()
+            .find(|peer| peer.key == key)
+            .expect("registration publishes security state")
+            .state
+            .peer_id = Some(map.peer_id);
+        Ok(())
+    }
+
+    pub fn unregister_peer_map(&mut self, peer_id: crate::PeerId) -> Result<(), DpError> {
+        let index = self
+            .security
+            .iter()
+            .position(|peer| peer.state.peer_id == Some(peer_id))
+            .ok_or(DpError::WrongState)?;
+        let key = self.security[index].key;
+        if !self.tearing_down.contains(&key) {
+            return Err(DpError::WrongState);
+        }
+        self.security.swap_remove(index);
+        self.try_retire_teardown(key);
+        Ok(())
+    }
+
+    /// Pinned `ath11k_dp_peer_rx_pn_replay_config`, followed by publication
+    /// of the peer key index and security type. Group keys deliberately skip
+    /// REO replay offload and retain host replay checking.
     #[allow(clippy::too_many_arguments)]
-    pub fn ath11k_dp_rx_ampdu_start<R: Rings<B>, T: Transport>(
+    pub fn install_peer_key<R: Rings<B>>(
+        &mut self,
+        controller: &mut ReoController,
+        rings: &mut R,
+        vdev_id: u32,
+        peer_addr: [u8; 6],
+        pairwise: bool,
+        key_index: u8,
+        security_type: PeerSecurityType,
+    ) -> Result<(), DpError> {
+        let key = PeerKey { vdev_id, peer_addr };
+        let security_index = self
+            .security
+            .iter()
+            .position(|peer| peer.key == key)
+            .ok_or(DpError::WrongState)?;
+        if self.uncertain_security.contains(&key) || self.tearing_down.contains(&key) {
+            return Err(DpError::WrongState);
+        }
+        if pairwise {
+            // Peer setup creates TIDs 0..=16. Treat a missing queue as a
+            // lifecycle error instead of silently weakening replay checking.
+            if !(0..=16).all(|tid| self.is_active(vdev_id, peer_addr, tid)) {
+                return Err(DpError::WrongState);
+            }
+            for tid in 0..=16 {
+                let active = self
+                    .tids
+                    .iter()
+                    .find(|active| {
+                        active.vdev_id == vdev_id
+                            && active.peer_addr == peer_addr
+                            && active.tid.tid == tid
+                    })
+                    .expect("all active TIDs checked above");
+                if let Err(error) = controller.ath11k_dp_tx_send_reo_cmd(
+                    rings,
+                    ReoCommandKind::UpdateRxQueue,
+                    &active.tid,
+                    ReoCommandParams {
+                        update0: UPDATE_PN
+                            | UPDATE_PN_SIZE
+                            | UPDATE_PN_VALID
+                            | UPDATE_PN_CHECK
+                            | UPDATE_SVLD,
+                        update1: VALUE_PN_CHECK,
+                        pn_size: 48,
+                        ..ReoCommandParams::default().need_status()
+                    },
+                ) {
+                    // A successfully published prefix has already changed
+                    // replay state. No retry can safely recreate the old
+                    // boundary, so quarantine this peer until device reset.
+                    self.uncertain_security.push(key);
+                    return Err(error);
+                }
+            }
+        }
+        let state = &mut self.security[security_index].state;
+        if pairwise {
+            state.unicast_key_index = key_index;
+            state.unicast_type = Some(security_type);
+        } else {
+            state.multicast_key_index = key_index;
+            state.multicast_type = Some(security_type);
+        }
+        Ok(())
+    }
+
+    pub fn peer_security(&self, vdev_id: u32, peer_addr: [u8; 6]) -> Option<PeerSecurity> {
+        let key = PeerKey { vdev_id, peer_addr };
+        self.security
+            .iter()
+            .find(|peer| peer.key == key)
+            .map(|peer| peer.state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ath11k_dp_rx_ampdu_start<R: Rings<B>, T: ReorderSetupControl>(
         &mut self,
         controller: &mut ReoController,
         rings: &mut R,
@@ -286,7 +464,7 @@ impl<B: Backend> PeerRxTids<B> {
         )
     }
 
-    pub fn ath11k_dp_rx_ampdu_stop<R: Rings<B>, T: Transport>(
+    pub fn ath11k_dp_rx_ampdu_stop<R: Rings<B>, T: ReorderSetupControl>(
         &mut self,
         controller: &mut ReoController,
         rings: &mut R,
@@ -321,7 +499,7 @@ impl<B: Backend> PeerRxTids<B> {
     /// Ports `ath11k_peer_rx_tid_setup`, including the already-active update
     /// path and the reorder-queue WMI publication boundary.
     #[allow(clippy::too_many_arguments)]
-    pub fn ath11k_peer_rx_tid_setup<R: Rings<B>, T: Transport>(
+    pub fn ath11k_peer_rx_tid_setup<R: Rings<B>, T: ReorderSetupControl>(
         &mut self,
         controller: &mut ReoController,
         rings: &mut R,
@@ -851,7 +1029,13 @@ impl<B: Backend> PeerRxTids<B> {
             .pending_fragment_links
             .iter()
             .any(|entry| entry.key == key);
-        if !(active || pending || cached || quarantined || fragments || fragment_links) {
+        // Keep teardown admission closed until firmware withdraws the HTT
+        // peer identity. REO delete completions can precede PEER_UNMAP.
+        let mapped = self
+            .security
+            .iter()
+            .any(|peer| peer.key == key && peer.state.peer_id.is_some());
+        if !(active || pending || cached || quarantined || fragments || fragment_links || mapped) {
             self.tearing_down.retain(|teardown| *teardown != key);
         }
     }
@@ -866,7 +1050,7 @@ fn packet_numbers_are_consecutive(fragments: &[StoredFragment]) -> bool {
     })
 }
 
-fn send_reorder_setup<B: Backend, T: Transport>(
+fn send_reorder_setup<B: Backend, T: ReorderSetupControl>(
     wmi: &mut T,
     vdev_id: u32,
     peer_addr: [u8; 6],
@@ -881,8 +1065,7 @@ fn send_reorder_setup<B: Backend, T: Transport>(
         ba_window_size_valid: 1,
         ba_window_size,
     };
-    let command = request.encode_command().map_err(|_| DpError::DeviceFault)?;
-    wmi.send(command).map_err(|_| DpError::DeviceFault)
+    wmi.send_reorder_setup(&request)
 }
 
 pub struct ReoController {
@@ -1066,6 +1249,120 @@ mod tests {
             next_command_number: 1,
             resources: ReoResources::default(),
         }
+    }
+
+    fn peer_with_all_tids(
+        address: [u8; 6],
+    ) -> (PeerRxTids<DeterministicBackend>, ReoController, ModelRings) {
+        let mut peer = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+        let mut wmi = ModelWmi::default();
+        peer.register_peer_after_firmware_create(1, address)
+            .unwrap();
+        for tid in 0..=16 {
+            peer.ath11k_peer_rx_tid_setup(
+                &mut reo,
+                &mut rings,
+                &mut wmi,
+                1,
+                address,
+                tid,
+                1,
+                0,
+                PacketNumberType::None,
+            )
+            .unwrap();
+        }
+        (peer, reo, rings)
+    }
+
+    #[test]
+    fn pairwise_key_updates_every_active_tid_before_security_publication() {
+        let address = [0x31; 6];
+        let (mut peer, mut reo, mut rings) = peer_with_all_tids(address);
+        peer.install_peer_key(
+            &mut reo,
+            &mut rings,
+            1,
+            address,
+            true,
+            2,
+            PeerSecurityType::Ccmp128,
+        )
+        .unwrap();
+        assert_eq!(rings.published.len(), 17);
+        for (_, descriptor) in &rings.published {
+            let words = descriptor.bytes();
+            let word = |index: usize| {
+                u32::from_le_bytes(words[index * 4..index * 4 + 4].try_into().unwrap())
+            };
+            assert_ne!(word(1) & (1 << 16), 0);
+            assert_eq!(
+                word(3) & 0x6fff_ff00,
+                UPDATE_PN | UPDATE_PN_SIZE | UPDATE_PN_VALID | UPDATE_PN_CHECK | UPDATE_SVLD
+            );
+            assert_eq!(word(4) & 0xffff_0000, VALUE_PN_CHECK);
+            assert_eq!((word(5) >> 8) & 3, 1);
+        }
+        assert_eq!(
+            peer.peer_security(1, address),
+            Some(PeerSecurity {
+                peer_id: None,
+                unicast_key_index: 2,
+                multicast_key_index: 0,
+                unicast_type: Some(PeerSecurityType::Ccmp128),
+                multicast_type: None,
+            })
+        );
+    }
+
+    #[test]
+    fn group_key_skips_reo_and_partial_pairwise_failure_quarantines_peer() {
+        let address = [0x32; 6];
+        let (mut peer, mut reo, mut rings) = peer_with_all_tids(address);
+        peer.install_peer_key(
+            &mut reo,
+            &mut rings,
+            1,
+            address,
+            false,
+            1,
+            PeerSecurityType::Gcmp128,
+        )
+        .unwrap();
+        assert!(rings.published.is_empty());
+        assert_eq!(
+            peer.peer_security(1, address).unwrap().multicast_key_index,
+            1
+        );
+
+        rings.fail_publish_attempt = Some(2);
+        assert_eq!(
+            peer.install_peer_key(
+                &mut reo,
+                &mut rings,
+                1,
+                address,
+                true,
+                0,
+                PeerSecurityType::Ccmp128,
+            ),
+            Err(DpError::NoResources)
+        );
+        assert_eq!(peer.peer_security(1, address).unwrap().unicast_type, None);
+        assert_eq!(
+            peer.install_peer_key(
+                &mut reo,
+                &mut rings,
+                1,
+                address,
+                true,
+                0,
+                PeerSecurityType::Ccmp128,
+            ),
+            Err(DpError::WrongState)
+        );
     }
 
     fn status(command_number: u16, kind: u32, execution_status: u8) -> Descriptor {
@@ -2081,6 +2378,38 @@ mod tests {
             peers.take_pending_fragment_link_returns(9, address),
             [FragmentLinkDescriptor(500)]
         );
+        peers
+            .register_peer_after_firmware_create(9, address)
+            .unwrap();
+    }
+
+    #[test]
+    fn teardown_remains_closed_until_peer_unmap() {
+        let address = [0xf6; 6];
+        let peer_id = crate::PeerId(42);
+        let mut peers = PeerRxTids::new(DeterministicBackend::device()).unwrap();
+        peers
+            .register_peer_map(crate::htt::PeerMap {
+                vdev_id: 9,
+                peer_id,
+                address,
+                ast_hash: 0,
+                hardware_peer_id: 0,
+                v2: true,
+            })
+            .unwrap();
+        let mut reo = controller();
+        let mut rings = ModelRings::default();
+
+        peers
+            .ath11k_peer_rx_tid_cleanup(&mut reo, &mut rings, 9, address)
+            .unwrap();
+        assert_eq!(
+            peers.register_peer_after_firmware_create(9, address),
+            Err(DpError::WrongState)
+        );
+
+        peers.unregister_peer_map(peer_id).unwrap();
         peers
             .register_peer_after_firmware_create(9, address)
             .unwrap();
