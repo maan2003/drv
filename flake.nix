@@ -96,6 +96,29 @@
           '';
         };
 
+      checks.x86_64-linux.linux-self-sandbox =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "linux-self-sandbox-check";
+          version = "0.1.0";
+          src = ./crates/linux-self-sandbox;
+          cargoLock.lockFile = ./crates/linux-self-sandbox/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cargo test --locked --offline -- --nocapture
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       checks.x86_64-linux.network-service =
         let
           pkgs = nixpkgs.legacyPackages.x86_64-linux;
