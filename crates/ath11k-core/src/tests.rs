@@ -487,7 +487,10 @@ fn core_start_error_unwinds_without_panicking() {
     };
     let mut device = WCN6750.device(model);
     device.probe().unwrap();
-    assert_eq!(device.attach_firmware(), Err(CoreError::DeviceFault));
+    assert_eq!(
+        device.attach_firmware(),
+        Err(CoreError::DeviceFaultAt(OperationTarget::Wmi))
+    );
     assert_eq!(device.state(), DeviceState::Probed);
     assert!(device.backend().log.ends_with(&[
         Operation::DpReoCleanup,
@@ -542,7 +545,7 @@ fn vdev_configuration_failure_deletes_firmware_vdev() {
     });
     assert_eq!(
         device.create_client_vdev([2, 0, 0, 0, 0, 1]),
-        Err(CoreError::DeviceFault)
+        Err(CoreError::DeviceFaultAt(OperationTarget::Wmi))
     );
     assert!(device.backend().log.ends_with(&[
         Operation::WmiVdevDelete { vdev: VdevId(0) },

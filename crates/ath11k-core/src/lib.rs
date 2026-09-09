@@ -47,6 +47,7 @@ pub enum CoreError {
     Qmi(ath11k_qmi::QmiError),
     Protocol,
     DeviceFault,
+    DeviceFaultAt(OperationTarget),
     NoResources,
     NotFound,
 }
@@ -212,7 +213,11 @@ impl<B: Subsystems> Device<B> {
     }
 
     fn op(&mut self, operation: Operation) -> Result<(), CoreError> {
-        self.backend.execute(operation)
+        let target = operation.target();
+        self.backend.execute(operation).map_err(|error| match error {
+            CoreError::DeviceFault => CoreError::DeviceFaultAt(target),
+            error => error,
+        })
     }
 
     fn has_vdev(&self, id: VdevId) -> bool {
