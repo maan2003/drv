@@ -13,7 +13,10 @@ anyhow = "=1.0.102"
 async-trait = "=0.1.89"
 futures = "=0.3.32"
 libc = "=0.2.189"
+linux-self-sandbox = { path = "../linux-self-sandbox" }
+tokio = { version = "=1.52.3", features = ["rt", "time"] }
 fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
+fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
 wlan-control-wire = { path = "../wlan-control-wire" }
 wlancfg-selection = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/wlancfg" }
 
@@ -21,3 +24,9 @@ wlancfg-selection = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea964
 fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
+wifi-control-service = { path = "../wifi-control-service" }
+
+[[test]]
+name = "separate-process-e2e"
+path = "tests/separate_process_e2e.rs"
+harness = false

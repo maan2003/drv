@@ -476,6 +476,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "linux-self-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "userspace-vfio",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -896,6 +904,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "userspace-vfio"
+version = "0.1.0"
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -903,6 +915,23 @@ checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
 ]
+
+[[package]]
+name = "wifi-control-service"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-sme",
+ "futures",
+ "libc",
+ "linux-self-sandbox",
+ "wifi-supervisor-wire",
+ "wlan-control-wire",
+]
+
+[[package]]
+name = "wifi-supervisor-wire"
+version = "0.1.0"
 
 [[package]]
 name = "windows-link"
@@ -1090,8 +1119,12 @@ dependencies = [
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-sme",
+ "fuchsia-inspect",
  "futures",
  "libc",
+ "linux-self-sandbox",
+ "tokio",
+ "wifi-control-service",
  "wlan-control-wire",
  "wlancfg-selection",
 ]

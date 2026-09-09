@@ -5,6 +5,8 @@
 //! This library owns transport mechanics only. Policy, persistence, process
 //! setup, and sandboxing remain with the eventual service binary.
 
+pub mod policy;
+
 use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use fidl_fuchsia_wlan_sme as sme;
