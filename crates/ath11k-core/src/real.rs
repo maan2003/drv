@@ -919,7 +919,12 @@ where
                                 .ok_or(CoreError::Protocol);
                         }
                     } else if self.pump_bounded(1)? == 0 {
-                        return Err(CoreError::Protocol);
+                        let router = Self::protocol(self.router.as_ref())?;
+                        return Err(CoreError::HttVersionTimeout {
+                            ce4_source_progress: router.source_progress(4).ok(),
+                            ce1_destination_progress: router.destination_progress(1).ok(),
+                            ce1_status_progress: router.status_progress(1).ok(),
+                        });
                     }
                 }
             }

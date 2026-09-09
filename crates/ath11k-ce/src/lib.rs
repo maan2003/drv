@@ -1118,6 +1118,10 @@ impl<I> HtcTransport<I> {
         &mut self.htc
     }
 
+    pub fn io_mut(&mut self) -> &mut I {
+        &mut self.io
+    }
+
     pub fn into_parts(self) -> (Htc, I) {
         (self.htc, self.io)
     }
@@ -1264,6 +1268,35 @@ impl<I: HtcPacketIo> HtcRouter<I> {
             Ok(core) => Ok(core.into_inner().transport),
             Err(core) => Err(Self { core }),
         }
+    }
+}
+
+impl<B: Backend, W: CeCompletionWait> HtcRouter<CePipesPacketIo<B, W>> {
+    pub fn source_progress(&self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .io_mut()
+            .source_progress(pipe)
+    }
+
+    pub fn destination_progress(&self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .io_mut()
+            .destination_progress(pipe)
+    }
+
+    pub fn status_progress(&self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.core
+            .try_borrow_mut()
+            .map_err(|_| CeError::DeviceFault)?
+            .transport
+            .io_mut()
+            .status_progress(pipe)
     }
 }
 
