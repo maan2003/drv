@@ -1,0 +1,15 @@
+[package]
+name = "wlan-control-wire"
+description = "Bounded transport-neutral WLAN policy control wire contract"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+fidl-fuchsia-wlan-common = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-sme = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.sme" }

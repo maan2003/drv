@@ -68,6 +68,34 @@
           '';
         };
 
+      checks.x86_64-linux.wlan-control-wire =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "wlan-control-wire-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/wlan-control-wire";
+          buildAndTestSubdir = "crates/wlan-control-wire";
+          cargoLock.lockFile = ./crates/wlan-control-wire/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/wlan-control-wire
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            mkdir -p "$out/share/wlan-control-wire"
+            cp Cargo.toml "$out/share/wlan-control-wire/"
+          '';
+        };
+
       checks.x86_64-linux.network-service =
         let
           pkgs = nixpkgs.legacyPackages.x86_64-linux;
@@ -230,6 +258,26 @@
               grep -Fi offset offset.log
               touch "$out"
             '';
+          wlan-control-wire =
+            let
+              mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+            in
+            pkgs.rustPlatform.buildRustPackage {
+              pname = "wlan-control-wire";
+              version = "0.1.0";
+              src = mt7921FuchsiaSource;
+              cargoRoot = "crates/wlan-control-wire";
+              buildAndTestSubdir = "crates/wlan-control-wire";
+              cargoLock.lockFile = ./crates/wlan-control-wire/Cargo.lock;
+              doCheck = false;
+              installPhase = ''
+                mkdir -p "$out/share/wlan-control-wire"
+                cp crates/wlan-control-wire/Cargo.toml crates/wlan-control-wire/Cargo.lock \
+                  "$out/share/wlan-control-wire/"
+                cp -R crates/wlan-control-wire/src "$out/share/wlan-control-wire/"
+              '';
+            };
+
           audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
 
           netstack3-provider-daemon = pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix { };
