@@ -159,6 +159,7 @@ where
     handshake: ath11k_qmi::Wcn6750Handshake<A, M>,
     transport: T,
     service_started: bool,
+    device_bar_discovered: bool,
 }
 
 impl<T, A, M> Wcn6750QmiSession<T, A, M>
@@ -176,6 +177,7 @@ where
             ),
             transport,
             service_started: false,
+            device_bar_discovered: false,
         }
     }
 
@@ -192,7 +194,9 @@ where
         if !self.service_started {
             self.init_service()?;
         }
-        self.handshake.discover_device_bar(&mut self.transport)
+        self.handshake.discover_device_bar(&mut self.transport)?;
+        self.device_bar_discovered = true;
+        Ok(())
     }
 
     pub fn memory(&self) -> &M {
@@ -203,7 +207,12 @@ where
         if !self.service_started {
             self.init_service()?;
         }
-        self.handshake.wait_for_firmware_ready(&mut self.transport)
+        if self.device_bar_discovered {
+            self.handshake
+                .wait_for_firmware_ready_after_device_bar(&mut self.transport)
+        } else {
+            self.handshake.wait_for_firmware_ready(&mut self.transport)
+        }
     }
 
     pub fn start_cold_boot_calibration(&mut self) -> Result<(), QmiError> {
@@ -229,6 +238,7 @@ where
         if self.service_started {
             self.handshake.deinit_service(&mut self.transport);
             self.service_started = false;
+            self.device_bar_discovered = false;
         }
     }
 

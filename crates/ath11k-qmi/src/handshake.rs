@@ -158,6 +158,27 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
                 _ => {}
             }
         }
+        self.wait_for_firmware_events(transport)
+    }
+
+    /// Continue the firmware-ready handshake after `discover_device_bar`
+    /// consumed server arrival, host registration, and capabilities.
+    pub fn wait_for_firmware_ready_after_device_bar(
+        &mut self,
+        transport: &mut dyn Transport,
+    ) -> Result<FirmwareReady, QmiError> {
+        // `discover_device_bar` deliberately stops before BDF. Resume the
+        // fixed-memory path at the work normally performed by server_arrived.
+        if self.config.fixed_firmware_memory {
+            self.load_bdf_after_capabilities(transport, false)?;
+        }
+        self.wait_for_firmware_events(transport)
+    }
+
+    fn wait_for_firmware_events(
+        &mut self,
+        transport: &mut dyn Transport,
+    ) -> Result<FirmwareReady, QmiError> {
         let mut cold_boot_deadline: Option<u64> = None;
         loop {
             let timeout = if let Some(deadline) = cold_boot_deadline {
@@ -479,6 +500,15 @@ impl<A: FirmwareAssets, M: MemoryProvider> Wcn6750Handshake<A, M> {
 
     fn load_bdf(&mut self, transport: &mut dyn Transport, send_m3: bool) -> Result<(), QmiError> {
         self.capabilities(transport)?;
+
+        self.load_bdf_after_capabilities(transport, send_m3)
+    }
+
+    fn load_bdf_after_capabilities(
+        &mut self,
+        transport: &mut dyn Transport,
+        send_m3: bool,
+    ) -> Result<(), QmiError> {
 
         if self.config.supports_regdb {
             // qmi.c deliberately ignores the regdb download return value.

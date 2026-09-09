@@ -922,6 +922,7 @@ fn actual_qmi_handshake_runs_through_fake_qrtr_peer() {
     // A failed service start must remain retryable, while the completed
     // discovery path must make the lifecycle's repeated init idempotent.
     assert_eq!(qmi.init_service(), Err(QmiError::Transport));
+    qmi.discover_device_bar().unwrap();
     let ready = qmi.wait_for_firmware_ready().unwrap();
     qmi.init_service().unwrap();
     assert_eq!(ready.firmware_version, 0x1122_3344);
