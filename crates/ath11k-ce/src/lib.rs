@@ -1158,9 +1158,13 @@ impl<I: HtcPacketIo> Transport for HtcTransport<I> {
     }
 
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError> {
-        match self.io.receive_htc(deadline_ns)? {
-            Some(frame) => self.htc.receive(&frame),
-            None => Ok(None),
+        loop {
+            let Some(frame) = self.io.receive_htc(deadline_ns)? else {
+                return Ok(None);
+            };
+            if let Some(frame) = self.htc.receive(&frame)? {
+                return Ok(Some(frame));
+            }
         }
     }
 }
@@ -2112,6 +2116,31 @@ mod tests {
         drop(wmi);
         drop(htt);
         assert!(router.try_into_transport().is_ok());
+    }
+
+    #[test]
+    fn trailer_only_frame_is_progress_not_receive_timeout() {
+        let credit_only = vec![1, 2, 8, 0, 8, 0, 0, 0, 1, 4, 0, 0, 1, 2, 0, 0];
+        let io = PacketIo {
+            receive: VecDeque::from([credit_only, htc_frame(1, &[9, 8])]),
+            ..PacketIo::default()
+        };
+        let router = HtcRouter::new(HtcTransport::new(connected_wmi_htc(), io));
+        let mut wmi = router.endpoint(ServiceId::WMI_CONTROL).unwrap();
+
+        assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
+        assert_eq!(wmi.receive_payload(10), Ok(Some(vec![9, 8])));
+        assert_eq!(
+            router
+                .core
+                .borrow()
+                .transport
+                .htc()
+                .endpoint(1)
+                .unwrap()
+                .tx_credits,
+            6
+        );
     }
 
     #[test]
