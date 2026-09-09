@@ -45,6 +45,19 @@ fn validate_seqpacket(fd: RawFd) -> Result<(), String> {
     if flags & libc::O_NONBLOCK == 0 {
         return Err("Wi-Fi supervisor capability must be nonblocking".into());
     }
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut peer_len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe {
+        libc::getpeername(
+            fd,
+            (&mut peer as *mut libc::sockaddr_storage).cast(),
+            &mut peer_len,
+        )
+    } != 0
+        || peer.ss_family as i32 != libc::AF_UNIX
+    {
+        return Err("Wi-Fi supervisor capability must be a connected Unix socket".into());
+    }
     Ok(())
 }
 
@@ -246,5 +259,27 @@ impl WifiLifecycleReceiver {
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiver_rejects_unconnected_seqpacket_capability() {
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert!(matches!(
+            WifiLifecycleReceiver::new(fd),
+            Err(error) if error == "Wi-Fi supervisor capability must be a connected Unix socket"
+        ));
     }
 }
