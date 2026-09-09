@@ -3,19 +3,13 @@
 ## Status
 
 Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
-association, DHCP, and proved Internet connectivity before production hardening.
-The DT-assisted physical run proved a running WPSS, a 2 MiB VFIO region 1, QMI
-DeviceInfo BAR `0x61e00000`/`0x200000`, and an exact region-1 match and map. It
-stopped at the software QMI-to-core seam before MMIO or CE, so neither is yet
-physically proved. Source now continues the selected QMI region into core, but
-that continuation (revision `0c71becf`, now in master) has only deterministic
-build/test evidence and remains pending physical validation. Automatic recovery
-for the no-reset VFIO experiment uses a process timeout plus a local
-forced-reboot deadline and
-reboots on runner exit instead of attempting a native-driver rebind. Its
-stalled-runner and successful-exit paths pass a host-only test; an ordinary
-pre-release runner failure also physically forced reboot to the unchanged,
-reachable Linux 7.2.0 #1 system.
+association, DHCP, and proved Internet connectivity before production
+hardening. Physical bring-up currently reaches `DpHttConnect`: QMI discovers
+and maps the 2 MiB VFIO region 1 at BAR `0x61e00000`, CE receives HTC target
+ready, and firmware consumes the first CE0 HTC service-connect descriptor, but
+no service response arrives before timeout. Two same-kernel cycles proved the
+normal cleanup path described below in about 20.3 seconds each. That proof is
+specific to this current failure boundary, not arbitrary later DMA states.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
@@ -39,10 +33,12 @@ the device driver above them:
   vfio-platform reset handler; pinned ath11k AHB contains the firmware through
   the WPSS remoteproc lifecycle instead. A no-RESET cdev is admitted only for
   the polling diagnostic after the supervisor/operator externally restarts
-  WPSS before DMA, names that now-running remoteproc to the read-only runner,
-  and arms a watchdog to reboot on run or restart failure. The runner never
-  controls remoteproc. Production still requires a proved remoteproc
-  restart/reset ownership contract.
+  WPSS before DMA and arms independent reboot fallbacks. On a runner error, the
+  runner requests and verifies a synchronous WPSS stop through remoteproc while
+  it still owns every VFIO mapping. The privileged authentication and stop
+  implementation remain kernel-owned in remoteproc/PIL; userspace owns the
+  experiment's lifecycle policy. Production still requires a proved
+  remoteproc restart/reset ownership contract beyond the current failure stage.
 
 Everything ath11k-specific moves to userspace: QMI WLAN handshake, WMI, HTC/CE,
 HTT, HAL descriptors/registers/SRNG, TCL/REO/WBM data path, and hardware-facing
@@ -74,10 +70,15 @@ is expected. Preserve reports locally and retrieve them over USB; restoring
 Each experiment has a bounded duration and automatic recovery to a reachable,
 known state on ordinary runner failure, timeout, or control-session loss. Use
 the smallest mechanism that covers those failures. There is no requirement for
-a particular number of timers or for rebinding ath11k/iwd. For the current
-no-reset VFIO experiment, reboot to the unchanged known-good system is preferred
-to an unvalidated rebind sequence. A runner's successful exit is not recovery:
-do not disarm protection before the intended cleanup/recovery completes.
+a particular number of timers or for rebinding ath11k/iwd. At the current
+`DpHttConnect` failure stage, the runner retains all VFIO authority while it
+stops WPSS and verifies `offline`; the wrapper then verifies the child is reaped
+and no cdev descriptor remains before unbinding VFIO. A stop or verification
+failure holds that authority rather than dropping live DMA mappings, leaving an
+independent deadline and hardware watchdog to reboot. After normal verified
+cleanup, the wrapper disarms those emergency fallbacks and retains the inert
+candidate for another userspace cycle. A session-lifetime sleep inhibitor keeps
+USB control available while that candidate is idle.
 
 The current initrd userspace watchdog can recover process/control-path loss,
 not a hung kernel. An independently ticking runner heartbeat is not evidence
