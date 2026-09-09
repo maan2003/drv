@@ -720,6 +720,14 @@ impl<B: Backend, W: CeCompletionWait> CePipesPacketIo<B, W> {
         self.pipes
             .source_progress(&mut self.remote_read_pointers, pipe)
     }
+    pub fn destination_progress(&mut self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.pipes
+            .destination_progress(&mut self.remote_read_pointers, pipe)
+    }
+    pub fn status_progress(&mut self, pipe: usize) -> Result<(u32, u32), CeError> {
+        self.pipes
+            .status_progress(&mut self.remote_read_pointers, pipe)
+    }
     pub fn into_parts_with_waiter(self) -> (CePipesPacketIoParts<B>, W) {
         (
             (
@@ -1521,6 +1529,32 @@ impl<B: Backend> CePipes<B> {
     ) -> Result<(u32, u32), CeError> {
         let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
         let ring = pipe.source.as_mut().ok_or(CeError::DeviceFault)?;
+        ring.access_begin_remote(remote_read_pointers)?;
+        Ok(ring.progress())
+    }
+
+    /// Refresh and return `(host_head, target_tail)` for a CE destination
+    /// buffer ring, which is a HAL source ring from the host's perspective.
+    pub fn destination_progress(
+        &mut self,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+        pipe: usize,
+    ) -> Result<(u32, u32), CeError> {
+        let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
+        let ring = pipe.destination.as_mut().ok_or(CeError::DeviceFault)?;
+        ring.access_begin_remote(remote_read_pointers)?;
+        Ok(ring.progress())
+    }
+
+    /// Refresh and return `(host_tail, target_head)` for a CE destination
+    /// status ring.
+    pub fn status_progress(
+        &mut self,
+        remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
+        pipe: usize,
+    ) -> Result<(u32, u32), CeError> {
+        let pipe = self.pipes.get_mut(pipe).ok_or(CeError::InvalidFrame)?;
+        let ring = pipe.status.as_mut().ok_or(CeError::DeviceFault)?;
         ring.access_begin_remote(remote_read_pointers)?;
         Ok(ring.progress())
     }
@@ -2699,6 +2733,8 @@ mod tests {
         };
         assert!(descriptor_write < packet_sync && packet_sync < head_write);
         assert_eq!(packet_io.source_progress(0), Ok((4, 0)));
+        assert_eq!(packet_io.destination_progress(1), Ok((0, 0)));
+        assert_eq!(packet_io.status_progress(1), Ok((0, 0)));
         state.borrow_mut().dmas.get_mut(&1).unwrap()[128..132]
             .copy_from_slice(&4_u32.to_le_bytes());
         assert_eq!(packet_io.source_progress(0), Ok((4, 4)));

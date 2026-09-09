@@ -447,11 +447,14 @@ where
         let raw = match raw {
             Some(raw) => raw,
             None => {
-                let ce0_source_progress = Self::protocol(self.packet_io.as_mut())?
-                    .source_progress(0)
-                    .ok();
+                let packet_io = Self::protocol(self.packet_io.as_mut())?;
+                let ce0_source_progress = packet_io.source_progress(0).ok();
+                let ce2_destination_progress = packet_io.destination_progress(2).ok();
+                let ce2_status_progress = packet_io.status_progress(2).ok();
                 return Err(CoreError::HtcControlTimeout {
                     ce0_source_progress,
+                    ce2_destination_progress,
+                    ce2_status_progress,
                 });
             }
         };
