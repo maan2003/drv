@@ -13,6 +13,11 @@
 //! runtime-terminal failures use [`Message::GenerationEnd`]. Transports attach
 //! no file descriptors except the single capability required by
 //! [`Message::EthernetReady`], as reported by [`required_fd_count`].
+//!
+//! Header `request_id` is the sending endpoint's packet sequence, not an echo:
+//! each direction has an independent strictly increasing sequence. Reply bodies
+//! carry [`Reply::in_reply_to`] to identify the request packet they complete,
+//! so unsolicited events may safely interleave and requests may overlap.
 
 use fidl_fuchsia_wlan_common::{ScanType, WlanMacRole};
 use fidl_fuchsia_wlan_ieee80211 as ieee;
@@ -56,6 +61,13 @@ pub enum GenerationEndReason {
     ProtocolViolation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reply<T> {
+    /// Header `request_id` of the request packet completed by this reply.
+    pub in_reply_to: u64,
+    pub result: T,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum Message {
     Ready,
@@ -64,13 +76,13 @@ pub enum Message {
         mac: [u8; 6],
     },
     Scan(sme::ScanRequest),
-    ScanReply(Result<Vec<sme::ScanResult>, sme::ScanErrorCode>),
+    ScanReply(Reply<Result<Vec<sme::ScanResult>, sme::ScanErrorCode>>),
     Connect(sme::ConnectRequest),
-    ConnectReply(ConnectReply),
+    ConnectReply(Reply<ConnectReply>),
     Disconnect(sme::UserDisconnectReason),
-    DisconnectReply(CommandReply),
+    DisconnectReply(Reply<CommandReply>),
     Roam(sme::RoamRequest),
-    RoamReply(CommandReply),
+    RoamReply(Reply<CommandReply>),
     Event(sme::ConnectTransactionEvent),
     GenerationEnd(GenerationEndReason),
 }
@@ -110,6 +122,18 @@ impl fmt::Debug for Message {
     }
 }
 
+impl Message {
+    pub const fn in_reply_to(&self) -> Option<u64> {
+        match self {
+            Self::ScanReply(reply) => Some(reply.in_reply_to),
+            Self::ConnectReply(reply) => Some(reply.in_reply_to),
+            Self::DisconnectReply(reply) => Some(reply.in_reply_to),
+            Self::RoamReply(reply) => Some(reply.in_reply_to),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Packet {
     pub generation: [u8; 16],
@@ -142,6 +166,8 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// Validates packets received from one peer. Use a separate instance for each
+/// direction; `request_id` is that peer's packet sequence in this generation.
 #[derive(Clone, Debug)]
 pub struct SessionValidator {
     generation: [u8; 16],
@@ -290,7 +316,7 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             SCAN
         }
         Message::ScanReply(v) => {
-            enc_scan_reply(&mut w, v)?;
+            enc_reply(&mut w, v, enc_scan_reply)?;
             SCAN_REPLY
         }
         Message::Connect(v) => {
@@ -298,7 +324,10 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             CONNECT
         }
         Message::ConnectReply(v) => {
-            enc_connect_reply(&mut w, v);
+            enc_reply(&mut w, v, |w, v| {
+                enc_connect_reply(w, v);
+                Ok(())
+            })?;
             CONNECT_REPLY
         }
         Message::Disconnect(v) => {
@@ -306,7 +335,10 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             DISCONNECT
         }
         Message::DisconnectReply(v) => {
-            w.push(command_reply(*v));
+            enc_reply(&mut w, v, |w, v| {
+                w.push(command_reply(*v));
+                Ok(())
+            })?;
             DISCONNECT_REPLY
         }
         Message::Roam(v) => {
@@ -314,7 +346,10 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             ROAM
         }
         Message::RoamReply(v) => {
-            w.push(command_reply(*v));
+            enc_reply(&mut w, v, |w, v| {
+                w.push(command_reply(*v));
+                Ok(())
+            })?;
             ROAM_REPLY
         }
         Message::Event(v) => {
@@ -343,15 +378,15 @@ fn decode_message(kind: u16, r: &mut Reader<'_>) -> Result<Message, Error> {
             }
         }
         SCAN => Message::Scan(dec_scan(r)?),
-        SCAN_REPLY => Message::ScanReply(dec_scan_reply(r)?),
+        SCAN_REPLY => Message::ScanReply(dec_reply(r, dec_scan_reply)?),
         CONNECT => Message::Connect(dec_connect(r)?),
-        CONNECT_REPLY => Message::ConnectReply(dec_connect_reply(r)?),
+        CONNECT_REPLY => Message::ConnectReply(dec_reply(r, dec_connect_reply)?),
         DISCONNECT => Message::Disconnect(dec_disconnect_reason(r.u32()?)?),
-        DISCONNECT_REPLY => Message::DisconnectReply(dec_command_reply(r.u8()?)?),
+        DISCONNECT_REPLY => Message::DisconnectReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?),
         ROAM => Message::Roam(sme::RoamRequest {
             bss_description: dec_bss(r)?,
         }),
-        ROAM_REPLY => Message::RoamReply(dec_command_reply(r.u8()?)?),
+        ROAM_REPLY => Message::RoamReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?),
         EVENT => Message::Event(dec_event(r)?),
         GENERATION_END => Message::GenerationEnd(dec_generation_end(r.u8()?)?),
         other => return Err(Error::UnknownKind(other)),
@@ -382,6 +417,32 @@ fn dec_connect(r: &mut Reader<'_>) -> Result<sme::ConnectRequest, Error> {
         multiple_bss_candidates,
         authentication,
         deprecated_scan_type,
+    })
+}
+
+fn enc_reply<T>(
+    w: &mut Vec<u8>,
+    reply: &Reply<T>,
+    encode_result: impl FnOnce(&mut Vec<u8>, &T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if reply.in_reply_to == 0 {
+        return Err(Error::ZeroRequestId);
+    }
+    put_u64(w, reply.in_reply_to);
+    encode_result(w, &reply.result)
+}
+
+fn dec_reply<T>(
+    r: &mut Reader<'_>,
+    decode_result: impl FnOnce(&mut Reader<'_>) -> Result<T, Error>,
+) -> Result<Reply<T>, Error> {
+    let in_reply_to = r.u64()?;
+    if in_reply_to == 0 {
+        return Err(Error::ZeroRequestId);
+    }
+    Ok(Reply {
+        in_reply_to,
+        result: decode_result(r)?,
     })
 }
 
@@ -1079,6 +1140,13 @@ mod tests {
             message,
         }
     }
+    fn reply<T>(result: T) -> Reply<T> {
+        Reply {
+            in_reply_to: 42,
+            result,
+        }
+    }
+
     fn roundtrip(message: Message) {
         let expected = packet(message, 7);
         let encoded = encode(&expected).unwrap();
@@ -1116,23 +1184,23 @@ mod tests {
             Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
                 channels: vec![],
             })),
-            Message::ScanReply(Ok(vec![scan_result])),
-            Message::ScanReply(Err(sme::ScanErrorCode::ShouldWait)),
+            Message::ScanReply(reply(Ok(vec![scan_result]))),
+            Message::ScanReply(reply(Err(sme::ScanErrorCode::ShouldWait))),
             Message::Connect(connect()),
-            Message::ConnectReply(ConnectReply::Completed(sme::ConnectResult {
+            Message::ConnectReply(reply(ConnectReply::Completed(sme::ConnectResult {
                 code: ieee::StatusCode::EstablishRsnaFailure,
                 is_credential_rejected: true,
                 is_reconnect: false,
-            })),
-            Message::ConnectReply(ConnectReply::Timeout),
-            Message::ConnectReply(ConnectReply::DriverFault),
-            Message::ConnectReply(ConnectReply::ContainmentFault),
+            }))),
+            Message::ConnectReply(reply(ConnectReply::Timeout)),
+            Message::ConnectReply(reply(ConnectReply::DriverFault)),
+            Message::ConnectReply(reply(ConnectReply::ContainmentFault)),
             Message::Disconnect(sme::UserDisconnectReason::ProactiveNetworkSwitch),
-            Message::DisconnectReply(CommandReply::Success),
+            Message::DisconnectReply(reply(CommandReply::Success)),
             Message::Roam(sme::RoamRequest {
                 bss_description: bss(vec![]),
             }),
-            Message::RoamReply(CommandReply::NotConnected),
+            Message::RoamReply(reply(CommandReply::NotConnected)),
             Message::GenerationEnd(GenerationEndReason::Shutdown),
             Message::GenerationEnd(GenerationEndReason::Timeout),
             Message::GenerationEnd(GenerationEndReason::DriverFault),
@@ -1274,7 +1342,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            encode(&packet(Message::ScanReply(Ok(many)), 1)),
+            encode(&packet(Message::ScanReply(reply(Ok(many))), 1)),
             Err(Error::PacketTooLarge)
         );
     }
@@ -1327,6 +1395,51 @@ mod tests {
     }
 
     #[test]
+    fn replies_correlate_explicitly_while_events_interleave() {
+        let mut inbound_from_server = SessionValidator::new([9; 16]);
+        let first_reply = packet(
+            Message::DisconnectReply(Reply {
+                in_reply_to: 40,
+                result: CommandReply::Success,
+            }),
+            1,
+        );
+        let event = packet(
+            Message::Event(sme::ConnectTransactionEvent::OnSignalReport {
+                ind: internal::SignalReportIndication {
+                    rssi_dbm: -55,
+                    snr_db: 20,
+                },
+            }),
+            2,
+        );
+        let second_reply = packet(
+            Message::RoamReply(Reply {
+                in_reply_to: 41,
+                result: CommandReply::Success,
+            }),
+            3,
+        );
+        for packet in [&first_reply, &event, &second_reply] {
+            inbound_from_server.validate(packet).unwrap();
+        }
+        assert_eq!(first_reply.message.in_reply_to(), Some(40));
+        assert_eq!(event.message.in_reply_to(), None);
+        assert_eq!(second_reply.message.in_reply_to(), Some(41));
+
+        assert_eq!(
+            encode(&packet(
+                Message::DisconnectReply(Reply {
+                    in_reply_to: 0,
+                    result: CommandReply::Success,
+                }),
+                4,
+            )),
+            Err(Error::ZeroRequestId)
+        );
+    }
+
+    #[test]
     fn debug_redacts_credentials() {
         let rendered = format!("{:?}", Message::Connect(connect()));
         assert!(rendered.contains("<redacted>"));
@@ -1362,8 +1475,8 @@ mod tests {
             CommandReply::DriverFault,
             CommandReply::ContainmentFault,
         ] {
-            roundtrip(Message::DisconnectReply(reply));
-            roundtrip(Message::RoamReply(reply));
+            roundtrip(Message::DisconnectReply(self::reply(reply)));
+            roundtrip(Message::RoamReply(self::reply(reply)));
         }
         for error in [
             sme::ScanErrorCode::NotSupported,
@@ -1372,7 +1485,7 @@ mod tests {
             sme::ScanErrorCode::ShouldWait,
             sme::ScanErrorCode::CanceledByDriverOrFirmware,
         ] {
-            roundtrip(Message::ScanReply(Err(error)));
+            roundtrip(Message::ScanReply(reply(Err(error))));
         }
     }
 
@@ -1404,6 +1517,6 @@ mod tests {
             timestamp_nanos: i64::MAX,
             bss_description: bss(vec![]),
         };
-        roundtrip(Message::ScanReply(Ok(vec![result])));
+        roundtrip(Message::ScanReply(reply(Ok(vec![result]))));
     }
 }
