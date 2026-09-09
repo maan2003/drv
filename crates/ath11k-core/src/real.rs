@@ -1111,11 +1111,9 @@ where
                     rings,
                     ClientTxConfig::wcn6750_station(0),
                 )
-                .map_err(|error| {
-                    error
-                        .cleanup_error()
-                        .map(Self::dp_error)
-                        .unwrap_or_else(|| Self::dp_error(error.cause()))
+                .map_err(|error| CoreError::DpAllocation {
+                    cause: error.cause(),
+                    cleanup: error.cleanup_error(),
                 })?;
                 self.dp = Some(dp);
                 Ok(())

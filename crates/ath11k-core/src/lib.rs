@@ -45,6 +45,10 @@ pub struct PdevId(pub u8);
 pub enum CoreError {
     WrongState,
     Qmi(ath11k_qmi::QmiError),
+    DpAllocation {
+        cause: ath11k_dp::DpError,
+        cleanup: Option<ath11k_dp::DpError>,
+    },
     Protocol,
     DeviceFault,
     DeviceFaultAt(OperationTarget),
