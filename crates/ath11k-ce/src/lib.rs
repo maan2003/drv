@@ -479,6 +479,12 @@ pub struct RxFrame {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RxProgress {
+    Payload(RxFrame),
+    Control,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CeError {
     NoCredits,
@@ -611,6 +617,10 @@ pub trait Transport {
     /// On `Err`, the frame has not been made visible to firmware and may be retried.
     fn send(&mut self, frame: TxFrame) -> Result<(), CeError>;
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError>;
+    fn receive_progress(&mut self, deadline_ns: u64) -> Result<Option<RxProgress>, CeError> {
+        self.receive(deadline_ns)
+            .map(|frame| frame.map(RxProgress::Payload))
+    }
 }
 
 /// Endpoint-bound payload seam consumed by protocol adapters in WMI and DP.
@@ -1159,13 +1169,22 @@ impl<I: HtcPacketIo> Transport for HtcTransport<I> {
 
     fn receive(&mut self, deadline_ns: u64) -> Result<Option<RxFrame>, CeError> {
         loop {
-            let Some(frame) = self.io.receive_htc(deadline_ns)? else {
-                return Ok(None);
-            };
-            if let Some(frame) = self.htc.receive(&frame)? {
-                return Ok(Some(frame));
+            match self.receive_progress(deadline_ns)? {
+                Some(RxProgress::Payload(frame)) => return Ok(Some(frame)),
+                Some(RxProgress::Control) => {}
+                None => return Ok(None),
             }
         }
+    }
+
+    fn receive_progress(&mut self, deadline_ns: u64) -> Result<Option<RxProgress>, CeError> {
+        let Some(frame) = self.io.receive_htc(deadline_ns)? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.htc.receive(&frame)? {
+            Some(frame) => RxProgress::Payload(frame),
+            None => RxProgress::Control,
+        }))
     }
 }
 
@@ -1248,21 +1267,23 @@ impl<I: HtcPacketIo> HtcRouter<I> {
             .core
             .try_borrow_mut()
             .map_err(|_| CeError::DeviceFault)?;
-        let mut routed = 0;
-        while routed < budget {
-            let Some(frame) = core.transport.receive(deadline_ns)? else {
+        let mut serviced = 0;
+        while serviced < budget {
+            let Some(progress) = core.transport.receive_progress(deadline_ns)? else {
                 break;
             };
-            let endpoint = core
-                .transport
-                .htc()
-                .endpoint_for_service(frame.service)
-                .map(|endpoint| endpoint.endpoint as usize)
-                .ok_or(CeError::InvalidFrame)?;
-            core.endpoint_queues[endpoint].push_back(frame.bytes);
-            routed += 1;
+            if let RxProgress::Payload(frame) = progress {
+                let endpoint = core
+                    .transport
+                    .htc()
+                    .endpoint_for_service(frame.service)
+                    .map(|endpoint| endpoint.endpoint as usize)
+                    .ok_or(CeError::InvalidFrame)?;
+                core.endpoint_queues[endpoint].push_back(frame.bytes);
+            }
+            serviced += 1;
         }
-        Ok(routed)
+        Ok(serviced)
     }
 
     /// Recover the sole transport for deterministic HIF/CE teardown after all
@@ -2128,6 +2149,8 @@ mod tests {
         let router = HtcRouter::new(HtcTransport::new(connected_wmi_htc(), io));
         let mut wmi = router.endpoint(ServiceId::WMI_CONTROL).unwrap();
 
+        assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
+        assert_eq!(wmi.receive_payload(10), Ok(None));
         assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
         assert_eq!(wmi.receive_payload(10), Ok(Some(vec![9, 8])));
         assert_eq!(
