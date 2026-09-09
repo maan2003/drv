@@ -7,7 +7,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
     sync::{
         Arc,
@@ -61,7 +61,8 @@ pub struct OpenedPciCoherent {
 /// [`LinuxVfioPciCapabilities::adopt`]. Adoption performs no ioctl, mmap,
 /// device access, or PCI configuration read/write/seek. The caller is
 /// responsible for validating descriptor provenance and access mode before
-/// adoption.
+/// adoption. Both constructors also create and retain one opaque IRQ eventfd
+/// before lockdown.
 ///
 /// Sandboxed callers must consume this value with
 /// [`LinuxVfioPciCapabilities::lock_down`] and then pass the result to
@@ -74,6 +75,7 @@ pub struct LinuxVfioPciCapabilities {
     pci: PciControl,
     device: Arc<File>,
     iommu: Arc<File>,
+    irq_event: OwnedFd,
 }
 
 /// The same inert authority after the exact MT7921 sandbox profile is active.
@@ -83,12 +85,16 @@ pub struct LockedLinuxVfioPciCapabilities(LinuxVfioPciCapabilities);
 pub struct LockedVfioEduReport {
     pub region_index: u32,
     pub irq_index: u32,
+    pub irq_deliveries: u64,
+    pub bar_round_trip: bool,
+    pub dma_round_trip: bool,
+    pub pci_config_rw: bool,
     pub reset_supported: bool,
     pub reset_succeeded: bool,
 }
 
 /// Exercise real VFIO/iommufd mechanics under the MT7921 filter while bypassing
-/// only endpoint identity and PCI power-management policy that QEMU edu cannot
+/// endpoint identity, PCI power-management, and MSI policy that QEMU edu cannot
 /// satisfy. This is proof tooling, not a production device constructor.
 pub fn run_locked_vfio_edu_mechanics(
     capabilities: LockedLinuxVfioPciCapabilities,
@@ -97,6 +103,7 @@ pub fn run_locked_vfio_edu_mechanics(
         mut pci,
         device,
         iommu,
+        irq_event,
     } = capabilities.0;
     if pci
         .bus_master_enabled()
@@ -104,7 +111,6 @@ pub fn run_locked_vfio_edu_mechanics(
     {
         return Err("QEMU edu entered proof with PCI bus mastering enabled".into());
     }
-    let pci = pci.into_file();
     userspace_vfio::bind_iommufd(&device, &iommu)?;
     let mut ioas = userspace_vfio::allocate_ioas(&iommu)?;
     userspace_vfio::attach_ioas(&device, ioas.id())?;
@@ -125,63 +131,122 @@ pub fn run_locked_vfio_edu_mechanics(
     }
     let (region_index, mut region) =
         mapped_region.ok_or_else(|| "QEMU edu exposes no writable mmap BAR".to_string())?;
+    region.write_u32(0x04, 0x1234_5678)?;
+    let bar_round_trip = region.read_u32(0x04)? == !0x1234_5678u32;
+    if !bar_round_trip {
+        return Err("QEMU edu BAR write/read liveness check failed".into());
+    }
 
     let mut dma = userspace_vfio::DmaMapping::map(&iommu, ioas.id(), 0x0100_0000, 4096, 4096)?;
-    dma.write(0, b"locked-vfio-edu")?;
+    let payload = [1, 2, 3, 4];
+    dma.write(0, &payload)?;
 
-    let mut installed_irq = None;
-    for index in [2, 1] {
-        let Ok(capability) = userspace_vfio::irq_capability(&device, index) else {
-            continue;
-        };
-        if capability.count == 0 || !capability.eventfd {
-            continue;
-        }
-        if let Ok(irq) = userspace_vfio::VfioIrq::install(&device, capability) {
-            installed_irq = Some((index, irq));
-            break;
-        }
+    // QEMU edu delivers its DMA completion through INTx. Production PCI
+    // activation still accepts only MSI-X/MSI; this proof uses edu's index 0
+    // solely to exercise real post-lockdown IRQ delivery and teardown.
+    let (irq_index, capability) = [0]
+        .into_iter()
+        .find_map(|index| {
+            userspace_vfio::irq_capability(&device, index)
+                .ok()
+                .filter(|capability| capability.count != 0 && capability.eventfd)
+                .map(|capability| (index, capability))
+        })
+        .ok_or_else(|| "QEMU edu exposes no eventfd IRQ".to_string())?;
+    let mut irq = userspace_vfio::VfioIrq::install_prepared_at(&device, capability, 0, irq_event)?;
+
+    // Mirror production ordering: attach the IOAS and install all resources
+    // before enabling DMA, then clear BME again before teardown.
+    pci.set_bus_master_for_edu_proof(true)
+        .map_err(|error| error.to_string())?;
+    let iova = dma.iova();
+    region.write_u32(0x80, iova as u32)?;
+    region.write_u32(0x84, (iova >> 32) as u32)?;
+    region.write_u32(0x88, 0x40000)?;
+    region.write_u32(0x8c, 0)?;
+    region.write_u32(0x90, payload.len() as u32)?;
+    fence(Ordering::Release);
+    region.write_u32(0x98, 1 | 4)?;
+    let first = irq
+        .wait_until(userspace_vfio::monotonic_time_ns()?.saturating_add(5_000_000_000))?
+        .ok_or_else(|| "timed out waiting for QEMU edu host-to-device DMA IRQ".to_string())?;
+    region.write_u32(0x64, 0x100)?;
+
+    // QEMU's DMA_START names a private `EduState::dma_buf`, not a BAR
+    // offset. Copy it back through the opposite DMA direction to observe the
+    // first transfer without pretending the private buffer is MMIO.
+    region.write_u32(0x80, 0x40000)?;
+    region.write_u32(0x84, 0)?;
+    region.write_u32(0x88, (iova + 2048) as u32)?;
+    region.write_u32(0x8c, ((iova + 2048) >> 32) as u32)?;
+    region.write_u32(0x98, 1 | 2 | 4)?;
+    let second = irq
+        .wait_until(userspace_vfio::monotonic_time_ns()?.saturating_add(5_000_000_000))?
+        .ok_or_else(|| "timed out waiting for QEMU edu device-to-host DMA IRQ".to_string())?;
+    fence(Ordering::Acquire);
+    let observed = dma.read(2048, payload.len())?;
+    let dma_round_trip = observed == payload;
+    if !dma_round_trip {
+        return Err(format!(
+            "QEMU edu DMA round trip changed payload: expected {payload:?}, observed {observed:?}"
+        ));
     }
-    let (irq_index, mut irq) =
-        installed_irq.ok_or_else(|| "QEMU edu exposes no installable eventfd IRQ".to_string())?;
 
-    userspace_vfio::prove_mt7921_sandbox_ioctl_denials(&pci, &device, &iommu)?;
-    let reset = userspace_vfio::reset_device_unchecked(&device);
-    if let Err(error) = &reset
-        && error.contains("Operation not permitted")
-    {
-        return Err("seccomp rejected VFIO_DEVICE_RESET".into());
+    pci.set_bus_master_for_edu_proof(false)
+        .map_err(|error| error.to_string())?;
+    let pci_config_rw = !pci
+        .bus_master_enabled()
+        .map_err(|error| error.to_string())?;
+    if !pci_config_rw {
+        return Err("QEMU edu PCI bus mastering remained enabled".into());
     }
-
+    let pci = pci.into_file();
     irq.disable()?;
     region.teardown()?;
     dma.teardown()?;
     drop(irq);
     drop(region);
     drop(dma);
+    let reset = userspace_vfio::reset_device_unchecked(&device);
+    if let Err(error) = &reset
+        && error.contains("Operation not permitted")
+    {
+        return Err("seccomp rejected VFIO_DEVICE_RESET".into());
+    }
     drop(device);
     ioas.teardown()?;
+    drop(pci);
     Ok(LockedVfioEduReport {
         region_index,
         irq_index,
+        irq_deliveries: first.saturating_add(second),
+        bar_round_trip,
+        dma_round_trip,
+        pci_config_rw,
         reset_supported: info.reset_supported,
         reset_succeeded: reset.is_ok(),
     })
 }
 
 impl LinuxVfioPciCapabilities {
-    /// Adopt the three PCI/VFIO descriptors without inspecting or activating
-    /// them.
+    /// Adopt the three PCI/VFIO descriptors and precreate the opaque IRQ
+    /// eventfd without inspecting or activating the device descriptors.
     ///
     /// The caller or supervising process must ensure that `pci_config` is the
     /// intended endpoint's writable PCI configuration file, `device` is its
     /// VFIO cdev, and `iommu` is a usable read/write iommufd.
-    pub fn adopt(pci_config: File, device: File, iommu: File) -> Self {
-        Self {
+    pub fn adopt(
+        pci_config: File,
+        device: File,
+        iommu: File,
+    ) -> std::result::Result<Self, LinuxVfioError> {
+        let irq_event = userspace_vfio::create_irq_eventfd().map_err(LinuxVfioError::Setup)?;
+        Ok(Self {
             pci: PciControl::from_file(pci_config),
             device: Arc::new(device),
             iommu: Arc::new(iommu),
-        }
+            irq_event,
+        })
     }
 
     /// Open and adopt the three PCI/VFIO descriptors without activating them.
@@ -199,12 +264,14 @@ impl LinuxVfioPciCapabilities {
         let pci_config_fd = self.pci.raw_fd();
         let vfio_fd = self.device.as_raw_fd();
         let iommufd = self.iommu.as_raw_fd();
+        let irq_eventfd = self.irq_event.as_raw_fd();
         linux_self_sandbox::Sandbox::new()
-            .setup(&[pci_config_fd, vfio_fd, iommufd], None)?
+            .setup(&[pci_config_fd, vfio_fd, iommufd, irq_eventfd], None)?
             .lockdown(linux_self_sandbox::Profile::Mt7921Vfio {
                 pci_config_fd,
                 vfio_fd,
                 iommufd,
+                irq_eventfd,
             })?;
         Ok(LockedLinuxVfioPciCapabilities(self))
     }
@@ -223,7 +290,7 @@ impl LinuxVfioPciCapabilities {
             .write(true)
             .open(iommu_path)
             .map_err(LinuxVfioError::OpenIommufd)?;
-        Ok(Self::adopt(pci_config, device, iommu))
+        Self::adopt(pci_config, device, iommu)
     }
 }
 
@@ -270,6 +337,7 @@ pub struct LinuxVfio {
     quarantined_dmas: HashMap<u64, Dma>,
     interrupts: HashMap<u64, (u32, VfioIrq)>,
     ambiguous_irq_indices: HashSet<u32>,
+    prepared_irq: Option<OwnedFd>,
 }
 
 impl LinuxVfio {
@@ -383,8 +451,13 @@ impl LinuxVfio {
     fn activate_pci_coherent(
         capabilities: LinuxVfioPciCapabilities,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
-        let LinuxVfioPciCapabilities { pci, device, iommu } = capabilities;
-        Self::initialize_pci_controlled(pci, device, iommu, |device, iommu| {
+        let LinuxVfioPciCapabilities {
+            pci,
+            device,
+            iommu,
+            irq_event,
+        } = capabilities;
+        Self::initialize_pci_controlled(pci, device, iommu, irq_event, |device, iommu| {
             userspace_vfio::bind_iommufd(device, iommu)?;
             let ioas = userspace_vfio::allocate_ioas(iommu)?;
             userspace_vfio::attach_ioas(device, ioas.id())?;
@@ -396,11 +469,12 @@ impl LinuxVfio {
         mut pci: PciControl,
         device: Arc<File>,
         iommu: Arc<File>,
+        irq_event: OwnedFd,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
         pci.verify_dma_disabled()
             .map_err(LinuxVfioError::PciControl)?;
-        let backend = Self::initialize_pci_coherent(device, iommu, setup)?;
+        let backend = Self::initialize_pci_coherent(device, iommu, irq_event, setup)?;
         let config = pci
             .verify_dma_disabled()
             .map_err(LinuxVfioError::PciControl)?;
@@ -423,12 +497,14 @@ impl LinuxVfio {
             Some(iommu),
             Some(ioas),
             None,
+            None,
         ))
     }
 
     fn initialize_pci_coherent(
         device: Arc<File>,
         iommu: Arc<File>,
+        irq_event: OwnedFd,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         let ioas = setup(&device, &iommu).map_err(LinuxVfioError::Setup)?;
@@ -451,6 +527,7 @@ impl LinuxVfio {
             Some(iommu),
             Some(ioas),
             Some(irq),
+            Some(irq_event),
         ))
     }
 
@@ -459,7 +536,7 @@ impl LinuxVfio {
         probe: impl FnOnce(&File) -> std::result::Result<(), String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         probe(&device).map_err(LinuxVfioError::DmaBrokerUnavailable)?;
-        Ok(Self::new(device, Flavor::Broker, None, None, None))
+        Ok(Self::new(device, Flavor::Broker, None, None, None, None))
     }
 
     fn new(
@@ -468,6 +545,7 @@ impl LinuxVfio {
         iommu: Option<Arc<File>>,
         ioas: Option<Ioas>,
         pci_irq: Option<IrqCapability>,
+        prepared_irq: Option<OwnedFd>,
     ) -> Self {
         Self {
             device,
@@ -483,6 +561,7 @@ impl LinuxVfio {
             quarantined_dmas: HashMap::new(),
             interrupts: HashMap::new(),
             ambiguous_irq_indices: HashSet::new(),
+            prepared_irq,
         }
     }
 
@@ -949,8 +1028,13 @@ impl Backend for LinuxVfio {
             )
         };
         self.ambiguous_irq_indices.insert(capability.index);
-        let interrupt =
-            VfioIrq::install_at(&self.device, capability, start).map_err(|_| Error::DeviceFault)?;
+        let interrupt = if self.flavor == Flavor::PciCoherent {
+            let event_fd = self.prepared_irq.take().ok_or(Error::Limit)?;
+            VfioIrq::install_prepared_at(&self.device, capability, start, event_fd)
+        } else {
+            VfioIrq::install_at(&self.device, capability, start)
+        }
+        .map_err(|_| Error::DeviceFault)?;
         let id = self.id()?;
         self.interrupts.insert(id, (vector, interrupt));
         self.ambiguous_irq_indices.remove(&capability.index);
@@ -1129,12 +1213,17 @@ mod tests {
 
     fn fake_pci_backend(device: Arc<File>) -> LinuxVfio {
         let iommu = Arc::new(File::open("/dev/null").unwrap());
-        LinuxVfio::initialize_pci_coherent(device, iommu, |device, iommu| {
-            userspace_vfio::bind_iommufd(device, iommu)?;
-            let ioas = userspace_vfio::allocate_ioas(iommu)?;
-            userspace_vfio::attach_ioas(device, ioas.id())?;
-            Ok(ioas)
-        })
+        LinuxVfio::initialize_pci_coherent(
+            device,
+            iommu,
+            userspace_vfio::create_irq_eventfd().unwrap(),
+            |device, iommu| {
+                userspace_vfio::bind_iommufd(device, iommu)?;
+                let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                userspace_vfio::attach_ioas(device, ioas.id())?;
+                Ok(ioas)
+            },
+        )
         .unwrap()
     }
 
@@ -1448,6 +1537,7 @@ mod tests {
                 unsafe_pci,
                 Arc::clone(&device),
                 Arc::clone(&iommu),
+                userspace_vfio::create_irq_eventfd().unwrap(),
                 |_, _| {
                     attached.set(true);
                     unreachable!()
@@ -1475,6 +1565,7 @@ mod tests {
                         safe_pci,
                         device,
                         iommu,
+                        userspace_vfio::create_irq_eventfd().unwrap(),
                         |device, iommu| {
                             userspace_vfio::bind_iommufd(device, iommu)?;
                             let ioas = userspace_vfio::allocate_ioas(iommu)?;
@@ -1527,6 +1618,7 @@ mod tests {
                     Arc::try_unwrap(device).unwrap(),
                     iommu,
                 )
+                .unwrap()
             },
         );
         assert!(setup_records.is_empty());

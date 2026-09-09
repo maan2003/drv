@@ -171,7 +171,8 @@ testers.runNixOSTest {
     virtualisation.qemu.options = [
       "-machine q35,kernel_irqchip=split"
       "-device intel-iommu,intremap=on,caching-mode=on"
-      "-device edu,id=edu"
+      "-device edu,id=edu-locked"
+      "-device edu,id=edu-safe"
     ];
   };
 
@@ -180,12 +181,13 @@ testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
 
     with subtest("QEMU edu function is enumerated behind the virtual IOMMU"):
-        bdf = machine.succeed(
+        bdfs = machine.succeed(
             "for d in /sys/bus/pci/devices/*; do "
             "[ \"$(cat $d/vendor)\" = 0x1234 ] && "
             "[ \"$(cat $d/device)\" = 0x11e8 ] && basename $d; done; true"
-        ).strip()
-        assert bdf, "QEMU edu PCI function 1234:11e8 was not found"
+        ).split()
+        assert len(bdfs) == 2, f"expected two isolated QEMU edu functions, found {bdfs}"
+        bdf, safe_bdf = bdfs
         machine.succeed(f"lspci -s {bdf} -nn | grep -F '[1234:11e8]'")
         machine.succeed(f"test -L /sys/bus/pci/devices/{bdf}/iommu_group")
         group = machine.succeed(
@@ -198,15 +200,16 @@ testers.runNixOSTest {
 
     with subtest("the complete group binds exclusively to vfio-pci"):
         machine.succeed("modprobe vfio-pci")
-        machine.succeed(f"echo vfio-pci > /sys/bus/pci/devices/{bdf}/driver_override")
-        machine.execute(
-            f"test ! -L /sys/bus/pci/devices/{bdf}/driver || "
-            f"echo {bdf} > /sys/bus/pci/devices/{bdf}/driver/unbind"
-        )
-        machine.succeed(f"echo {bdf} > /sys/bus/pci/drivers/vfio-pci/bind")
-        machine.succeed(
-            f"test \"$(basename $(readlink -f /sys/bus/pci/devices/{bdf}/driver))\" = vfio-pci"
-        )
+        for endpoint in [bdf, safe_bdf]:
+            machine.succeed(f"echo vfio-pci > /sys/bus/pci/devices/{endpoint}/driver_override")
+            machine.execute(
+                f"test ! -L /sys/bus/pci/devices/{endpoint}/driver || "
+                f"echo {endpoint} > /sys/bus/pci/devices/{endpoint}/driver/unbind"
+            )
+            machine.succeed(f"echo {endpoint} > /sys/bus/pci/drivers/vfio-pci/bind")
+            machine.succeed(
+                f"test \"$(basename $(readlink -f /sys/bus/pci/devices/{endpoint}/driver))\" = vfio-pci"
+            )
         for member in members:
             machine.succeed(
                 f"test \"$(basename $(readlink -f /sys/bus/pci/devices/{member}/driver))\" = vfio-pci"
@@ -217,8 +220,18 @@ testers.runNixOSTest {
         cdev = machine.succeed(
             f"basename /sys/bus/pci/devices/{bdf}/vfio-dev/vfio*"
         ).strip()
+        safe_cdev = machine.succeed(
+            f"basename /sys/bus/pci/devices/{safe_bdf}/vfio-dev/vfio*"
+        ).strip()
         machine.succeed(f"test -c /dev/vfio/devices/{cdev}")
         machine.succeed(f"vfio-iommufd-probe /dev/vfio/devices/{cdev}")
+
+    with subtest("safe Device LinuxVfio path reaches the honest reset boundary"):
+        status, legacy = machine.execute(
+            f"vfio_edu /dev/vfio/devices/{safe_cdev} 2>&1"
+        )
+        assert status != 0, "QEMU edu unexpectedly advertised VFIO reset support"
+        assert "safe edu sequence: Unsupported" in legacy, legacy
 
     with subtest("MT7921 lockdown admits exact real-kernel VFIO/iommufd mechanics"):
         proof = machine.succeed(
@@ -226,10 +239,14 @@ testers.runNixOSTest {
             f"/sys/bus/pci/devices/{bdf}/config"
         )
         assert "locked_vfio_edu=PASS" in proof
-        assert "irq=2" not in proof, "QEMU edu unexpectedly skipped the IRQ fallback path"
+        assert "pci_config_rw=true" in proof
+        assert "bar_round_trip=true dma_round_trip=true" in proof
+        assert "irq_deliveries=2" in proof
+        assert "irq=0" in proof, "QEMU edu did not exercise its real INTx delivery path"
         assert "reset_supported=false reset_succeeded=false" in proof
-        assert "denial_injection=true clean_teardown=true" in proof
-        assert "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw" in proof
+        assert "in_process_denial_injection=false" in proof
+        assert "fatal_denials=separate-sandbox-subprocess-proof clean_teardown=true" in proof
+        assert "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd" in proof
 
     with subtest("VFIO ownership can be torn down and restored"):
         machine.succeed(f"echo {bdf} > /sys/bus/pci/drivers/vfio-pci/unbind")

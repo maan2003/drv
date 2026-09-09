@@ -1397,20 +1397,25 @@ impl VfioIrq {
         capability: IrqCapability,
         start: u32,
     ) -> Result<Self, String> {
+        Self::install_prepared_at(device, capability, start, create_irq_eventfd()?)
+    }
+
+    /// Install a caller-created IRQ eventfd without duplicating or replacing it.
+    ///
+    /// Sandboxed users create this descriptor before lockdown so the filter can
+    /// authorize its stable numeric identity and deny later descriptor creation.
+    pub fn install_prepared_at(
+        device: &Arc<File>,
+        capability: IrqCapability,
+        start: u32,
+        event_fd: OwnedFd,
+    ) -> Result<Self, String> {
         if capability.count == 0 || !capability.eventfd {
             return Err("refused non-eventfd VFIO interrupt".into());
         }
         if start >= capability.count {
             return Err("VFIO interrupt vector is out of range".into());
         }
-        let raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-        if raw < 0 {
-            return Err(format!(
-                "create IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let event_fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut set = IrqSetEventfd {
             header: IrqSetHeader {
                 argsz: size::<IrqSetEventfd>(),
@@ -1520,6 +1525,18 @@ impl VfioIrq {
         self.installed = false;
         Ok(())
     }
+}
+
+/// Create the nonblocking, close-on-exec counter used by one VFIO IRQ.
+pub fn create_irq_eventfd() -> Result<OwnedFd, String> {
+    let raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+    if raw < 0 {
+        return Err(format!(
+            "create IRQ eventfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 pub fn wait_eventfds_until(event_fds: &[RawFd], deadline_ns: u64) -> Result<Vec<usize>, String> {
@@ -1656,6 +1673,42 @@ mod tests {
         assert_eq!(dma_broker_uapi::GET, 1 << 16);
         assert_eq!(dma_broker_uapi::SET, 1 << 17);
         assert_eq!(dma_broker_uapi::PROBE, 1 << 18);
+    }
+
+    #[test]
+    fn prepared_irq_install_preserves_the_authorized_fd_identity() {
+        let device = Arc::new(File::open("/dev/null").unwrap());
+        let event_fd = create_irq_eventfd().unwrap();
+        let authorized_fd = event_fd.as_raw_fd();
+        assert_eq!(
+            std::fs::read_link(format!("/proc/self/fd/{authorized_fd}")).unwrap(),
+            std::path::Path::new("anon_inode:[eventfd]")
+        );
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{authorized_fd}")).unwrap();
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .map(|flags| u32::from_str_radix(flags, 8).unwrap())
+            .unwrap();
+        assert_ne!(flags & EFD_NONBLOCK as u32, 0);
+        assert_ne!(flags & EFD_CLOEXEC as u32, 0);
+        let (irq, records) = with_fake_io(false, || {
+            VfioIrq::install_prepared_at(
+                &device,
+                IrqCapability {
+                    index: 2,
+                    count: 1,
+                    eventfd: true,
+                    automasked: false,
+                },
+                0,
+                event_fd,
+            )
+            .unwrap()
+        });
+        assert_eq!(irq.event_fd(), authorized_fd);
+        assert_eq!(irq.try_read().unwrap(), None);
+        assert_eq!(records, [Record::InstallIrq(2)]);
     }
 
     #[test]

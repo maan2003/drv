@@ -179,6 +179,16 @@ impl PciControl {
     pub fn disable_bus_master(&mut self) -> Result<u16, PciControlError> {
         update_command(&mut self.config, PCI_COMMAND_MASTER, false, false)
     }
+
+    /// Toggle BME for the QEMU edu proof, whose synthetic PCI function has no
+    /// power-management capability. Production activation must use
+    /// [`Self::enable_bus_master`] and its D0/MSE checks.
+    pub(crate) fn set_bus_master_for_edu_proof(
+        &mut self,
+        enabled: bool,
+    ) -> Result<u16, PciControlError> {
+        update_command(&mut self.config, PCI_COMMAND_MASTER, enabled, enabled)
+    }
 }
 
 fn io(operation: &'static str, source: std::io::Error) -> PciControlError {

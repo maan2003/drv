@@ -45,8 +45,15 @@ fn main() {
         let report = run_locked_vfio_edu_mechanics(capabilities)
             .expect("prove locked VFIO/iommufd mechanics");
         println!(
-            "locked_vfio_edu=PASS bind=true attach=true info=true region={} bar_mmap=true dma_map_unmap=true irq={} irq_disabled=true reset_admitted=true reset_supported={} reset_succeeded={} ioas_destroyed=true denial_injection=true clean_teardown=true",
-            report.region_index, report.irq_index, report.reset_supported, report.reset_succeeded
+            "locked_vfio_edu=PASS bind=true attach=true info=true pci_config_rw={} region={} bar_mmap=true bar_round_trip={} dma_round_trip={} irq={} irq_deliveries={} irq_disabled=true reset_admitted=true reset_supported={} reset_succeeded={} ioas_destroyed=true in_process_denial_injection=false fatal_denials=separate-sandbox-subprocess-proof clean_teardown=true",
+            report.pci_config_rw,
+            report.region_index,
+            report.bar_round_trip,
+            report.dma_round_trip,
+            report.irq_index,
+            report.irq_deliveries,
+            report.reset_supported,
+            report.reset_succeeded
         );
         println!("{}", linux_self_sandbox::MT7921_VFIO_AUTHORITY_INVENTORY);
         return;
