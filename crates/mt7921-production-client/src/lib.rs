@@ -5,10 +5,10 @@
 //! Setup opens [`LinuxVfioPciCapabilities`] before sandbox lockdown. After
 //! lockdown, [`Mt7921HardwareSession::open`] consumes that inert authority and
 //! owns the activated `LinuxVfio` backend (inside `Device<LinuxVfio>`), its
-//! IOAS, PCI control descriptor, BAR mapping, DMA arenas, and interrupt. Loader
-//! and passive mechanics code receives only short-lived views; the session
-//! never stores references to its own fields. Policy/effects and lab telemetry
-//! deliberately remain outside this crate.
+//! IOAS, PCI control descriptor, BAR mapping, DMA arenas, and interrupt. Active
+//! data-path authority remains private while containment is brought under this
+//! owner. Policy/effects and lab telemetry deliberately remain outside this
+//! crate.
 
 mod setup_inputs;
 pub use setup_inputs::{
@@ -38,10 +38,6 @@ const MT7921_BAR0_BYTES: usize = 0x10_0000;
 const MCU_TX_RING_COUNT: usize = 256;
 const MCU_COMMAND_SLOT_BYTES: usize = 256;
 const MCU_COMMAND_PAYLOAD_BYTES: usize = MCU_TX_RING_COUNT * MCU_COMMAND_SLOT_BYTES;
-const PASSIVE_MAC_BAR_PAGES: [usize; 13] = [
-    0x08000, 0x09000, 0x0c000, 0x0f000, 0x21000, 0x23000, 0x24000, 0x34000, 0x38000, 0x39000,
-    0xa1000, 0xa3000, 0xa4000,
-];
 
 /// Inert setup result that can cross the sandbox-lockdown boundary.
 pub struct Mt7921HardwareSessionConfig {
@@ -110,6 +106,10 @@ pub struct ContainmentLedger {
     dma_mapped: bool,
     irq_installed: bool,
     bus_master_enabled: bool,
+    bme_disabled_command: Option<u16>,
+    reset_generation: Option<u64>,
+    post_reset_registers: Option<PostResetRegisters>,
+    post_reset_pci: Option<PostResetPciSnapshot>,
 }
 
 impl ContainmentLedger {
@@ -132,7 +132,86 @@ impl ContainmentLedger {
     pub fn bus_master_enabled(&self) -> bool {
         self.bus_master_enabled
     }
+
+    pub fn bme_disabled_command(&self) -> Option<u16> {
+        self.bme_disabled_command
+    }
+    pub fn reset_generation(&self) -> Option<u64> {
+        self.reset_generation
+    }
+    pub fn post_reset_registers(&self) -> Option<PostResetRegisters> {
+        self.post_reset_registers
+    }
+    pub fn post_reset_pci(&self) -> Option<PostResetPciSnapshot> {
+        self.post_reset_pci
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostResetRegisters {
+    pub wfdma_global_config: u32,
+    pub host_interrupt_enable: u32,
+    pub pcie_mac_interrupt_enable: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostResetPciSnapshot {
+    pub command: u16,
+    pub power_state: u8,
+    pub vendor: u16,
+    pub device: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionLifecycle {
+    Active,
+    Closing,
+    Contained,
+}
+
+fn ensure_operational(lifecycle: SessionLifecycle) -> Result<(), drv_hardware::Error> {
+    if lifecycle == SessionLifecycle::Active {
+        Ok(())
+    } else {
+        Err(drv_hardware::Error::StaleHandle)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainmentStage {
+    DisableBusMaster,
+    Reset,
+    PostResetRegisters,
+    PostResetPci,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921ContainmentError {
+    stage: ContainmentStage,
+    detail: String,
+    ledger: ContainmentLedger,
+}
+
+impl Mt7921ContainmentError {
+    pub fn stage(&self) -> ContainmentStage {
+        self.stage
+    }
+    pub fn ledger(&self) -> &ContainmentLedger {
+        &self.ledger
+    }
+}
+
+impl fmt::Display for Mt7921ContainmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MT7921 containment failed at {:?}: {}",
+            self.stage, self.detail
+        )
+    }
+}
+
+impl std::error::Error for Mt7921ContainmentError {}
 
 #[derive(Debug)]
 pub enum Mt7921HardwareSessionError {
@@ -165,6 +244,7 @@ impl fmt::Display for Mt7921HardwareSessionError {
 
 impl std::error::Error for Mt7921HardwareSessionError {}
 
+#[allow(dead_code, reason = "staged arenas remain owned for containment")]
 struct DmaArenas<B: Backend> {
     tx_guard: CoherentDma<B, Bidirectional>,
     fwdl_ring: CoherentDma<B, Bidirectional>,
@@ -185,7 +265,9 @@ struct DmaArenas<B: Backend> {
 
 struct OwnedHardwareResources<B: Backend> {
     // Release externally observable resources before the shared backend owner.
+    #[allow(dead_code, reason = "IRQ ownership is retained through reset")]
     interrupt: Interrupt<B>,
+    #[allow(dead_code, reason = "DMA ownership is retained through reset")]
     dma: DmaArenas<B>,
     bar0: MmioRegion<B>,
     device: Device<B>,
@@ -299,6 +381,149 @@ impl<B: Backend> OwnedHardwareResources<B> {
     }
 }
 
+trait ContainmentAuthority {
+    fn reset(&mut self) -> Result<u64, String>;
+    fn post_reset_registers(&mut self) -> Result<PostResetRegisters, String>;
+}
+
+fn validate_post_reset_registers(
+    registers: PostResetRegisters,
+) -> Result<PostResetRegisters, String> {
+    for (name, value) in [
+        ("WFDMA GLO_CFG", registers.wfdma_global_config),
+        ("HOST_INT_EN", registers.host_interrupt_enable),
+        ("PCIe MAC INT_ENABLE", registers.pcie_mac_interrupt_enable),
+    ] {
+        if value == u32::MAX {
+            return Err(format!("post-reset {name} returned all ones"));
+        }
+    }
+    if registers.wfdma_global_config & 0xf != 0 {
+        return Err(format!(
+            "post-reset WFDMA GLO_CFG remained active: {:#010x}",
+            registers.wfdma_global_config
+        ));
+    }
+    if registers.host_interrupt_enable != 0 {
+        return Err(format!(
+            "post-reset HOST_INT_EN remained active: {:#010x}",
+            registers.host_interrupt_enable
+        ));
+    }
+    if registers.pcie_mac_interrupt_enable != 0 {
+        return Err(format!(
+            "post-reset PCIe MAC INT_ENABLE remained active: {:#010x}",
+            registers.pcie_mac_interrupt_enable
+        ));
+    }
+    Ok(registers)
+}
+
+impl<B: Backend> ContainmentAuthority for OwnedHardwareResources<B> {
+    fn reset(&mut self) -> Result<u64, String> {
+        self.device
+            .reset()
+            .map_err(|error| format!("reset device: {error:?}"))
+    }
+
+    fn post_reset_registers(&mut self) -> Result<PostResetRegisters, String> {
+        // Every handle acquired before reset is stale by construction. Reopen
+        // BAR0 at the new generation rather than reading through `self.bar0`.
+        let bar0 = self
+            .device
+            .open_region_sized(0, MT7921_BAR0_BYTES)
+            .map_err(|error| format!("reopen post-reset BAR0: {error:?}"))?;
+        let wfdma = bar0
+            .slice(0xd4000, PAGE)
+            .map_err(|error| format!("slice post-reset WFDMA page: {error:?}"))?;
+        let pcie_mac = bar0
+            .slice(0x10000, PAGE)
+            .map_err(|error| format!("slice post-reset PCIe MAC page: {error:?}"))?;
+        let registers = PostResetRegisters {
+            wfdma_global_config: wfdma
+                .read_u32(0x208)
+                .map_err(|error| format!("read post-reset WFDMA GLO_CFG: {error:?}"))?,
+            host_interrupt_enable: wfdma
+                .read_u32(0x204)
+                .map_err(|error| format!("read post-reset HOST_INT_EN: {error:?}"))?,
+            pcie_mac_interrupt_enable: pcie_mac
+                .read_u32(0x188)
+                .map_err(|error| format!("read post-reset PCIe MAC INT_ENABLE: {error:?}"))?,
+        };
+        validate_post_reset_registers(registers)
+    }
+}
+
+trait PciContainmentAuthority {
+    fn disable_bus_master(&mut self) -> Result<u16, String>;
+    fn verify_dma_disabled(&mut self) -> Result<PostResetPciSnapshot, String>;
+}
+
+impl PciContainmentAuthority for PciControl {
+    fn disable_bus_master(&mut self) -> Result<u16, String> {
+        PciControl::disable_bus_master(self)
+            .map_err(|error| format!("disable PCI bus master: {error}"))
+    }
+
+    fn verify_dma_disabled(&mut self) -> Result<PostResetPciSnapshot, String> {
+        let snapshot = PciControl::verify_dma_disabled(self)
+            .map_err(|error| format!("verify PCI DMA disabled: {error}"))?;
+        Ok(PostResetPciSnapshot {
+            command: snapshot.command(),
+            power_state: snapshot.power_state(),
+            vendor: snapshot.vendor_id(),
+            device: snapshot.device_id(),
+        })
+    }
+}
+
+fn advance_containment(
+    resources: &mut impl ContainmentAuthority,
+    pci: &mut impl PciContainmentAuthority,
+    lifecycle: &mut SessionLifecycle,
+    ledger: &mut ContainmentLedger,
+) -> Result<(), Mt7921ContainmentError> {
+    if *lifecycle == SessionLifecycle::Contained {
+        return Ok(());
+    }
+    *lifecycle = SessionLifecycle::Closing;
+    let failure = |stage, detail: String, ledger: &ContainmentLedger| Mt7921ContainmentError {
+        stage,
+        detail,
+        ledger: *ledger,
+    };
+    if ledger.bme_disabled_command.is_none() {
+        let command = pci
+            .disable_bus_master()
+            .map_err(|detail| failure(ContainmentStage::DisableBusMaster, detail, ledger))?;
+        ledger.bme_disabled_command = Some(command);
+        ledger.bus_master_enabled = false;
+    }
+    if ledger.reset_generation.is_none() {
+        let generation = resources
+            .reset()
+            .map_err(|detail| failure(ContainmentStage::Reset, detail, ledger))?;
+        ledger.reset_generation = Some(generation);
+    }
+    if ledger.post_reset_registers.is_none() {
+        let registers = resources
+            .post_reset_registers()
+            .map_err(|detail| failure(ContainmentStage::PostResetRegisters, detail, ledger))?;
+        ledger.post_reset_registers = Some(registers);
+    }
+    if ledger.post_reset_pci.is_none() {
+        let snapshot = pci
+            .verify_dma_disabled()
+            .map_err(|detail| failure(ContainmentStage::PostResetPci, detail, ledger))?;
+        ledger.post_reset_pci = Some(snapshot);
+    }
+    ledger.bar_mapped = false;
+    ledger.dma_mapped = false;
+    ledger.irq_installed = false;
+    *lifecycle = SessionLifecycle::Contained;
+    Ok(())
+}
+
 /// Complete owned physical MT7921 resource graph.
 ///
 /// `resources.device` owns the `LinuxVfio`, iommufd and IOAS state. Every BAR,
@@ -309,6 +534,7 @@ pub struct Mt7921HardwareSession {
     pci_snapshot: PciConfigSnapshot,
     acquisition: AcquisitionLedger,
     containment: ContainmentLedger,
+    lifecycle: SessionLifecycle,
     // Dropped after resources so the PCI control owner spans their lifetime.
     pci: PciControl,
 }
@@ -347,7 +573,12 @@ impl Mt7921HardwareSession {
                 dma_mapped: true,
                 irq_installed: true,
                 bus_master_enabled: false,
+                bme_disabled_command: None,
+                reset_generation: None,
+                post_reset_registers: None,
+                post_reset_pci: None,
             },
+            lifecycle: SessionLifecycle::Active,
             pci,
         })
     }
@@ -376,6 +607,7 @@ impl Mt7921HardwareSession {
 
     /// Read the bounded status registers without exposing their BAR pages.
     pub fn read_only_status(&self) -> Result<ReadOnlyStatus, drv_hardware::Error> {
+        self.ensure_active()?;
         let wfdma = self.resources.bar0.slice(0xd4000, PAGE)?;
         let conn = self.resources.bar0.slice(0xe0000, PAGE)?;
         Ok(ReadOnlyStatus::decode(
@@ -393,6 +625,7 @@ impl Mt7921HardwareSession {
         &mut self,
         event: impl FnMut(OwnershipEvent),
     ) -> Result<(), OwnershipError<drv_hardware::Error>> {
+        self.ensure_active().map_err(OwnershipError::Transport)?;
         let mut transport = DriverOwnershipIo {
             conn: self
                 .resources
@@ -404,76 +637,23 @@ impl Mt7921HardwareSession {
         acquire_driver_ownership(&mut transport, event)
     }
 
-    /// Create a short-lived firmware-loader view of session-owned resources.
-    pub fn firmware_loader(
-        &mut self,
-    ) -> Result<Mt7921FirmwareLoaderResources<'_>, drv_hardware::Error> {
-        Ok(Mt7921FirmwareLoaderResources {
-            wfdma: self.resources.bar0.slice(0xd4000, PAGE)?,
-            conn: self.resources.bar0.slice(0xe0000, PAGE)?,
-            pcie_mac: self.resources.bar0.slice(0x10000, PAGE)?,
-            dmashdl: self.resources.bar0.slice(0xd6000, PAGE)?,
-            fwdl_ring: &mut self.resources.dma.fwdl_ring,
-            mcu_tx_ring: &mut self.resources.dma.mcu_tx_ring,
-            tx_guard: &mut self.resources.dma.tx_guard,
-            rx_guard: &mut self.resources.dma.rx_guard,
-            mcu_rx_ring: &mut self.resources.dma.mcu_rx_ring,
-            mcu_rx_buffers: &mut self.resources.dma.mcu_rx_buffers,
-            command_payloads: &mut self.resources.dma.command_payloads,
-            fwdl_payload: &mut self.resources.dma.fwdl_payload,
-            wa_rx_ring: &mut self.resources.dma.wa_rx_ring,
-            wa_rx_buffers: &mut self.resources.dma.wa_rx_buffers,
-            interrupt: &self.resources.interrupt,
-        })
+    fn ensure_active(&self) -> Result<(), drv_hardware::Error> {
+        ensure_operational(self.lifecycle)
     }
 
-    /// Create a short-lived passive data-path mechanics view.
-    pub fn passive_mechanics(
-        &mut self,
-    ) -> Result<Mt7921PassiveMechanicsResources<'_>, drv_hardware::Error> {
-        Ok(Mt7921PassiveMechanicsResources {
-            swdef: self.resources.bar0.slice(0x9f000, PAGE)?,
-            dmashdl: self.resources.bar0.slice(0xd6000, PAGE)?,
-            mac_pages: PASSIVE_MAC_BAR_PAGES
-                .into_iter()
-                .map(|offset| self.resources.bar0.slice(offset, PAGE))
-                .collect::<Result<Vec<_>, _>>()?,
-            data_rx_ring: &mut self.resources.dma.data_rx_ring,
-            data_rx_buffers: &mut self.resources.dma.data_rx_buffers,
-            management_txwi: &mut self.resources.dma.management_txwi,
-            management_frame: &mut self.resources.dma.management_frame,
-            management_tx_ring: &mut self.resources.dma.management_tx_ring,
-        })
+    /// Progress containment from the first unverified milestone.
+    ///
+    /// Failures retain the complete resource graph and PCI owner so callers
+    /// can retry. Once contained, repeated calls are idempotent.
+    pub fn contain(&mut self) -> Result<ContainmentLedger, Mt7921ContainmentError> {
+        advance_containment(
+            &mut self.resources,
+            &mut self.pci,
+            &mut self.lifecycle,
+            &mut self.containment,
+        )?;
+        Ok(self.containment)
     }
-}
-
-pub struct Mt7921FirmwareLoaderResources<'a> {
-    pub wfdma: MmioRegion<LinuxVfio>,
-    pub conn: MmioRegion<LinuxVfio>,
-    pub pcie_mac: MmioRegion<LinuxVfio>,
-    pub dmashdl: MmioRegion<LinuxVfio>,
-    pub fwdl_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub mcu_tx_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub tx_guard: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub rx_guard: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub mcu_rx_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub mcu_rx_buffers: &'a mut CoherentDma<LinuxVfio, FromDevice>,
-    pub command_payloads: &'a mut CoherentDma<LinuxVfio, ToDevice>,
-    pub fwdl_payload: &'a mut CoherentDma<LinuxVfio, ToDevice>,
-    pub wa_rx_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub wa_rx_buffers: &'a mut CoherentDma<LinuxVfio, FromDevice>,
-    pub interrupt: &'a Interrupt<LinuxVfio>,
-}
-
-pub struct Mt7921PassiveMechanicsResources<'a> {
-    pub swdef: MmioRegion<LinuxVfio>,
-    pub dmashdl: MmioRegion<LinuxVfio>,
-    pub mac_pages: Vec<MmioRegion<LinuxVfio>>,
-    pub data_rx_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
-    pub data_rx_buffers: &'a mut CoherentDma<LinuxVfio, FromDevice>,
-    pub management_txwi: &'a mut CoherentDma<LinuxVfio, ToDevice>,
-    pub management_frame: &'a mut CoherentDma<LinuxVfio, ToDevice>,
-    pub management_tx_ring: &'a mut CoherentDma<LinuxVfio, Bidirectional>,
 }
 
 #[cfg(test)]
@@ -482,6 +662,140 @@ mod tests {
     use drv_hardware_backends::{
         DeterministicBackend, DeterministicRelease, DeterministicResourceProbe,
     };
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ContainmentCall {
+        DisableBme,
+        Reset,
+        PostResetRegisters,
+        PostResetPci,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum InjectedFailure {
+        DisableBme,
+        IrqDisable,
+        IoasUnmap,
+        ResetIoctl,
+        BarOpen,
+        WfdmaRead,
+        HostIrqRead,
+        MacIrqRead,
+        PostResetPci,
+    }
+
+    struct FakeContainment {
+        calls: Rc<RefCell<Vec<ContainmentCall>>>,
+        failure: Rc<RefCell<Option<InjectedFailure>>>,
+        registers: PostResetRegisters,
+    }
+
+    impl ContainmentAuthority for FakeContainment {
+        fn reset(&mut self) -> Result<u64, String> {
+            self.calls.borrow_mut().push(ContainmentCall::Reset);
+            let injected = self.failure.borrow_mut().take();
+            match injected {
+                Some(
+                    failure @ (InjectedFailure::IrqDisable
+                    | InjectedFailure::IoasUnmap
+                    | InjectedFailure::ResetIoctl),
+                ) => Err(format!("injected {failure:?}")),
+                other => {
+                    *self.failure.borrow_mut() = other;
+                    Ok(2)
+                }
+            }
+        }
+
+        fn post_reset_registers(&mut self) -> Result<PostResetRegisters, String> {
+            self.calls
+                .borrow_mut()
+                .push(ContainmentCall::PostResetRegisters);
+            let injected = self.failure.borrow_mut().take();
+            match injected {
+                Some(
+                    failure @ (InjectedFailure::BarOpen
+                    | InjectedFailure::WfdmaRead
+                    | InjectedFailure::HostIrqRead
+                    | InjectedFailure::MacIrqRead),
+                ) => Err(format!("injected {failure:?}")),
+                other => {
+                    *self.failure.borrow_mut() = other;
+                    validate_post_reset_registers(self.registers)
+                }
+            }
+        }
+    }
+
+    struct FakePci {
+        calls: Rc<RefCell<Vec<ContainmentCall>>>,
+        failure: Rc<RefCell<Option<InjectedFailure>>>,
+    }
+
+    impl PciContainmentAuthority for FakePci {
+        fn disable_bus_master(&mut self) -> Result<u16, String> {
+            self.calls.borrow_mut().push(ContainmentCall::DisableBme);
+            if *self.failure.borrow() == Some(InjectedFailure::DisableBme) {
+                self.failure.borrow_mut().take();
+                Err("injected BME clear/readback".into())
+            } else {
+                Ok(0x2)
+            }
+        }
+
+        fn verify_dma_disabled(&mut self) -> Result<PostResetPciSnapshot, String> {
+            self.calls.borrow_mut().push(ContainmentCall::PostResetPci);
+            if *self.failure.borrow() == Some(InjectedFailure::PostResetPci) {
+                self.failure.borrow_mut().take();
+                Err("injected PCI post-read".into())
+            } else {
+                Ok(PostResetPciSnapshot {
+                    command: 0x2,
+                    power_state: 0,
+                    vendor: 0x14c3,
+                    device: 0x7961,
+                })
+            }
+        }
+    }
+
+    fn initial_containment() -> ContainmentLedger {
+        ContainmentLedger {
+            vfio_attached: true,
+            bar_mapped: true,
+            dma_mapped: true,
+            irq_installed: true,
+            bus_master_enabled: false,
+            bme_disabled_command: None,
+            reset_generation: None,
+            post_reset_registers: None,
+            post_reset_pci: None,
+        }
+    }
+
+    fn fake_pair(
+        failure: Option<InjectedFailure>,
+    ) -> (FakeContainment, FakePci, Rc<RefCell<Vec<ContainmentCall>>>) {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let failure = Rc::new(RefCell::new(failure));
+        (
+            FakeContainment {
+                calls: calls.clone(),
+                failure: failure.clone(),
+                registers: PostResetRegisters {
+                    wfdma_global_config: 0,
+                    host_interrupt_enable: 0,
+                    pcie_mac_interrupt_enable: 0,
+                },
+            },
+            FakePci {
+                calls: calls.clone(),
+                failure,
+            },
+            calls,
+        )
+    }
 
     const ACQUISITION_ORDER: [HardwareResource; 17] = [
         HardwareResource::Bar0,
@@ -604,6 +918,135 @@ mod tests {
                     value: 0,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn containment_orders_verified_milestones_and_is_idempotent() {
+        let (mut resources, mut pci, calls) = fake_pair(None);
+        let mut lifecycle = SessionLifecycle::Active;
+        let mut ledger = initial_containment();
+        advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ContainmentCall::DisableBme,
+                ContainmentCall::Reset,
+                ContainmentCall::PostResetRegisters,
+                ContainmentCall::PostResetPci
+            ]
+        );
+        assert_eq!(lifecycle, SessionLifecycle::Contained);
+        assert_eq!(ledger.reset_generation(), Some(2));
+        assert!(ledger.post_reset_registers().is_some());
+        assert!(ledger.post_reset_pci().is_some());
+        advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).unwrap();
+        assert_eq!(calls.borrow().len(), 4);
+    }
+
+    #[test]
+    fn every_containment_failure_retains_authority_and_retries_first_missing_milestone() {
+        for failure in [
+            InjectedFailure::DisableBme,
+            InjectedFailure::IrqDisable,
+            InjectedFailure::IoasUnmap,
+            InjectedFailure::ResetIoctl,
+            InjectedFailure::BarOpen,
+            InjectedFailure::WfdmaRead,
+            InjectedFailure::HostIrqRead,
+            InjectedFailure::MacIrqRead,
+            InjectedFailure::PostResetPci,
+        ] {
+            let (mut resources, mut pci, calls) = fake_pair(Some(failure));
+            let mut lifecycle = SessionLifecycle::Active;
+            let mut ledger = initial_containment();
+            let error = advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger)
+                .unwrap_err();
+            let expected_stage = match failure {
+                InjectedFailure::DisableBme => ContainmentStage::DisableBusMaster,
+                InjectedFailure::IrqDisable
+                | InjectedFailure::IoasUnmap
+                | InjectedFailure::ResetIoctl => ContainmentStage::Reset,
+                InjectedFailure::BarOpen
+                | InjectedFailure::WfdmaRead
+                | InjectedFailure::HostIrqRead
+                | InjectedFailure::MacIrqRead => ContainmentStage::PostResetRegisters,
+                InjectedFailure::PostResetPci => ContainmentStage::PostResetPci,
+            };
+            assert_eq!(error.stage(), expected_stage, "{failure:?}");
+            assert_eq!(error.ledger(), &ledger, "{failure:?}");
+            assert_eq!(lifecycle, SessionLifecycle::Closing, "{failure:?}");
+            let reset_before_retry = calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == ContainmentCall::Reset)
+                .count();
+            advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).unwrap();
+            let reset_after_retry = calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == ContainmentCall::Reset)
+                .count();
+            if error.stage() == ContainmentStage::PostResetRegisters
+                || error.stage() == ContainmentStage::PostResetPci
+            {
+                assert_eq!(
+                    reset_after_retry, reset_before_retry,
+                    "reset repeated after {failure:?}"
+                );
+            }
+            assert_eq!(lifecycle, SessionLifecycle::Contained);
+        }
+    }
+
+    #[test]
+    fn post_reset_register_gates_reject_each_all_ones_and_active_value() {
+        let safe = PostResetRegisters {
+            wfdma_global_config: 0,
+            host_interrupt_enable: 0,
+            pcie_mac_interrupt_enable: 0,
+        };
+        assert_eq!(validate_post_reset_registers(safe), Ok(safe));
+        for registers in [
+            PostResetRegisters {
+                wfdma_global_config: u32::MAX,
+                ..safe
+            },
+            PostResetRegisters {
+                host_interrupt_enable: u32::MAX,
+                ..safe
+            },
+            PostResetRegisters {
+                pcie_mac_interrupt_enable: u32::MAX,
+                ..safe
+            },
+            PostResetRegisters {
+                wfdma_global_config: 1,
+                ..safe
+            },
+            PostResetRegisters {
+                host_interrupt_enable: 1,
+                ..safe
+            },
+            PostResetRegisters {
+                pcie_mac_interrupt_enable: 1,
+                ..safe
+            },
+        ] {
+            assert!(validate_post_reset_registers(registers).is_err());
+        }
+    }
+
+    #[test]
+    fn closing_and_contained_sessions_reject_operational_access() {
+        assert_eq!(ensure_operational(SessionLifecycle::Active), Ok(()));
+        assert_eq!(
+            ensure_operational(SessionLifecycle::Closing),
+            Err(drv_hardware::Error::StaleHandle)
+        );
+        assert_eq!(
+            ensure_operational(SessionLifecycle::Contained),
+            Err(drv_hardware::Error::StaleHandle)
         );
     }
 }
