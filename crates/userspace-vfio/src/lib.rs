@@ -24,6 +24,25 @@ const IOMMU_DESTROY: u64 = (VFIO_TYPE << 8) | 0x80;
 const IOMMU_IOAS_ALLOC: u64 = (VFIO_TYPE << 8) | 0x81;
 const IOMMU_IOAS_MAP: u64 = (VFIO_TYPE << 8) | 0x85;
 const IOMMU_IOAS_UNMAP: u64 = (VFIO_TYPE << 8) | 0x86;
+
+/// Exact requests required by the PCI coherent backend's sandbox profile.
+pub mod mt7921_seccomp {
+    pub const VFIO_REQUESTS: &[u64] = &[
+        super::VFIO_DEVICE_BIND_IOMMUFD,
+        super::VFIO_DEVICE_ATTACH_IOMMUFD_PT,
+        super::VFIO_DEVICE_GET_INFO,
+        super::VFIO_DEVICE_GET_REGION_INFO,
+        super::VFIO_DEVICE_GET_IRQ_INFO,
+        super::VFIO_DEVICE_SET_IRQS,
+        super::VFIO_DEVICE_RESET,
+    ];
+    pub const IOMMUFD_REQUESTS: &[u64] = &[
+        super::IOMMU_IOAS_ALLOC,
+        super::IOMMU_IOAS_MAP,
+        super::IOMMU_IOAS_UNMAP,
+        super::IOMMU_DESTROY,
+    ];
+}
 const IOMMU_MAP_FIXED: u32 = 1;
 const IOMMU_MAP_WRITEABLE: u32 = 2;
 const IOMMU_MAP_READABLE: u32 = 4;

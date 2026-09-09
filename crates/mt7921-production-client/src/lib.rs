@@ -27,7 +27,9 @@ use drv_hardware::{
     Backend, Bidirectional, CoherentDma, Device, DmaConstraints, FromDevice, Interrupt, MmioRegion,
     ToDevice,
 };
-use drv_hardware_backends::{LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, PciControl};
+use drv_hardware_backends::{
+    LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LockedLinuxVfioPciCapabilities, PciControl,
+};
 use firmware_loader::ProductionFirmwareLoader;
 use mt7921_core::{
     ActivationFailure, ActivationStage, ActivationState, FirmwareLoaderError, FirmwareLoaderReport,
@@ -45,6 +47,10 @@ const MCU_COMMAND_PAYLOAD_BYTES: usize = MT7921_LOADER_COMMAND_MAX_BYTES;
 
 /// Inert setup result that can cross the sandbox-lockdown boundary.
 pub struct Mt7921HardwareSessionConfig {
+    vfio: LockedLinuxVfioPciCapabilities,
+}
+
+pub struct Mt7921HardwareSessionSetup {
     vfio: LinuxVfioPciCapabilities,
 }
 
@@ -56,14 +62,18 @@ impl Mt7921HardwareSessionConfig {
     pub fn setup(
         vfio_cdev: impl AsRef<Path>,
         pci_config: impl AsRef<Path>,
-    ) -> Result<Self, LinuxVfioError> {
-        Ok(Self {
+    ) -> Result<Mt7921HardwareSessionSetup, LinuxVfioError> {
+        Ok(Mt7921HardwareSessionSetup {
             vfio: LinuxVfioPciCapabilities::open(vfio_cdev, pci_config)?,
         })
     }
+}
 
-    pub fn from_capabilities(vfio: LinuxVfioPciCapabilities) -> Self {
-        Self { vfio }
+impl Mt7921HardwareSessionSetup {
+    pub fn lock_down(self) -> Result<Mt7921HardwareSessionConfig, linux_self_sandbox::Error> {
+        Ok(Mt7921HardwareSessionConfig {
+            vfio: self.vfio.lock_down()?,
+        })
     }
 }
 
@@ -562,7 +572,7 @@ impl Mt7921HardwareSession {
     /// the later active mechanics boundary must not enable it until ring and
     /// interrupt programming is complete.
     fn open(config: Mt7921HardwareSessionConfig) -> Result<Self, Mt7921HardwareSessionError> {
-        let opened = LinuxVfio::activate_pci_coherent(config.vfio)
+        let opened = LinuxVfio::activate_locked_pci_coherent(config.vfio)
             .map_err(Mt7921HardwareSessionError::Activate)?;
         let (backend, pci, pci_snapshot) = opened.into_parts();
         if pci_snapshot.vendor_id() != 0x14c3 || pci_snapshot.device_id() != 0x7961 {

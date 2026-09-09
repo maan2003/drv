@@ -25,6 +25,12 @@ pub enum Profile {
     Wlancfg { persistence_dir_fd: RawFd },
     /// Simulated Wi-Fi IPC, memory, timers, and worker threads.
     WifiSimulated,
+    /// One MT7921 PCI function, represented only by its three inert descriptors.
+    Mt7921Vfio {
+        pci_config_fd: RawFd,
+        vfio_fd: RawFd,
+        iommufd: RawFd,
+    },
 }
 
 #[derive(Debug)]
@@ -243,6 +249,21 @@ impl Sandbox<SetupComplete> {
             && self.persistence_dir_fd != Some(persistence_dir_fd)
         {
             return Err(Error::PersistenceFdNotInherited(persistence_dir_fd));
+        }
+        if let Profile::Mt7921Vfio {
+            pci_config_fd,
+            vfio_fd,
+            iommufd,
+        } = profile
+        {
+            if self.persistence_dir_fd.is_some() {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
+            let mut expected = vec![pci_config_fd, vfio_fd, iommufd];
+            expected.sort_unstable();
+            if expected != self.inherited {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
         }
         install_filter(profile)?;
         Ok(Sandbox {
@@ -491,6 +512,10 @@ fn arg(index: usize) -> Filter {
     stmt(LD_W_ABS, 16 + (index * 8) as u32)
 }
 
+fn arg_high(index: usize) -> Filter {
+    stmt(LD_W_ABS, 20 + (index * 8) as u32)
+}
+
 fn install_filter(profile: Profile) -> Result<(), Error> {
     let mut f = vec![
         stmt(LD_W_ABS, 4),
@@ -506,6 +531,17 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         append_openat(&mut f, fd);
         append_renameat(&mut f, fd);
         append_unlinkat(&mut f, fd);
+    }
+    if let Profile::Mt7921Vfio {
+        pci_config_fd,
+        vfio_fd,
+        iommufd,
+    } = profile
+    {
+        append_mt7921_ioctl(&mut f, vfio_fd, iommufd);
+        append_mt7921_mmap(&mut f, vfio_fd);
+        append_no_exec_mprotect(&mut f);
+        append_fd_only(&mut f, libc::SYS_lseek, pci_config_fd);
     }
     append_errno(&mut f, libc::SYS_clone3, ENOSYS);
     append_clone_thread_only(&mut f);
@@ -534,6 +570,85 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
             io::Error::last_os_error(),
         ))
     }
+}
+
+fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_ioctl as u32, 0, 0));
+    f.push(arg_high(0));
+    let fd_high = f.len();
+    f.push(jump(0, 0, 0));
+    append_ioctl_fd_requests(f, vfio_fd, userspace_vfio::mt7921_seccomp::VFIO_REQUESTS);
+    append_ioctl_fd_requests(f, iommufd, userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS);
+    let denied = f.len();
+    f.push(stmt(RET_K, EPERM));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small ioctl filter");
+    f[fd_high].jf = (denied - fd_high - 1)
+        .try_into()
+        .expect("small ioctl filter");
+}
+
+fn append_ioctl_fd_requests(f: &mut Vec<Filter>, fd: RawFd, requests: &[u64]) {
+    for &request in requests {
+        f.push(arg(0));
+        f.push(jump(fd as u32, 0, 5));
+        f.push(arg_high(1));
+        f.push(jump(0, 0, 3));
+        f.push(arg(1));
+        f.push(jump(request as u32, 0, 1));
+        f.push(stmt(RET_K, ALLOW));
+    }
+}
+
+fn append_mt7921_mmap(f: &mut Vec<Filter>, vfio_fd: RawFd) {
+    f.push(jump(libc::SYS_mmap as u32, 0, 12));
+    f.push(arg(2));
+    f.push(Filter {
+        code: 0x45,
+        jt: 0,
+        jf: 1,
+        k: libc::PROT_EXEC as u32,
+    });
+    f.push(stmt(RET_K, EPERM));
+    f.push(arg_high(4));
+    f.push(jump(0, 2, 0));
+    f.push(jump(u32::MAX, 1, 0));
+    f.push(stmt(RET_K, EPERM));
+    f.push(arg(4));
+    f.push(jump(u32::MAX, 2, 0));
+    f.push(jump(vfio_fd as u32, 1, 0));
+    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_no_exec_mprotect(f: &mut Vec<Filter>) {
+    f.push(jump(libc::SYS_mprotect as u32, 0, 4));
+    f.push(arg(2));
+    f.push(Filter {
+        code: 0x45,
+        jt: 0,
+        jf: 1,
+        k: libc::PROT_EXEC as u32,
+    });
+    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
+    f.push(jump(syscall as u32, 0, 6));
+    f.push(arg_high(0));
+    f.push(jump(0, 0, 2));
+    f.push(arg(0));
+    f.push(jump(fd as u32, 1, 0));
+    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(LD_W_ABS, 0));
 }
 
 fn append_protected_close(f: &mut Vec<Filter>, fd: RawFd) {
@@ -636,10 +751,7 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
         libc::SYS_fstat,
         libc::SYS_poll,
         libc::SYS_ppoll,
-        libc::SYS_recvmsg,
-        libc::SYS_sendmsg,
-        libc::SYS_mmap,
-        libc::SYS_mprotect,
+        // MT7921's mmap/mprotect and lseek have argument filters above.
         libc::SYS_munmap,
         libc::SYS_madvise,
         libc::SYS_brk,
@@ -669,6 +781,14 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
         libc::SYS_exit,
         libc::SYS_exit_group,
     ];
+    if !matches!(profile, Profile::Mt7921Vfio { .. }) {
+        calls.extend([
+            libc::SYS_recvmsg,
+            libc::SYS_sendmsg,
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+        ]);
+    }
     #[cfg(target_arch = "x86_64")]
     calls.push(libc::SYS_epoll_wait);
     if matches!(profile, Profile::Wlancfg { .. }) {
@@ -688,6 +808,23 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
 mod filter_tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn mt7921_profile_rejects_persistence_authority() {
+        let setup = Sandbox::<SetupComplete> {
+            inherited: vec![3, 4, 5],
+            persistence_dir_fd: Some(3),
+            _state: PhantomData,
+        };
+        assert!(matches!(
+            setup.lockdown(Profile::Mt7921Vfio {
+                pci_config_fd: 3,
+                vfio_fd: 4,
+                iommufd: 5,
+            }),
+            Err(Error::ProfileAuthorityMismatch)
+        ));
+    }
 
     #[test]
     fn wifi_filter_denials_and_thread_fallback_execute() {
@@ -769,6 +906,117 @@ mod filter_tests {
                 );
                 assert_errno(unsafe { libc::close(fd) } as i64, libc::EPERM);
                 assert_eq!(unsafe { libc::unlinkat(fd, installed.as_ptr(), 0) }, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn mt7921_filter_is_exact_by_fd_request_and_mapping_protection() {
+        subprocess(
+            "mt7921",
+            "filter_tests::mt7921_filter_is_exact_by_fd_request_and_mapping_protection",
+            || {
+                let vfio_get_info = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
+                let ioas_alloc = userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS[0];
+                let pci = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+                let vfio = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+                let iommu = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+                assert!(pci >= 0 && vfio >= 0 && iommu >= 0);
+                enable_filter(Profile::Mt7921Vfio {
+                    pci_config_fd: pci,
+                    vfio_fd: vfio,
+                    iommufd: iommu,
+                });
+                // Allowed pairs reach /dev/null and therefore fail with ENOTTY,
+                // proving seccomp did not replace the result with EPERM.
+                assert_errno(
+                    unsafe { libc::ioctl(vfio, vfio_get_info, 0) } as i64,
+                    libc::ENOTTY,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(iommu, ioas_alloc, 0) } as i64,
+                    libc::ENOTTY,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(vfio, ioas_alloc, 0) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(iommu, vfio_get_info, 0) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(pci, vfio_get_info, 0) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(vfio, 0xffff_u64, 0) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::ioctl(vfio, vfio_get_info | (1_u64 << 32), 0) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            4096,
+                            libc::PROT_READ | libc::PROT_EXEC,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            4096,
+                            libc::PROT_READ,
+                            libc::MAP_PRIVATE,
+                            pci,
+                            0,
+                        )
+                    } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } as i64,
+                    libc::EPERM,
+                );
+                let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+                assert_errno(
+                    unsafe { libc::recvmsg(vfio, &mut message, libc::MSG_DONTWAIT) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::sendmsg(vfio, &message, libc::MSG_DONTWAIT) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(
+                    unsafe { libc::open(c"/etc/passwd".as_ptr(), libc::O_RDONLY) } as i64,
+                    libc::EPERM,
+                );
+                assert_errno(unsafe { libc::fork() } as i64, libc::EPERM);
+                let argv = [c"/bin/true".as_ptr(), std::ptr::null()];
+                assert_errno(
+                    unsafe {
+                        libc::execve(c"/bin/true".as_ptr(), argv.as_ptr(), argv[1..].as_ptr())
+                    } as i64,
+                    libc::EPERM,
+                );
+                let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+                    0
+                );
+                std::thread::spawn(|| {}).join().unwrap();
+                let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+                assert!(event >= 0);
+                assert_eq!(unsafe { libc::close(event) }, 0);
             },
         );
     }

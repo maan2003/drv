@@ -10,3 +10,4 @@ resolver = "3"
 
 [dependencies]
 libc = "0.2"
+userspace-vfio = { path = "../userspace-vfio" }

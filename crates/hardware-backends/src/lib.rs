@@ -11,7 +11,10 @@ use std::{
 #[cfg(target_os = "linux")]
 mod linux_vfio;
 #[cfg(target_os = "linux")]
-pub use linux_vfio::{LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, OpenedPciCoherent};
+pub use linux_vfio::{
+    LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LockedLinuxVfioPciCapabilities,
+    OpenedPciCoherent,
+};
 #[cfg(target_os = "linux")]
 pub fn monotonic_time_ns() -> Result<u64> {
     userspace_vfio::monotonic_time_ns().map_err(|_| Error::DeviceFault)

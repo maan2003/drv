@@ -133,6 +133,10 @@ impl PciControl {
         self.config
     }
 
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.config)
+    }
+
     pub fn verify_dma_disabled(&mut self) -> Result<PciConfigSnapshot, PciControlError> {
         verify_dma_disabled(&mut self.config)
     }

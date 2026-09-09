@@ -7,6 +7,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
+    os::fd::AsRawFd,
     path::Path,
     sync::{
         Arc,
@@ -62,8 +63,10 @@ pub struct OpenedPciCoherent {
 /// responsible for validating descriptor provenance and access mode before
 /// adoption.
 ///
-/// Pass this value to [`LinuxVfio::activate_pci_coherent`] after lockdown. That
-/// consuming activation phase performs PCI configuration read/seek and
+/// Sandboxed callers must consume this value with
+/// [`LinuxVfioPciCapabilities::lock_down`] and then pass the result to
+/// [`LinuxVfio::activate_locked_pci_coherent`]. That consuming activation phase
+/// performs PCI configuration read/seek and
 /// VFIO/iommufd ioctl setup. The resulting active owner may subsequently use
 /// PCI configuration write/seek, ioctl, mmap/munmap, eventfd/read/ppoll,
 /// clocks/futex, and telemetry write/close while it operates the device.
@@ -72,6 +75,9 @@ pub struct LinuxVfioPciCapabilities {
     device: Arc<File>,
     iommu: Arc<File>,
 }
+
+/// The same inert authority after the exact MT7921 sandbox profile is active.
+pub struct LockedLinuxVfioPciCapabilities(LinuxVfioPciCapabilities);
 
 impl LinuxVfioPciCapabilities {
     /// Adopt the three PCI/VFIO descriptors without inspecting or activating
@@ -94,6 +100,23 @@ impl LinuxVfioPciCapabilities {
         pci_config_path: impl AsRef<Path>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         Self::open_with_iommu_path(path, pci_config_path, "/dev/iommu")
+    }
+
+    /// Consume the inert descriptors and install their exact no-ambient-authority jail.
+    pub fn lock_down(
+        self,
+    ) -> std::result::Result<LockedLinuxVfioPciCapabilities, linux_self_sandbox::Error> {
+        let pci_config_fd = self.pci.raw_fd();
+        let vfio_fd = self.device.as_raw_fd();
+        let iommufd = self.iommu.as_raw_fd();
+        linux_self_sandbox::Sandbox::new()
+            .setup(&[pci_config_fd, vfio_fd, iommufd], None)?
+            .lockdown(linux_self_sandbox::Profile::Mt7921Vfio {
+                pci_config_fd,
+                vfio_fd,
+                iommufd,
+            })?;
+        Ok(LockedLinuxVfioPciCapabilities(self))
     }
 
     fn open_with_iommu_path(
@@ -160,6 +183,11 @@ pub struct LinuxVfio {
 }
 
 impl LinuxVfio {
+    pub fn activate_locked_pci_coherent(
+        capabilities: LockedLinuxVfioPciCapabilities,
+    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
+        Self::activate_pci_coherent(capabilities.0)
+    }
     pub fn open_coherent(path: impl AsRef<Path>) -> std::result::Result<Self, LinuxVfioError> {
         let device = Arc::new(open_device(path)?);
         let iommu = Arc::new(
@@ -249,8 +277,9 @@ impl LinuxVfio {
 
     /// Compatibility entrypoint that performs both pre-lockdown descriptor
     /// adoption and activation. New sandboxed production callers should call
-    /// [`LinuxVfioPciCapabilities::open`], install lockdown, and then pass the
-    /// result to [`LinuxVfio::activate_pci_coherent`].
+    /// [`LinuxVfioPciCapabilities::open`], call
+    /// [`LinuxVfioPciCapabilities::lock_down`], and then pass the result to
+    /// [`LinuxVfio::activate_locked_pci_coherent`].
     pub fn open_pci_coherent(
         path: impl AsRef<Path>,
         pci_config_path: impl AsRef<Path>,
@@ -259,9 +288,11 @@ impl LinuxVfio {
         Self::activate_pci_coherent(capabilities)
     }
 
-    /// Consume inert, pre-opened PCI/VFIO capabilities and activate the device.
+    /// Compatibility activation for callers that establish confinement elsewhere.
     ///
-    /// This is the post-lockdown phase. It validates PCI DMA state, binds the
+    /// Self-sandboxed production callers must use
+    /// [`LinuxVfio::activate_locked_pci_coherent`] instead. This method validates
+    /// PCI DMA state, binds the
     /// VFIO cdev to iommufd, allocates and attaches an IOAS, discovers reset and
     /// MSI-X/MSI support, then revalidates PCI DMA state before exposing the
     /// backend. These operations issue VFIO/iommufd ioctls and PCI config

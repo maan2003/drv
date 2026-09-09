@@ -17588,13 +17588,8 @@ fn run_production_firmware_bootstrap() -> Result<(), String> {
         Mt7921HardwareSessionConfig::setup(vfio, format!("/sys/bus/pci/devices/{bdf}/config"))
             .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
     let watchdog = verify_external_watchdog_armed()?;
-    // Keep the inert authority and verified images live through the handoff
-    // decision.  The repository's current self-sandbox profiles deliberately
-    // deny VFIO ioctls and retain no device capabilities, so neither is a
-    // valid production lockdown for this operation.  Do not activate merely
-    // because setup and the external recovery watchdog succeeded.
     std::hint::black_box((&config, &images, watchdog.deadline));
-    Err("production firmware bootstrap refused: no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile is available".into())
+    Err("production firmware bootstrap refused: MT7921 VFIO lockdown lacks real-kernel lifecycle proof because QEMU edu has no PCI power-management capability".into())
 }
 
 fn decompress_ram() -> Result<Vec<u8>, String> {
@@ -20314,10 +20309,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(boundary.contains("verify_external_watchdog_armed()?"));
-        assert!(
-            boundary
-                .contains("no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile")
-        );
+        assert!(boundary.contains("lacks real-kernel lifecycle proof"));
         assert!(!boundary.contains("run_firmware_bootstrap(config, images)"));
         for forbidden in [
             "ioctl",
@@ -21442,9 +21434,7 @@ mod tests {
         let verify = dispatch.find("VerifiedFirmwareImages::verify").unwrap();
         let setup = dispatch.find("Mt7921HardwareSessionConfig::setup").unwrap();
         let watchdog = dispatch.find("verify_external_watchdog_armed()?").unwrap();
-        let refusal = dispatch
-            .find("no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile")
-            .unwrap();
+        let refusal = dispatch.find("lacks real-kernel lifecycle proof").unwrap();
         assert!(verify < setup && setup < watchdog && watchdog < refusal);
         assert!(!dispatch.contains("run_firmware_bootstrap(config, images)"));
     }

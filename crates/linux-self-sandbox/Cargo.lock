@@ -13,4 +13,9 @@ name = "linux-self-sandbox"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "userspace-vfio",
 ]
+
+[[package]]
+name = "userspace-vfio"
+version = "0.1.0"

@@ -14,6 +14,7 @@ drv-hardware-backends = { path = "../hardware-backends" }
 mt7921-core = { path = "../mt7921-core" }
 sha2 = "=0.11.0"
 zeroize = "=1.8.2"
+linux-self-sandbox = { path = "../linux-self-sandbox" }
 
 [dev-dependencies]
 drv-hardware-backends = { path = "../hardware-backends" }

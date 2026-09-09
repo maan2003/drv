@@ -51,6 +51,8 @@ fn raw_vfio_authority_stays_in_the_current_owner_crates() {
         "hardware-backends".to_owned(),
         // Shared raw VFIO/iommufd UAPI owner; eng-65db owns this crate.
         "userspace-vfio".to_owned(),
+        // Seccomp owner imports the backend's exact request inventory and never issues ioctls.
+        "linux-self-sandbox".to_owned(),
         // Cut-2 migration source; eng-0lja will replace its direct UAPI use.
         "mt7921-port-spike".to_owned(),
         // Preflight cdev/sysfs consumer; eng-xvq1 will review routing it through the backend.

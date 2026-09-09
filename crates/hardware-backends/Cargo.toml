@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 drv-hardware = { path = "../hardware-api" }
 userspace-vfio = { path = "../userspace-vfio" }
+linux-self-sandbox = { path = "../linux-self-sandbox" }
 
 [dev-dependencies]
 proptest = "1"
