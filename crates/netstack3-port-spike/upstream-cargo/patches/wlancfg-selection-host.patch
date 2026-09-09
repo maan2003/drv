@@ -195,3 +195,48 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
  fn log_metric_for_scan_error(reason: &fidl_sme::ScanErrorCode, scan_defects: &mut Vec<ScanIssue>) {
      let metric_type = match *reason {
          fidl_sme::ScanErrorCode::NotSupported
+--- a/src/connectivity/wlan/wlancfg/src/client/state_machine.rs
++++ b/src/connectivity/wlan/wlancfg/src/client/state_machine.rs
+@@ -20,8 +20,15 @@
+ use anyhow::format_err;
+ use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
+ use fidl_fuchsia_wlan_internal as fidl_internal;
++#[cfg(feature = "host-selection")]
++use crate::fidl_fuchsia_wlan_policy as fidl_policy;
++#[cfg(not(feature = "host-selection"))]
+ use fidl_fuchsia_wlan_policy as fidl_policy;
+ use fidl_fuchsia_wlan_sme as fidl_sme;
++#[cfg(feature = "host-selection")]
++use crate::mode_management::{ClientSmeEventStream, ConnectTransactionEventStream};
++#[cfg(not(feature = "host-selection"))]
++use fidl_sme::{ClientSmeEventStream, ConnectTransactionEventStream};
+ use fuchsia_async::{self as fasync, DurationExt};
+ use fuchsia_inspect::Node as InspectNode;
+ use fuchsia_inspect_contrib::inspect_insert;
+@@ -167,7 +174,7 @@
+ pub async fn serve(
+     iface_id: u16,
+     proxy: SmeForClientStateMachine,
+-    sme_event_stream: fidl_sme::ClientSmeEventStream,
++    sme_event_stream: ClientSmeEventStream,
+     req_stream: mpsc::Receiver<ManualRequest>,
+     update_sender: ClientListenerMessageSender,
+     saved_networks_manager: Arc<dyn SavedNetworksManagerApi>,
+@@ -575,7 +582,7 @@
+     network_identifier: types::NetworkIdentifier,
+     credential: Credential,
+     ess_connect_reason: types::ConnectReason,
+-    connect_txn_stream: fidl_sme::ConnectTransactionEventStream,
++    connect_txn_stream: ConnectTransactionEventStream,
+     network_is_likely_hidden: bool,
+     ess_connect_start_time: fasync::MonotonicInstant,
+     bss_connect_start_time: fasync::MonotonicInstant,
+@@ -596,7 +603,7 @@
+         network_identifier: types::NetworkIdentifier,
+         credential: Credential,
+         ess_connect_reason: types::ConnectReason,
+-        connect_txn_stream: fidl_sme::ConnectTransactionEventStream,
++        connect_txn_stream: ConnectTransactionEventStream,
+         network_is_likely_hidden: bool,
+     ) -> Self {
+         // Tracked signals

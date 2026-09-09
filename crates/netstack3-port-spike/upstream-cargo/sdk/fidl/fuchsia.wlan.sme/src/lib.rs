@@ -166,7 +166,7 @@ pub struct ConnectResult {
     pub is_reconnect: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisconnectInfo {
     pub is_sme_reconnecting: bool,
     pub disconnect_source: DisconnectSource,

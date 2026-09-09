@@ -760,6 +760,8 @@ dependencies = [
 name = "fuchsia-async"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "tokio",
  "zx",
 ]
 
@@ -3389,6 +3391,7 @@ dependencies = [
  "fidl-fuchsia-wlan-stats",
  "fuchsia-async",
  "fuchsia-inspect",
+ "fuchsia-softmac-port",
  "fuchsia-sync",
  "fuchsia-trace",
  "futures",
@@ -3505,11 +3508,13 @@ dependencies = [
  "fuchsia-async",
  "fuchsia-inspect",
  "fuchsia-inspect-contrib",
+ "fuchsia-sync",
  "futures",
  "ieee80211",
  "itertools 0.14.0",
  "log",
  "rand 0.9.4",
+ "tokio",
  "wlan-common",
  "wlan-sme",
  "zx",

@@ -6,4 +6,6 @@ license = "MIT OR Apache-2.0"
 version.workspace = true
 
 [dependencies]
+futures.workspace = true
+tokio.workspace = true
 zx = { path = "../../../sdk/rust/zx" }
