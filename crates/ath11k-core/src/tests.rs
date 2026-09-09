@@ -489,7 +489,7 @@ fn core_start_error_unwinds_without_panicking() {
     device.probe().unwrap();
     assert_eq!(
         device.attach_firmware(),
-        Err(CoreError::DeviceFaultAt(OperationTarget::Wmi))
+        Err(CoreError::DeviceFaultAt(Operation::WmiCommandInit))
     );
     assert_eq!(device.state(), DeviceState::Probed);
     assert!(device.backend().log.ends_with(&[
@@ -545,7 +545,10 @@ fn vdev_configuration_failure_deletes_firmware_vdev() {
     });
     assert_eq!(
         device.create_client_vdev([2, 0, 0, 0, 0, 1]),
-        Err(CoreError::DeviceFaultAt(OperationTarget::Wmi))
+        Err(CoreError::DeviceFaultAt(Operation::WmiVdevSetNss {
+            vdev: VdevId(0),
+            nss: 2,
+        }))
     );
     assert!(device.backend().log.ends_with(&[
         Operation::WmiVdevDelete { vdev: VdevId(0) },

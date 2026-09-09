@@ -427,7 +427,7 @@ pub trait Subsystems {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VdevStartFailure {
     /// The command was definitively not visible to firmware.
     NotSent(CoreError),

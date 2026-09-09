@@ -41,7 +41,7 @@ pub struct VdevId(pub u8);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PdevId(pub u8);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreError {
     WrongState,
     Qmi(ath11k_qmi::QmiError),
@@ -51,7 +51,7 @@ pub enum CoreError {
     },
     Protocol,
     DeviceFault,
-    DeviceFaultAt(OperationTarget),
+    DeviceFaultAt(Operation),
     NoResources,
     NotFound,
 }
@@ -217,9 +217,9 @@ impl<B: Subsystems> Device<B> {
     }
 
     fn op(&mut self, operation: Operation) -> Result<(), CoreError> {
-        let target = operation.target();
+        let failed_operation = operation.clone();
         self.backend.execute(operation).map_err(|error| match error {
-            CoreError::DeviceFault => CoreError::DeviceFaultAt(target),
+            CoreError::DeviceFault => CoreError::DeviceFaultAt(failed_operation),
             error => error,
         })
     }
