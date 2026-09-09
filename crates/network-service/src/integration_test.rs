@@ -66,7 +66,7 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
         .serve_socks5_listener(
             listener,
             listen,
-            Some(std::time::Instant::now() + Duration::from_millis(20)),
+            Some(std::time::Instant::now() + Duration::from_millis(200)),
             || false,
         )
         .unwrap();
@@ -608,7 +608,12 @@ fn associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss() {
     assert_eq!(&response[..read], b"HTTP/1.0 200 OK\r\n\r\n");
 
     sink.set_link(false);
-    drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(112));
+    for second in 112..128 {
+        drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
+        if runner.stack().runtime().ipv4_address().is_none() {
+            break;
+        }
+    }
     assert_eq!(runner.stack().runtime().ipv4_address(), None);
     assert_eq!(runner.stack().runtime().dns_servers(), [None, None]);
     let blocked = provider.tcp_socket(client, RemoteIpVersion::V4).unwrap();

@@ -9,9 +9,11 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+libc = "0.2"
 netstack3-port-integration = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration" }
 netstack3-port-spike = { path = "../netstack3-port-spike" }
 rand = "=0.9.4"
+wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
 
 [dev-dependencies]
 dhcp-protocol = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/dhcpv4/protocol" }

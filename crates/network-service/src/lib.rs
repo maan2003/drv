@@ -22,10 +22,12 @@ use std::time::Duration;
 
 mod child;
 mod ethernet_device;
+mod lifecycle;
 mod supervisor;
 
 pub use child::{run, run_lab};
 use ethernet_device::ServiceEthernetDevice;
+pub use lifecycle::{WifiLifecycleReceiver, WifiLifecycleUpdate};
 pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor};
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;

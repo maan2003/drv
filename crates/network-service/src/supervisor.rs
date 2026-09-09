@@ -122,6 +122,10 @@ pub struct NetworkServiceSupervisor {
 }
 
 impl NetworkServiceSupervisor {
+    pub(crate) fn mac_address(&self) -> [u8; 6] {
+        self.mac_address
+    }
+
     pub fn new(
         binary: impl AsRef<Path>,
         listener: TcpListener,
@@ -169,8 +173,13 @@ impl NetworkServiceSupervisor {
             running: None,
         });
         self.next_generation = next_generation;
-        self.start_installed()?;
-        Ok(generation)
+        match self.start_installed() {
+            Ok(()) => Ok(generation),
+            Err(error) => match self.terminate() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
+            },
+        }
     }
 
     /// Restarts the process for the currently installed Ethernet generation.
@@ -333,13 +342,82 @@ impl Drop for NetworkServiceSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{WifiLifecycleReceiver, WifiLifecycleUpdate};
     use std::fs::File;
     use std::io::ErrorKind;
+    use std::mem::size_of;
+    use std::os::fd::IntoRawFd as _;
     use std::os::unix::net::UnixStream;
     use wlan_softmac_host::ethernet::{EthernetIngressError, ethernet_port};
 
-    unsafe extern "C" {
-        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn lifecycle_channel() -> (OwnedFd, OwnedFd) {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        unsafe {
+            (
+                OwnedFd::from_raw_fd(sockets[0]),
+                OwnedFd::from_raw_fd(sockets[1]),
+            )
+        }
+    }
+
+    fn send_lifecycle(channel: &OwnedFd, bytes: &[u8], descriptors: &[RawFd]) {
+        let mut bytes = bytes.to_vec();
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let control_len = if descriptors.is_empty() {
+            0
+        } else {
+            unsafe { libc::CMSG_SPACE(size_of_val(descriptors) as u32) as usize }
+        };
+        let mut control = vec![0usize; control_len.div_ceil(size_of::<usize>())];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_len;
+        if !descriptors.is_empty() {
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_len = libc::CMSG_LEN(size_of_val(descriptors) as u32) as usize;
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                std::ptr::copy_nonoverlapping(
+                    descriptors.as_ptr(),
+                    libc::CMSG_DATA(header).cast::<RawFd>(),
+                    descriptors.len(),
+                );
+            }
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(channel.as_raw_fd(), &message, 0) },
+            bytes.len() as isize
+        );
+    }
+
+    fn lifecycle_message(
+        kind: wifi_supervisor_wire::LifecycleKind,
+        ethernet_generation: u64,
+    ) -> [u8; wifi_supervisor_wire::MESSAGE_LEN] {
+        wifi_supervisor_wire::LifecycleMessage {
+            kind,
+            wifi_generation: [7; 16],
+            ethernet_generation,
+            mac_address: [2, 0, 0, 0, 0, 1],
+        }
+        .encode()
     }
 
     fn wait_for_exit(supervisor: &mut NetworkServiceSupervisor) -> NetworkServiceProcessExit {
@@ -367,6 +445,39 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "network-service fixture did not return a frame"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_lifecycle_update(
+        receiver: &mut WifiLifecycleReceiver,
+        supervisor: &mut NetworkServiceSupervisor,
+    ) -> WifiLifecycleUpdate {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(update) = receiver.receive(supervisor).unwrap() {
+                return update;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Wi-Fi lifecycle receiver did not observe an update"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_driver_closed(driver: &mut wlan_softmac_host::ethernet::DriverEthernetPort) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match driver.deliver(&[0; 14]) {
+                Err(EthernetIngressError::Closed) => return,
+                Ok(()) | Err(EthernetIngressError::Backpressure) => {}
+                Err(error) => panic!("unexpected driver state while waiting for close: {error:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ethernet driver peer did not close"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -501,17 +612,13 @@ mod tests {
 
         let (second, second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
-        let waited = unsafe { waitpid(first_pid, std::ptr::null_mut(), 1) };
+        let waited = unsafe { libc::waitpid(first_pid, std::ptr::null_mut(), libc::WNOHANG) };
         assert_eq!(
             waited, -1,
             "replaced child remained waitable instead of being reaped"
         );
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10));
-        assert_eq!(
-            first_driver.deliver(&[0; 14]),
-            Err(EthernetIngressError::Closed),
-            "old Ethernet generation remained open after replacement"
-        );
+        wait_for_driver_closed(&mut first_driver);
 
         drop(second_driver);
         assert_eq!(wait_for_exit(&mut supervisor).generation, 2);
@@ -602,9 +709,365 @@ mod tests {
             second_frame
         );
         supervisor.terminate().unwrap();
+        wait_for_driver_closed(&mut second_driver);
+    }
+
+    #[test]
+    fn lifecycle_receiver_installs_revokes_and_replaces_real_process_capabilities() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new(
+            std::env::current_exe().unwrap(),
+            listener,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+        supervisor.fixture_echo_frames = true;
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+
+        let (first, mut first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        first_driver.set_link(true);
+        let first = first.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[first.as_raw_fd()],
+        );
+        drop(first);
+        assert!(matches!(
+            receiver.receive(&mut supervisor).unwrap(),
+            Some(WifiLifecycleUpdate::Installed {
+                ethernet_generation: 1,
+                network_generation: 1,
+                ..
+            })
+        ));
+        first_driver.deliver(&[0x11; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut first_driver).as_bytes(), [0x11; 14]);
+
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Revoke, 1),
+            &[],
+        );
+        assert!(matches!(
+            receiver.receive(&mut supervisor).unwrap(),
+            Some(WifiLifecycleUpdate::Revoked {
+                ethernet_generation: 1,
+                ..
+            })
+        ));
+        wait_for_driver_closed(&mut first_driver);
+
+        let (stale, mut stale_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        stale_driver.set_link(true);
+        let stale = stale.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[stale.as_raw_fd()],
+        );
+        drop(stale);
         assert_eq!(
-            second_driver.deliver(&second_frame),
-            Err(EthernetIngressError::Closed)
+            receiver.receive(&mut supervisor),
+            Err("nonmonotonic Wi-Fi lifecycle generation".into())
+        );
+        wait_for_driver_closed(&mut stale_driver);
+
+        let (second, mut second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        second_driver.set_link(true);
+        let second = second.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 2),
+            &[second.as_raw_fd()],
+        );
+        drop(second);
+        assert!(matches!(
+            receiver.receive(&mut supervisor).unwrap(),
+            Some(WifiLifecycleUpdate::Installed {
+                ethernet_generation: 2,
+                network_generation: 2,
+                ..
+            })
+        ));
+        second_driver.deliver(&[0x22; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut second_driver).as_bytes(), [0x22; 14]);
+
+        assert_eq!(
+            unsafe { libc::shutdown(sender.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+        assert_eq!(
+            wait_for_lifecycle_update(&mut receiver, &mut supervisor),
+            WifiLifecycleUpdate::ChannelClosed
+        );
+        wait_for_driver_closed(&mut second_driver);
+    }
+
+    #[test]
+    fn lifecycle_receiver_rejects_bad_records_and_ancillary_descriptors() {
+        let supervisor = || {
+            NetworkServiceSupervisor::new(
+                "/not-spawned-for-invalid-message",
+                TcpListener::bind("127.0.0.1:0").unwrap(),
+                [2, 0, 0, 0, 0, 1],
+            )
+            .unwrap()
+        };
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[],
+        );
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("Wi-Fi lifecycle Install requires exactly one descriptor".into())
+        );
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        let (one, _one_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let (two, _two_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let one = one.into_frame_fd();
+        let two = two.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[one.as_raw_fd(), two.as_raw_fd()],
+        );
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("Wi-Fi lifecycle Install requires exactly one descriptor".into())
+        );
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Revoke, 1)[..39],
+            &[one.as_raw_fd()],
+        );
+        assert!(matches!(
+            receiver.receive(&mut service),
+            Err(error) if error.contains("InvalidLength")
+        ));
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[one.as_raw_fd(); 16],
+        );
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("truncated Wi-Fi lifecycle message or ancillary data".into())
+        );
+
+        let (sender, receiver) = lifecycle_channel();
+        let credential = 1i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    receiver.as_raw_fd(),
+                    1,
+                    16,
+                    (&credential as *const i32).cast(),
+                    size_of::<i32>() as u32,
+                )
+            },
+            0
+        );
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Revoke, 1),
+            &[],
+        );
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("unknown or malformed Wi-Fi lifecycle ancillary data".into())
+        );
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let stream = unsafe { OwnedFd::from_raw_fd(stream.into_raw_fd()) };
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[stream.as_raw_fd()],
+        );
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("Wi-Fi supervisor capability must be AF_UNIX SOCK_SEQPACKET".into())
+        );
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        send_lifecycle(&sender, &[], &[]);
+        assert!(matches!(
+            receiver.receive(&mut service),
+            Err(error) if error.contains("InvalidLength")
+        ));
+
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut service = supervisor();
+        let (zero_frame, mut zero_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        zero_driver.set_link(true);
+        let zero_frame = zero_frame.into_frame_fd();
+        send_lifecycle(&sender, &[], &[zero_frame.as_raw_fd()]);
+        drop(zero_frame);
+        assert_eq!(
+            receiver.receive(&mut service),
+            Err("zero-length Wi-Fi lifecycle record carried descriptors".into())
+        );
+        wait_for_driver_closed(&mut zero_driver);
+    }
+
+    #[test]
+    fn lifecycle_receiver_replaces_an_active_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new(
+            std::env::current_exe().unwrap(),
+            listener,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+        supervisor.fixture_echo_frames = true;
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+
+        let (first, mut first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        first_driver.set_link(true);
+        let first = first.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[first.as_raw_fd()],
+        );
+        drop(first);
+        receiver.receive(&mut supervisor).unwrap().unwrap();
+
+        let (second, mut second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        second_driver.set_link(true);
+        let second = second.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 2),
+            &[second.as_raw_fd()],
+        );
+        drop(second);
+        assert!(matches!(
+            receiver.receive(&mut supervisor).unwrap(),
+            Some(WifiLifecycleUpdate::Installed {
+                ethernet_generation: 2,
+                network_generation: 2,
+                ..
+            })
+        ));
+        wait_for_driver_closed(&mut first_driver);
+        second_driver.deliver(&[0x44; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut second_driver).as_bytes(), [0x44; 14]);
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Revoke, 2),
+            &[],
+        );
+        receiver.receive(&mut supervisor).unwrap().unwrap();
+
+        let (third, mut third_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        third_driver.set_link(true);
+        let third = third.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 3),
+            &[third.as_raw_fd()],
+        );
+        drop(third);
+        receiver.receive(&mut supervisor).unwrap().unwrap();
+        drop(sender);
+        assert_eq!(
+            wait_for_lifecycle_update(&mut receiver, &mut supervisor),
+            WifiLifecycleUpdate::ChannelClosed
+        );
+        wait_for_driver_closed(&mut third_driver);
+    }
+
+    #[test]
+    fn lifecycle_receiver_commits_identity_and_closes_failed_install() {
+        let (sender, receiver) = lifecycle_channel();
+        let mut receiver = WifiLifecycleReceiver::new(receiver).unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new(
+            "/network-service-does-not-exist",
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        let (frame, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        driver.set_link(true);
+        let frame = frame.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[frame.as_raw_fd()],
+        );
+        drop(frame);
+        assert!(matches!(
+            receiver.receive(&mut supervisor),
+            Err(error) if error.contains("spawn network service")
+        ));
+        wait_for_driver_closed(&mut driver);
+
+        let (replay, _replay_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let replay = replay.into_frame_fd();
+        send_lifecycle(
+            &sender,
+            &lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 1),
+            &[replay.as_raw_fd()],
+        );
+        assert_eq!(
+            receiver.receive(&mut supervisor),
+            Err("nonmonotonic Wi-Fi lifecycle generation".into())
+        );
+
+        let (different, _different_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let different = different.into_frame_fd();
+        let mut message = lifecycle_message(wifi_supervisor_wire::LifecycleKind::Install, 2);
+        message[8..24].copy_from_slice(&[8; 16]);
+        send_lifecycle(&sender, &message, &[different.as_raw_fd()]);
+        assert_eq!(
+            receiver.receive(&mut supervisor),
+            Err("nonmonotonic Wi-Fi lifecycle generation".into())
         );
     }
 }

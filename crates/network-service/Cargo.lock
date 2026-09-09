@@ -471,6 +471,7 @@ name = "drv-network-service"
 version = "0.1.0"
 dependencies = [
  "dhcp-protocol",
+ "libc",
  "net_types",
  "netstack3-port-integration",
  "netstack3-port-spike",
@@ -478,6 +479,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "wifi-supervisor-wire",
  "wlan-softmac-host",
 ]
 
@@ -618,6 +620,8 @@ dependencies = [
 name = "fuchsia-async"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "tokio",
  "zx",
 ]
 
@@ -820,9 +824,9 @@ dependencies = [
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]
@@ -2214,6 +2218,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-supervisor-wire"
+version = "0.1.0"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2455,6 +2463,7 @@ dependencies = [
  "futures",
  "netstack3-port-spike",
  "tokio",
+ "wlan-common",
  "wlan-mlme",
  "wlan-sme",
  "zx",
