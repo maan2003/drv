@@ -8,6 +8,9 @@
 
 extern crate alloc;
 
+mod loader_mechanics;
+pub use loader_mechanics::*;
+
 mod mcu_rx {
     use alloc::vec::Vec;
 
@@ -16363,3 +16366,13 @@ mod tests {
 /// };
 /// ```
 pub struct PrivateProvenanceIsNotExported;
+
+// Test-only differential oracle retained from the pre-cutover physical executor.
+#[cfg(test)]
+extern crate self as mt7921_core;
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+mod active_mcu_legacy_oracle;
+#[cfg(test)]
+mod loader_differential;

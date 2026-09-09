@@ -26,8 +26,9 @@ use drv_hardware_backends::{
     LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, PciConfigSnapshot, PciControl,
 };
 use mt7921_core::{
-    MT7921_DATA_RX_RING_COUNT, MT7921_MCU_RX_BUFFER_BYTES, OwnershipError, OwnershipEvent,
-    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus, acquire_driver_ownership,
+    MT7921_DATA_RX_RING_COUNT, MT7921_LOADER_COMMAND_MAX_BYTES, MT7921_MCU_RX_BUFFER_BYTES,
+    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
+    acquire_driver_ownership,
 };
 use std::{
     fmt,
@@ -37,9 +38,7 @@ use std::{
 
 const PAGE: usize = 4096;
 const MT7921_BAR0_BYTES: usize = 0x10_0000;
-const MCU_TX_RING_COUNT: usize = 256;
-const MCU_COMMAND_SLOT_BYTES: usize = 256;
-const MCU_COMMAND_PAYLOAD_BYTES: usize = MCU_TX_RING_COUNT * MCU_COMMAND_SLOT_BYTES;
+const MCU_COMMAND_PAYLOAD_BYTES: usize = MT7921_LOADER_COMMAND_MAX_BYTES;
 
 /// Inert setup result that can cross the sandbox-lockdown boundary.
 pub struct Mt7921HardwareSessionConfig {
@@ -679,6 +678,8 @@ impl Mt7921HardwareSession {
                     .map_err(TransactionError::Io)?,
                 tx_ring: &mut resources.dma.mcu_tx_ring,
                 payloads: &mut resources.dma.command_payloads,
+                fwdl_ring: &mut resources.dma.fwdl_ring,
+                fwdl_payload: &mut resources.dma.fwdl_payload,
                 wm_ring: &mut resources.dma.mcu_rx_ring,
                 wm_buffers: &mut resources.dma.mcu_rx_buffers,
                 wm2_ring: &mut resources.dma.wa_rx_ring,
@@ -951,6 +952,95 @@ mod tests {
             releases[1..releases.len() - 1],
             [DeterministicRelease::Dma; 15]
         );
+    }
+
+    #[test]
+    fn production_command_buffer_accepts_real_channel_domain_reuses_address_and_wipes() {
+        use mt7921_core::{
+            DMA_DESCRIPTOR_LEN, DmaDescriptor, LoaderMechanicsTransport, NicCapability,
+            NicPhyCapability, conservative_channel_domain, encode_channel_domain_command,
+        };
+
+        let command = conservative_channel_domain(
+            NicCapability {
+                element_count: 1,
+                mac_address: None,
+                phy: Some(NicPhyCapability {
+                    ht: true,
+                    vht: true,
+                    has_5ghz: true,
+                    max_bandwidth: 2,
+                    spatial_streams: 2,
+                    hardware_path: 3,
+                    he: true,
+                }),
+                has_6ghz: Some(false),
+                chip_capability: None,
+                unknown_elements: 0,
+            },
+            *b"00",
+            true,
+            0,
+        )
+        .unwrap();
+        let encoded = encode_channel_domain_command(&command, 1).unwrap();
+        assert_eq!(encoded.len(), 388);
+
+        let device = DeterministicBackend::device();
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let issued_address = resources
+            .dma
+            .command_payloads
+            .device_address(0)
+            .unwrap()
+            .bits();
+        resources
+            .dma
+            .command_payloads
+            .write(0, &[0xa5; MCU_COMMAND_PAYLOAD_BYTES])
+            .unwrap();
+        let descriptor = DmaDescriptor {
+            buf0: issued_address as u32,
+            ctrl: (encoded.len() as u32) << 16,
+            buf1: 0,
+            info: 0,
+        };
+        {
+            let dma = &mut resources.dma;
+            let mut views = ActiveMcuViews {
+                wfdma: resources.bar0.slice(0xd4000, PAGE).unwrap(),
+                tx_ring: &mut dma.mcu_tx_ring,
+                payloads: &mut dma.command_payloads,
+                fwdl_ring: &mut dma.fwdl_ring,
+                fwdl_payload: &mut dma.fwdl_payload,
+                wm_ring: &mut dma.mcu_rx_ring,
+                wm_buffers: &mut dma.mcu_rx_buffers,
+                wm2_ring: &mut dma.wa_rx_ring,
+                wm2_buffers: &mut dma.wa_rx_buffers,
+                interrupt: &resources.interrupt,
+            };
+            assert_eq!(
+                views.command_payload_capacity(255),
+                MCU_COMMAND_PAYLOAD_BYTES
+            );
+            assert_eq!(views.command_payload_address(255).unwrap(), issued_address);
+            assert_eq!(views.command_payload_address(0).unwrap(), issued_address);
+            for slot in [255, 0] {
+                views.write_command_payload(slot, &encoded).unwrap();
+                views.write_command_descriptor(slot, descriptor).unwrap();
+                views.reclaim_command(slot).unwrap();
+            }
+        }
+
+        for slot in [255usize, 0] {
+            let mut bytes = [0; DMA_DESCRIPTOR_LEN];
+            resources
+                .dma
+                .mcu_tx_ring
+                .read(slot * DMA_DESCRIPTOR_LEN, &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, DmaDescriptor::reset().to_le_bytes());
+        }
     }
 
     #[test]

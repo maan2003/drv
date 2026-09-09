@@ -1,6 +1,6 @@
 # MT7921 shared MCU sequence audit
 
-This audit covers every production command reachable after firmware bootstrap becomes ready and before universal cleanup completes. The sole wire authority is `VfioFirmwareLoader.sequence`; every client sender replaces byte 39 from that cursor at the physical publication edge and wraps 15 → 1.
+This audit covers every production command reachable after firmware bootstrap becomes ready and before universal cleanup completes. The sole wire authority is `LoaderMechanics`; every client sender replaces byte 39 from that cursor at the physical publication edge and wraps 15 → 1.
 
 | Lifecycle area | Commands / encoders | Physical sender | Completion |
 |---|---|---|---|
@@ -14,11 +14,11 @@ This audit covers every production command reachable after firmware bootstrap be
 | post-association | beacon offload, RX filter, RLM | acknowledged or unacknowledged UNI / CE no-ACK | command policy |
 | teardown | key/WTBL/STA removal, BSS disable, DEV disable, ROC abort | the same three client senders | attempt-all cleanup |
 
-Management frames and EAPOL frames are data-ring publications, not MCU commands. Patch-table diagnostics have an isolated diagnostic cursor and are not reachable in the production full-firmware operation. Firmware download, patch semaphore, CLC, and initial channel-domain commands precede firmware-ready; they already allocate from the same `VfioFirmwareLoader.sequence` via `FirmwareLoaderTransport::next_sequence`.
+Management frames and EAPOL frames are data-ring publications, not MCU commands. Patch-table diagnostics have an isolated diagnostic cursor and are not reachable in the production full-firmware operation. Firmware download, patch semaphore, CLC, and initial channel-domain commands precede firmware-ready; they allocate from the same `LoaderMechanics` cursor via `FirmwareLoaderTransport::next_sequence`.
 
 ## Authority and failure boundary
 
-Encoders receive a non-authoritative template sequence because their payload goldens include a complete Connac2 header. `stamp_next_mcu_sequence` overwrites that byte immediately before physical submission, so a literal or stale encoder value cannot reach firmware. `SourceExactPassiveTransport.mcu_sequence` is only a mirror used to form templates and is resynchronized from `current_mcu_sequence` after success. ROC APIs no longer accept sequence values, eliminating the second lifecycle allocator.
+Encoders receive a non-authoritative template sequence because their payload goldens include a complete Connac2 header. `candidate_and_stamp` overwrites that byte immediately before physical submission, so a literal or stale encoder value cannot reach firmware. `SourceExactPassiveTransport.mcu_sequence` is only a mirror used to form templates and is resynchronized from `current_mcu_sequence` after success. ROC APIs no longer accept sequence values, eliminating the second lifecycle allocator.
 
 Envelope, size, ring ownership, cancellation, and required MMIO checks happen before cursor consumption. At the producer publication boundary the cursor advances. A failure after that boundary is publication-uncertain and cannot reuse the number or DMA slot. ACK matching remains keyed to the stamped value; unsolicited or late responses cannot satisfy a later command. No-wait commands consume on publication-uncertain or published outcomes, while local validation failures retain the cursor.
 
