@@ -195,7 +195,9 @@ states. The retained physical run
 `runB-fast-cycle-20260909T-current` completed two fresh-process cycles in
 20,209 ms and 20,155 ms from cycle start through verified WPSS offline, before
 successful VFIO unbind; the second full QMI handshake proves QRTR/WPSS service
-reappearance. The wrapper intentionally forces recovery after all cycles.
+reappearance. After the final verified offline/reaped/unbound boundary, the
+wrapper disarms its emergency fallbacks and retains the inert candidate kernel
+for the next userspace cycle. An earlier failure leaves those fallbacks armed.
 
 The current physical proof is retained on np at
 `/var/lib/poco-linux/redwood/work/artifacts/runB-core-region1-qmi-match-20260909T043223Z`:

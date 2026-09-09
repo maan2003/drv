@@ -75,4 +75,12 @@ while test "$i" -le "$CYCLES"; do
 done
 
 echo "FAST_COMPLETE=$(date -u +%FT%TZ)"
-"$TRANSACTION" --recover fast_cycle_complete
+# Every child is reaped, WPSS is offline, and VFIO is unbound. Only at this
+# proved inert boundary may the emergency fallbacks be disarmed; keep the
+# candidate kernel alive for the next userspace iteration.
+"$LAB/watchdog-acceptance/redwood-lab-watchdog" stop
+systemctl stop ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service \
+  2>/dev/null || true
+systemctl reset-failed ath11k-fast-cycle-deadline.timer \
+  ath11k-fast-cycle-deadline.service 2>/dev/null || true
+echo "FAST_INERT_CANDIDATE_RETAINED=$(date -u +%FT%TZ)"
