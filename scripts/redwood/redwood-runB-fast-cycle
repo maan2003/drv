@@ -19,6 +19,7 @@ STOP_AFTER=${REDWOOD_STOP_AFTER:-core}
 mkdir -p "$RUN"
 exec >>"$RUN/fast-cycle.log" 2>&1
 echo "FAST_BEGIN=$(date -u +%FT%TZ)"
+sync -f "$RUN/fast-cycle.log"
 sha256sum -c "$LAB/stage12/SHA256SUMS"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 test "$(cat "$RPROC/state")" = offline
@@ -43,6 +44,46 @@ systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
 "$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
 systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=300s \
   "$TRANSACTION" --recover fast_cycle_deadline
+
+# Keep the smallest useful evidence durable across an abrupt reboot. The
+# watchdog checks both the runner heartbeat and ICMP control reachability; this
+# independent recorder captures those exact inputs and syncs the existing run
+# logs without depending on the runner making forward progress.
+record_flight_state() {
+  uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo unavailable)
+  runner_pid=$(cat /run/redwood-lab-watchdog/runner.pid 2>/dev/null || echo absent)
+  heartbeat_mtime=$(stat -c %Y /run/redwood-lab-watchdog/heartbeat 2>/dev/null || echo absent)
+  remoteproc_state=$(cat "$RPROC/state" 2>/dev/null || echo unavailable)
+  usb_carrier=$(cat /sys/class/net/usb0/carrier 2>/dev/null || echo unavailable)
+  if ping -c 1 -W 1 172.16.42.2 >/dev/null 2>&1; then
+    control=reachable
+  else
+    control=lost
+  fi
+  printf 'uptime=%s runner_pid=%s heartbeat_mtime=%s remoteproc=%s usb_carrier=%s control=%s\n' \
+    "$uptime" "$runner_pid" "$heartbeat_mtime" "$remoteproc_state" \
+    "$usb_carrier" "$control" >>"$RUN/flight-recorder.log"
+  for log in "$RUN/flight-recorder.log" "$RUN/fast-cycle.log" \
+    "$RUN"/preflight-*.log "$RUN"/runB-*.log "$RUN"/runB-*.wmi.jsonl; do
+    test ! -e "$log" || sync -f "$log"
+  done
+}
+
+flight_recorder() {
+  while :; do
+    record_flight_state
+    sleep 2
+  done
+}
+
+flight_recorder &
+flight_pid=$!
+stop_flight_recorder() {
+  kill "$flight_pid" 2>/dev/null || true
+  wait "$flight_pid" 2>/dev/null || true
+}
+trap stop_flight_recorder EXIT INT TERM
+
 printf 1 >/sys/module/iommufd/parameters/allow_unsafe_interrupts
 test -d /sys/module/vfio_platform || \
   insmod "$LAB/stage7/modules/vfio-platform-base.ko"
@@ -66,6 +107,9 @@ while test "$i" -le "$CYCLES"; do
   test -c "$cdev"
   "$RUNNER" preflight --vfio-device "$cdev" >"$RUN/preflight-$i.log" 2>&1
   touch /run/redwood-lab-watchdog/run
+  launch_ns=$(date +%s%N)
+  echo "CYCLE_${i}_RUNNER_LAUNCH_NS=$launch_ns"
+  sync -f "$RUN/fast-cycle.log"
 
   set +e
   "$RUNNER" --vfio-device "$cdev" --containment remoteproc:remoteproc2 \
@@ -73,6 +117,7 @@ while test "$i" -le "$CYCLES"; do
     --wmi-log "$RUN/runB-$i.wmi.jsonl" >"$RUN/runB-$i.log" 2>&1
   rc=$?
   set -e
+  record_flight_state
   offline_ns=$(date +%s%N)
   echo "CYCLE_${i}_RUNNER_RC=$rc OFFLINE_NS=$offline_ns RUN_TO_OFFLINE_MS=$(((offline_ns-running_ns)/1000000))"
   test "$(cat "$RPROC/state")" = offline
@@ -89,6 +134,9 @@ while test "$i" -le "$CYCLES"; do
   echo "CYCLE_${i}_COMPLETE_NS=$end_ns TOTAL_MS=$(((end_ns-start_ns)/1000000))"
   i=$((i + 1))
 done
+
+stop_flight_recorder
+trap - EXIT INT TERM
 
 echo "FAST_COMPLETE=$(date -u +%FT%TZ)"
 # Every child is reaped, WPSS is offline, and VFIO is unbound. Only at this

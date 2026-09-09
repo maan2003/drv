@@ -189,6 +189,12 @@ deadline and the hardware watchdog remain armed throughout. If remoteproc stop
 or verification fails, the runner deliberately holds its VFIO owners until that
 fallback reboots the phone.
 
+While those fallbacks are armed, the wrapper records a synced flight-recorder
+line every two seconds with the runner PID/heartbeat timestamp, remoteproc
+state, USB carrier, and watchdog control-peer reachability. It also syncs the
+runner and WMI logs. This is diagnostic evidence only: it does not renew,
+disarm, or replace either recovery deadline.
+
 This is evidence for repeated failure at the currently tested
 `DpHttConnect` boundary, not a universal reset proof for arbitrary later DMA
 states. The retained physical run
