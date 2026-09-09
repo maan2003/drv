@@ -146,6 +146,33 @@
           '';
         };
 
+      checks.x86_64-linux.wlancfg-service =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "wlancfg-service-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/wlancfg-service";
+          buildAndTestSubdir = "crates/wlancfg-service";
+          cargoLock.lockFile = ./crates/wlancfg-service/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/wlancfg-service
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       checks.x86_64-linux.network-service =
         let
           pkgs = nixpkgs.legacyPackages.x86_64-linux;

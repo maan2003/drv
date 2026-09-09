@@ -1,6 +1,6 @@
 [package]
-name = "wlan-control-wire"
-description = "Bounded transport-neutral WLAN policy control wire contract"
+name = "wlancfg-service"
+description = "Bounded wlancfg-side WLAN host control transport"
 edition = "2024"
 license = "GPL-2.0-only"
 version = "0.1.0"
@@ -9,7 +9,15 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+anyhow = "=1.0.102"
+async-trait = "=0.1.89"
+futures = "=0.3.32"
+libc = "=0.2.189"
+fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
+wlan-control-wire = { path = "../wlan-control-wire" }
+wlancfg-selection = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/wlancfg" }
+
+[dev-dependencies]
 fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
-fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
