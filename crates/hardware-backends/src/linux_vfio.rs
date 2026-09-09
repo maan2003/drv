@@ -3,7 +3,7 @@
 use crate::{PciConfigSnapshot, PciControl, PciControlError};
 use drv_hardware::{Backend, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
@@ -76,6 +76,7 @@ pub struct LinuxVfioPciCapabilities {
     device: Arc<File>,
     iommu: Arc<File>,
     irq_event: OwnedFd,
+    hash_state: RandomState,
 }
 
 /// Inert, pre-opened authority for one VFIO platform device.
@@ -126,6 +127,7 @@ pub fn run_locked_vfio_edu_mechanics(
         device,
         iommu,
         irq_event,
+        hash_state: _,
     } = capabilities.0;
     if pci
         .bus_master_enabled()
@@ -268,6 +270,7 @@ impl LinuxVfioPciCapabilities {
             device: Arc::new(device),
             iommu: Arc::new(iommu),
             irq_event,
+            hash_state: RandomState::new(),
         })
     }
 
@@ -429,11 +432,20 @@ pub struct LinuxVfio {
     quarantined_dmas: HashMap<u64, Dma>,
     interrupts: HashMap<u64, (u32, VfioIrq)>,
     ambiguous_irq_indices: HashSet<u32>,
+    hash_state: RandomState,
     dma_trace: bool,
     prepared_irqs: Option<VecDeque<OwnedFd>>,
 }
 
 impl LinuxVfio {
+    fn take_map<V>(map: &mut HashMap<u64, V>, hash_state: &RandomState) -> HashMap<u64, V> {
+        std::mem::replace(map, HashMap::with_hasher(hash_state.clone()))
+    }
+
+    fn take_set(set: &mut HashSet<u32>, hash_state: &RandomState) -> HashSet<u32> {
+        std::mem::replace(set, HashSet::with_hasher(hash_state.clone()))
+    }
+
     pub fn activate_locked_pci_coherent(
         capabilities: LockedLinuxVfioPciCapabilities,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
@@ -574,13 +586,21 @@ impl LinuxVfio {
             device,
             iommu,
             irq_event,
+            hash_state,
         } = capabilities;
-        Self::initialize_pci_controlled(pci, device, iommu, irq_event, |device, iommu| {
-            userspace_vfio::bind_iommufd(device, iommu)?;
-            let ioas = userspace_vfio::allocate_ioas(iommu)?;
-            userspace_vfio::attach_ioas(device, ioas.id())?;
-            Ok(ioas)
-        })
+        Self::initialize_pci_controlled(
+            pci,
+            device,
+            iommu,
+            irq_event,
+            hash_state,
+            |device, iommu| {
+                userspace_vfio::bind_iommufd(device, iommu)?;
+                let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                userspace_vfio::attach_ioas(device, ioas.id())?;
+                Ok(ioas)
+            },
+        )
     }
 
     fn initialize_pci_controlled(
@@ -588,11 +608,12 @@ impl LinuxVfio {
         device: Arc<File>,
         iommu: Arc<File>,
         irq_event: OwnedFd,
+        hash_state: RandomState,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
         pci.verify_dma_disabled()
             .map_err(LinuxVfioError::PciControl)?;
-        let backend = Self::initialize_pci_coherent(device, iommu, irq_event, setup)?;
+        let backend = Self::initialize_pci_coherent(device, iommu, irq_event, hash_state, setup)?;
         let config = pci
             .verify_dma_disabled()
             .map_err(LinuxVfioError::PciControl)?;
@@ -645,6 +666,7 @@ impl LinuxVfio {
         device: Arc<File>,
         iommu: Arc<File>,
         irq_event: OwnedFd,
+        hash_state: RandomState,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         let ioas = setup(&device, &iommu).map_err(LinuxVfioError::Setup)?;
@@ -661,13 +683,14 @@ impl LinuxVfio {
             }
             msi
         };
-        Ok(Self::new(
+        Ok(Self::new_with_hash_state(
             device,
             Flavor::PciCoherent,
             Some(iommu),
             Some(ioas),
             Some(irq),
             Some(VecDeque::from([irq_event])),
+            hash_state,
         ))
     }
 
@@ -702,6 +725,26 @@ impl LinuxVfio {
         pci_irq: Option<IrqCapability>,
         prepared_irqs: Option<VecDeque<OwnedFd>>,
     ) -> Self {
+        Self::new_with_hash_state(
+            device,
+            flavor,
+            iommu,
+            ioas,
+            pci_irq,
+            prepared_irqs,
+            RandomState::new(),
+        )
+    }
+
+    fn new_with_hash_state(
+        device: Arc<File>,
+        flavor: Flavor,
+        iommu: Option<Arc<File>>,
+        ioas: Option<Ioas>,
+        pci_irq: Option<IrqCapability>,
+        prepared_irqs: Option<VecDeque<OwnedFd>>,
+        hash_state: RandomState,
+    ) -> Self {
         Self {
             device,
             iommu,
@@ -711,11 +754,12 @@ impl LinuxVfio {
             generation: 1,
             next_id: 1,
             next_iova: FIRST_IOVA,
-            regions: HashMap::new(),
-            dmas: HashMap::new(),
-            quarantined_dmas: HashMap::new(),
-            interrupts: HashMap::new(),
-            ambiguous_irq_indices: HashSet::new(),
+            regions: HashMap::with_hasher(hash_state.clone()),
+            dmas: HashMap::with_hasher(hash_state.clone()),
+            quarantined_dmas: HashMap::with_hasher(hash_state.clone()),
+            interrupts: HashMap::with_hasher(hash_state.clone()),
+            ambiguous_irq_indices: HashSet::with_hasher(hash_state.clone()),
+            hash_state,
             dma_trace: false,
             prepared_irqs,
         }
@@ -779,13 +823,14 @@ impl LinuxVfio {
 
     fn revoke_interrupts(&mut self) -> Result<()> {
         let mut failed = false;
-        for index in std::mem::take(&mut self.ambiguous_irq_indices) {
+        for index in Self::take_set(&mut self.ambiguous_irq_indices, &self.hash_state) {
             if userspace_vfio::disable_irq(&self.device, index).is_err() {
                 self.ambiguous_irq_indices.insert(index);
                 failed = true;
             }
         }
-        for (id, (vector, mut interrupt)) in std::mem::take(&mut self.interrupts) {
+        for (id, (vector, mut interrupt)) in Self::take_map(&mut self.interrupts, &self.hash_state)
+        {
             if interrupt.disable().is_err() {
                 self.interrupts.insert(id, (vector, interrupt));
                 failed = true;
@@ -795,9 +840,10 @@ impl LinuxVfio {
     }
 
     fn revoke_dmas(&mut self) -> Result<()> {
-        self.quarantined_dmas.extend(std::mem::take(&mut self.dmas));
-        let mut failed = HashMap::new();
-        for (id, mut dma) in std::mem::take(&mut self.quarantined_dmas) {
+        self.quarantined_dmas
+            .extend(Self::take_map(&mut self.dmas, &self.hash_state));
+        let mut failed = HashMap::with_hasher(self.hash_state.clone());
+        for (id, mut dma) in Self::take_map(&mut self.quarantined_dmas, &self.hash_state) {
             if self.release_dma_resource(&mut dma).is_err() {
                 failed.insert(id, dma);
             }
@@ -810,8 +856,9 @@ impl LinuxVfio {
     }
 
     fn discard_reset_broker_dmas(&mut self) {
-        self.quarantined_dmas.extend(std::mem::take(&mut self.dmas));
-        for (_, mut dma) in std::mem::take(&mut self.quarantined_dmas) {
+        self.quarantined_dmas
+            .extend(Self::take_map(&mut self.dmas, &self.hash_state));
+        for (_, mut dma) in Self::take_map(&mut self.quarantined_dmas, &self.hash_state) {
             dma.broker_handle = None;
             match &mut dma.memory {
                 DmaMemory::BrokerCoherent(mapping) => {
@@ -1397,6 +1444,7 @@ mod tests {
             device,
             iommu,
             userspace_vfio::create_irq_eventfd().unwrap(),
+            RandomState::new(),
             |device, iommu| {
                 userspace_vfio::bind_iommufd(device, iommu)?;
                 let ioas = userspace_vfio::allocate_ioas(iommu)?;
@@ -1792,6 +1840,7 @@ mod tests {
                 Arc::clone(&device),
                 Arc::clone(&iommu),
                 userspace_vfio::create_irq_eventfd().unwrap(),
+                RandomState::new(),
                 |_, _| {
                     attached.set(true);
                     unreachable!()
@@ -1820,6 +1869,7 @@ mod tests {
                         device,
                         iommu,
                         userspace_vfio::create_irq_eventfd().unwrap(),
+                        RandomState::new(),
                         |device, iommu| {
                             userspace_vfio::bind_iommufd(device, iommu)?;
                             let ioas = userspace_vfio::allocate_ioas(iommu)?;

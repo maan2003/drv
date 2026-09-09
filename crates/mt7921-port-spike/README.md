@@ -154,8 +154,10 @@ errors when necessary. Golden-trace and per-operation error-injection tests
 cover the transaction. `VfioFirmwareLoader` is the bounded physical adapter: it
 uses the fully owned command/FWDL/RX rings, matched MCU responses, modular DIDX
 completion, cancellation, IRQ disable, DMA quiescence, and reset-while-pinned
-teardown before any mapping is released. `--run-one-shot-fwdl` is the explicit
-lab-only entry and must run through `wifi-driver-lab-remote`'s reboot watchdog.
+teardown before any mapping is released. `--run-one-shot-fwdl
+--watchdog-armed` is the explicit lab-only entry. It requires the installed
+external watchdog to report an unexpired, active, waiting lease before any
+device authority is prepared and authorizes one recovery-contained run.
 Like pinned Linux, a one-second download-ready timeout is recorded as a warning
 and loading continues; N9 readiness remains a terminal 1.5-second timeout. The
 offline safety model is stricter than Linux scatter submission: it requires an
@@ -195,8 +197,10 @@ indoor operation, and a firmware special-UNII mask of zero. It intersects the
 device capability with the pinned Fuchsia passive universe: 2.4 GHz channels
 1-14 and 5 GHz channels 36-165 (excluding 169-177), never 6 GHz. All 39 channels
 in the installed capability fixture carry `IEEE80211_CHAN_NO_IR`, so this step
-does not authorize transmission. The old `--run-one-shot-fwdl` mode still stops
-after CLC; only `--run-one-shot-channel-domain` can publish the new command.
+does not authorize transmission. The legacy raw `--run-one-shot-fwdl` path
+stopped after CLC; only `--run-one-shot-channel-domain` can publish the new
+command. The current production-owned firmware-bootstrap entry stops earlier,
+after `GET_NIC_CAPABILITY`.
 Both modes retain simultaneous WM/WM2 receive ownership and mandatory
 reset-while-pinned cleanup. No set-channel, radio-enable, or scan command is
 encoded by this boundary.
@@ -1623,14 +1627,48 @@ post-N9 capability response and returns. The next command in the full path is
 the EEPROM hardware-block read, so the bootstrap boundary issues no EEPROM,
 CLC/calibration, channel-domain, scan, management-frame, or radio command.
 
-The `--run-one-shot-fwdl` transport uses the established ownership, WFSYS
-reset, global-ring, MSI eventfd, BME, WFDMA TX/RX, and dual MCU-response-ring
-path. Its cleanup masks PCIe MAC and WFDMA interrupts, disables WFDMA, waits
-for DMA idle, clears BME, disables the IRQ, unmaps every DMA arena, resets the
-VFIO device, and verifies the established BME/WFDMA/host/MAC safe state before
-releasing the remaining BAR and IOAS resources. Bootstrap dispatch and this
-cleanup order have focused source-shape coverage; the loader fixture proves
-that `GET_NIC_CAPABILITY` is followed by cleanup rather than EEPROM or CLC.
+The `--run-one-shot-fwdl --watchdog-armed` dispatch calls the production-owned
+typed `run_firmware_bootstrap` boundary; it does not resurrect the older raw
+VFIO transport. Its owner contains BME, IRQ, DMA mappings, reset, and post-reset
+verification before releasing PCI authority. QEMU proves the locked VFIO,
+iommufd, BAR, DMA, and IRQ mechanics but, because edu reports reset unsupported,
+does not prove MT7921 reset or same-device reuse. This candidate is single-run
+only and relies on the prior real-MT reset evidence; any uncontained failure
+parks the complete owner graph until watchdog reboot. Focused
+source-shape coverage keeps that contract at the dispatch boundary.
+
+The fixed `mt7921-firmware-bootstrap-manual-run` harness is the only prepared
+launcher for this candidate. It directly invokes the existing ownership
+boundary as `wifi-driver-lab --run STATE 0000:05:00.0 -- EXACT_DRIVER
+--run-one-shot-fwdl --watchdog-armed`, with no worker timeout, signal
+escalation, or unconditional post-stop restore. Before detach it requires the
+installed `np` Wi-Fi watchdog to be disarmed, captures the exact token from
+arming its fixed 120-second lease, and verifies that the lease is unexpired,
+active, and waiting. This does not change the Redwood or phone watchdog
+contracts. All child output is captured in a new root-owned mode-0600 report under
+`/var/lib/wifi-driver-lab/reports`. Native restore is attempted only after a
+normal zero exit, exactly one strict typed success certification (including a
+numeric reset generation and the np-watchdog/armed/single-run fields), and a
+still-private state whose safety file remains exactly `SAFE`. A signal,
+nonzero exit, missing, duplicate, or malformed certification, or ineligible
+state leaves VFIO and the state files in place for the installed lease to
+reboot the host. The watchdog is disarmed with the exact arm token only after typed cleanup certification,
+successful state removal, and `wifi-driver-lab --native-ready` verifies the
+restored driver, iwd, address, default route, and gateway connectivity. Kernel
+abrupt-death isolation remains a separate property: it does not prove MT7921
+reset completion or safe reuse of the same device.
+
+The first activation attempt failed closed before device acquisition with
+`SIGSYS` on x86-64 syscall 14. Its audit instruction pointer resolves to the
+deployed glibc `getrandom_vdso` lazy initializer: the first post-lockdown
+HashMap insertion tried to block signals while allocating its random state.
+The MT profile still kills every `rt_sigprocmask`; instead, the typed sandbox
+boundary now initializes the same HashMap random state before installing the
+filter. A real-filter subprocess regression proves the cold insertion dies
+with `SIGSYS` while prewarm followed by a post-lockdown insertion succeeds.
+The earlier QEMU mechanics path bypassed the production session's HashMap-backed
+resource acquisition, and production-client tests used deterministic backends,
+so neither exercised this startup dependency.
 
 The pinned artifacts are patch SHA-256
 `a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6`

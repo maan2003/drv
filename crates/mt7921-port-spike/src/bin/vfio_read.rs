@@ -94,6 +94,7 @@ use mt7921_port_spike::{
 };
 use mt7921_production_client::{
     FirmwareImageExpectation, Mt7921HardwareSessionConfig, VerifiedFirmwareImages,
+    run_firmware_bootstrap,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -4825,7 +4826,7 @@ fn run() -> Result<(), String> {
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
     if operation == Operation::RunOneShotFirmware {
-        return run_production_firmware_bootstrap();
+        return run_production_firmware_bootstrap(require_watchdog_armed_recovery()?);
     }
     let dmashdl_transition_diagnostic = match env::var("DRV_DMASHDL_TRANSITION_DIAGNOSTIC") {
         Err(env::VarError::NotPresent) => false,
@@ -17566,7 +17567,18 @@ fn decompress_patch() -> Result<Vec<u8>, String> {
     decompress_verified_image(PATCH_PATH, PATCH_SHA256, PATCH_IMAGE_BYTES)
 }
 
-fn run_production_firmware_bootstrap() -> Result<(), String> {
+/// Explicit authority for a single recovery-contained run. The installed
+/// watchdog must be verified before any device authority is prepared.
+fn require_watchdog_armed_recovery() -> Result<ArmedWatchdog, String> {
+    if env::args().len() != 3 || env::args().nth(2).as_deref() != Some("--watchdog-armed") {
+        return Err(
+            "--run-one-shot-fwdl requires explicit --watchdog-armed acknowledgement".into(),
+        );
+    }
+    verify_external_watchdog_armed()
+}
+
+fn run_production_firmware_bootstrap(watchdog: ArmedWatchdog) -> Result<(), String> {
     let patch = decompress_patch()?;
     let ram = decompress_ram()?;
     let images = VerifiedFirmwareImages::verify(
@@ -17582,14 +17594,26 @@ fn run_production_firmware_bootstrap() -> Result<(), String> {
         },
     )
     .map_err(|error| format!("verify production firmware images: {error:?}"))?;
-    let watchdog = verify_external_watchdog_armed()?;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     let config = Mt7921HardwareSessionConfig::setup(vfio, &bdf)
-        .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
+        .map_err(|error| format!("prepare production MT7921 authority: {error}"))?
+        .lock_down()
+        .map_err(|error| format!("lock down production MT7921 authority: {error}"))?;
+    // Single-run only. QEMU proves locked VFIO mechanics, not MT7921 reset or
+    // same-device reuse; activation relies on the prior physical MT7921 reset
+    // evidence and leaves any uncontained failure parked until watchdog reboot.
+    let report = run_firmware_bootstrap(config, images)
+        .map_err(|error| format!("run production MT7921 firmware bootstrap: {error}"))?;
+    println!(
+        "{{\"production_firmware_bootstrap\":\"passed\",\"recovery\":\"np-watchdog\",\"watchdog\":\"armed\",\"single_run\":true,\"reset_generation\":{}}}",
+        report
+            .containment
+            .reset_generation()
+            .expect("successful containment records a reset generation")
+    );
     std::hint::black_box(watchdog.deadline);
-    std::hint::black_box((&config, &images));
-    Err("production firmware bootstrap refused: QEMU edu does not advertise or complete VFIO_DEVICE_RESET, so the MT7921 locked lifecycle lacks required reset proof".into())
+    Ok(())
 }
 
 fn decompress_ram() -> Result<Vec<u8>, String> {
@@ -20300,7 +20324,9 @@ mod tests {
             .split("let dmashdl_transition_diagnostic")
             .next()
             .unwrap();
-        assert!(dispatch.contains("return run_production_firmware_bootstrap()"));
+        assert!(dispatch.contains(
+            "return run_production_firmware_bootstrap(require_watchdog_armed_recovery()?)"
+        ));
         let boundary = source
             .split("fn run_production_firmware_bootstrap")
             .nth(1)
@@ -20308,9 +20334,12 @@ mod tests {
             .split("fn decompress_ram")
             .next()
             .unwrap();
-        assert!(boundary.contains("verify_external_watchdog_armed()?"));
-        assert!(boundary.contains("lacks required reset proof"));
-        assert!(!boundary.contains("run_firmware_bootstrap(config, images)"));
+        assert!(boundary.contains("watchdog: ArmedWatchdog"));
+        assert!(boundary.contains("black_box(watchdog.deadline)"));
+        assert!(boundary.contains(".lock_down()"));
+        assert!(boundary.contains("run_firmware_bootstrap(config, images)"));
+        assert!(boundary.contains("QEMU proves locked VFIO mechanics, not MT7921 reset"));
+        assert!(!boundary.contains("verify_external_watchdog_armed"));
         for forbidden in [
             "ioctl",
             "mmap",
@@ -21432,11 +21461,30 @@ mod tests {
             .next()
             .unwrap();
         let verify = dispatch.find("VerifiedFirmwareImages::verify").unwrap();
-        let watchdog = dispatch.find("verify_external_watchdog_armed()?").unwrap();
         let setup = dispatch.find("Mt7921HardwareSessionConfig::setup").unwrap();
-        let refusal = dispatch.find("lacks required reset proof").unwrap();
-        assert!(verify < watchdog && watchdog < setup && setup < refusal);
-        assert!(!dispatch.contains("run_firmware_bootstrap(config, images)"));
+        let lockdown = dispatch.find(".lock_down()").unwrap();
+        let activate = dispatch
+            .find("run_firmware_bootstrap(config, images)")
+            .unwrap();
+        assert!(verify < setup && setup < lockdown && lockdown < activate);
+        assert!(!dispatch.contains("verify_external_watchdog_armed"));
+        assert!(dispatch.contains("Single-run only"));
+        assert!(dispatch.contains("same-device reuse"));
+    }
+
+    #[test]
+    fn firmware_bootstrap_requires_explicit_armed_watchdog_recovery() {
+        let source = include_str!("vfio_read.rs");
+        let contract = source
+            .split("fn require_watchdog_armed_recovery")
+            .nth(1)
+            .unwrap()
+            .split("fn run_production_firmware_bootstrap")
+            .next()
+            .unwrap();
+        assert!(contract.contains("Some(\"--watchdog-armed\")"));
+        assert!(contract.contains("env::args().len() != 3"));
+        assert!(contract.contains("verify_external_watchdog_armed()"));
     }
 
     #[cfg(feature = "fuchsia-passive")]

@@ -114,7 +114,9 @@
             runHook preCheck
             cd crates/linux-self-sandbox
             cargo test --locked --offline -- --nocapture
-            cargo clippy --locked --offline --all-targets -- -D warnings
+            cargo test --locked --offline --features filter-integration-test \
+              --test mt_hashmap_filter -- --nocapture
+            cargo clippy --locked --offline --all-targets --all-features -- -D warnings
             runHook postCheck
           '';
           installPhase = ''
@@ -733,6 +735,252 @@
             '';
             meta.mainProgram = "mt7921-full-firmware-validation";
           };
+
+          mt7921-firmware-bootstrap-manual-run = pkgs.runCommand
+            "mt7921-firmware-bootstrap-manual-run"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              mkdir -p "$out/bin"
+              substitute ${./nix/mt7921-firmware-bootstrap-manual-run.sh} \
+                "$out/bin/mt7921-firmware-bootstrap-manual-run" \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
+                --subst-var-by driver ${mt7921-full-firmware-validation}/libexec/mt7921-full-firmware-validation \
+                --subst-var-by run_root /run \
+                --subst-var-by var_root /var \
+                --subst-var-by id ${pkgs.coreutils}/bin/id \
+                --subst-var-by install ${pkgs.coreutils}/bin/install \
+                --subst-var-by date ${pkgs.coreutils}/bin/date \
+                --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                --subst-var-by stat ${pkgs.coreutils}/bin/stat \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat \
+                --subst-var-by readlink ${pkgs.coreutils}/bin/readlink \
+                --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog
+              chmod 0755 "$out/bin/mt7921-firmware-bootstrap-manual-run"
+              bash -n "$out/bin/mt7921-firmware-bootstrap-manual-run"
+              ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-firmware-bootstrap-manual-run"
+              ! grep -E 'RuntimeMaxSec|ExecStopPost|SIGKILL' \
+                "$out/bin/mt7921-firmware-bootstrap-manual-run"
+              ! grep -E '(^|[;&|[:space:]])(timeout|trap)([;&|[:space:]]|$)' \
+                "$out/bin/mt7921-firmware-bootstrap-manual-run"
+            '';
+
+          mt7921-firmware-bootstrap-manual-run-test = pkgs.runCommand
+            "mt7921-firmware-bootstrap-manual-run-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            ''
+              mkdir -p work/bin work/run work/var
+              cat > work/bin/id <<'EOF'
+              #!${pkgs.runtimeShell}
+              echo 0
+              EOF
+              cat > work/bin/driver <<'EOF'
+              #!${pkgs.runtimeShell}
+              exit 99
+              EOF
+              cat > work/bin/stat <<'EOF'
+              #!${pkgs.runtimeShell}
+              path=''${!#}
+              set -- $(${pkgs.coreutils}/bin/stat "$@")
+              case ''${MODE-}:$path in
+                bad-owner:*/lib/wifi-driver-lab/reports) uid=1 ;;
+                *) uid=0 ;;
+              esac
+              printf '%s %s %s\n' "$uid" "$2" "$3"
+              EOF
+              cat > work/bin/wifi-driver-lab <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              state=$2
+              marker='{"production_firmware_bootstrap":"passed","recovery":"np-watchdog","watchdog":"armed","single_run":true,"reset_generation":1}'
+              case $1 in
+                --run)
+                  printf 'run\n' >> "$PWD/worker.calls"
+                  test "$3" = 0000:05:00.0
+                  test "$4" = --
+                  test "$5" = "$PWD/work/bin/driver"
+                  test "$6" = --run-one-shot-fwdl
+                  test "$7" = --watchdog-armed
+                  test -f "$PWD/watchdog.armed"
+                  printf 'IWD\ttrue\t-\t-\nPCI\t0000:05:00.0\tmt7921e\tmt7921e\n' > "$state"
+                  printf 'SAFE\n' > "$state.safety"
+                  case ''${MODE-success} in
+                    success) printf '%s\n' "$marker" ;;
+                    abnormal) printf '%s\n' "$marker"; exit 23 ;;
+                    signal) printf '%s\n' "$marker"; kill -TERM $$ ;;
+                    sigsys) kill -SYS $$ ;;
+                    missing) echo 'no certification' ;;
+                    duplicate) printf '%s\n%s\n' "$marker" "$marker" ;;
+                    malformed) echo '{"production_firmware_bootstrap":"passed","recovery":"np-watchdog","watchdog":"armed","single_run":true,"reset_generation":"1"}' ;;
+                    unsafe) printf 'UNSAFE\n' > "$state.safety"; printf '%s\n' "$marker" ;;
+                    malformed-state) printf 'UNKNOWN\tbad\t-\t-\n' >> "$state"; printf '%s\n' "$marker" ;;
+                    extra-pci) printf 'PCI\t0000:06:00.0\tother\tother\n' >> "$state"; printf '%s\n' "$marker" ;;
+                    wrong-bdf) printf 'IWD\ttrue\t-\t-\nPCI\t0000:06:00.0\tmt7921e\tmt7921e\n' > "$state"; printf '%s\n' "$marker" ;;
+                    wrong-driver) printf 'IWD\ttrue\t-\t-\nPCI\t0000:05:00.0\tother\tother\n' > "$state"; printf '%s\n' "$marker" ;;
+                    trailing-nul) printf '\0' >> "$state"; printf '%s\n' "$marker" ;;
+                    restore-leaves|restore-fail|native-fail) printf '%s\n' "$marker" ;;
+                    *) exit 98 ;;
+                  esac
+                  ;;
+                --restore)
+                  test -f "$state"
+                  printf '%s\n' "$state" >> "$PWD/restore.calls"
+                  if [ "''${MODE-}" = restore-fail ]; then exit 42; fi
+                  if [ "''${MODE-}" != restore-leaves ]; then
+                    rm -f "$state" "$state.safety"
+                  fi
+                  ;;
+                --native-ready)
+                  test "$2" = 0000:05:00.0
+                  test "''${MODE-}" != native-fail
+                  ;;
+                *) exit 97 ;;
+              esac
+              EOF
+              cat > work/bin/wifi-lab-watchdog <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              case $1 in
+                status)
+                  if [ -f "$PWD/watchdog.armed" ]; then
+                    now=$(${pkgs.coreutils}/bin/date +%s)
+                    case ''${MODE-} in
+                      wrong-lease) deadline=$((now + 3600)) ;;
+                      *) deadline=$((now + 120)) ;;
+                    esac
+                    printf 'armed deadline=%s\nNextElapseUSecMonotonic=exact-test-value\nSubState=waiting\nActiveState=active\n' "$deadline"
+                  else
+                    printf 'disarmed\n'
+                  fi
+                  ;;
+                arm)
+                  test ! -e "$PWD/watchdog.armed"
+                  : > "$PWD/watchdog.armed"
+                  printf '0123456789abcdef0123456789abcdef\n'
+                  ;;
+                disarm)
+                  test "$#" -eq 2
+                  test "$2" = 0123456789abcdef0123456789abcdef
+                  test -f "$PWD/watchdog.armed"
+                  printf '%s\n' "$2" >> "$PWD/watchdog.disarm.calls"
+                  rm -f "$PWD/watchdog.armed"
+                  ;;
+                *) exit 96 ;;
+              esac
+              EOF
+              chmod +x work/bin/*
+              substitute ${./nix/mt7921-firmware-bootstrap-manual-run.sh} work/harness \
+                --subst-var-by shell ${pkgs.runtimeShell} \
+                --subst-var-by wifi_driver_lab "$PWD/work/bin/wifi-driver-lab" \
+                --subst-var-by driver "$PWD/work/bin/driver" \
+                --subst-var-by run_root "$PWD/work/run" \
+                --subst-var-by var_root "$PWD/work/var" \
+                --subst-var-by id "$PWD/work/bin/id" \
+                --subst-var-by install ${pkgs.coreutils}/bin/install \
+                --subst-var-by date ${pkgs.coreutils}/bin/date \
+                --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
+                --subst-var-by stat "$PWD/work/bin/stat" \
+                --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
+                --subst-var-by wc ${pkgs.coreutils}/bin/wc \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat \
+                --subst-var-by readlink ${pkgs.coreutils}/bin/readlink \
+                --subst-var-by wifi_lab_watchdog "$PWD/work/bin/wifi-lab-watchdog"
+              chmod +x work/harness
+
+              run_case() {
+                mode=$1 expected_rc=$2
+                rm -f restore.calls worker.calls watchdog.* \
+                  work/run/wifi-driver-lab/*.state work/run/wifi-driver-lab/*.safety
+                set +e
+                output=$(MODE=$mode ./work/harness)
+                rc=$?
+                set -e
+                test "$rc" -eq "$expected_rc"
+                report=''${output#*: }
+                test -f "$report"
+                test "$(stat -c '%a:%h' "$report")" = 600:1
+                if [ "$mode" = success ]; then
+                  test "$(wc -l < worker.calls)" -eq 1
+                  test "$(wc -l < restore.calls)" -eq 1
+                  test "$(wc -l < watchdog.disarm.calls)" -eq 1
+                  test ! -e watchdog.armed
+                  ! find work/run/wifi-driver-lab -name '*.state' -print -quit | grep -q .
+                  grep -Fx 'MANUAL_BOOTSTRAP restore=passed state_removed=true native_ready=true watchdog=disarmed' "$report"
+                elif [ "$mode" = wrong-lease ]; then
+                  test ! -e worker.calls
+                  test -f watchdog.armed
+                  test ! -e watchdog.disarm.calls
+                  test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 0
+                  grep -F 'did not provide its fixed 120-second lease' "$report"
+                elif [ "$mode" = restore-leaves ]; then
+                  test "$(wc -l < restore.calls)" -eq 1
+                  test -f watchdog.armed
+                  test ! -e watchdog.disarm.calls
+                  test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 1
+                  grep -F 'MANUAL_BOOTSTRAP restore=invalid' "$report"
+                elif [ "$mode" = restore-fail ]; then
+                  test "$(wc -l < restore.calls)" -eq 1
+                  test -f watchdog.armed
+                  test ! -e watchdog.disarm.calls
+                  test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 1
+                  grep -F 'MANUAL_BOOTSTRAP restore=failed rc=42' "$report"
+                elif [ "$mode" = native-fail ]; then
+                  test "$(wc -l < restore.calls)" -eq 1
+                  test -f watchdog.armed
+                  test ! -e watchdog.disarm.calls
+                  test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 0
+                  grep -F 'MANUAL_BOOTSTRAP native_ready=false' "$report"
+                else
+                  test ! -e restore.calls
+                  test -f watchdog.armed
+                  test ! -e watchdog.disarm.calls
+                  test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 1
+                  grep -F 'MANUAL_BOOTSTRAP retain=true' "$report"
+                fi
+              }
+              run_case success 0
+              run_case wrong-lease 75
+              run_case abnormal 23
+              run_case signal 143
+              run_case sigsys 159
+              run_case missing 75
+              run_case duplicate 75
+              run_case malformed 75
+              run_case unsafe 75
+              run_case malformed-state 75
+              run_case extra-pci 75
+              run_case wrong-bdf 75
+              run_case wrong-driver 75
+              run_case trailing-nul 75
+              run_case restore-leaves 75
+              run_case restore-fail 42
+              run_case native-fail 75
+
+              rm -f restore.calls worker.calls watchdog.*
+              rm -rf work/run/wifi-driver-lab work/var/lib/wifi-driver-lab
+              mkdir -p work/run/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
+              chmod 0700 work/run/wifi-driver-lab work/var/lib/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
+              set +e
+              MODE=bad-owner ./work/harness >/dev/null
+              rc=$?
+              set -e
+              test "$rc" -eq 73
+              test ! -e restore.calls
+              test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 0
+
+              rm -rf work/var/lib/wifi-driver-lab/reports
+              mkdir -p work/attacker
+              ln -s "$PWD/work/attacker" work/var/lib/wifi-driver-lab/reports
+              set +e
+              ./work/harness >/dev/null
+              rc=$?
+              set -e
+              test "$rc" -eq 73
+              test ! -e restore.calls
+              touch "$out"
+            '';
 
           mt7921-fresh-laa-diagnostic =
             mt7921-full-firmware-validation.overrideAttrs (old: {

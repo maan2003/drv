@@ -14,3 +14,8 @@ filter-integration-test = []
 [dependencies]
 libc = "0.2"
 userspace-vfio = { path = "../userspace-vfio" }
+
+[[bin]]
+name = "mt-hashmap-filter-probe"
+path = "src/bin/mt-hashmap-filter-probe.rs"
+required-features = ["filter-integration-test"]
