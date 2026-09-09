@@ -104,10 +104,32 @@ impl PreparedHostControlClient {
         Ok(Self { fd, generation })
     }
 
-    /// Starts the bounded I/O owner. Call only from the service's locked-down
-    /// run phase, after all setup-only namespace and privilege work completes.
-    pub fn start_after_lockdown(self) -> anyhow::Result<HostControlClient> {
-        HostControlClient::start(self.fd, self.generation)
+    /// Creates the bounded I/O owner thread while setup syscalls are still
+    /// available, but parks it before it can poll or receive from the socket.
+    /// Call after namespace/capability setup and before seccomp lockdown so the
+    /// runtime profile needs no process-creation syscall.
+    pub fn park_owner_before_lockdown(self) -> anyhow::Result<ParkedHostControlClient> {
+        HostControlClient::park(self.fd, self.generation)
+    }
+}
+
+/// An owner thread parked outside the control receive loop. Lockdown must be
+/// installed with TSYNC before this value is opened.
+pub struct ParkedHostControlClient {
+    client: HostControlClient,
+    start: Option<sync_mpsc::SyncSender<()>>,
+}
+
+impl ParkedHostControlClient {
+    /// Releases the already-confined owner thread into its poll/receive loop.
+    /// Call only from the service's locked-down run phase.
+    pub fn start_after_lockdown(mut self) -> anyhow::Result<HostControlClient> {
+        self.start
+            .take()
+            .expect("parked owner start is single-use")
+            .send(())
+            .map_err(|_| anyhow!("WLAN control owner ended before lockdown opened"))?;
+        Ok(self.client.clone())
     }
 }
 
@@ -116,10 +138,12 @@ impl HostControlClient {
     /// Service startup should use [`PreparedHostControlClient`] so the type
     /// boundary preserves the no-receive-before-lockdown invariant.
     pub fn from_inherited_socket(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
-        PreparedHostControlClient::from_inherited_socket(fd, generation)?.start_after_lockdown()
+        PreparedHostControlClient::from_inherited_socket(fd, generation)?
+            .park_owner_before_lockdown()?
+            .start_after_lockdown()
     }
 
-    fn start(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
+    fn park(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<ParkedHostControlClient> {
 
         let wake = wake_event()?;
         let (command_tx, command_rx) = sync_mpsc::sync_channel(QUEUE_PACKETS);
@@ -129,19 +153,27 @@ impl HostControlClient {
         let force_terminal = Arc::new(AtomicBool::new(false));
         let owner_terminal = force_terminal.clone();
         let owner_wake = wake.clone();
+        let (start_tx, start_rx) = sync_mpsc::sync_channel(0);
         thread::Builder::new()
             .name("wlancfg-control-io".into())
             .spawn(move || {
-                Owner::new(fd, owner_wake, generation, command_rx, event_tx).run(owner_terminal)
+                if start_rx.recv().is_ok() {
+                    Owner::new(fd, owner_wake, generation, command_rx, event_tx)
+                        .run(owner_terminal);
+                }
             })
             .context("spawn WLAN control I/O owner")?;
 
-        Ok(Self(Arc::new(ClientInner {
+        let client = Self(Arc::new(ClientInner {
             commands: command_tx,
             wake,
             force_terminal,
             event_stream: Mutex::new(Some(event_rx)),
-        })))
+        }));
+        Ok(ParkedHostControlClient {
+            client,
+            start: Some(start_tx),
+        })
     }
 
     fn submit(&self, command: OwnerCommand) -> anyhow::Result<()> {
@@ -590,7 +622,9 @@ mod tests {
         // queued untrusted packet. Starting the owner later observes it and
         // terminates the generation.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let client = prepared.start_after_lockdown().unwrap();
+        let parked = prepared.park_owner_before_lockdown().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let client = parked.start_after_lockdown().unwrap();
         let mut liveness = client.take_event_stream();
         assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
     }

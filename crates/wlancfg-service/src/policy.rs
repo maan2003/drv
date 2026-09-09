@@ -7,7 +7,7 @@
 //! interface, and gives that exact selection to the pinned client state
 //! machine for the lifetime of one Wi-Fi generation.
 
-use crate::{HostControlClient, PreparedHostControlClient};
+use crate::{HostControlClient, ParkedHostControlClient};
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use fidl_fuchsia_wlan_sme as sme;
@@ -76,7 +76,7 @@ impl ScanRequestApi for ControlScan {
 /// Load persisted policy and serve one already-locked-down interface
 /// generation. The caller must not invoke this before `LockedDown::run`.
 pub fn serve_one_generation(
-    prepared: PreparedHostControlClient,
+    parked: ParkedHostControlClient,
     state_directory: OwnedFd,
 ) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
@@ -98,7 +98,7 @@ pub fn serve_one_generation(
             );
             // Start the first possible IPC receive only after persistence metadata,
             // stale-temp cleanup, load, and parsing have all completed.
-            let control = prepared
+            let control = parked
                 .start_after_lockdown()
                 .context("start WLAN control owner")?;
 

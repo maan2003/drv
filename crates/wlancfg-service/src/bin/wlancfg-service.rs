@@ -33,14 +33,20 @@ fn main() -> anyhow::Result<()> {
     // Production has no sandbox-bypass flag: inability to establish the jail
     // is a fatal startup error. Tests that cannot unshare use a separately
     // labelled integration-test process role.
-    let locked = Sandbox::new()
+    let setup = Sandbox::new()
         .setup(&[control_raw, state_raw], Some(state_raw))
-        .context("establish wlancfg namespaces and capabilities")?
+        .context("establish wlancfg namespaces and capabilities")?;
+    // Thread creation is setup-only. The owner blocks on a private start gate
+    // and cannot poll or receive the policy socket before TSYNC lockdown.
+    let parked = prepared
+        .park_owner_before_lockdown()
+        .context("park WLAN control owner before lockdown")?;
+    let locked = setup
         .lockdown(Profile::Wlancfg {
             persistence_dir_fd: state_raw,
         })
         .context("install wlancfg seccomp policy")?;
-    locked.run(|| serve_one_generation(prepared, state_fd))
+    locked.run(|| serve_one_generation(parked, state_fd))
 }
 
 fn parse_fd(value: Option<String>, name: &str) -> anyhow::Result<RawFd> {
