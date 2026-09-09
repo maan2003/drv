@@ -95,7 +95,7 @@ pub struct Cli {
     pub wmi_log: Option<PathBuf>,
     pub ssid: Option<Vec<u8>>,
     pub containment_remoteproc: Option<String>,
-    pub stop_remoteproc_on_error: bool,
+    pub stop_remoteproc_on_exit: bool,
 }
 
 impl Default for Cli {
@@ -112,7 +112,7 @@ impl Default for Cli {
             wmi_log: Some("ath11k-wmi-run.jsonl".into()),
             ssid: None,
             containment_remoteproc: None,
-            stop_remoteproc_on_error: false,
+            stop_remoteproc_on_exit: false,
         }
     }
 }
@@ -167,7 +167,7 @@ impl Cli {
                     }
                     cli.containment_remoteproc = Some(name.into());
                 }
-                "--stop-remoteproc-on-error" => cli.stop_remoteproc_on_error = true,
+                "--stop-remoteproc-on-exit" => cli.stop_remoteproc_on_exit = true,
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -184,8 +184,8 @@ impl Cli {
                 usage()
             ));
         }
-        if cli.stop_remoteproc_on_error && cli.containment_remoteproc.is_none() {
-            return Err("--stop-remoteproc-on-error requires --containment".into());
+        if cli.stop_remoteproc_on_exit && cli.containment_remoteproc.is_none() {
+            return Err("--stop-remoteproc-on-exit requires --containment".into());
         }
         Ok(cli)
     }
@@ -201,7 +201,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-error] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--broker]"
 }
 
 #[derive(Debug)]
@@ -460,26 +460,31 @@ pub trait Host {
     fn passive_scan(&mut self) -> Result<(), Error>;
     fn scan_results(&mut self, ssid: Option<&[u8]>) -> Result<(), Error>;
     fn dp_poll(&mut self) -> Result<(), Error>;
+    fn terminal(&mut self) {}
 }
 
 pub fn run(config: &Cli, host: &mut dyn Host) -> Result<Vec<Stage>, Error> {
-    let mut completed = Vec::new();
-    for stage in Stage::ALL {
-        match stage {
-            Stage::Resources => host.resources(config)?,
-            Stage::Firmware => host.firmware(&config.board, &config.regdb)?,
-            Stage::Qmi => host.qmi()?,
-            Stage::Core => host.core()?,
-            Stage::PassiveScan => host.passive_scan()?,
-            Stage::ScanResults => host.scan_results(config.ssid.as_deref())?,
-            Stage::DpPoll => host.dp_poll()?,
+    let result = (|| {
+        let mut completed = Vec::new();
+        for stage in Stage::ALL {
+            match stage {
+                Stage::Resources => host.resources(config)?,
+                Stage::Firmware => host.firmware(&config.board, &config.regdb)?,
+                Stage::Qmi => host.qmi()?,
+                Stage::Core => host.core()?,
+                Stage::PassiveScan => host.passive_scan()?,
+                Stage::ScanResults => host.scan_results(config.ssid.as_deref())?,
+                Stage::DpPoll => host.dp_poll()?,
+            }
+            completed.push(stage);
+            if stage == config.stop_after {
+                break;
+            }
         }
-        completed.push(stage);
-        if stage == config.stop_after {
-            break;
-        }
-    }
-    Ok(completed)
+        Ok(completed)
+    })();
+    host.terminal();
+    result
 }
 
 const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
@@ -995,7 +1000,7 @@ pub struct RealHost {
     vdev: Option<ath11k_core::VdevId>,
     summary: Option<ScanSummary>,
     dp_poll_log: Vec<String>,
-    stop_remoteproc_on_error: Option<String>,
+    stop_remoteproc_on_exit: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1080,6 +1085,15 @@ fn remoteproc_containment_for_resources(
     verify_remoteproc_containment(root, name).map(Some)
 }
 
+fn stop_and_verify_remoteproc<W, R>(mut write_stop: W, mut read_state: R) -> io::Result<bool>
+where
+    W: FnMut() -> io::Result<()>,
+    R: FnMut() -> io::Result<String>,
+{
+    write_stop()?;
+    read_state().map(|observed| observed.trim() == "offline")
+}
+
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
         let vfio = if config.broker {
@@ -1146,11 +1160,15 @@ impl Host for RealHost {
         self.qrtr = Some(qrtr);
         self.register_region = config.register_region;
         self.wmi_log = config.wmi_log.clone();
-        self.stop_remoteproc_on_error = config
-            .stop_remoteproc_on_error
+        self.stop_remoteproc_on_exit = config
+            .stop_remoteproc_on_exit
             .then(|| config.containment_remoteproc.clone())
             .flatten();
         Ok(())
+    }
+
+    fn terminal(&mut self) {
+        self.quiesce_before_release();
     }
 
     fn firmware(&mut self, board: &Path, regdb: &Path) -> Result<(), Error> {
@@ -1261,7 +1279,7 @@ impl Host for RealHost {
     fn core(&mut self) -> Result<(), Error> {
         use ath11k_core::{Lifecycle as _, RadioControl as _};
 
-        let result = (|| {
+        (|| {
             let device = self.device.as_mut().ok_or(Error::Unsupported(
                 "core requested before QMI initialization",
             ))?;
@@ -1273,28 +1291,7 @@ impl Host for RealHost {
                     .map_err(Error::Core)?,
             );
             Ok(())
-        })();
-        if result.is_err()
-            && let Some(name) = &self.stop_remoteproc_on_error
-        {
-            let state = Path::new(REMOTEPROC_CLASS).join(name).join("state");
-            let stopped = fs::write(&state, "stop\n")
-                .and_then(|()| fs::read_to_string(&state))
-                .map(|observed| observed.trim() == "offline");
-            if !matches!(stopped, Ok(true)) {
-                eprintln!(
-                    "remoteproc_quiesce_failed_holding_vfio name={name:?} result={stopped:?}"
-                );
-                // Closing this process would revoke IOMMU mappings while WPSS
-                // might still DMA. Retain every owner until the independently
-                // armed lab watchdog reboots the machine.
-                loop {
-                    std::thread::park();
-                }
-            }
-            eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
-        }
-        result
+        })()
     }
 
     fn passive_scan(&mut self) -> Result<(), Error> {
@@ -1339,6 +1336,36 @@ impl Host for RealHost {
 }
 
 impl RealHost {
+    /// Quiesce WPSS before this owner can drop any VFIO mapping, on both
+    /// successful and failed terminal paths.
+    pub fn quiesce_before_release(&mut self) {
+        use ath11k_core::Lifecycle as _;
+
+        if let Some(device) = self.device.as_mut()
+            && matches!(
+                device.state(),
+                ath11k_core::DeviceState::Ready | ath11k_core::DeviceState::Recovering
+            )
+        {
+            let _ = device.stop();
+        }
+        let Some(name) = self.stop_remoteproc_on_exit.take() else {
+            return;
+        };
+        let state = Path::new(REMOTEPROC_CLASS).join(&name).join("state");
+        let stopped = stop_and_verify_remoteproc(
+            || fs::write(&state, "stop\n"),
+            || fs::read_to_string(&state),
+        );
+        if !matches!(stopped, Ok(true)) {
+            eprintln!("remoteproc_quiesce_failed_holding_vfio name={name:?} result={stopped:?}");
+            loop {
+                std::thread::park();
+            }
+        }
+        eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
+    }
+
     pub fn scan_summary(&self) -> Option<&ScanSummary> {
         self.summary.as_ref()
     }
@@ -1350,16 +1377,7 @@ impl RealHost {
 
 impl Drop for RealHost {
     fn drop(&mut self) {
-        use ath11k_core::Lifecycle as _;
-
-        if let Some(device) = self.device.as_mut()
-            && matches!(
-                device.state(),
-                ath11k_core::DeviceState::Ready | ath11k_core::DeviceState::Recovering
-            )
-        {
-            let _ = device.stop();
-        }
+        self.quiesce_before_release();
     }
 }
 
@@ -1471,6 +1489,7 @@ mod tests {
     struct Fake {
         visited: Vec<Stage>,
         fail: Option<Stage>,
+        terminal_calls: usize,
     }
     impl Fake {
         fn visit(&mut self, stage: Stage) -> Result<(), Error> {
@@ -1503,6 +1522,9 @@ mod tests {
         }
         fn dp_poll(&mut self) -> Result<(), Error> {
             self.visit(Stage::DpPoll)
+        }
+        fn terminal(&mut self) {
+            self.terminal_calls += 1;
         }
     }
 
@@ -1596,6 +1618,7 @@ mod tests {
             vec![Stage::Resources, Stage::Firmware]
         );
         assert_eq!(host.visited, vec![Stage::Resources, Stage::Firmware]);
+        assert_eq!(host.terminal_calls, 1);
     }
 
     #[test]
@@ -1650,20 +1673,59 @@ mod tests {
     }
 
     #[test]
+    fn remoteproc_stop_is_written_before_offline_verification_and_fails_closed() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let write_operations = operations.clone();
+        let read_operations = operations.clone();
+        assert!(
+            stop_and_verify_remoteproc(
+                move || {
+                    write_operations.borrow_mut().push("write-stop");
+                    Ok(())
+                },
+                move || {
+                    read_operations.borrow_mut().push("read-state");
+                    Ok("offline\n".into())
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(&*operations.borrow(), &["write-stop", "read-state"]);
+
+        let read_called = Rc::new(RefCell::new(false));
+        let read_called_inner = read_called.clone();
+        assert!(
+            stop_and_verify_remoteproc(
+                || Err(io::Error::other("stop failed")),
+                move || {
+                    *read_called_inner.borrow_mut() = true;
+                    Ok("offline".into())
+                },
+            )
+            .is_err()
+        );
+        assert!(!*read_called.borrow());
+        assert!(!stop_and_verify_remoteproc(|| Ok(()), || Ok("running".into())).unwrap());
+    }
+
+    #[test]
     fn containment_cli_accepts_only_a_safe_remoteproc_name() {
         let cli = Cli::parse(["--dry-run", "--containment", "remoteproc:remoteproc3"]).unwrap();
         assert_eq!(cli.containment_remoteproc.as_deref(), Some("remoteproc3"));
         assert!(Cli::parse(["--dry-run", "--containment", "remoteproc:../state"]).is_err());
-        assert!(Cli::parse(["--dry-run", "--stop-remoteproc-on-error"]).is_err());
+        assert!(Cli::parse(["--dry-run", "--stop-remoteproc-on-exit"]).is_err());
         assert!(
             Cli::parse([
                 "--dry-run",
                 "--containment",
                 "remoteproc:remoteproc3",
-                "--stop-remoteproc-on-error",
+                "--stop-remoteproc-on-exit",
             ])
             .unwrap()
-            .stop_remoteproc_on_error
+            .stop_remoteproc_on_exit
         );
     }
 
@@ -1678,6 +1740,7 @@ mod tests {
             host.visited,
             vec![Stage::Resources, Stage::Firmware, Stage::Qmi]
         );
+        assert_eq!(host.terminal_calls, 1);
     }
 
     #[test]
