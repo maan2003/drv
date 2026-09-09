@@ -153,6 +153,19 @@ impl PciControl {
         update_command(&mut self.config, PCI_COMMAND_MASTER, true, true)
     }
 
+    /// Independently read back PCI Command and require Bus Master Enable.
+    pub fn verify_bus_master_enabled(&mut self) -> Result<u16, PciControlError> {
+        let command = read_command(&mut self.config)?;
+        if command & PCI_COMMAND_MASTER != 0 {
+            Ok(command)
+        } else {
+            Err(PciControlError::CommandDidNotLatch {
+                requested: command | PCI_COMMAND_MASTER,
+                observed: command,
+            })
+        }
+    }
+
     /// Clear Bus Master Enable. Failure never reasserts BME; callers retain
     /// this owner together with the VFIO device for containment.
     pub fn disable_bus_master(&mut self) -> Result<u16, PciControlError> {

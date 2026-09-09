@@ -1570,6 +1570,12 @@ mod tests {
         ) -> Result<Vec<IrqEvent>, HardwareError> {
             Ok(Vec::new())
         }
+        fn disable_interrupt(&mut self, _: &Self::Interrupt) -> Result<(), HardwareError> {
+            Ok(())
+        }
+        fn disable_interrupt_vector(&mut self, _: u32) -> Result<(), HardwareError> {
+            Ok(())
+        }
         fn reset(&mut self) -> Result<u64, HardwareError> {
             Ok(0)
         }

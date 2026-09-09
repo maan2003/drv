@@ -21,6 +21,7 @@ drv-network-service = { path = "../network-service" }
 drv-hardware = { path = "../hardware-api" }
 drv-hardware-backends = { path = "../hardware-backends" }
 mt7921-port-spike = { path = "../mt7921-port-spike" }
+mt7921-production-client = { path = "../mt7921-production-client" }
 mt7921-softmac-adapter = { path = "../mt7921-softmac-adapter" }
 userspace-vfio = { path = "../userspace-vfio" }
 wlan-softmac-host = { path = "../wlan-softmac-host" }

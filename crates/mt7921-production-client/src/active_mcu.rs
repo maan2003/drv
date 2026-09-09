@@ -9,6 +9,7 @@ use mt7921_core::{
     LoaderMechanicsError, LoaderMechanicsTransport, MT7921_LOADER_COMMAND_MAX_BYTES,
     MT7921_MCU_RX_BUFFER_BYTES, McuRxIrqRing,
 };
+use std::time::Instant;
 
 const MCU_TX_DIDX: usize = 0x41c;
 const MCU_TX_CIDX: usize = 0x418;
@@ -65,7 +66,7 @@ fn map_error<E>(error: LoaderMechanicsError<E>) -> TransactionError<E> {
 }
 
 #[derive(Default)]
-pub(super) struct ActiveMcuProtocol(LoaderMechanics);
+pub(super) struct ActiveMcuProtocol(pub(super) LoaderMechanics);
 
 impl ActiveMcuProtocol {
     pub(super) fn transact<I: LoaderMechanicsTransport>(
@@ -100,6 +101,7 @@ pub(super) struct ActiveMcuViews<'a, B: Backend> {
     pub wm2_ring: &'a mut CoherentDma<B, Bidirectional>,
     pub wm2_buffers: &'a mut CoherentDma<B, FromDevice>,
     pub interrupt: &'a Interrupt<B>,
+    pub start: Instant,
 }
 
 impl<B: Backend> ActiveMcuViews<'_, B> {
@@ -171,11 +173,30 @@ impl<B: Backend> LoaderMechanicsTransport for ActiveMcuViews<'_, B> {
         self.payloads
             .write(0, &[0; MT7921_LOADER_COMMAND_MAX_BYTES])
     }
-    fn wait_for_interrupt(&mut self, deadline: u64) -> Result<bool, Self::Error> {
-        Ok(self.interrupt.wait_until(deadline)?.is_some())
+    fn wait_for_interrupt(&mut self, deadline_ms: u64) -> Result<bool, Self::Error> {
+        let remaining_ms = deadline_ms.saturating_sub(
+            self.start
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        let now = drv_hardware_backends::monotonic_time_ns()?;
+        let deadline_ns = now.saturating_add(remaining_ms.saturating_mul(1_000_000));
+        Ok(self.interrupt.wait_until(deadline_ns)?.is_some())
     }
-    fn wait_for_progress(&mut self, deadline: u64) -> Result<bool, Self::Error> {
-        Ok(self.interrupt.wait_until(deadline)?.is_some())
+    fn wait_for_progress(&mut self, deadline_ms: u64) -> Result<bool, Self::Error> {
+        let now_ms: u64 = self
+            .start
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        if now_ms >= deadline_ms {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(true)
     }
     fn mask_response_interrupts(&mut self) -> Result<(), Self::Error> {
         self.wfdma.write_u32(HOST_INT_ENABLE, 0)

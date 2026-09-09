@@ -8,6 +8,15 @@
 
 extern crate alloc;
 
+mod dmashdl;
+pub use dmashdl::*;
+
+mod transport_activation;
+pub use transport_activation::*;
+
+mod mcu_completion;
+pub use mcu_completion::*;
+
 mod loader_mechanics;
 pub use loader_mechanics::*;
 

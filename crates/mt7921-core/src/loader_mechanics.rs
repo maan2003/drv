@@ -790,6 +790,9 @@ mod tests {
         fail_publish_command: bool,
         fail_publish_scatter: bool,
         command_capacity: usize,
+        written_command_descriptor: Option<DmaDescriptor>,
+        command_wipe_bytes: usize,
+        scatter_wipe_bytes: usize,
     }
 
     impl Default for Fake {
@@ -817,6 +820,9 @@ mod tests {
                 fail_publish_command: false,
                 fail_publish_scatter: false,
                 command_capacity: MT7921_LOADER_COMMAND_MAX_BYTES,
+                written_command_descriptor: None,
+                command_wipe_bytes: 0,
+                scatter_wipe_bytes: 0,
             }
         }
     }
@@ -869,8 +875,9 @@ mod tests {
         fn write_command_descriptor(
             &mut self,
             slot: u16,
-            _: DmaDescriptor,
+            descriptor: DmaDescriptor,
         ) -> Result<(), Self::Error> {
+            self.written_command_descriptor = Some(descriptor);
             self.ops.push(Op::CommandDescriptor(slot));
             Ok(())
         }
@@ -894,6 +901,7 @@ mod tests {
             Ok(self.command_descriptor)
         }
         fn reclaim_command(&mut self, slot: u16) -> Result<(), Self::Error> {
+            self.command_wipe_bytes = MT7921_LOADER_COMMAND_MAX_BYTES;
             self.ops.push(Op::ReclaimCommand(slot));
             Ok(())
         }
@@ -1003,6 +1011,7 @@ mod tests {
             Ok(self.scatter_descriptor)
         }
         fn reclaim_scatter(&mut self, slot: u16) -> Result<(), Self::Error> {
+            self.scatter_wipe_bytes = MT7921_FWDL_CHUNK_BYTES;
             self.ops.push(Op::ReclaimScatter(slot));
             Ok(())
         }
@@ -1288,6 +1297,69 @@ mod tests {
             .unwrap();
         assert_eq!(next, 1);
         assert_eq!(engine.fwdl_producer(), 2);
+    }
+
+    #[test]
+    fn exact_4096_byte_command_and_scatter_boundaries_are_owned_and_fully_wiped() {
+        let mut engine = LoaderMechanics::default();
+        let mut command = vec![0x5a; MT7921_LOADER_COMMAND_MAX_BYTES];
+        command[39] = 0;
+        let mut io = Fake {
+            command_descriptor: done(MT7921_LOADER_COMMAND_MAX_BYTES),
+            ..Fake::default()
+        };
+        assert_eq!(
+            engine
+                .execute_template(
+                    &mut io,
+                    &mut (),
+                    &command,
+                    LoaderCommandCompletion::NoResponse,
+                    1,
+                )
+                .unwrap(),
+            LoaderCompletion::NoResponse
+        );
+        let descriptor = io.written_command_descriptor.unwrap();
+        assert_eq!(descriptor.buf0, 0x1000_0000);
+        assert_eq!((descriptor.ctrl >> 16) & 0x3fff, 4096);
+        assert_eq!(io.command_wipe_bytes, 4096);
+        assert_eq!(
+            engine.execute_template(
+                &mut Fake::default(),
+                &mut (),
+                &[0; MT7921_LOADER_COMMAND_MAX_BYTES + 1],
+                LoaderCommandCompletion::NoResponse,
+                1,
+            ),
+            Err(LoaderMechanicsError::InvalidCommandLength)
+        );
+
+        let mut scatter = Fake {
+            scatter_descriptor: done(MT7921_FWDL_CHUNK_BYTES),
+            ..Fake::default()
+        };
+        let sequence = engine
+            .publish_scatter(
+                &mut scatter,
+                &mut (),
+                FirmwareImagePart::Ram,
+                &[0xa5; MT7921_FWDL_CHUNK_BYTES],
+            )
+            .unwrap();
+        engine
+            .complete_scatter(&mut scatter, &mut (), FirmwareImagePart::Ram, sequence, 1)
+            .unwrap();
+        assert_eq!(scatter.scatter_wipe_bytes, 4096);
+        assert_eq!(
+            engine.publish_scatter(
+                &mut Fake::default(),
+                &mut (),
+                FirmwareImagePart::Ram,
+                &[0; MT7921_FWDL_CHUNK_BYTES + 1],
+            ),
+            Err(LoaderMechanicsError::InvalidScatterLength)
+        );
     }
 
     #[test]

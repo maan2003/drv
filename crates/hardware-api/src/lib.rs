@@ -189,6 +189,12 @@ pub trait Backend {
         interrupts: &[&Self::Interrupt],
         deadline_ns: u64,
     ) -> Result<Vec<IrqEvent>>;
+    /// Explicitly disable an installed interrupt while retaining its handle on
+    /// failure so containment can retry and report ambiguity.
+    fn disable_interrupt(&mut self, interrupt: &Self::Interrupt) -> Result<()>;
+    /// Disable a vector by index even when installation returned an ambiguous
+    /// error before producing an owned interrupt handle.
+    fn disable_interrupt_vector(&mut self, vector: u32) -> Result<()>;
     fn reset(&mut self) -> Result<u64>;
     fn release_region(&mut self, region: Self::Region);
     fn release_dma(&mut self, dma: Self::Dma);
@@ -315,6 +321,9 @@ impl<B: Backend> Device<B> {
             token: Some(token),
             generation,
         })
+    }
+    pub fn disable_interrupt_vector(&self, vector: u32) -> Result<()> {
+        self.shared.0.borrow_mut().disable_interrupt_vector(vector)
     }
     pub fn reset(&self) -> Result<u64> {
         self.shared.0.borrow_mut().reset()
@@ -884,6 +893,13 @@ pub struct Interrupt<B: Backend> {
     generation: u64,
 }
 impl<B: Backend> Interrupt<B> {
+    pub fn disable(&mut self) -> Result<()> {
+        current(&self.shared, self.generation)?;
+        self.shared
+            .0
+            .borrow_mut()
+            .disable_interrupt(self.token.as_ref().unwrap())
+    }
     pub fn wait_until(&self, deadline_ns: u64) -> Result<Option<IrqEvent>> {
         current(&self.shared, self.generation)?;
         self.shared

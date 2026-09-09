@@ -10,6 +10,7 @@ driver-runtime = { path = "../driver-runtime" }
 drv-hardware = { path = "../hardware-api" }
 drv-hardware-backends = { path = "../hardware-backends" }
 mt7921-core = { path = "../mt7921-core" }
+mt7921-production-client = { path = "../mt7921-production-client" }
 userspace-vfio = { path = "../userspace-vfio" }
 
 [lib]

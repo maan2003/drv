@@ -3,7 +3,7 @@
 use drv_hardware::{Backend, Device, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     rc::Rc,
 };
@@ -12,6 +12,10 @@ use std::{
 mod linux_vfio;
 #[cfg(target_os = "linux")]
 pub use linux_vfio::{LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, OpenedPciCoherent};
+#[cfg(target_os = "linux")]
+pub fn monotonic_time_ns() -> Result<u64> {
+    userspace_vfio::monotonic_time_ns().map_err(|_| Error::DeviceFault)
+}
 #[cfg(target_os = "linux")]
 mod pci_control;
 #[cfg(target_os = "linux")]
@@ -149,6 +153,9 @@ pub struct DeterministicBackend {
     region_len: usize,
     device_model: Option<DeviceModel>,
     resource_probe: Option<DeterministicResourceProbe>,
+    registers: HashMap<(u8, usize), u32>,
+    mt7921_activation_model: bool,
+    ambiguous_interrupt_vectors: HashSet<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,11 +211,26 @@ impl DeterministicResourceProbe {
     }
 }
 
+#[derive(Default)]
+struct FailureState {
+    sync_for_device: bool,
+    interrupt_open: bool,
+    interrupt_disable: usize,
+}
 #[derive(Clone, Default)]
-pub struct FailureInjection(Rc<RefCell<bool>>);
+pub struct FailureInjection(Rc<RefCell<FailureState>>);
 impl FailureInjection {
     pub fn fail_next_sync_for_device(&self) {
-        *self.0.borrow_mut() = true;
+        self.0.borrow_mut().sync_for_device = true;
+    }
+    pub fn fail_next_interrupt_disable(&self) {
+        self.fail_interrupt_disable_attempts(1);
+    }
+    pub fn fail_interrupt_disable_attempts(&self, attempts: usize) {
+        self.0.borrow_mut().interrupt_disable = attempts;
+    }
+    pub fn fail_next_interrupt_open(&self) {
+        self.0.borrow_mut().interrupt_open = true;
     }
 }
 impl Default for DeterministicBackend {
@@ -233,6 +255,9 @@ impl Default for DeterministicBackend {
             region_len: 0x10_0000,
             device_model: None,
             resource_probe: None,
+            registers: HashMap::new(),
+            mt7921_activation_model: false,
+            ambiguous_interrupt_vectors: HashSet::new(),
         }
     }
 }
@@ -273,6 +298,29 @@ impl DeterministicBackend {
             ..Self::default()
         };
         (Device::from_backend(backend), operations)
+    }
+    /// Recording device whose small register model supplies MT7921 activation
+    /// readbacks while retaining the exact operation trace.
+    pub fn recording_mt7921_activation_device() -> (Device<Self>, OperationLog) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let backend = Self {
+            operations: Some(operations.clone()),
+            mt7921_activation_model: true,
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations)
+    }
+    pub fn recording_mt7921_activation_device_with_failures()
+    -> (Device<Self>, OperationLog, FailureInjection) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let failures = FailureInjection::default();
+        let backend = Self {
+            operations: Some(operations.clone()),
+            failures: Some(failures.clone()),
+            mt7921_activation_model: true,
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations, failures)
     }
     /// Recording device with a caller-sized BAR for drivers whose register
     /// windows exceed the compact default test region.
@@ -389,9 +437,21 @@ impl Backend for DeterministicBackend {
                     .then(|| state.register_reads.pop_front())
                     .flatten()
             })
-            .unwrap_or_else(|| match offset {
-                0x24 => self.pending.into(),
-                _ => 0,
+            .unwrap_or_else(|| {
+                if self.mt7921_activation_model {
+                    match offset {
+                        0x40140 => {
+                            self.registers.get(&(*region, offset)).copied().unwrap_or(1) | (1 << 4)
+                        }
+                        0x40010 => 0,
+                        _ => self.registers.get(&(*region, offset)).copied().unwrap_or(0),
+                    }
+                } else {
+                    match offset {
+                        0x24 => self.pending.into(),
+                        _ => 0,
+                    }
+                }
             });
         if let Some(log) = &self.operations {
             log.borrow_mut().push(Operation::ReadU32 {
@@ -501,6 +561,10 @@ impl Backend for DeterministicBackend {
             _ => Ok(()),
         })();
         if result.is_ok() {
+            if self.mt7921_activation_model {
+                let stored = if offset == 0xd4200 { 0 } else { value };
+                self.registers.insert((*region, offset), stored);
+            }
             if let Some(ordering) = &self.ordering {
                 for dependency in ordering.0.borrow_mut().iter_mut() {
                     if dependency.doorbell_offset == offset {
@@ -690,8 +754,8 @@ impl Backend for DeterministicBackend {
     fn sync_for_device(&mut self, dma: &u64, range: Range<usize>) -> Result<()> {
         if let Some(failures) = &self.failures {
             let mut fail = failures.0.borrow_mut();
-            if *fail {
-                *fail = false;
+            if fail.sync_for_device {
+                fail.sync_for_device = false;
                 return Err(Error::DeviceFault);
             }
         }
@@ -714,11 +778,20 @@ impl Backend for DeterministicBackend {
         }
     }
     fn open_interrupt(&mut self, vector: u32) -> Result<u32> {
+        self.ambiguous_interrupt_vectors.insert(vector);
+        if let Some(failures) = &self.failures {
+            let mut fail = failures.0.borrow_mut();
+            if fail.interrupt_open {
+                fail.interrupt_open = false;
+                return Err(Error::DeviceFault);
+            }
+        }
         if let Some(probe) = &self.resource_probe {
             probe.acquire()?;
             probe.0.borrow_mut().live_interrupts += 1;
         }
         self.live_irqs += 1;
+        self.ambiguous_interrupt_vectors.remove(&vector);
         Ok(vector)
     }
     fn wait_interrupt(&mut self, i: &u32, deadline: u64) -> Result<Option<IrqEvent>> {
@@ -762,7 +835,37 @@ impl Backend for DeterministicBackend {
             .into_iter()
             .collect())
     }
+    fn disable_interrupt(&mut self, _: &u32) -> Result<()> {
+        if let Some(failures) = &self.failures {
+            let mut fail = failures.0.borrow_mut();
+            if fail.interrupt_disable != 0 {
+                fail.interrupt_disable -= 1;
+                return Err(Error::DeviceFault);
+            }
+        }
+        Ok(())
+    }
+    fn disable_interrupt_vector(&mut self, vector: u32) -> Result<()> {
+        self.ambiguous_interrupt_vectors.insert(vector);
+        if let Some(failures) = &self.failures {
+            let mut fail = failures.0.borrow_mut();
+            if fail.interrupt_disable != 0 {
+                fail.interrupt_disable -= 1;
+                return Err(Error::DeviceFault);
+            }
+        }
+        self.ambiguous_interrupt_vectors.remove(&vector);
+        Ok(())
+    }
     fn reset(&mut self) -> Result<u64> {
+        for vector in self
+            .ambiguous_interrupt_vectors
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.disable_interrupt_vector(vector)?;
+        }
         self.generation += 1;
         self.dmas.clear();
         self.pending = false;

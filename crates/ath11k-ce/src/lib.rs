@@ -2477,6 +2477,12 @@ mod tests {
                 Ok(Vec::new())
             }
         }
+        fn disable_interrupt(&mut self, _: &Self::Interrupt) -> Result<(), Error> {
+            Ok(())
+        }
+        fn disable_interrupt_vector(&mut self, _: u32) -> Result<(), Error> {
+            Ok(())
+        }
         fn reset(&mut self) -> Result<u64, Error> {
             Ok(1)
         }

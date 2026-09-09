@@ -3,38 +3,41 @@
 //! Owned physical resources for the production MT7921 SoftMAC client.
 //!
 //! Setup opens [`LinuxVfioPciCapabilities`] before sandbox lockdown. After
-//! lockdown, [`Mt7921HardwareSession::open`] consumes that inert authority and
+//! lockdown, the single firmware-bootstrap operation consumes that inert authority and
 //! owns the activated `LinuxVfio` backend (inside `Device<LinuxVfio>`), its
 //! IOAS, PCI control descriptor, BAR mapping, DMA arenas, and interrupt. Active
 //! data-path authority remains private while containment is brought under this
 //! owner. Policy/effects and lab telemetry deliberately remain outside this
 //! crate.
 
+mod activation;
 mod active_mcu;
+mod firmware_loader;
 mod setup_inputs;
 pub use setup_inputs::{
     CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
     FirmwareVerificationError, RegulatorySnapshotFile, VerifiedFirmware, VerifiedFirmwareImages,
 };
 
-use active_mcu::{ActiveMcuProtocol, ActiveMcuViews, CompletionKind, TransactionError};
+use activation::activate;
+use active_mcu::ActiveMcuProtocol;
+#[cfg(test)]
+use active_mcu::{ActiveMcuViews, TransactionError};
 use drv_hardware::{
     Backend, Bidirectional, CoherentDma, Device, DmaConstraints, FromDevice, Interrupt, MmioRegion,
     ToDevice,
 };
-use drv_hardware_backends::{
-    LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, PciConfigSnapshot, PciControl,
-};
+use drv_hardware_backends::{LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, PciControl};
+use firmware_loader::ProductionFirmwareLoader;
 use mt7921_core::{
+    ActivationFailure, ActivationStage, ActivationState, FirmwareLoaderError, FirmwareLoaderReport,
     MT7921_DATA_RX_RING_COUNT, MT7921_LOADER_COMMAND_MAX_BYTES, MT7921_MCU_RX_BUFFER_BYTES,
-    OwnershipError, OwnershipEvent, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, ReadOnlyStatus,
-    acquire_driver_ownership,
 };
-use std::{
-    fmt,
-    path::Path,
-    time::{Duration, Instant},
-};
+#[cfg(test)]
+use mt7921_core::{OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, acquire_driver_ownership};
+#[cfg(test)]
+use std::time::Duration;
+use std::{fmt, path::Path, time::Instant};
 
 const PAGE: usize = 4096;
 const MT7921_BAR0_BYTES: usize = 0x10_0000;
@@ -49,7 +52,7 @@ impl Mt7921HardwareSessionConfig {
     /// Open the PCI config, VFIO cdev, and `/dev/iommu` descriptors only.
     ///
     /// This setup phase performs no ioctl, mapping, PCI config access, or
-    /// device access. Call [`Mt7921HardwareSession::open`] after lockdown.
+    /// device access. Pass the result to [`run_firmware_bootstrap`] after lockdown.
     pub fn setup(
         vfio_cdev: impl AsRef<Path>,
         pci_config: impl AsRef<Path>,
@@ -165,13 +168,20 @@ pub struct PostResetPciSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionLifecycle {
-    Active,
+    ResourcesMappedDmaDisabled,
+    Activating(ActivationStage),
+    LoaderTransportActive,
+    FirmwareReady,
     Closing,
     Contained,
 }
 
+#[cfg(test)]
 fn ensure_operational(lifecycle: SessionLifecycle) -> Result<(), drv_hardware::Error> {
-    if lifecycle == SessionLifecycle::Active {
+    if matches!(
+        lifecycle,
+        SessionLifecycle::ResourcesMappedDmaDisabled | SessionLifecycle::LoaderTransportActive
+    ) {
         Ok(())
     } else {
         Err(drv_hardware::Error::StaleHandle)
@@ -267,7 +277,7 @@ struct DmaArenas<B: Backend> {
 struct OwnedHardwareResources<B: Backend> {
     // Release externally observable resources before the shared backend owner.
     #[allow(dead_code, reason = "IRQ ownership is retained through reset")]
-    interrupt: Interrupt<B>,
+    interrupt: Option<Interrupt<B>>,
     #[allow(dead_code, reason = "DMA ownership is retained through reset")]
     dma: DmaArenas<B>,
     bar0: MmioRegion<B>,
@@ -281,11 +291,13 @@ struct AcquireFailure {
     ledger: AcquisitionLedger,
 }
 
+#[cfg(test)]
 struct DriverOwnershipIo<B: Backend> {
     conn: MmioRegion<B>,
     start: Instant,
 }
 
+#[cfg(test)]
 impl<B: Backend> OwnershipTransport for DriverOwnershipIo<B> {
     type Error = drv_hardware::Error;
 
@@ -369,10 +381,11 @@ impl<B: Backend> OwnedHardwareResources<B> {
             management_frame: dma!(ManagementFrame, ToDevice, PAGE),
             management_tx_ring: dma!(ManagementTxRing, Bidirectional, PAGE),
         };
-        let interrupt = acquire!(Interrupt, device.open_interrupt(0));
         Ok((
             Self {
-                interrupt,
+                // Interrupt installation is an activation effect.  Acquisition
+                // must leave the device fully masked with no eventfd assigned.
+                interrupt: None,
                 dma,
                 bar0,
                 device,
@@ -530,14 +543,14 @@ fn advance_containment(
 /// `resources.device` owns the `LinuxVfio`, iommufd and IOAS state. Every BAR,
 /// DMA, and IRQ handle shares that same backend identity without borrowing the
 /// session, so this type has no self-referential lifetime.
-pub struct Mt7921HardwareSession {
+struct Mt7921HardwareSession {
     resources: Option<OwnedHardwareResources<LinuxVfio>>,
-    pci_snapshot: PciConfigSnapshot,
     acquisition: AcquisitionLedger,
     containment: ContainmentLedger,
     lifecycle: SessionLifecycle,
     potentially_active: bool,
     mcu: ActiveMcuProtocol,
+    activation_state: ActivationState,
     // Dropped after resources so the PCI control owner spans their lifetime.
     pci: Option<PciControl>,
 }
@@ -548,7 +561,7 @@ impl Mt7921HardwareSession {
     /// This is the post-lockdown entrypoint. PCI remains bus-master-disabled;
     /// the later active mechanics boundary must not enable it until ring and
     /// interrupt programming is complete.
-    pub fn open(config: Mt7921HardwareSessionConfig) -> Result<Self, Mt7921HardwareSessionError> {
+    fn open(config: Mt7921HardwareSessionConfig) -> Result<Self, Mt7921HardwareSessionError> {
         let opened = LinuxVfio::activate_pci_coherent(config.vfio)
             .map_err(Mt7921HardwareSessionError::Activate)?;
         let (backend, pci, pci_snapshot) = opened.into_parts();
@@ -568,128 +581,71 @@ impl Mt7921HardwareSession {
             })?;
         Ok(Self {
             resources: Some(resources),
-            pci_snapshot,
             acquisition,
             containment: ContainmentLedger {
                 vfio_attached: true,
                 bar_mapped: true,
                 dma_mapped: true,
-                irq_installed: true,
+                irq_installed: false,
                 bus_master_enabled: false,
                 bme_disabled_command: None,
                 reset_generation: None,
                 post_reset_registers: None,
                 post_reset_pci: None,
             },
-            lifecycle: SessionLifecycle::Active,
+            lifecycle: SessionLifecycle::ResourcesMappedDmaDisabled,
             potentially_active: false,
             mcu: ActiveMcuProtocol::default(),
+            activation_state: ActivationState::initial(),
             pci: Some(pci),
         })
     }
 
-    pub fn pci_snapshot(&self) -> &PciConfigSnapshot {
-        &self.pci_snapshot
+    fn activate_loader(&mut self) -> Result<(), ActivationFailure<String>> {
+        self.potentially_active = true;
+        self.lifecycle = SessionLifecycle::Activating(ActivationStage::PrepareDescriptors);
+        let result = activate(
+            self.resources.as_mut().expect("live session resources"),
+            self.pci.as_mut().expect("live PCI authority"),
+            &mut self.acquisition,
+            &mut self.containment,
+        );
+        match result {
+            Ok(state) => {
+                self.activation_state = state;
+                self.lifecycle = SessionLifecycle::LoaderTransportActive;
+                Ok(())
+            }
+            Err(error) => {
+                self.activation_state = error.state;
+                self.lifecycle = SessionLifecycle::Activating(error.primary.stage);
+                Err(error)
+            }
+        }
     }
 
-    pub fn acquisition(&self) -> &AcquisitionLedger {
-        &self.acquisition
-    }
-
-    pub fn containment(&self) -> &ContainmentLedger {
-        &self.containment
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.resources
-            .as_ref()
-            .expect("live session resources")
-            .device
-            .generation()
-    }
-
-    pub fn verify_dma_disabled(
+    fn load_firmware_bootstrap(
         &mut self,
-    ) -> Result<PciConfigSnapshot, drv_hardware_backends::PciControlError> {
-        self.pci
-            .as_mut()
-            .expect("live PCI authority")
-            .verify_dma_disabled()
-    }
-
-    /// Read the bounded status registers without exposing their BAR pages.
-    pub fn read_only_status(&self) -> Result<ReadOnlyStatus, drv_hardware::Error> {
-        self.ensure_active()?;
-        let resources = self.resources.as_ref().expect("live session resources");
-        let wfdma = resources.bar0.slice(0xd4000, PAGE)?;
-        let conn = resources.bar0.slice(0xe0000, PAGE)?;
-        Ok(ReadOnlyStatus::decode(
-            conn.read_u32(0xf0)?,
-            conn.read_u32(0x10)?,
-            wfdma.read_u32(0x208)?,
-        ))
-    }
-
-    /// Run the exact bounded `mt7921-core` driver-ownership mechanic.
-    ///
-    /// The short-lived transport owns only the CONN page and disappears before
-    /// this method returns; no reference is retained in the session.
-    pub fn acquire_driver_ownership(
-        &mut self,
-        event: impl FnMut(OwnershipEvent),
-    ) -> Result<(), OwnershipError<drv_hardware::Error>> {
-        self.ensure_active().map_err(OwnershipError::Transport)?;
-        let mut transport = DriverOwnershipIo {
-            conn: self
-                .resources
-                .as_ref()
-                .expect("live session resources")
-                .bar0
-                .slice(0xe0000, PAGE)
-                .map_err(OwnershipError::Transport)?,
+        images: &VerifiedFirmwareImages,
+    ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<String>> {
+        let verified = images.open();
+        let mut loader = ProductionFirmwareLoader {
+            resources: self.resources.as_mut().expect("live session resources"),
+            pci: self.pci.as_mut().expect("live PCI authority"),
+            acquisition: &mut self.acquisition,
+            containment: &mut self.containment,
+            activation_state: &mut self.activation_state,
+            mechanics: std::mem::take(&mut self.mcu.0),
             start: Instant::now(),
         };
-        acquire_driver_ownership(&mut transport, event)
-    }
-
-    fn ensure_active(&self) -> Result<(), drv_hardware::Error> {
-        ensure_operational(self.lifecycle)
-    }
-
-    /// Private and intentionally incomplete until the firmware-loader raw
-    /// transaction path is cut over atomically to this executor.
-    #[allow(dead_code)]
-    fn transact_mcu(
-        &mut self,
-        template: &[u8],
-        completion: CompletionKind,
-        deadline_ns: u64,
-    ) -> Result<Option<mt7921_core::FirmwareRx>, TransactionError<drv_hardware::Error>> {
-        self.ensure_active().map_err(TransactionError::Io)?;
-        // Publication below is meaningful only for an active device.  Mark
-        // retention first, just as the eventual BME/WFDMA enable path must.
-        self.potentially_active = true;
-        let result = {
-            let resources = self.resources.as_mut().expect("live session resources");
-            let mut views = ActiveMcuViews {
-                wfdma: resources
-                    .bar0
-                    .slice(0xd4000, PAGE)
-                    .map_err(TransactionError::Io)?,
-                tx_ring: &mut resources.dma.mcu_tx_ring,
-                payloads: &mut resources.dma.command_payloads,
-                fwdl_ring: &mut resources.dma.fwdl_ring,
-                fwdl_payload: &mut resources.dma.fwdl_payload,
-                wm_ring: &mut resources.dma.mcu_rx_ring,
-                wm_buffers: &mut resources.dma.mcu_rx_buffers,
-                wm2_ring: &mut resources.dma.wa_rx_ring,
-                wm2_buffers: &mut resources.dma.wa_rx_buffers,
-                interrupt: &resources.interrupt,
-            };
-            self.mcu
-                .transact(&mut views, template, completion, deadline_ns)
-        };
-        close_after_transaction_error(&mut self.lifecycle, &result);
+        let result =
+            mt7921_core::load_mt7921_firmware_bootstrap(&mut loader, verified.patch, verified.ram);
+        self.mcu.0 = loader.mechanics;
+        if result.is_ok() {
+            self.lifecycle = SessionLifecycle::FirmwareReady;
+        } else {
+            self.lifecycle = SessionLifecycle::Closing;
+        }
         result
     }
 
@@ -697,7 +653,7 @@ impl Mt7921HardwareSession {
     ///
     /// Failures retain the complete resource graph and PCI owner so callers
     /// can retry. Once contained, repeated calls are idempotent.
-    pub fn contain(&mut self) -> Result<ContainmentLedger, Mt7921ContainmentError> {
+    fn contain(&mut self) -> Result<ContainmentLedger, Mt7921ContainmentError> {
         advance_containment(
             self.resources.as_mut().expect("live session resources"),
             self.pci.as_mut().expect("live PCI authority"),
@@ -708,6 +664,94 @@ impl Mt7921HardwareSession {
     }
 }
 
+/// Result of the single production-owned firmware bootstrap operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mt7921FirmwareRunReport {
+    pub firmware: FirmwareLoaderReport,
+    pub acquisition: AcquisitionLedger,
+    pub containment: ContainmentLedger,
+}
+
+#[derive(Debug)]
+pub enum Mt7921FirmwareRunError {
+    Open(Mt7921HardwareSessionError),
+    Activation {
+        stage: String,
+        detail: String,
+        acquisition: AcquisitionLedger,
+        containment: Box<Result<ContainmentLedger, Mt7921ContainmentError>>,
+    },
+    Loader {
+        source: Box<FirmwareLoaderError<String>>,
+        acquisition: AcquisitionLedger,
+        containment: Box<Result<ContainmentLedger, Mt7921ContainmentError>>,
+    },
+    Containment {
+        source: Box<Mt7921ContainmentError>,
+        acquisition: AcquisitionLedger,
+    },
+}
+
+impl fmt::Display for Mt7921FirmwareRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(f, "open production MT7921 resources: {error}"),
+            Self::Activation { stage, detail, .. } => {
+                write!(f, "activate MT7921 loader at {stage}: {detail}")
+            }
+            Self::Loader { source, .. } => write!(f, "run MT7921 firmware loader: {source:?}"),
+            Self::Containment { source, .. } => {
+                write!(f, "contain MT7921 after firmware loader: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Mt7921FirmwareRunError {}
+
+/// Activate, bootstrap the verified patch and RAM images, and return only
+/// after loader cleanup plus reset containment have both completed.
+pub fn run_firmware_bootstrap(
+    config: Mt7921HardwareSessionConfig,
+    images: VerifiedFirmwareImages,
+) -> Result<Mt7921FirmwareRunReport, Mt7921FirmwareRunError> {
+    let mut session = Mt7921HardwareSession::open(config).map_err(Mt7921FirmwareRunError::Open)?;
+    if let Err(error) = session.activate_loader() {
+        let acquisition = session.acquisition.clone();
+        let containment = session.contain();
+        return Err(Mt7921FirmwareRunError::Activation {
+            stage: format!("{:?}", error.primary.stage),
+            detail: format!(
+                "{}; transport cleanup errors: {:?}",
+                error.primary.source, error.cleanup
+            ),
+            acquisition,
+            containment: Box::new(containment),
+        });
+    }
+    let loader = session.load_firmware_bootstrap(&images);
+    let acquisition = session.acquisition.clone();
+    session.lifecycle = SessionLifecycle::Closing;
+    let containment = session.contain();
+    match (loader, containment) {
+        (Ok(firmware), Ok(containment)) => Ok(Mt7921FirmwareRunReport {
+            firmware,
+            acquisition,
+            containment,
+        }),
+        (Err(source), containment) => Err(Mt7921FirmwareRunError::Loader {
+            source: Box::new(source),
+            acquisition,
+            containment: Box::new(containment),
+        }),
+        (Ok(_), Err(source)) => Err(Mt7921FirmwareRunError::Containment {
+            source: Box::new(source),
+            acquisition,
+        }),
+    }
+}
+
+#[cfg(test)]
 fn close_after_transaction_error<T, E>(
     lifecycle: &mut SessionLifecycle,
     result: &Result<T, TransactionError<E>>,
@@ -895,7 +939,7 @@ mod tests {
         )
     }
 
-    const ACQUISITION_ORDER: [HardwareResource; 17] = [
+    const ACQUISITION_ORDER: [HardwareResource; 16] = [
         HardwareResource::Bar0,
         HardwareResource::TxGuard,
         HardwareResource::FirmwareDownloadRing,
@@ -912,7 +956,6 @@ mod tests {
         HardwareResource::ManagementTxwi,
         HardwareResource::ManagementFrame,
         HardwareResource::ManagementTxRing,
-        HardwareResource::Interrupt,
     ];
 
     fn assert_no_live_resources(probe: &DeterministicResourceProbe) {
@@ -926,8 +969,11 @@ mod tests {
         let (device, probe) = DeterministicBackend::device_with_resource_probe(None);
         let (resources, ledger) = OwnedHardwareResources::acquire(device).unwrap();
         assert_eq!(ledger.acquired().first(), Some(&HardwareResource::Bar0));
-        assert_eq!(ledger.acquired().last(), Some(&HardwareResource::Interrupt));
-        assert_eq!(ledger.acquired().len(), 17);
+        assert_eq!(
+            ledger.acquired().last(),
+            Some(&HardwareResource::ManagementTxRing)
+        );
+        assert_eq!(ledger.acquired().len(), 16);
         assert_eq!(resources.bar0.len(), MT7921_BAR0_BYTES);
         assert_eq!(
             resources.dma.command_payloads.len(),
@@ -939,17 +985,16 @@ mod tests {
         );
         assert!(resources.dma.tx_guard.device_address(0).is_ok());
         assert!(resources.dma.rx_guard.device_address(0).is_ok());
-        assert_eq!(probe.live_interrupts(), 1);
+        assert_eq!(probe.live_interrupts(), 0);
         assert_eq!(probe.live_dmas(), 15);
         assert_eq!(probe.live_regions(), 1);
 
         drop(resources);
         assert_no_live_resources(&probe);
         let releases = probe.releases();
-        assert_eq!(releases.first(), Some(&DeterministicRelease::Interrupt));
         assert_eq!(releases.last(), Some(&DeterministicRelease::Region));
         assert_eq!(
-            releases[1..releases.len() - 1],
+            releases[..releases.len() - 1],
             [DeterministicRelease::Dma; 15]
         );
     }
@@ -988,6 +1033,7 @@ mod tests {
 
         let device = DeterministicBackend::device();
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
         let issued_address = resources
             .dma
             .command_payloads
@@ -1017,7 +1063,8 @@ mod tests {
                 wm_buffers: &mut dma.mcu_rx_buffers,
                 wm2_ring: &mut dma.wa_rx_ring,
                 wm2_buffers: &mut dma.wa_rx_buffers,
-                interrupt: &resources.interrupt,
+                interrupt: resources.interrupt.as_ref().expect("live interrupt"),
+                start: Instant::now(),
             };
             assert_eq!(
                 views.command_payload_capacity(255),
@@ -1111,7 +1158,7 @@ mod tests {
     #[test]
     fn containment_orders_verified_milestones_and_is_idempotent() {
         let (mut resources, mut pci, calls) = fake_pair(None);
-        let mut lifecycle = SessionLifecycle::Active;
+        let mut lifecycle = SessionLifecycle::LoaderTransportActive;
         let mut ledger = initial_containment();
         advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).unwrap();
         assert_eq!(
@@ -1145,7 +1192,7 @@ mod tests {
             InjectedFailure::PostResetPci,
         ] {
             let (mut resources, mut pci, calls) = fake_pair(Some(failure));
-            let mut lifecycle = SessionLifecycle::Active;
+            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
             let mut ledger = initial_containment();
             let error = advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger)
                 .unwrap_err();
@@ -1226,7 +1273,10 @@ mod tests {
 
     #[test]
     fn closing_and_contained_sessions_reject_operational_access() {
-        assert_eq!(ensure_operational(SessionLifecycle::Active), Ok(()));
+        assert_eq!(
+            ensure_operational(SessionLifecycle::LoaderTransportActive),
+            Ok(())
+        );
         assert_eq!(
             ensure_operational(SessionLifecycle::Closing),
             Err(drv_hardware::Error::StaleHandle)
@@ -1240,7 +1290,7 @@ mod tests {
     #[test]
     fn active_failure_retains_authority_for_resumable_containment() {
         let (mut resources, mut pci, calls) = fake_pair(Some(InjectedFailure::ResetIoctl));
-        let mut lifecycle = SessionLifecycle::Active;
+        let mut lifecycle = SessionLifecycle::LoaderTransportActive;
         let mut ledger = initial_containment();
         assert!(
             advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).is_err()
@@ -1271,7 +1321,7 @@ mod tests {
         let releases = Rc::new(Cell::new(0));
         {
             let (mut containment, mut pci_control, _) = fake_pair(None);
-            let mut lifecycle = SessionLifecycle::Active;
+            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
             let mut ledger = initial_containment();
             advance_containment(
                 &mut containment,
@@ -1289,7 +1339,7 @@ mod tests {
         {
             let (mut containment, mut pci_control, _) =
                 fake_pair(Some(InjectedFailure::ResetIoctl));
-            let mut lifecycle = SessionLifecycle::Active;
+            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
             let mut ledger = initial_containment();
             assert!(
                 advance_containment(
@@ -1318,7 +1368,7 @@ mod tests {
             },
             TransactionError::Descriptor,
         ] {
-            let mut lifecycle = SessionLifecycle::Active;
+            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
             let result: Result<(), TransactionError<drv_hardware::Error>> = Err(error);
             close_after_transaction_error(&mut lifecycle, &result);
             assert_eq!(lifecycle, SessionLifecycle::Closing);

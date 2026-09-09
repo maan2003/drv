@@ -631,6 +631,8 @@ dependencies = [
 name = "fuchsia-async"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "tokio",
  "zx",
 ]
 
@@ -833,9 +835,9 @@ dependencies = [
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]
@@ -1117,6 +1119,7 @@ dependencies = [
  "futures",
  "ieee80211",
  "mt7921-port-spike",
+ "mt7921-production-client",
  "mt7921-softmac-adapter",
  "num-bigint",
  "sha2",
@@ -1136,7 +1139,20 @@ dependencies = [
  "drv-hardware",
  "drv-hardware-backends",
  "mt7921-core",
+ "mt7921-production-client",
  "userspace-vfio",
+]
+
+[[package]]
+name = "mt7921-production-client"
+version = "0.1.0"
+dependencies = [
+ "drv-hardware",
+ "drv-hardware-backends",
+ "mt7921-core",
+ "sha2",
+ "userspace-vfio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2568,6 +2584,7 @@ dependencies = [
  "futures",
  "netstack3-port-spike",
  "tokio",
+ "wlan-common",
  "wlan-mlme",
  "wlan-sme",
  "zx",
@@ -2665,6 +2682,12 @@ dependencies = [
  "syn 2.0.119",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 
 [[package]]
 name = "zerotrie"

@@ -3,7 +3,7 @@
 use crate::{PciConfigSnapshot, PciControl, PciControlError};
 use drv_hardware::{Backend, DmaConstraints, DmaDirection, Error, IrqEvent, Result};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
@@ -156,6 +156,7 @@ pub struct LinuxVfio {
     dmas: HashMap<u64, Dma>,
     quarantined_dmas: HashMap<u64, Dma>,
     interrupts: HashMap<u64, (u32, VfioIrq)>,
+    ambiguous_irq_indices: HashSet<u32>,
 }
 
 impl LinuxVfio {
@@ -368,6 +369,7 @@ impl LinuxVfio {
             dmas: HashMap::new(),
             quarantined_dmas: HashMap::new(),
             interrupts: HashMap::new(),
+            ambiguous_irq_indices: HashSet::new(),
         }
     }
 
@@ -422,6 +424,12 @@ impl LinuxVfio {
 
     fn revoke_interrupts(&mut self) -> Result<()> {
         let mut failed = false;
+        for index in std::mem::take(&mut self.ambiguous_irq_indices) {
+            if userspace_vfio::disable_irq(&self.device, index).is_err() {
+                self.ambiguous_irq_indices.insert(index);
+                failed = true;
+            }
+        }
         for (id, (vector, mut interrupt)) in std::mem::take(&mut self.interrupts) {
             if interrupt.disable().is_err() {
                 self.interrupts.insert(id, (vector, interrupt));
@@ -814,10 +822,12 @@ impl Backend for LinuxVfio {
                 0,
             )
         };
+        self.ambiguous_irq_indices.insert(capability.index);
         let interrupt =
             VfioIrq::install_at(&self.device, capability, start).map_err(|_| Error::DeviceFault)?;
         let id = self.id()?;
         self.interrupts.insert(id, (vector, interrupt));
+        self.ambiguous_irq_indices.remove(&capability.index);
         Ok(id)
     }
 
@@ -862,6 +872,29 @@ impl Backend for LinuxVfio {
             }
         }
         Ok(events)
+    }
+    fn disable_interrupt(&mut self, interrupt: &u64) -> Result<()> {
+        self.interrupts
+            .get_mut(interrupt)
+            .ok_or(Error::StaleHandle)?
+            .1
+            .disable()
+            .map_err(|_| Error::DeviceFault)
+    }
+    fn disable_interrupt_vector(&mut self, vector: u32) -> Result<()> {
+        let capability = if let Some(capability) = self.pci_irq {
+            if vector >= capability.count {
+                return Err(Error::Limit);
+            }
+            capability
+        } else {
+            userspace_vfio::irq_capability(&self.device, vector).map_err(|_| Error::DeviceFault)?
+        };
+        self.ambiguous_irq_indices.insert(capability.index);
+        userspace_vfio::disable_irq(&self.device, capability.index)
+            .map_err(|_| Error::DeviceFault)?;
+        self.ambiguous_irq_indices.remove(&capability.index);
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<u64> {

@@ -4,7 +4,9 @@
 
 #[cfg(feature = "fuchsia-passive")]
 use driver_runtime::{PublicationState, TranscriptEvent};
-use drv_hardware::{Backend, Bidirectional, CoherentDma, Device, DmaConstraints, MmioRegion, ToDevice};
+use drv_hardware::{
+    Backend, Bidirectional, CoherentDma, Device, DmaConstraints, MmioRegion, ToDevice,
+};
 use drv_hardware_backends::{LinuxVfio, PciControl};
 #[cfg(feature = "fuchsia-passive")]
 use fidl_fuchsia_wlan_common as fidl_common;
@@ -62,35 +64,36 @@ use mt7921_port_spike::{
     DisabledFirmwareStageEvent, DisabledFirmwareStageTransport, DisabledFwdlError,
     DisabledFwdlEvent, DisabledFwdlInterruptTransport, DisabledFwdlRegister,
     DisabledFwdlRingTransport, DisabledFwdlWrite, DisabledInterruptError, DisabledInterruptEvent,
-    DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DownloadCommand,
-    DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware, FirmwareCommandCompletion,
-    FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport, FirmwareOwnershipEvent,
-    FirmwareRxDisposition, GlobalTxRingError, GlobalTxRingEvent, GlobalTxRingTransport,
+    DisabledMcuRxEvent, DisabledMcuRxTransport, DmaDescriptor, DmaSegment, DmashdlInvariantIo,
+    DownloadCommand, DynamicL1Error, DynamicL1Event, DynamicL1Transport, Firmware,
+    FirmwareCommandCompletion, FirmwareImagePart, FirmwareLoaderState, FirmwareLoaderTransport,
+    FirmwareOwnershipEvent, FirmwareRxDisposition, GlobalTxRingError, GlobalTxRingEvent,
+    GlobalTxRingTransport, IrqLifecycle, IrqResetCleanupStep, IrqResetEvent, IrqResetTransport,
     LoaderCommandCompletion, LoaderCompletion, LoaderMechanics, LoaderMechanicsError,
-    LoaderMechanicsTransport,
-    IrqLifecycle, IrqResetCleanupStep,
-    IrqResetEvent, IrqResetTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
-    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_DATA_RX_IRQ_BIT as DATA_RX_IRQ_BIT,
-    MT7921_FWDL_CHUNK_BYTES, MT7921_FWDL_RING_BYTES, MT7921_WM2_RX_IRQ_BIT as WM2_RX_IRQ_BIT,
-    MT7921_WM_RX_IRQ_BIT as WM_RX_IRQ_BIT, McuRxDataRing, McuRxIrqActionKind, McuRxIrqMachine,
-    McuRxIrqMachineError, McuRxIrqReport, McuRxIrqRing, McuRxIrqTerminal, McuRxIrqTopology,
-    McuRxMaskState, McuRxParserKind,
-    McuRxRegisters, McuRxRoute,
-    Mt7921TxFree, Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
+    LoaderMechanicsTransport, MT_HIF_REMAP_L1_BAR_OFFSET, MT_HIF_REMAP_WINDOW_BAR_OFFSET,
+    MT_TOP_LPCR_HOST_DRV_OWN, MT7921_DATA_RX_IRQ_BIT as DATA_RX_IRQ_BIT, MT7921_FWDL_CHUNK_BYTES,
+    MT7921_FWDL_RING_BYTES, MT7921_WM_RX_IRQ_BIT as WM_RX_IRQ_BIT,
+    MT7921_WM2_RX_IRQ_BIT as WM2_RX_IRQ_BIT, McuResponse, McuRxDataRing, McuRxIrqActionKind,
+    McuRxIrqMachine, McuRxIrqMachineError, McuRxIrqReport, McuRxIrqRing, McuRxIrqTerminal,
+    McuRxIrqTopology, McuRxMaskState, McuRxParserKind, McuRxRegisters, McuRxRoute, Mt7921TxFree,
+    Mt7921TxStatus, OwnershipError, OwnershipEvent, OwnershipRoundTripEvent,
     OwnershipRoundTripTransport, OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN,
     PCIE_LPCR_HOST_SET_OWN, Patch, PciIrqCapability, PciIrqKind, ReadOnlyStatus, ReadRegister,
     TopOwnershipError, TopOwnershipEvent, TopOwnershipTransport, TxRingState, WfsysResetEvent,
     WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    classify_firmware_rx, encode_download_command, encode_mt7921_5ghz_auth_tx, exercise_irq_reset_boundary,
+    classify_clc_response, classify_firmware_rx, classify_mcu_completion, encode_download_command,
+    encode_mt7921_5ghz_auth_tx, ensure_linux_dmashdl_invariant, exercise_irq_reset_boundary,
     load_mt7921_firmware, load_mt7921_firmware_bootstrap,
     load_mt7921_firmware_through_channel_domain, load_mt7921_patch_bootstrap,
-    mask_ack_disabled_fwdl_interrupt, merge_matching_firmware_response, mt76_pci_aspm_supported, mt7921_dma_rx, mt7921_dma_tx,
-    mt7921_packet_type, parse_clc_set_response, parse_download_response, parse_eeprom_block,
-    parse_mt7921_tx_free, parse_mt7921_tx_status, parse_nic_capability, prepare_global_rx_rings,
-    prepare_global_tx_rings, prepare_mcu_rx_ring, program_disabled_fwdl_ring,
-    read_dynamic_identity_status, reset_wfsys, retain_nonmatching_firmware_response,
-    round_trip_driver_ownership, route_mcu_rx_descriptor, select_vfio_irq,
-    stage_disabled_firmware_chunk,
+    mask_ack_disabled_fwdl_interrupt, merge_matching_firmware_response, mt76_pci_aspm_supported,
+    mt7921_dma_rx, mt7921_dma_tx, mt7921_packet_type, parse_download_response,
+    parse_mt7921_tx_free, parse_mt7921_tx_status, prepare_global_rx_rings, prepare_global_tx_rings,
+    prepare_mcu_rx_ring, program_disabled_fwdl_ring, read_dynamic_identity_status, reset_wfsys,
+    retain_nonmatching_firmware_response, round_trip_driver_ownership, route_mcu_rx_descriptor,
+    select_vfio_irq, stage_disabled_firmware_chunk,
+};
+use mt7921_production_client::{
+    FirmwareImageExpectation, Mt7921HardwareSessionConfig, VerifiedFirmwareImages,
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::client_device::{
@@ -99,18 +102,18 @@ use mt7921_softmac_adapter::client_device::{
     PinnedDriverError,
 };
 #[cfg(feature = "fuchsia-passive")]
+use mt7921_softmac_adapter::production_effects::{
+    LIVE_CLIENT_EVENT_MAX_BYTES, LiveClientAuthorization, LiveClientEffects, LiveClientEvent,
+    LiveClientObserver, association_comeback_interval, classify_client_data_frame,
+    classify_client_management_frame, classify_eapol_key, client_physical_channel,
+    eapol_start_frame, is_anchored_eapol_data, is_authenticator_m1, management_ie_id_lengths,
+    strip_verified_management_ccmp,
+};
+#[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
     LinuxChannelShape, Mt7921ProductionClient, Mt7921SoftmacAdapter, PassiveMechanicsEvent,
     PassivePrerequisites, SourceExactPassiveMechanics, SourceExactPassiveTransport,
     query_from_capabilities, set_channel_request,
-};
-#[cfg(feature = "fuchsia-passive")]
-use mt7921_softmac_adapter::production_effects::{
-    LIVE_CLIENT_EVENT_MAX_BYTES, LiveClientAuthorization, LiveClientEffects, LiveClientEvent,
-    LiveClientObserver, association_comeback_interval,
-    classify_client_data_frame, classify_client_management_frame, classify_eapol_key,
-    client_physical_channel, eapol_start_frame, is_anchored_eapol_data, is_authenticator_m1,
-    management_ie_id_lengths, strip_verified_management_ccmp,
 };
 #[cfg(feature = "fuchsia-passive")]
 use sha2::{Digest as _, Sha256};
@@ -235,8 +238,7 @@ fn render_live_client_event(
     direct_json: bool,
     monotonic_ns: u128,
 ) -> LiveClientOutput {
-    let message = message
-        .replace("{observer_monotonic_ns}", &monotonic_ns.to_string());
+    let message = message.replace("{observer_monotonic_ns}", &monotonic_ns.to_string());
     if direct_json {
         LiveClientOutput::Direct(message)
     } else {
@@ -588,7 +590,6 @@ impl Drop for NetstackChildGuard {
     }
 }
 
-
 #[cfg(feature = "fuchsia-passive")]
 fn prebind_socks_listener(address: SocketAddr) -> Result<TcpListener, String> {
     const SOCK_STREAM: i32 = 1;
@@ -730,7 +731,13 @@ fn spawn_netstack_child(
         listener: Some(listener),
         handshake: NetworkReadyHandshake::default(),
     };
-    drop((frame, frame_pass, listener_pass, bootstrap_pass, bootstrap_child));
+    drop((
+        frame,
+        frame_pass,
+        listener_pass,
+        bootstrap_pass,
+        bootstrap_child,
+    ));
     let bootstrap = child.bootstrap.as_mut().expect("bootstrap installed");
     let mut ready = [0u8; 5];
     bootstrap
@@ -857,9 +864,7 @@ fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_runtime_descriptors(
-    descriptors: &[(String, String)],
-) -> Result<(), String> {
+fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
     let mut base = [false; 5];
     let mut seen = Vec::new();
     for (name, target) in descriptors {
@@ -1399,7 +1404,8 @@ fn run_contained_dma_resource_round_trip(
         wfdma.write_active_wfdma(0xd4100, reset | 0x30)?;
         let dmashdl = active.dmashdl.as_ref().expect("mapped");
         let dmashdl_readback =
-            ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant { wfdma, dmashdl })?;
+            ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant { wfdma, dmashdl })
+                .map_err(|error| error.to_string())?;
         record_sae_stage(&format!(
             "dmashdl_invariant point=contained_dma_init_post_reset ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
             dmashdl_readback.ext0_before,
@@ -2210,10 +2216,7 @@ fn install_disable_msi0_on_device<B: Backend>(device: &Device<B>) -> Result<(), 
     Ok(())
 }
 
-fn open_typed_mt7921(
-    vfio: &str,
-    bdf: &str,
-) -> Result<(Device<LinuxVfio>, PciControl), String> {
+fn open_typed_mt7921(vfio: &str, bdf: &str) -> Result<(Device<LinuxVfio>, PciControl), String> {
     let config = format!("/sys/bus/pci/devices/{bdf}/config");
     let opened = LinuxVfio::open_pci_coherent(vfio, config)
         .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
@@ -2292,7 +2295,6 @@ fn fixed_mt7921_rate_power_capability() -> mt7921_port_spike::NicCapability {
     }
 }
 
-#[cfg(feature = "fuchsia-passive")]
 fn parse_sha256_hex(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64 {
         return Err("regulatory source SHA-256 length is invalid".into());
@@ -3761,14 +3763,13 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
             beacon_period: 100,
             capability_info: 0x11,
             ies: vec![
-                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12,
-                48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0,
-                0, 0x0f, 0xac, 2, 0, 0,
+                0, 4, b't', b'e', b's', b't', 1, 2, 0x8c, 0x12, 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1,
+                0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
                 // Production association shaping requires the AP's base HT
                 // and VHT capabilities before applying the device profile.
-                45, 26, 0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                191, 12, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0x20,
+                45, 26, 0xff, 0x09, 3, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 191, 12, 0xb2, 0x71, 0x80, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0,
+                0x20,
             ],
             primary: channel,
             bandwidth: ChannelBandwidth::Cbw80,
@@ -4075,19 +4076,21 @@ async fn run_sae_committed_fallback_self_test() -> Result<(), String> {
     let security = support.security.clone();
     let spectrum = support.spectrum_management.clone();
     let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
-    device.set_runtime_channel(
-        set_channel_request(
+    device
+        .set_runtime_channel(set_channel_request(
             channel,
             ChannelBandwidth::Cbw80,
             Some(ChannelNumber {
                 number: 0,
                 ..channel
             }),
-        ),
-    )
-    .map_err(|e| format!("self-test set channel: {e}"))?;
+        ))
+        .map_err(|e| format!("self-test set channel: {e}"))?;
     {
-        let secondary = ChannelNumber { number: 0, ..channel };
+        let secondary = ChannelNumber {
+            number: 0,
+            ..channel
+        };
         authorization
             .mark_rate_power_ready(peer, channel, ChannelBandwidth::Cbw80, secondary)
             .map_err(|e| format!("self-test ready: {e}"))?;
@@ -4821,6 +4824,9 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
     };
+    if operation == Operation::RunOneShotFirmware {
+        return run_production_firmware_bootstrap();
+    }
     let dmashdl_transition_diagnostic = match env::var("DRV_DMASHDL_TRANSITION_DIAGNOSTIC") {
         Err(env::VarError::NotPresent) => false,
         Ok(value) if value == "1" => true,
@@ -4925,16 +4931,13 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "fuchsia-passive")]
     if operation.uses_contained_transport_gate() {
         record_sae_stage(match operation {
-            Operation::RunOneShotFirmware => "vfio_firmware_process_started",
             Operation::RunOneShotPassiveChannel1 => "vfio_passive_process_started",
             _ => "process_enter",
         });
     }
     let contained_firmware_images = if matches!(
         operation,
-        Operation::RunOneShotFirmware
-            | Operation::RunOneShotPatchTableGate
-            | Operation::RunOneShotPassiveChannel1
+        Operation::RunOneShotPatchTableGate | Operation::RunOneShotPassiveChannel1
     ) {
         let patch = decompress_patch()?;
         let ram = decompress_ram()?;
@@ -6468,7 +6471,8 @@ fn run() -> Result<(), String> {
             let dmashdl_readback = ensure_linux_dmashdl_invariant(&mut VfioDmashdlInvariant {
                 wfdma: &wfdma,
                 dmashdl,
-            })?;
+            })
+            .map_err(|error| error.to_string())?;
             record_sae_stage(&format!(
                 "dmashdl_invariant point=linux_dma_init_post_reset ext0_before={:#010x} control_before={:#010x} ext0_after={:#010x} control_after={:#010x} attempts={} result=verified",
                 dmashdl_readback.ext0_before,
@@ -6616,14 +6620,6 @@ fn run() -> Result<(), String> {
             observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_disable_pcie_l0s")?;
             swdef.write_swdef_normal()?;
             observe_dmashdl_transition(dmashdl, &mut dmashdl_watcher, "host_swdef_normal")?;
-            if operation == Operation::RunOneShotFirmware {
-                println!(
-                    "{{\"firmware_bootstrap_event\":\"transport_ready\",\"bme\":true,\"wfdma_global\":\"{global:#010x}\",\"irq_mask\":\"{response_irq_mask:#010x}\",\"rings\":[\"fwdl_tx\",\"mcu_tx\",\"wm_rx\",\"wm2_rx\"]}}"
-                );
-                std::io::stdout().flush().map_err(|error| {
-                    format!("flush firmware transport-ready milestone: {error}")
-                })?;
-            }
             if operation.loads_firmware() {
                 let (patch_bytes, ram_bytes) = firmware_images
                     .as_ref()
@@ -6687,10 +6683,10 @@ fn run() -> Result<(), String> {
                     patch_gate: PatchTableGate::new(
                         operation == Operation::RunOneShotPatchTableGate,
                     ),
-                        uni_terminal_poisoned: false,
+                    uni_terminal_poisoned: false,
                     #[cfg(feature = "fuchsia-passive")]
                     client_interface: None,
-                            dmashdl,
+                    dmashdl,
                     dmashdl_watcher,
                     start: Instant::now(),
                 };
@@ -6698,28 +6694,9 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("parse patch for loader: {error:?}"))?;
                 let firmware = Firmware::parse(ram_bytes)
                     .map_err(|error| format!("parse RAM for loader: {error:?}"))?;
-                if operation == Operation::RunOneShotFirmware {
-                    println!(
-                        r#"{{"firmware_bootstrap_event":"begin","patch_version":"{:#010x}","patch_build":"{}","ram_version":"{}","ram_build":"{}","downloadable_regions":{}}}"#,
-                        patch.header.patch_version,
-                        String::from_utf8_lossy(patch.header.build_date).trim_end_matches('\0'),
-                        String::from_utf8_lossy(firmware.trailer.firmware_version)
-                            .trim_end_matches('\0'),
-                        String::from_utf8_lossy(firmware.trailer.build_date).trim_end_matches('\0'),
-                        firmware
-                            .regions()
-                            .filter(|region| region.is_downloadable())
-                            .count(),
-                    );
-                    std::io::stdout()
-                        .flush()
-                        .map_err(|error| format!("flush firmware bootstrap begin: {error}"))?;
-                }
                 #[cfg(feature = "fuchsia-passive")]
                 let result = if operation == Operation::RunOneShotPatchTableGate {
                     load_mt7921_patch_bootstrap(&mut loader, patch, firmware)
-                } else if operation == Operation::RunOneShotFirmware {
-                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
                 } else if operation == Operation::RunOneShotPassivePrepare {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
@@ -7193,21 +7170,20 @@ fn run() -> Result<(), String> {
                                                 as u8
                                         })
                                         .ok_or("target BSS was not retained")?;
-                                    let (mut effects, mut authorization) =
-                                        LiveClientEffects::new(
-                                            selection,
-                                            power_target.as_ref().expect("SAE target").0,
-                                            power_target.as_ref().expect("SAE target").3.bytes(),
-                                            target_rcpi,
-                                            client_dtim_period(
-                                                &target_bss
-                                                    .as_ref()
-                                                    .ok_or("target BSS was not retained")?
-                                                    .ies,
-                                            )?,
-                                            Some((0x0015, 0x3fc0)),
-                                            live_client_observer(),
-                                        );
+                                    let (mut effects, mut authorization) = LiveClientEffects::new(
+                                        selection,
+                                        power_target.as_ref().expect("SAE target").0,
+                                        power_target.as_ref().expect("SAE target").3.bytes(),
+                                        target_rcpi,
+                                        client_dtim_period(
+                                            &target_bss
+                                                .as_ref()
+                                                .ok_or("target BSS was not retained")?
+                                                .ies,
+                                        )?,
+                                        Some((0x0015, 0x3fc0)),
+                                        live_client_observer(),
+                                    );
                                     let mut query =
                                         query_from_capabilities(report.nic_capability, &candidates);
                                     query.sta_addr =
@@ -7256,15 +7232,17 @@ fn run() -> Result<(), String> {
                                     // source-exact width transition while the passive
                                     // phase still permits CHANNEL_SWITCH; ClientMlme's
                                     // later replay must resolve to this same context.
-                                    device.set_runtime_channel(set_channel_request(
+                                    device
+                                        .set_runtime_channel(set_channel_request(
                                             bss.primary,
                                             bss.bandwidth,
                                             Some(bss.vht_secondary_80_channel),
-                                        ),
-                                    )
-                                    .map_err(|status| {
-                                        format!("DeviceOps target channel context failed: {status}")
-                                    })?;
+                                        ))
+                                        .map_err(|status| {
+                                            format!(
+                                                "DeviceOps target channel context failed: {status}"
+                                            )
+                                        })?;
                                     runner.with_physical(|adapter| {
                                         adapter.with_transport_mut(|transport| {
                                             let mechanics = transport.mechanics_mut();
@@ -7351,9 +7329,9 @@ fn run() -> Result<(), String> {
                                     record_sae_stage(
                                         "pinned_sme_connected association=true key_install=true controlled_port=true",
                                     );
-                                    let ethernet_device = client
-                                        .take_ethernet_device()
-                                        .ok_or("controlled-port UP did not publish Ethernet capability")?;
+                                    let ethernet_device = client.take_ethernet_device().ok_or(
+                                        "controlled-port UP did not publish Ethernet capability",
+                                    )?;
                                     let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
                                         .map_err(|_| "DRV_SOCKS5_LISTEN is required")?
                                         .parse()
@@ -7533,8 +7511,6 @@ fn run() -> Result<(), String> {
                 #[cfg(not(feature = "fuchsia-passive"))]
                 let result = if operation == Operation::RunOneShotPatchTableGate {
                     load_mt7921_patch_bootstrap(&mut loader, patch, firmware)
-                } else if operation == Operation::RunOneShotFirmware {
-                    load_mt7921_firmware_bootstrap(&mut loader, patch, firmware)
                 } else if operation == Operation::RunOneShotChannelDomain {
                     load_mt7921_firmware_through_channel_domain(&mut loader, patch, firmware)
                 } else {
@@ -7542,21 +7518,6 @@ fn run() -> Result<(), String> {
                 };
                 let report =
                     result.map_err(|error| format!("one-shot firmware loader: {error:?}"))?;
-                if operation == Operation::RunOneShotFirmware {
-                    println!(
-                        r#"{{"firmware_bootstrap_event":"n9_ready_and_capability_response","download_ready":{},"patch":"{:?}","patch_sections":{},"ram_regions":{},"scatter_chunks":{},"scatter_bytes":{},"capability_elements":{},"eeprom_read":false,"calibration":false,"radio":false}}"#,
-                        report.download_ready_observed,
-                        report.patch,
-                        report.patch_sections,
-                        report.ram_regions,
-                        report.scatter_chunks,
-                        report.scatter_bytes,
-                        report.nic_capability.element_count,
-                    );
-                    std::io::stdout().flush().map_err(|error| {
-                        format!("flush firmware bootstrap ready milestone: {error}")
-                    })?;
-                }
                 println!("{{\"active_fwdl_report\":\"{report:?}\"}}");
                 return Ok(());
             }
@@ -10682,79 +10643,6 @@ fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
     }
 }
 
-fn classify_mcu_completion(
-    command: DownloadCommand,
-    response: &ReceivedMcuResponse,
-) -> Result<FirmwareCommandCompletion, String> {
-    match command {
-        DownloadCommand::PatchSemaphoreGet | DownloadCommand::PatchSemaphoreRelease => {
-            if response.event_id != 0x04 {
-                return Err(format!(
-                    "patch semaphore response event was {:#04x}, expected 0x04",
-                    response.event_id
-                ));
-            }
-            let result = response
-                .bytes
-                .get(32)
-                .copied()
-                .ok_or("patch semaphore response omitted result")?;
-            Ok(FirmwareCommandCompletion::PatchSemaphore(result.into()))
-        }
-        DownloadCommand::PatchFinish => {
-            let status = response
-                .bytes
-                .get(32)
-                .copied()
-                .ok_or("patch finish response omitted status")?;
-            Ok(FirmwareCommandCompletion::PatchFinish(status))
-        }
-        DownloadCommand::PatchStart { .. }
-        | DownloadCommand::TargetAddressLength { .. }
-        | DownloadCommand::EepromBufferMode
-        | DownloadCommand::ProtectControl
-        | DownloadCommand::FirmwareStart { .. } => Ok(FirmwareCommandCompletion::Ack),
-        DownloadCommand::GetNicCapability => {
-            let body = response
-                .bytes
-                .get(36..)
-                .ok_or("NIC capability response omitted MCU header")?;
-            let capability = parse_nic_capability(body)
-                .map_err(|error| format!("parse NIC capability response: {error:?}"))?;
-            Ok(FirmwareCommandCompletion::NicCapability(capability))
-        }
-        DownloadCommand::ReadEepromBlock { address } => {
-            let body = response
-                .bytes
-                .get(36..)
-                .ok_or("EEPROM response omitted MCU header")?;
-            let block = parse_eeprom_block(body, address)
-                .map_err(|error| format!("parse EEPROM response: {error:?}"))?;
-            Ok(FirmwareCommandCompletion::EepromBlock(block))
-        }
-        DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost => {
-            Err("no-response command unexpectedly requested RX classification".into())
-        }
-    }
-}
-
-fn classify_clc_response(response: &ReceivedMcuResponse) -> Result<ClcSetResponse, String> {
-    if response.event_id != 0x80 {
-        return Err(format!(
-            "SET_CLC response event was {:#04x}, expected 0x80",
-            response.event_id
-        ));
-    }
-    if response.option & (1 << 2) != 0 {
-        return Err("SET_CLC response was marked as an unsolicited event".into());
-    }
-    let body = response
-        .bytes
-        .get(36..)
-        .ok_or("SET_CLC response omitted MCU header")?;
-    parse_clc_set_response(body).map_err(|error| format!("parse SET_CLC response: {error:?}"))
-}
-
 const fn next_dma_index(index: usize, count: usize) -> usize {
     (index + 1) % count
 }
@@ -10829,13 +10717,14 @@ fn drain_rx_queue(
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             let completed_index = queue.rx_tail;
             let response_len = ((descriptor.ctrl >> 16) & 0x3fff) as usize;
-            let response = if descriptor.ctrl & (1 << 30) != 0
-                && (12..=2048).contains(&response_len)
-            {
-                queue.rx_buffers.read_bytes(completed_index * 2048, response_len)?
-            } else {
-                Vec::new()
-            };
+            let response =
+                if descriptor.ctrl & (1 << 30) != 0 && (12..=2048).contains(&response_len) {
+                    queue
+                        .rx_buffers
+                        .read_bytes(completed_index * 2048, response_len)?
+                } else {
+                    Vec::new()
+                };
             let routed = route_mcu_rx_descriptor(
                 queue.rx_ring_index as u8,
                 completed_index as u16,
@@ -10850,9 +10739,12 @@ fn drain_rx_queue(
                     bytes,
                 )? {
                     PrivateFrameSeal::Carried(frame) => Ok(DrainedMcuRx::Normal(frame)),
-                    PrivateFrameSeal::Uncovered(bytes) => Ok(DrainedMcuRx::Normal(
-                        PrivateRawFrameCarrier { bytes, occurrence: None },
-                    )),
+                    PrivateFrameSeal::Uncovered(bytes) => {
+                        Ok(DrainedMcuRx::Normal(PrivateRawFrameCarrier {
+                            bytes,
+                            occurrence: None,
+                        }))
+                    }
                 },
                 Ok(McuRxRoute::TxFree(completion)) => {
                     provenance.consume_without_mint(
@@ -10878,7 +10770,10 @@ fn drain_rx_queue(
                         queue.rx_ring_index,
                         completed_index,
                     );
-                    Ok(DrainedMcuRx::Response(Some(firmware.response), firmware.bytes))
+                    Ok(DrainedMcuRx::Response(
+                        Some(firmware.response),
+                        firmware.bytes,
+                    ))
                 }
                 Err(error) => {
                     provenance.consume_without_mint(
@@ -10887,8 +10782,12 @@ fn drain_rx_queue(
                         completed_index,
                     );
                     let reason = match error.parser {
-                        McuRxParserKind::NotEndOfPacket => "fragmented MCU RX descriptor is unsupported",
-                        McuRxParserKind::DescriptorLength => "invalid MCU response descriptor length",
+                        McuRxParserKind::NotEndOfPacket => {
+                            "fragmented MCU RX descriptor is unsupported"
+                        }
+                        McuRxParserKind::DescriptorLength => {
+                            "invalid MCU response descriptor length"
+                        }
                         McuRxParserKind::BufferTruncated => "truncated MCU RX buffer",
                         McuRxParserKind::TxFree => "parse TX_FREE",
                         McuRxParserKind::TxStatus => "parse TXS",
@@ -10953,7 +10852,10 @@ fn drain_rx_queue(
             };
             if classify_firmware_rx(expected_sequence, &parsed) == FirmwareRxDisposition::Matched {
                 merge_matching_firmware_response(&mut matched, Some(routed)).map_err(|_| {
-                    format!("duplicate MCU sequence {} on RX ring {}", parsed.sequence, queue.rx_ring_index)
+                    format!(
+                        "duplicate MCU sequence {} on RX ring {}",
+                        parsed.sequence, queue.rx_ring_index
+                    )
                 })?;
                 println!(
                     "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{},\"rx_descriptor\":{completed_index}}}}}",
@@ -10993,7 +10895,10 @@ impl McuRxIrqExecutionError {
     fn into_string(self) -> String {
         match self.cause {
             McuRxIrqExecutionCause::Physical(error) => {
-                format!("MCU RX IRQ physical failure ({:?}): {error}", self.mask_state)
+                format!(
+                    "MCU RX IRQ physical failure ({:?}): {error}",
+                    self.mask_state
+                )
             }
             McuRxIrqExecutionCause::State(McuRxIrqMachineError::DuplicateMatch) => {
                 "matching MCU sequence appeared on both receive rings".into()
@@ -11023,10 +10928,7 @@ enum McuRxIrqExecution {
     Complete(McuRxIrqTerminal),
 }
 
-fn irq_action_failure(
-    machine: &mut McuRxIrqMachine,
-    error: String,
-) -> McuRxIrqExecutionError {
+fn irq_action_failure(machine: &mut McuRxIrqMachine, error: String) -> McuRxIrqExecutionError {
     McuRxIrqExecutionError {
         mask_state: machine.discard(),
         cause: McuRxIrqExecutionCause::Physical(error),
@@ -11050,7 +10952,8 @@ fn execute_mcu_rx_irq_actions(
     let Some(count) = ops.poll().map_err(|error| McuRxIrqExecutionError {
         mask_state: McuRxMaskState::Unknown,
         cause: McuRxIrqExecutionCause::Physical(error),
-    })? else {
+    })?
+    else {
         return Ok(McuRxIrqExecution::NoInterrupt);
     };
     let mut machine = McuRxIrqMachine::begin(topology);
@@ -11348,7 +11251,6 @@ impl VfioFirmwareLoader<'_> {
         let next = next_dma_index(descriptor_index, MCU_TX_RING_COUNT);
         self.publish_candidate_mcu_bytes(&encoded, sequence, descriptor_index)?;
 
-
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         loop {
             self.mcu.cancelled()?;
@@ -11505,10 +11407,10 @@ impl VfioFirmwareLoader<'_> {
                 .write_active_wfdma(0xd4204, self.mcu.rx_irq_mask())?;
             publication.begin().expect("fresh publication state");
             self.publish_candidate_mcu_bytes(&encoded, sequence, descriptor_index)
-            .map_err(|error| {
-                self.uni_terminal_poisoned = true;
-                format!("unacknowledged UNI publication failed: {error}")
-            })?;
+                .map_err(|error| {
+                    self.uni_terminal_poisoned = true;
+                    format!("unacknowledged UNI publication failed: {error}")
+                })?;
             publication.published().expect("publication completed");
 
             let deadline = Instant::now() + std::time::Duration::from_secs(1);
@@ -12036,31 +11938,68 @@ fn prepare_loader_rx_side_effects(
     let parsed = match routed {
         Ok(McuRxRoute::Normal(bytes)) => {
             let frame = match provenance.seal_frame(
-                DescriptorOccurrenceRoute::McuNormalRx, ring_index, usize::from(slot), bytes.clone(),
+                DescriptorOccurrenceRoute::McuNormalRx,
+                ring_index,
+                usize::from(slot),
+                bytes.clone(),
             )? {
                 PrivateFrameSeal::Carried(frame) => frame,
-                PrivateFrameSeal::Uncovered(bytes) => PrivateRawFrameCarrier { bytes, occurrence: None },
+                PrivateFrameSeal::Uncovered(bytes) => PrivateRawFrameCarrier {
+                    bytes,
+                    occurrence: None,
+                },
             };
             Ok(DrainedMcuRx::Normal(frame))
         }
         Ok(McuRxRoute::TxFree(completion)) => {
-            provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, ring_index, usize::from(slot));
-            Ok(DrainedMcuRx::Completion(MgmtTxCompletion::Free(*completion), raw.to_vec()))
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                ring_index,
+                usize::from(slot),
+            );
+            Ok(DrainedMcuRx::Completion(
+                MgmtTxCompletion::Free(*completion),
+                raw.to_vec(),
+            ))
         }
         Ok(McuRxRoute::TxStatus(completion)) => {
-            provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, ring_index, usize::from(slot));
-            Ok(DrainedMcuRx::Completion(MgmtTxCompletion::Status(*completion), raw.to_vec()))
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                ring_index,
+                usize::from(slot),
+            );
+            Ok(DrainedMcuRx::Completion(
+                MgmtTxCompletion::Status(*completion),
+                raw.to_vec(),
+            ))
         }
         Ok(McuRxRoute::Firmware(response)) => {
-            provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, ring_index, usize::from(slot));
-            Ok(DrainedMcuRx::Response(Some(response.response), response.bytes.clone()))
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                ring_index,
+                usize::from(slot),
+            );
+            Ok(DrainedMcuRx::Response(
+                Some(response.response),
+                response.bytes.clone(),
+            ))
         }
         Err(error) => {
-            provenance.consume_without_mint(DescriptorOccurrenceRoute::McuNormalRx, ring_index, usize::from(slot));
-            Err(format!("route MCU RX descriptor: ring={} slot={} parser={:?}", error.ring, error.slot, error.parser))
+            provenance.consume_without_mint(
+                DescriptorOccurrenceRoute::McuNormalRx,
+                ring_index,
+                usize::from(slot),
+            );
+            Err(format!(
+                "route MCU RX descriptor: ring={} slot={} parser={:?}",
+                error.ring, error.slot, error.parser
+            ))
         }
     };
-    if pending.replace((parsed, disposition, ring_index, slot)).is_some() {
+    if pending
+        .replace((parsed, disposition, ring_index, slot))
+        .is_some()
+    {
         return Err("shared loader RX side effect overlapped".into());
     }
     Ok(())
@@ -12074,29 +12013,51 @@ fn complete_loader_rx_side_effects(
     tx_completions: &mut Vec<MgmtTxCompletion>,
     pending: &mut Option<PendingLoaderRx>,
 ) -> Result<(), String> {
-    let (parsed, disposition, ring_index, slot) = pending.take().ok_or("shared loader RX completion omitted prepared route")?;
+    let (parsed, disposition, ring_index, slot) = pending
+        .take()
+        .ok_or("shared loader RX completion omitted prepared route")?;
     match parsed {
         Ok(DrainedMcuRx::Normal(frame)) => {
-            println!("{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{ring_index},\"rx_descriptor\":{slot},\"length\":{}}}", frame.bytes.len());
+            println!(
+                "{{\"active_mcu_event\":\"normal_rx_routed\",\"rx_ring\":{ring_index},\"rx_descriptor\":{slot},\"length\":{}}}",
+                frame.bytes.len()
+            );
             enqueue_client_rx_backlog(provenance, normal_rx_frames, frame)?;
         }
         Ok(DrainedMcuRx::Completion(completion, raw)) => {
             record_management_completion_received("mcu_normal", &raw, completion);
-            record_sae_stage(&format!("management_tx_completion_routed rx_ring={ring_index} completion={completion:?}"));
+            record_sae_stage(&format!(
+                "management_tx_completion_routed rx_ring={ring_index} completion={completion:?}"
+            ));
             tx_completions.push(completion);
         }
         Ok(DrainedMcuRx::Response(Some(response), raw)) => {
-            if disposition != Some(FirmwareRxDisposition::Matched) && retain_nonmatching_firmware_response(&response) {
-                unsolicited.push(ReceivedMcuResponse { event_id: response.event_id, option: response.option, bytes: raw });
+            if disposition != Some(FirmwareRxDisposition::Matched)
+                && retain_nonmatching_firmware_response(&response)
+            {
+                unsolicited.push(ReceivedMcuResponse {
+                    event_id: response.event_id,
+                    option: response.option,
+                    bytes: raw,
+                });
             }
             if disposition == Some(FirmwareRxDisposition::Matched) {
-                println!("{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{ring_index},\"rx_descriptor\":{slot}}}}}", response.sequence, response.event_id, response.length);
+                println!(
+                    "{{\"active_mcu_response\":{{\"sequence\":{},\"event_id\":{},\"length\":{},\"rx_ring\":{ring_index},\"rx_descriptor\":{slot}}}}}",
+                    response.sequence, response.event_id, response.length
+                );
             } else {
-                println!("{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{ring_index},\"rx_descriptor\":{slot}}}", response.sequence, response.event_id);
+                println!(
+                    "{{\"active_mcu_event\":\"unrelated_rx_drained\",\"sequence\":{},\"event_id\":{},\"rx_ring\":{ring_index},\"rx_descriptor\":{slot}}}",
+                    response.sequence, response.event_id
+                );
             }
         }
         Ok(DrainedMcuRx::Response(None, _)) => {}
-        Err(error) => { provenance.invalidate(DescriptorInvalidation::Run)?; return Err(error); }
+        Err(error) => {
+            provenance.invalidate(DescriptorInvalidation::Run)?;
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -12230,10 +12191,11 @@ impl LoaderMechanicsTransport for VfioLoaderEffects<'_, '_> {
                 .as_ref()
                 .ok_or("WM2 receive ring is unavailable")?,
         };
-        bytes.copy_from_slice(&queue.rx_buffers.read_bytes(
-            usize::from(slot) * MT7921_MCU_RX_BUFFER_BYTES,
-            bytes.len(),
-        )?);
+        bytes.copy_from_slice(
+            &queue
+                .rx_buffers
+                .read_bytes(usize::from(slot) * MT7921_MCU_RX_BUFFER_BYTES, bytes.len())?,
+        );
         Ok(())
     }
     fn rx_buffer_address(&self, ring: McuRxIrqRing, slot: u16) -> Result<u64, Self::Error> {
@@ -12269,7 +12231,9 @@ impl LoaderMechanicsTransport for VfioLoaderEffects<'_, '_> {
                 .as_mut()
                 .ok_or("WM2 receive ring is unavailable")?,
         };
-        queue.rx_ring.write_descriptor_at(usize::from(slot), descriptor);
+        queue
+            .rx_ring
+            .write_descriptor_at(usize::from(slot), descriptor);
         Ok(())
     }
     fn publish_rx_producer(
@@ -12287,7 +12251,8 @@ impl LoaderMechanicsTransport for VfioLoaderEffects<'_, '_> {
                 .ok_or("WM2 receive ring is unavailable")?,
         };
         queue.rx_head = next_dma_index(queue.rx_head, queue.rx_count);
-        let result = self.loader
+        let result = self
+            .loader
             .mcu
             .wfdma
             .write_rx_cpu_index(queue.rx_ring_index, u32::from(producer));
@@ -12322,7 +12287,13 @@ impl LoaderMechanicsTransport for VfioLoaderEffects<'_, '_> {
             let completed_total = if ring == McuRxIrqRing::Wm {
                 &mut self.loader.mcu.wm.completed_total
             } else {
-                &mut self.loader.mcu.wm2.as_mut().ok_or("WM2 receive ring is unavailable")?.completed_total
+                &mut self
+                    .loader
+                    .mcu
+                    .wm2
+                    .as_mut()
+                    .ok_or("WM2 receive ring is unavailable")?
+                    .completed_total
             };
             prepare_loader_rx_side_effects(
                 completed_total,
@@ -12447,7 +12418,9 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             command,
             DownloadCommand::NicPowerControl | DownloadCommand::FirmwareLogToHost
         );
-        let deadline = self.now_ms().saturating_add(if response { 3_000 } else { 1_000 });
+        let deadline = self
+            .now_ms()
+            .saturating_add(if response { 3_000 } else { 1_000 });
         let completion = self.shared_loader(|mechanics, effects| {
             mechanics.execute_reserved_template(
                 effects,
@@ -12465,28 +12438,40 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         let completion = match completion {
             LoaderCompletion::Response(response) => classify_mcu_completion(
                 command,
-                &ReceivedMcuResponse {
+                McuResponse {
                     event_id: response.response.event_id,
                     option: response.response.option,
-                    bytes: response.bytes,
+                    bytes: &response.bytes,
                 },
-            )?,
+            )
+            .map_err(|error| error.to_string())?,
             LoaderCompletion::NoResponse => FirmwareCommandCompletion::NoResponse,
         };
         if command == DownloadCommand::PatchSemaphoreRelease {
             self.capture_patch_table_snapshot("post_release_before_ram")?;
         }
         self.record_patch_gate_command(command, sequence, encoded)?;
-        if matches!(command, DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl) {
+        if matches!(
+            command,
+            DownloadCommand::EepromBufferMode | DownloadCommand::ProtectControl
+        ) {
             let (name, cid, payload) = match command {
                 DownloadCommand::EepromBufferMode => ("eeprom_buffer_mode", "0x21ed", "01000000"),
-                DownloadCommand::ProtectControl => ("protect_control", "0x3eed", "010000002b09000002000000"),
+                DownloadCommand::ProtectControl => {
+                    ("protect_control", "0x3eed", "010000002b09000002000000")
+                }
                 _ => unreachable!(),
             };
-            println!("{{\"firmware_bootstrap_transcript\":\"{name}\",\"cid\":\"{cid}\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"{payload}\",\"wait_response\":true}}", encoded.len());
+            println!(
+                "{{\"firmware_bootstrap_transcript\":\"{name}\",\"cid\":\"{cid}\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"{payload}\",\"wait_response\":true}}",
+                encoded.len()
+            );
         }
         if command == DownloadCommand::FirmwareLogToHost {
-            println!("{{\"firmware_bootstrap_transcript\":\"firmware_log_to_host\",\"cid\":\"0x400c5\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"01000000\",\"wait_response\":false}}", encoded.len());
+            println!(
+                "{{\"firmware_bootstrap_transcript\":\"firmware_log_to_host\",\"cid\":\"0x400c5\",\"sequence\":{sequence},\"bytes\":{},\"payload_raw\":\"01000000\",\"wait_response\":false}}",
+                encoded.len()
+            );
         }
         self.observe_dmashdl(format!("firmware_command_{command:?}"))?;
         let milestone = match command {
@@ -12501,7 +12486,9 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         };
         if let Some(event) = milestone {
             println!("{{\"firmware_bootstrap_event\":\"{event}\",\"sequence\":{sequence}}}");
-            std::io::stdout().flush().map_err(|error| format!("flush firmware command milestone: {error}"))?;
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush firmware command milestone: {error}"))?;
         }
         Ok(completion)
     }
@@ -12521,23 +12508,43 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
             self.mcu.verify_and_record_post_n9_dual_rx()?;
         }
         let response_expected = command.expects_response();
-        let deadline = self.now_ms().saturating_add(if response_expected { 3_000 } else { 1_000 });
-        let completion = self.shared_loader(|mechanics, effects| mechanics.execute_reserved_template(
-            effects, &mut (), sequence, encoded,
-            if response_expected { LoaderCommandCompletion::Response } else { LoaderCommandCompletion::NoResponse },
-            deadline,
-        ))?;
+        let deadline = self
+            .now_ms()
+            .saturating_add(if response_expected { 3_000 } else { 1_000 });
+        let completion = self.shared_loader(|mechanics, effects| {
+            mechanics.execute_reserved_template(
+                effects,
+                &mut (),
+                sequence,
+                encoded,
+                if response_expected {
+                    LoaderCommandCompletion::Response
+                } else {
+                    LoaderCommandCompletion::NoResponse
+                },
+                deadline,
+            )
+        })?;
         let response = match completion {
-            LoaderCompletion::Response(response) => Some(classify_clc_response(&ReceivedMcuResponse {
-                event_id: response.response.event_id,
-                option: response.response.option,
-                bytes: response.bytes,
-            })?),
+            LoaderCompletion::Response(response) => Some(
+                classify_clc_response(McuResponse {
+                    event_id: response.response.event_id,
+                    option: response.response.option,
+                    bytes: &response.bytes,
+                })
+                .map_err(|error| error.to_string())?,
+            ),
             LoaderCompletion::NoResponse => None,
         };
         self.observe_dmashdl(format!("firmware_clc_rule_{}", command.index))?;
-        println!("{{\"firmware_bootstrap_event\":\"clc_calibration_configured\",\"sequence\":{sequence},\"rule_index\":{},\"response\":{}}}", command.index, response.is_some());
-        std::io::stdout().flush().map_err(|error| format!("flush CLC/calibration milestone: {error}"))?;
+        println!(
+            "{{\"firmware_bootstrap_event\":\"clc_calibration_configured\",\"sequence\":{sequence},\"rule_index\":{},\"response\":{}}}",
+            command.index,
+            response.is_some()
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush CLC/calibration milestone: {error}"))?;
         Ok(response)
     }
 
@@ -12549,15 +12556,29 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
     ) -> Result<(), Self::Error> {
         self.ensure_mcu_tx_allowed()?;
         self.mcu.cancelled()?;
-        if command.alpha2 != *b"00" || !command.indoor || command.special_unii_mask != 0 || command.channels.is_empty() {
+        if command.alpha2 != *b"00"
+            || !command.indoor
+            || command.special_unii_mask != 0
+            || command.channels.is_empty()
+        {
             return Err("SET_CHAN_DOMAIN escaped the world/indoor mask-zero allowlist".into());
         }
         let deadline = self.now_ms().saturating_add(1_000);
-        self.shared_loader(|mechanics, effects| mechanics.execute_reserved_template(
-            effects, &mut (), sequence, encoded, LoaderCommandCompletion::NoResponse, deadline,
-        ))?;
+        self.shared_loader(|mechanics, effects| {
+            mechanics.execute_reserved_template(
+                effects,
+                &mut (),
+                sequence,
+                encoded,
+                LoaderCommandCompletion::NoResponse,
+                deadline,
+            )
+        })?;
         self.observe_dmashdl("firmware_channel_domain")?;
-        println!("{{\"active_mcu_event\":\"set_channel_domain_tx_complete\",\"sequence\":{sequence},\"channels\":{}}}", command.channels.len());
+        println!(
+            "{{\"active_mcu_event\":\"set_channel_domain_tx_complete\",\"sequence\":{sequence},\"channels\":{}}}",
+            command.channels.len()
+        );
         Ok(())
     }
 
@@ -12570,17 +12591,28 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         self.mcu.cancelled()?;
         if self.patch_gate.enabled {
             let expected_sequence = ((2 + self.patch_gate.scatters) % 15) + 1;
-            if self.patch_gate.stage != 2 || part != FirmwareImagePart::Patch || self.patch_gate.scatters >= 23 || sequence != expected_sequence {
-                return Err(format!("patch-table scatter mismatch: stage={} part={part:?} count={} sequence={sequence} expected_sequence={expected_sequence}", self.patch_gate.stage, self.patch_gate.scatters));
+            if self.patch_gate.stage != 2
+                || part != FirmwareImagePart::Patch
+                || self.patch_gate.scatters >= 23
+                || sequence != expected_sequence
+            {
+                return Err(format!(
+                    "patch-table scatter mismatch: stage={} part={part:?} count={} sequence={sequence} expected_sequence={expected_sequence}",
+                    self.patch_gate.stage, self.patch_gate.scatters
+                ));
             }
         }
         let descriptor = self.loader_mechanics.fwdl_producer();
-        self.shared_loader(|mechanics, effects| mechanics.publish_reserved_scatter(
-            effects, &mut (), part, sequence, chunk,
-        ))?;
+        self.shared_loader(|mechanics, effects| {
+            mechanics.publish_reserved_scatter(effects, &mut (), part, sequence, chunk)
+        })?;
         self.observe_dmashdl(format!("firmware_{part:?}_scatter_publish_{sequence}"))?;
-        println!(r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor},"bytes":{}}}"#, chunk.len());
-        self.patch_gate.record_scatter(part, sequence, chunk.len())?;
+        println!(
+            r#"{{"active_fwdl_event":"scatter_published","part":"{part:?}","sequence":{sequence},"descriptor":{descriptor},"bytes":{}}}"#,
+            chunk.len()
+        );
+        self.patch_gate
+            .record_scatter(part, sequence, chunk.len())?;
         Ok(())
     }
 
@@ -12590,11 +12622,13 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
         sequence: u8,
         deadline_ms: u64,
     ) -> Result<(), Self::Error> {
-        self.shared_loader(|mechanics, effects| mechanics.complete_scatter(
-            effects, &mut (), part, sequence, deadline_ms,
-        ))?;
+        self.shared_loader(|mechanics, effects| {
+            mechanics.complete_scatter(effects, &mut (), part, sequence, deadline_ms)
+        })?;
         self.observe_dmashdl(format!("firmware_{part:?}_scatter_complete_{sequence}"))?;
-        println!(r#"{{"active_fwdl_event":"scatter_completed","part":"{part:?}","sequence":{sequence}}}"#);
+        println!(
+            r#"{{"active_fwdl_event":"scatter_completed","part":"{part:?}","sequence":{sequence}}}"#
+        );
         Ok(())
     }
 
@@ -12624,10 +12658,11 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
 
     fn patch_release_boundary(&mut self) -> Result<(), Self::Error> {
         let page = self.patch_table_page;
-        self.patch_gate.release_boundary(self.loader_mechanics.sequence(), |offset| {
-            page.ok_or_else(|| "patch-table gate omitted TMAC BAR page".to_string())?
-                .read(offset)
-        })
+        self.patch_gate
+            .release_boundary(self.loader_mechanics.sequence(), |offset| {
+                page.ok_or_else(|| "patch-table gate omitted TMAC BAR page".to_string())?
+                    .read(offset)
+            })
     }
 
     fn now_ms(&self) -> u64 {
@@ -15022,8 +15057,8 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         }
         let sequence = self.loader.loader_mechanics.sequence() % 15 + 1;
         self.active_join_roc = None;
-        let command = encode_client_join_roc_abort(sequence, 0, token)
-            .map_err(|_| zx::Status::IO)?;
+        let command =
+            encode_client_join_roc_abort(sequence, 0, token).map_err(|_| zx::Status::IO)?;
         self.loader.send_unacknowledged_uni_command(0x27, &command).map_err(|(error, _)| {
             record_sae_stage(&format!("join_roc_abort result=error token={token} generation={generation} reason={error}"));
             zx::Status::IO
@@ -15747,9 +15782,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                             self.data.irq_bit,
                         )
                         .map_err(|error| {
-                            PhysicalPassiveError(format!(
-                                "invalid data RX IRQ topology: {error:?}"
-                            ))
+                            PhysicalPassiveError(format!("invalid data RX IRQ topology: {error:?}"))
                         })?,
                     ));
                     self.loader
@@ -16381,70 +16414,14 @@ fn observe_dmashdl_transition(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DmashdlInvariantReadback {
-    ext0_before: u32,
-    control_before: u32,
-    ext0_after: u32,
-    control_after: u32,
-    attempts: u8,
-}
-
-trait DmashdlInvariantIo {
-    fn read_ext0(&mut self) -> Result<u32, String>;
-    fn write_ext0(&mut self, value: u32) -> Result<(), String>;
-    fn read_control(&mut self) -> Result<u32, String>;
-    fn write_control(&mut self, value: u32) -> Result<(), String>;
-}
-
-fn ensure_linux_dmashdl_invariant(
-    io: &mut impl DmashdlInvariantIo,
-) -> Result<DmashdlInvariantReadback, String> {
-    let ext0_before = io.read_ext0()?;
-    let control_before = io.read_control()?;
-    if ext0_before == u32::MAX || control_before == u32::MAX {
-        return Err("DMASHDL invariant read returned all ones".into());
-    }
-    let mut ext0_after = ext0_before;
-    let mut control_after = control_before;
-    let mut attempts = 0;
-    while ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0 || control_after & DMASHDL_BYPASS == 0 {
-        if attempts == 2 {
-            return Err(format!(
-                "DMASHDL invariant did not latch ext0={ext0_after:#010x} control={control_after:#010x}"
-            ));
-        }
-        attempts += 1;
-        if ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0 {
-            io.write_ext0(ext0_after & !WFDMA_TX_DMASHDL_ENABLE)?;
-        }
-        if control_after & DMASHDL_BYPASS == 0 {
-            io.write_control(control_after | DMASHDL_BYPASS)?;
-        }
-        // A BAR read flushes the preceding posted PCIe write. Linux performs
-        // this idempotent RMW while DMA is disabled; one retry is safe at the
-        // same lifecycle point and catches an unlatched first publication.
-        ext0_after = io.read_ext0()?;
-        control_after = io.read_control()?;
-        if ext0_after == u32::MAX || control_after == u32::MAX {
-            return Err("DMASHDL invariant readback returned all ones".into());
-        }
-    }
-    Ok(DmashdlInvariantReadback {
-        ext0_before,
-        control_before,
-        ext0_after,
-        control_after,
-        attempts,
-    })
-}
-
 struct VfioDmashdlInvariant<'a> {
     wfdma: &'a ReadPage,
     dmashdl: &'a ReadPage,
 }
 
 impl DmashdlInvariantIo for VfioDmashdlInvariant<'_> {
+    type Error = String;
+
     fn read_ext0(&mut self) -> Result<u32, String> {
         self.wfdma.read(WFDMA_GLO_CFG_EXT0)
     }
@@ -17059,9 +17036,7 @@ impl Operation {
     fn uses_contained_transport_gate(self) -> bool {
         matches!(
             self,
-            Self::RunOneShotFirmware
-                | Self::RunOneShotPatchTableGate
-                | Self::RunOneShotPassiveChannel1
+            Self::RunOneShotPatchTableGate | Self::RunOneShotPassiveChannel1
         )
     }
 
@@ -17119,9 +17094,7 @@ impl Operation {
     fn loads_firmware(self) -> bool {
         matches!(
             self,
-            Self::RunOneShotFirmware
-                | Self::RunOneShotPatchTableGate
-                | Self::RunOneShotChannelDomain
+            Self::RunOneShotPatchTableGate | Self::RunOneShotChannelDomain
         ) || self.is_passive()
     }
 
@@ -17140,7 +17113,6 @@ impl Operation {
                 | Self::MaskAckDisabledFwdl
                 | Self::PrepareOwnedGlobalTxRings
                 | Self::QueryPatchSemaphore
-                | Self::RunOneShotFirmware
                 | Self::RunOneShotPatchTableGate
                 | Self::RunOneShotChannelDomain
         ) || self.is_passive()
@@ -17151,7 +17123,6 @@ impl Operation {
             self,
             Self::AcquireDriverOwnership
                 | Self::QueryPatchSemaphore
-                | Self::RunOneShotFirmware
                 | Self::RunOneShotPatchTableGate
                 | Self::RunOneShotChannelDomain
         ) || self.is_passive()
@@ -17595,6 +17566,37 @@ fn decompress_patch() -> Result<Vec<u8>, String> {
     decompress_verified_image(PATCH_PATH, PATCH_SHA256, PATCH_IMAGE_BYTES)
 }
 
+fn run_production_firmware_bootstrap() -> Result<(), String> {
+    let patch = decompress_patch()?;
+    let ram = decompress_ram()?;
+    let images = VerifiedFirmwareImages::verify(
+        patch,
+        ram,
+        FirmwareImageExpectation {
+            length: PATCH_IMAGE_BYTES,
+            sha256: parse_sha256_hex(PATCH_SHA256)?,
+        },
+        FirmwareImageExpectation {
+            length: RAM_IMAGE_BYTES,
+            sha256: parse_sha256_hex(RAM_SHA256)?,
+        },
+    )
+    .map_err(|error| format!("verify production firmware images: {error:?}"))?;
+    let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
+    let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
+    let config =
+        Mt7921HardwareSessionConfig::setup(vfio, format!("/sys/bus/pci/devices/{bdf}/config"))
+            .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
+    let watchdog = verify_external_watchdog_armed()?;
+    // Keep the inert authority and verified images live through the handoff
+    // decision.  The repository's current self-sandbox profiles deliberately
+    // deny VFIO ioctls and retain no device capabilities, so neither is a
+    // valid production lockdown for this operation.  Do not activate merely
+    // because setup and the external recovery watchdog succeeded.
+    std::hint::black_box((&config, &images, watchdog.deadline));
+    Err("production firmware bootstrap refused: no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile is available".into())
+}
+
 fn decompress_ram() -> Result<Vec<u8>, String> {
     decompress_verified_image(RAM_PATH, RAM_SHA256, RAM_IMAGE_BYTES)
 }
@@ -17735,21 +17737,28 @@ mod tests {
             .borrow()
             .iter()
             .filter_map(|operation| match operation {
-                drv_hardware_backends::Operation::ReadU32 { offset, .. } => Some(("read", *offset, 0)),
-                drv_hardware_backends::Operation::WriteU32 { offset, value, .. } => Some(("write", *offset, *value)),
+                drv_hardware_backends::Operation::ReadU32 { offset, .. } => {
+                    Some(("read", *offset, 0))
+                }
+                drv_hardware_backends::Operation::WriteU32 { offset, value, .. } => {
+                    Some(("write", *offset, *value))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(accesses, [
-            ("read", 0xd4208, 0),
-            ("read", 0xd4204, 0),
-            ("read", 0xd4200, 0),
-            ("write", 0xd4204, 0),
-            ("read", 0xd4204, 0),
-            ("write", 0xd4200, 0),
-            ("read", 0xd4200, 0),
-            ("write", 0xd4204, 0),
-        ]);
+        assert_eq!(
+            accesses,
+            [
+                ("read", 0xd4208, 0),
+                ("read", 0xd4204, 0),
+                ("read", 0xd4200, 0),
+                ("write", 0xd4204, 0),
+                ("read", 0xd4204, 0),
+                ("write", 0xd4200, 0),
+                ("read", 0xd4200, 0),
+                ("write", 0xd4204, 0),
+            ]
+        );
     }
 
     #[test]
@@ -17758,13 +17767,16 @@ mod tests {
         let generation = device.generation();
         install_disable_msi0_on_device(&device).unwrap();
         assert_eq!(device.generation(), generation + 1);
-        assert!(operations.borrow().iter().all(|operation| matches!(operation,
+        assert!(operations.borrow().iter().all(|operation| matches!(
+            operation,
             drv_hardware_backends::Operation::ReadU32 { .. }
         )));
     }
 
     #[cfg(feature = "fuchsia-passive")]
-    fn poll_option(poll: mt7921_softmac_adapter::client_device::ClientRxPoll) -> Option<ClientRxFrame> {
+    fn poll_option(
+        poll: mt7921_softmac_adapter::client_device::ClientRxPoll,
+    ) -> Option<ClientRxFrame> {
         use mt7921_softmac_adapter::client_device::ClientRxPoll;
         match poll {
             ClientRxPoll::Frame(frame) => Some(frame),
@@ -17840,7 +17852,10 @@ mod tests {
         channel: ChannelNumber,
         bandwidth: ChannelBandwidth,
     ) {
-        let secondary = ChannelNumber { number: 0, ..channel };
+        let secondary = ChannelNumber {
+            number: 0,
+            ..channel
+        };
         authorization
             .mark_rate_power_ready(bssid, channel, bandwidth, secondary)
             .unwrap();
@@ -17926,12 +17941,7 @@ mod tests {
                 },
             )
             .unwrap();
-        ready_and_authorize(
-            &mut authorization,
-            peer,
-            channel,
-            ChannelBandwidth::Cbw80,
-        );
+        ready_and_authorize(&mut authorization, peer, channel, ChannelBandwidth::Cbw80);
         effects
             .join_bss(&fidl_driver::JoinBssRequest {
                 bssid: Some(peer),
@@ -19339,11 +19349,19 @@ mod tests {
                 client_physical_channel(
                     channel,
                     ChannelBandwidth::Cbw20,
-                    ChannelNumber { number: 0, ..channel },
+                    ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
                 )
                 .unwrap(),
-            ), peer, client, 100, 2,
-            Some((0x0015, 0x3fc0)), live_client_observer(),
+            ),
+            peer,
+            client,
+            100,
+            2,
+            Some((0x0015, 0x3fc0)),
+            live_client_observer(),
         );
         let mut io = TestClientIo::default();
         effects
@@ -19401,7 +19419,6 @@ mod tests {
             effects.send_wlan_frame(&frame(2), fidl_softmac::WlanTxInfoFlags::empty(), &mut io,),
             Err(zx::Status::ACCESS_DENIED)
         );
-
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -19419,11 +19436,19 @@ mod tests {
                 client_physical_channel(
                     channel,
                     ChannelBandwidth::Cbw20,
-                    ChannelNumber { number: 0, ..channel },
+                    ChannelNumber {
+                        number: 0,
+                        ..channel
+                    },
                 )
                 .unwrap(),
-            ), peer, client, 100, 2,
-            Some((0x0015, 0x3fc0)), live_client_observer(),
+            ),
+            peer,
+            client,
+            100,
+            2,
+            Some((0x0015, 0x3fc0)),
+            live_client_observer(),
         );
         effects
             .set_channel(
@@ -19435,12 +19460,7 @@ mod tests {
                 },
             )
             .unwrap();
-        authorize_selection(
-            &mut authorization,
-            peer,
-            channel,
-            ChannelBandwidth::Cbw20,
-        );
+        authorize_selection(&mut authorization, peer, channel, ChannelBandwidth::Cbw20);
 
         let auth = |transmitter: [u8; 6], body: &[u8], primary: ChannelNumber| {
             let mut bytes = vec![0; 30];
@@ -20275,35 +20295,42 @@ mod tests {
     }
 
     #[test]
-    fn passive_firmware_init_reuses_contained_transport_source_shape() {
-        assert!(Operation::RunOneShotFirmware.uses_contained_transport_gate());
+    fn firmware_bootstrap_uses_only_the_production_owned_boundary() {
+        assert!(!Operation::RunOneShotFirmware.uses_contained_transport_gate());
         let source = include_str!("vfio_read.rs");
-        let boundary = source
-            .split("fn run_contained_dma_resource_round_trip")
+        let dispatch = source
+            .split("if operation == Operation::RunOneShotFirmware")
             .nth(1)
             .unwrap()
-            .split("pub fn main")
+            .split("let dmashdl_transition_diagnostic")
             .next()
             .unwrap();
-        let activated = boundary.find("vfio_wfdma_activation_complete").unwrap();
-        let ready = boundary.find("vfio_firmware_transport_ready").unwrap();
-        let loader = boundary.find("load_mt7921_firmware(&mut loader").unwrap();
-        let eeprom = source.find("eeprom_efuse_acquired").unwrap();
-        let clc = source.find("clc_calibration_configured").unwrap();
-        let cleanup = boundary.find("vfio_dma_cleanup_begin").unwrap();
-        assert!(activated < ready && ready < loader && loader < cleanup);
-        assert!(eeprom < clc);
-        assert!(!boundary.contains("load_mt7921_firmware_through_channel_domain(&mut loader"));
-        assert!(!boundary.contains("load_mt7921_firmware_with_passive_boundary(&mut loader"));
-
-        let run = source
-            .split("fn run() -> Result<(), String>")
+        assert!(dispatch.contains("return run_production_firmware_bootstrap()"));
+        let boundary = source
+            .split("fn run_production_firmware_bootstrap")
             .nth(1)
+            .unwrap()
+            .split("fn decompress_ram")
+            .next()
             .unwrap();
-        let process = run.find("vfio_firmware_process_started").unwrap();
-        let artifacts = run.find("vfio_firmware_artifacts_ready").unwrap();
-        let attach = run.find("VFIO_DEVICE_BIND_IOMMUFD").unwrap();
-        assert!(process < artifacts && artifacts < attach);
+        assert!(boundary.contains("verify_external_watchdog_armed()?"));
+        assert!(
+            boundary
+                .contains("no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile")
+        );
+        assert!(!boundary.contains("run_firmware_bootstrap(config, images)"));
+        for forbidden in [
+            "ioctl",
+            "mmap",
+            "DmaArena",
+            "ActiveVfioCapsule",
+            "VfioFirmwareLoader",
+        ] {
+            assert!(
+                !boundary.contains(forbidden),
+                "production boundary contains {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -20387,9 +20414,7 @@ mod tests {
     #[test]
     fn live_wpa3_path_keeps_driver_owner_while_netstack_runs_out_of_process() {
         let source = include_str!("vfio_read.rs");
-        let runtime_constructor = source
-            .find("Mt7921ProductionClient::new")
-            .unwrap();
+        let runtime_constructor = source.find("Mt7921ProductionClient::new").unwrap();
         let start = source[..runtime_constructor]
             .rfind("let (mut device, runner) =")
             .unwrap();
@@ -20417,8 +20442,10 @@ mod tests {
         assert!(connect < take && take < spawn && spawn < pump);
         let launcher = include_str!("vfio_read.rs");
         let process = launcher
-            .find(r#".spawn()
-        .map_err(|error| format!("spawn netstack child"#)
+            .find(
+                r#".spawn()
+        .map_err(|error| format!("spawn netstack child"#,
+            )
             .unwrap();
         let guard = launcher[process..]
             .find("let mut child = NetstackChildGuard")
@@ -20450,8 +20477,7 @@ mod tests {
     #[test]
     fn fragmented_network_ready_alone_activates_prebound_socks_socket() {
         const SIGNAL_FRAGMENT_POLL_LIMIT: usize = 4;
-        let mut listener =
-            Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
+        let mut listener = Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
         let address = listener.as_ref().unwrap().local_addr().unwrap();
         let mut child_listener = listener.as_ref().unwrap().try_clone().unwrap();
         let (mut parent, mut child) = UnixStream::pair().unwrap();
@@ -20459,36 +20485,25 @@ mod tests {
         let mut handshake = NetworkReadyHandshake::default();
 
         child.write_all(b"NETWORK_").unwrap();
-        assert!(!poll_network_ready_handshake(
-            &mut parent,
-            &mut listener,
-            &mut handshake
-        )
-        .unwrap());
-        assert!(std::net::TcpStream::connect_timeout(
-            &address,
-            std::time::Duration::from_millis(100),
-        )
-        .is_err());
+        assert!(!poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap());
+        assert!(
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100),)
+                .is_err()
+        );
 
         child.write_all(b"READY").unwrap();
         for _ in 0..SIGNAL_FRAGMENT_POLL_LIMIT {
-            assert!(!poll_network_ready_handshake(
-                &mut parent,
-                &mut listener,
-                &mut handshake
-            )
-            .unwrap());
+            assert!(
+                !poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap()
+            );
             if listener.is_none() {
                 break;
             }
         }
         assert!(listener.is_none());
-        let client = std::net::TcpStream::connect_timeout(
-            &address,
-            std::time::Duration::from_secs(1),
-        )
-        .unwrap();
+        let client =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1))
+                .unwrap();
         let mut accepted = None;
         for _ in 0..100 {
             match child_listener.accept() {
@@ -20508,20 +20523,12 @@ mod tests {
         child.read_exact(&mut serve).unwrap();
         assert_eq!(&serve, b"SERVE");
         drop(child);
-        assert!(poll_network_ready_handshake(
-            &mut parent,
-            &mut listener,
-            &mut handshake
-        )
-        .unwrap());
+        assert!(poll_network_ready_handshake(&mut parent, &mut listener, &mut handshake).unwrap());
 
-        let accepted_target = std::fs::read_link(format!(
-            "/proc/self/fd/{}",
-            accepted.as_raw_fd()
-        ))
-        .unwrap()
-        .display()
-        .to_string();
+        let accepted_target = std::fs::read_link(format!("/proc/self/fd/{}", accepted.as_raw_fd()))
+            .unwrap()
+            .display()
+            .to_string();
         let mut descriptors = (0..5)
             .map(|fd| (fd.to_string(), format!("base-{fd}")))
             .collect::<Vec<_>>();
@@ -20553,11 +20560,13 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("invalid") || error.contains("before network readiness"));
-            assert!(std::net::TcpStream::connect_timeout(
-                &address,
-                std::time::Duration::from_millis(100),
-            )
-            .is_err());
+            assert!(
+                std::net::TcpStream::connect_timeout(
+                    &address,
+                    std::time::Duration::from_millis(100),
+                )
+                .is_err()
+            );
             drop(listener);
             TcpListener::bind(address).unwrap();
         }
@@ -21424,32 +21433,20 @@ mod tests {
     fn firmware_bootstrap_boundary_and_cleanup_source_shape() {
         let source = include_str!("vfio_read.rs");
         let dispatch = source
-            .split("let result = if operation == Operation::RunOneShotFirmware")
+            .split("fn run_production_firmware_bootstrap")
             .nth(1)
             .unwrap()
-            .split("let report =")
+            .split("fn decompress_ram")
             .next()
             .unwrap();
-        assert!(dispatch.starts_with(" {\n                    load_mt7921_firmware_bootstrap"));
-
-        let cleanup = source
-            .split("ledger.phase = RunPhase::Containing;")
-            .nth(1)
-            .unwrap()
-            .split("if !release_errors.is_empty()")
-            .next()
+        let verify = dispatch.find("VerifiedFirmwareImages::verify").unwrap();
+        let setup = dispatch.find("Mt7921HardwareSessionConfig::setup").unwrap();
+        let watchdog = dispatch.find("verify_external_watchdog_armed()?").unwrap();
+        let refusal = dispatch
+            .find("no verified MT7921 VFIO namespace/privilege/seccomp lockdown profile")
             .unwrap();
-        let mask = cleanup.find("write_active_wfdma(0xd4204, 0)").unwrap();
-        let disable_dma = cleanup
-            .find("write_active_wfdma(0xd4208, disabled)")
-            .unwrap();
-        let bme = cleanup.find("set_pci_bus_master(&bdf, false)").unwrap();
-        let irq = cleanup.find("installed.disable()").unwrap();
-        let unmap = cleanup.find("attempt_all_cleanup(").unwrap();
-        let reset = cleanup.find("reset_vfio_device(&device)").unwrap();
-        let verify = cleanup.find("verify_active_reset_containment").unwrap();
-        assert!(mask < disable_dma && disable_dma < bme && bme < irq);
-        assert!(irq < unmap && unmap < reset && reset < verify);
+        assert!(verify < setup && setup < watchdog && watchdog < refusal);
+        assert!(!dispatch.contains("run_firmware_bootstrap(config, images)"));
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -22454,12 +22451,7 @@ mod tests {
         let mut provenance = DescriptorProvenance::new();
         let carrier = carried(
             provenance
-                .seal_frame(
-                    DescriptorOccurrenceRoute::McuNormalRx,
-                    0,
-                    0,
-                    vec![1, 2, 3],
-                )
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![1, 2, 3])
                 .unwrap(),
         );
         provenance
@@ -22480,21 +22472,11 @@ mod tests {
         let mut provenance = DescriptorProvenance::new();
         let pending = carried(
             provenance
-                .seal_frame(
-                    DescriptorOccurrenceRoute::McuNormalRx,
-                    0,
-                    0,
-                    vec![0xa5; 32],
-                )
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 0, vec![0xa5; 32])
                 .unwrap(),
         );
         let lease = Arc::clone(&pending.occurrence.as_ref().unwrap().lease);
-        let mut pending = Some((
-            Ok(DrainedMcuRx::Normal(pending)),
-            None,
-            0,
-            0,
-        ));
+        let mut pending = Some((Ok(DrainedMcuRx::Normal(pending)), None, 0, 0));
         let mut queued = VecDeque::new();
         abort_loader_rx_side_effects(&mut provenance, &mut queued, &mut pending).unwrap();
         assert!(!lease.current.load(Ordering::Acquire));
@@ -22884,7 +22866,10 @@ mod tests {
         };
         assert!(error.contains("invalid MCU response descriptor length"));
         assert_eq!((queue.rx_tail, queue.rx_head), (2, 1));
-        assert_eq!(queue.rx_ring.read_descriptor_at(0).buf0, buffers.iova as u32);
+        assert_eq!(
+            queue.rx_ring.read_descriptor_at(0).buf0,
+            buffers.iova as u32
+        );
         assert!(normal.is_empty());
         assert!(provenance.sealed.is_empty());
         assert!(!lease.current.load(Ordering::Acquire));
@@ -23213,8 +23198,13 @@ mod tests {
             )
             .unwrap();
             let (effects, mut authorization) = LiveClientEffects::new(
-                selected_live_selection(peer, physical), peer, client, 100, 2,
-                Some((0x0015, 0x3fc0)), live_client_observer(),
+                selected_live_selection(peer, physical),
+                peer,
+                client,
+                100,
+                2,
+                Some((0x0015, 0x3fc0)),
+                live_client_observer(),
             );
             let support = live_client_support(query_from_capabilities(capability, &candidates));
             let device_info =
@@ -23222,16 +23212,16 @@ mod tests {
             let security = support.security.clone();
             let spectrum = support.spectrum_management.clone();
             let (mut device, runner) = Mt7921ClientDevice::new(effects, adapter, support);
-            device.set_runtime_channel(set_channel_request(
+            device
+                .set_runtime_channel(set_channel_request(
                     channel,
                     ChannelBandwidth::Cbw80,
                     Some(ChannelNumber {
                         number: 0,
                         ..channel
                     }),
-                ),
-            )
-            .unwrap();
+                ))
+                .unwrap();
             {
                 let state = &mut authorization;
                 state
@@ -23983,74 +23973,6 @@ mod tests {
     }
 
     #[test]
-    fn dmashdl_invariant_retries_and_reasserts_after_reset() {
-        struct FakeDmashdl {
-            ext0: u32,
-            control: u32,
-            drop_first_control_write: bool,
-            ext0_writes: usize,
-            control_writes: usize,
-        }
-        impl DmashdlInvariantIo for FakeDmashdl {
-            fn read_ext0(&mut self) -> Result<u32, String> {
-                Ok(self.ext0)
-            }
-            fn write_ext0(&mut self, value: u32) -> Result<(), String> {
-                self.ext0_writes += 1;
-                self.ext0 = value;
-                Ok(())
-            }
-            fn read_control(&mut self) -> Result<u32, String> {
-                Ok(self.control)
-            }
-            fn write_control(&mut self, value: u32) -> Result<(), String> {
-                self.control_writes += 1;
-                if self.drop_first_control_write {
-                    self.drop_first_control_write = false;
-                } else {
-                    self.control = value;
-                }
-                Ok(())
-            }
-        }
-
-        let mut lost_once = FakeDmashdl {
-            ext0: WFDMA_TX_DMASHDL_ENABLE | 3,
-            control: 5,
-            drop_first_control_write: true,
-            ext0_writes: 0,
-            control_writes: 0,
-        };
-        let readback = ensure_linux_dmashdl_invariant(&mut lost_once).unwrap();
-        assert_eq!(readback.attempts, 2);
-        assert_eq!(readback.ext0_after, 3);
-        assert_eq!(readback.control_after, DMASHDL_BYPASS | 5);
-        assert_eq!(lost_once.ext0_writes, 1);
-        assert_eq!(lost_once.control_writes, 2);
-
-        let mut correct = FakeDmashdl {
-            ext0: 3,
-            control: DMASHDL_BYPASS | 5,
-            drop_first_control_write: false,
-            ext0_writes: 0,
-            control_writes: 0,
-        };
-        let readback = ensure_linux_dmashdl_invariant(&mut correct).unwrap();
-        assert_eq!(readback.attempts, 0);
-        assert_eq!((correct.ext0_writes, correct.control_writes), (0, 0));
-
-        // E2E91 observed the host WFDMA reset clear bypass. Model that exact
-        // reset effect and require the post-reset invariant publication to
-        // restore bypass before the lifecycle can continue.
-        correct.control &= !DMASHDL_BYPASS;
-        assert_eq!(correct.control & DMASHDL_BYPASS, 0);
-        let readback = ensure_linux_dmashdl_invariant(&mut correct).unwrap();
-        assert_eq!(readback.control_before & DMASHDL_BYPASS, 0);
-        assert_ne!(readback.control_after & DMASHDL_BYPASS, 0);
-        assert_eq!(correct.control_writes, 1);
-    }
-
-    #[test]
     fn dma_init_publishes_dmashdl_invariant_after_wfdma_reset() {
         let source = include_str!("vfio_read.rs");
         for point in [
@@ -24175,13 +24097,18 @@ mod tests {
             assert_eq!(error.mask_state, mask_state, "{failure}");
             assert_eq!(ops.transcript.last().map(String::as_str), Some("revoke"));
             assert_eq!(
-                ops.transcript.iter().filter(|step| *step == "revoke").count(),
+                ops.transcript
+                    .iter()
+                    .filter(|step| *step == "revoke")
+                    .count(),
                 1,
                 "{failure}"
             );
             if failure != "unmask" {
                 assert!(
-                    !ops.transcript.iter().any(|step| step.starts_with("unmask:")),
+                    !ops.transcript
+                        .iter()
+                        .any(|step| step.starts_with("unmask:")),
                     "{failure}"
                 );
             }
@@ -24198,11 +24125,18 @@ mod tests {
         );
         assert_eq!(
             none.transcript,
-            ["poll", "mask", "status", "observed:3:0x0", "wm", "wm2", "unmask:0x400001"]
+            [
+                "poll",
+                "mask",
+                "status",
+                "observed:3:0x0",
+                "wm",
+                "wm2",
+                "unmask:0x400001"
+            ]
         );
 
-        let wm_only =
-            McuRxIrqTopology::validate((0, 8, WM_RX_IRQ_BIT), None).unwrap();
+        let wm_only = McuRxIrqTopology::validate((0, 8, WM_RX_IRQ_BIT), None).unwrap();
         let mut wm = test_irq_ops((1 << 27) | WM_RX_IRQ_BIT);
         wm.wm_match = true;
         assert_eq!(
@@ -24211,7 +24145,15 @@ mod tests {
         );
         assert_eq!(
             wm.transcript,
-            ["poll", "mask", "status", "ack:0x1", "observed:3:0x8000001", "wm", "unmask:0x1"]
+            [
+                "poll",
+                "mask",
+                "status",
+                "ack:0x1",
+                "observed:3:0x8000001",
+                "wm",
+                "unmask:0x1"
+            ]
         );
 
         let mut wm2 = test_irq_ops((1 << 27) | firmware.mask());
@@ -24222,7 +24164,16 @@ mod tests {
         );
         assert_eq!(
             wm2.transcript,
-            ["poll", "mask", "status", "ack:0x400001", "observed:3:0x8400001", "wm", "wm2", "unmask:0x400001"]
+            [
+                "poll",
+                "mask",
+                "status",
+                "ack:0x400001",
+                "observed:3:0x8400001",
+                "wm",
+                "wm2",
+                "unmask:0x400001"
+            ]
         );
 
         let mut duplicate = test_irq_ops(firmware.mask());
@@ -24235,7 +24186,12 @@ mod tests {
             McuRxIrqExecutionCause::State(McuRxIrqMachineError::DuplicateMatch)
         );
         assert_eq!(duplicate.transcript.last().unwrap(), "revoke");
-        assert!(!duplicate.transcript.iter().any(|step| step.starts_with("unmask:")));
+        assert!(
+            !duplicate
+                .transcript
+                .iter()
+                .any(|step| step.starts_with("unmask:"))
+        );
 
         let mut data_topology = firmware;
         data_topology.set_data(Some(
@@ -24264,10 +24220,7 @@ mod tests {
             .unwrap();
         let action = machine.action();
         machine
-            .report(
-                action.step(),
-                McuRxIrqReport::HostStatus(mask | (1 << 27)),
-            )
+            .report(action.step(), McuRxIrqReport::HostStatus(mask | (1 << 27)))
             .unwrap();
         assert_eq!(
             machine.action().kind(),
@@ -24319,7 +24272,9 @@ mod tests {
 
         let actions = &source[source.find("fn execute_mcu_rx_irq_actions(").unwrap()
             ..source.find("struct ActiveMcuRxIrqOps").unwrap()];
-        assert!(actions.find("ops.poll()").unwrap() < actions.find("McuRxIrqMachine::begin").unwrap());
+        assert!(
+            actions.find("ops.poll()").unwrap() < actions.find("McuRxIrqMachine::begin").unwrap()
+        );
         assert!(
             actions.find("McuRxIrqActionKind::Acknowledge").unwrap()
                 < actions.find("ops.record_observed").unwrap()
@@ -24331,16 +24286,23 @@ mod tests {
         let capability = &command[command
             .find("if command == DownloadCommand::GetNicCapability")
             .unwrap()..];
-        assert!(capability.find("verify_and_record_post_n9_dual_rx").unwrap()
-            < capability.find("self.shared_loader(").unwrap());
+        assert!(
+            capability
+                .find("verify_and_record_post_n9_dual_rx")
+                .unwrap()
+                < capability.find("self.shared_loader(").unwrap()
+        );
         let set_clc = &command[command.find("    fn set_clc(").unwrap()..];
-        assert!(set_clc.find("verify_and_record_post_n9_dual_rx").unwrap()
-            < set_clc.find("self.shared_loader(").unwrap());
-        let record = &source[source
-            .find("fn verify_and_record_post_n9_dual_rx")
-            .unwrap()..source.find("    fn handle_irq(").unwrap()];
-        assert!(record.find("verify_post_n9_dual_rx()?").unwrap()
-            < record.find("post_n9_dual_rx_verified").unwrap());
+        assert!(
+            set_clc.find("verify_and_record_post_n9_dual_rx").unwrap()
+                < set_clc.find("self.shared_loader(").unwrap()
+        );
+        let record = &source[source.find("fn verify_and_record_post_n9_dual_rx").unwrap()
+            ..source.find("    fn handle_irq(").unwrap()];
+        assert!(
+            record.find("verify_post_n9_dual_rx()?").unwrap()
+                < record.find("post_n9_dual_rx_verified").unwrap()
+        );
     }
 
     #[cfg(feature = "fuchsia-passive")]
@@ -24491,130 +24453,24 @@ mod tests {
         assert!(Operation::MaskAckDisabledFwdl.wfdma_writable());
         assert!(Operation::PrepareOwnedGlobalTxRings.wfdma_writable());
         assert!(Operation::QueryPatchSemaphore.wfdma_writable());
-        assert!(Operation::RunOneShotFirmware.wfdma_writable());
+        assert!(!Operation::RunOneShotFirmware.wfdma_writable());
         assert!(Operation::RunOneShotChannelDomain.wfdma_writable());
         assert!(!Operation::ReadFixed.wfdma_writable());
         assert!(!Operation::AcquireDriverOwnership.wfdma_writable());
         assert!(!Operation::InventoryVfioIrqs.wfdma_writable());
         assert!(Operation::AcquireDriverOwnership.conn_writable());
         assert!(Operation::QueryPatchSemaphore.conn_writable());
-        assert!(Operation::RunOneShotFirmware.conn_writable());
+        assert!(!Operation::RunOneShotFirmware.conn_writable());
         assert!(Operation::RunOneShotChannelDomain.conn_writable());
         assert!(!Operation::ReadFixed.conn_writable());
         assert!(!Operation::PrepareOwnedGlobalTxRings.conn_writable());
     }
 
     #[test]
-    fn active_backend_classifies_responses_and_modular_completion_fail_closed() {
-        let mut bytes = vec![0; 33];
-        bytes[32] = 2;
-        let response = ReceivedMcuResponse {
-            event_id: 0x04,
-            option: 0,
-            bytes,
-        };
-        assert_eq!(
-            classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &response),
-            Ok(FirmwareCommandCompletion::PatchSemaphore(
-                mt7921_port_spike::PatchSemaphoreStatus::Acquired
-            ))
-        );
-        let wrong_event = ReceivedMcuResponse {
-            event_id: 3,
-            option: 0,
-            bytes: response.bytes.clone(),
-        };
-        assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &wrong_event).is_err());
-        let truncated = ReceivedMcuResponse {
-            event_id: 4,
-            option: 0,
-            bytes: vec![0; 32],
-        };
-        assert!(classify_mcu_completion(DownloadCommand::PatchSemaphoreGet, &truncated).is_err());
+    fn modular_completion_checks_fail_closed() {
         assert_eq!(next_dma_index(127, 128), 0);
         assert!(dma_index_completed(0, 0));
         assert!(!dma_index_completed(127, 0));
-
-        let capability_response = ReceivedMcuResponse {
-            event_id: 1,
-            option: 0,
-            bytes: vec![0; 40],
-        };
-        assert_eq!(
-            classify_mcu_completion(DownloadCommand::GetNicCapability, &capability_response),
-            Ok(FirmwareCommandCompletion::NicCapability(
-                mt7921_port_spike::NicCapability {
-                    element_count: 0,
-                    mac_address: None,
-                    phy: None,
-                    has_6ghz: None,
-                    chip_capability: None,
-                    unknown_elements: 0,
-                }
-            ))
-        );
-        assert!(
-            classify_mcu_completion(
-                DownloadCommand::GetNicCapability,
-                &ReceivedMcuResponse {
-                    event_id: 1,
-                    option: 0,
-                    bytes: vec![0; 39],
-                }
-            )
-            .is_err()
-        );
-
-        let mut eeprom_bytes = vec![0; 60];
-        eeprom_bytes[36..40].copy_from_slice(&0x550u32.to_le_bytes());
-        eeprom_bytes[40..44].copy_from_slice(&1u32.to_le_bytes());
-        eeprom_bytes[55] = 1;
-        assert_eq!(
-            classify_mcu_completion(
-                DownloadCommand::ReadEepromBlock { address: 0x550 },
-                &ReceivedMcuResponse {
-                    event_id: 1,
-                    option: 0,
-                    bytes: eeprom_bytes,
-                }
-            ),
-            Ok(FirmwareCommandCompletion::EepromBlock(
-                mt7921_port_spike::EepromBlock {
-                    address: 0x550,
-                    valid: 1,
-                    data: {
-                        let mut data = [0; 16];
-                        data[11] = 1;
-                        data
-                    },
-                }
-            ))
-        );
-
-        let mut clc_bytes = vec![0; 108];
-        clc_bytes[42..44].copy_from_slice(&68u16.to_le_bytes());
-        clc_bytes[44] = 0x1f;
-        let clc = ReceivedMcuResponse {
-            event_id: 0x80,
-            option: 0,
-            bytes: clc_bytes.clone(),
-        };
-        assert_eq!(
-            classify_clc_response(&clc),
-            Ok(ClcSetResponse {
-                tag: 0,
-                length: 68,
-                special_unii_mask: 0x1f,
-            })
-        );
-        assert!(
-            classify_clc_response(&ReceivedMcuResponse {
-                event_id: 0x80,
-                option: 1 << 2,
-                bytes: clc_bytes,
-            })
-            .is_err()
-        );
     }
 
     #[test]
@@ -25551,9 +25407,10 @@ mod tests {
         assert!(!telemetry.contains("transmit_"));
         assert!(effects_source.contains("auth_frame_event(\"tx\", bytes)"));
         assert!(effects_source.contains("auth_frame_event(\"rx\", &frame.bytes)"));
-        assert!(effects_source.contains(
-            "association_response_structure monotonic_ns={{observer_monotonic_ns}}"
-        ));
+        assert!(
+            effects_source
+                .contains("association_response_structure monotonic_ns={{observer_monotonic_ns}}")
+        );
         assert!(!effects_source.contains("fn(&str, &[u8])"));
         assert!(!effects_source.contains("fn(&[u8]) -> Result"));
     }
@@ -25567,9 +25424,7 @@ mod tests {
                 false,
                 42,
             ),
-            LiveClientOutput::Public(
-                "association_response_structure monotonic_ns=42".to_string()
-            )
+            LiveClientOutput::Public("association_response_structure monotonic_ns=42".to_string())
         );
         assert_eq!(
             render_live_client_event(r#"{"sae_peer_status":{}}"#, true, 99),
