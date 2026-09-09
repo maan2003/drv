@@ -177,6 +177,34 @@
           '';
         };
 
+      checks.x86_64-linux.wlancfg-saved-networks =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+          commit = mt7921FuchsiaSource.fuchsiaBaseRevision;
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "wlancfg-saved-networks-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
+          buildAndTestSubdir = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
+          cargoLock.lockFile = ./crates/netstack3-port-spike/upstream-cargo/src/connectivity/network/netstack3/Cargo.lock;
+          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config pkgs.perl ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd reference/fuchsia-${commit}/src/connectivity/network/netstack3
+            cargo test --locked --offline -p wlancfg-selection --test host-saved-networks
+            cargo test --locked --offline -p wlancfg-selection --test host-selection
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       packages = forAllSystems (
         system:
         let

@@ -55,11 +55,20 @@ pub mod fidl_fuchsia_wlan_policy {
         Wpa2,
         Wpa3,
     }
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Eq, PartialEq)]
     pub enum Credential {
         None(Empty),
         Password(Vec<u8>),
         Psk(Vec<u8>),
+    }
+    impl std::fmt::Debug for Credential {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::None(_) => f.write_str("None"),
+                Self::Password(_) => f.write_str("Password(<redacted>)"),
+                Self::Psk(_) => f.write_str("Psk(<redacted>)"),
+            }
+        }
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Empty;
@@ -249,6 +258,11 @@ pub mod telemetry {
             request_time: fuchsia_async::MonotonicInstant,
             result_time: fuchsia_async::MonotonicInstant,
         },
+        SavedNetworkCount {
+            saved_network_count: usize,
+            config_count_per_saved_network: Vec<usize>,
+        },
+
     }
 }
 
@@ -260,6 +274,10 @@ pub mod config_management {
     pub use config_manager::*;
     pub use network_config::*;
 }
+
+#[path = "host_saved_networks.rs"]
+mod host_saved_networks;
+pub use host_saved_networks::PersistenceError as SavedNetworksPersistenceError;
 
 pub mod client {
     #[path = "types.rs"]

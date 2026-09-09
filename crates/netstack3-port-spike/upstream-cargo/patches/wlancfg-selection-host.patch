@@ -25,8 +25,8 @@ diff -ruN a/src/connectivity/wlan/wlancfg/src/client/types.rs b/src/connectivity
      PolicyConnectionAttemptMigratedMetricDimensionReason,
      PolicyDisconnectionMigratedMetricDimensionReason,
 diff -ruN a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs b/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
---- a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs	2026-08-09 22:11:17.622551284 +0000
-+++ b/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs	2026-08-09 22:11:17.659264225 +0000
+--- a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
++++ b/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
 @@ -7,6 +7,7 @@
      NetworkConfig, NetworkConfigError, NetworkIdentifier, PastConnectionData, PastConnectionList,
      SecurityType,
@@ -35,41 +35,209 @@ diff -ruN a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.r
  use super::stash_conversion::*;
  use crate::client::types::{self, ScanObservation};
  use crate::telemetry::{TelemetryEvent, TelemetrySender};
-@@ -18,6 +19,7 @@
+@@ -17,7 +18,14 @@
+ use fuchsia_async as fasync;
  use futures::lock::Mutex;
  use log::{error, info};
- use std::collections::{HashMap, HashSet};
+-use std::collections::{HashMap, HashSet};
++use std::collections::HashMap;
++#[cfg(not(feature = "host-selection"))]
++use std::collections::HashSet;
++#[cfg(feature = "host-selection")]
++use std::fs::File;
++#[cfg(feature = "host-selection")]
++use crate::host_saved_networks::{HostPolicyStorage as PolicyStorage, PersistenceError};
 +#[cfg(not(feature = "host-selection"))]
  use wlan_storage::policy::{POLICY_STORAGE_ID, PolicyStorage};
- 
+
  const MAX_SAVED_NETWORKS: usize = 1000;
-@@ -27,6 +29,7 @@
- /// (SSID and security protocol). Network configs are saved in-memory, and part of each network
- /// data is saved persistently. Futures aware locks are used in order to wait for the storage flush
- /// operations to complete when data changes.
-+#[cfg(not(feature = "host-selection"))]
- pub struct SavedNetworksManager {
-     saved_networks: Mutex<NetworkConfigMap>,
-     // Persistent storage for networks, which should be updated when there is a change to the data
-@@ -118,6 +121,7 @@
+@@ -35,6 +43,13 @@
+     telemetry_sender: TelemetrySender,
+ }
+
++#[cfg(feature = "host-selection")]
++impl std::fmt::Debug for SavedNetworksManager {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SavedNetworksManager").finish_non_exhaustive()
++    }
++}
++
+ /// Save a single network config per NetworkIdentifier (which combines SSID and security type).
+ type NetworkConfigMap = HashMap<NetworkIdentifier, NetworkConfig>;
+
+@@ -118,6 +133,7 @@
      ) -> PastConnectionList;
  }
- 
+
 +#[cfg(not(feature = "host-selection"))]
  impl SavedNetworksManager {
      /// Initializes a new Saved Network Manager by reading saved networks from local storage using
      /// a WLAN helper library. It will attempt to migrate any data from legacy storage.
-@@ -201,6 +205,7 @@
+@@ -201,20 +217,72 @@
      }
  }
- 
-+#[cfg(not(feature = "host-selection"))]
+
++#[cfg(feature = "host-selection")]
++impl SavedNetworksManager {
++    /// Load saved networks from an explicitly supplied, already-open directory.
++    ///
++    /// The directory capability is required because durable atomic replacement
++    /// cannot be implemented from a single already-open regular file.
++    pub async fn new_with_directory(
++        directory: File,
++        telemetry_sender: TelemetrySender,
++    ) -> Result<Self, PersistenceError> {
++        let mut store = PolicyStorage::new(directory)?;
++        let stored_networks = store.load()?;
++        let mut saved_networks = HashMap::with_capacity(stored_networks.len());
++        for persisted_data in stored_networks {
++            let id = NetworkIdentifier::new(
++                types::Ssid::from_bytes_unchecked(persisted_data.ssid),
++                persisted_data.security_type,
++            );
++            let config = NetworkConfig::new(
++                id.clone(),
++                persisted_data.credential,
++                persisted_data.has_ever_connected,
++                persisted_data.hidden_probability,
++            )
++            .map_err(|_| PersistenceError::invalid_config())?;
++            if saved_networks.insert(id, config).is_some() {
++                return Err(PersistenceError::invalid_config());
++            }
++        }
++        Ok(Self {
++            saved_networks: Mutex::new(saved_networks),
++            store: Mutex::new(store),
++            telemetry_sender,
++        })
++    }
++}
++
++#[cfg(feature = "host-selection")]
++fn persistent_data_from_config_map(networks: &NetworkConfigMap) -> &NetworkConfigMap {
++    networks
++}
++
++#[cfg(feature = "host-selection")]
++fn failed_before_install(error: &PersistenceError) -> bool {
++    !error.was_installed()
++}
++
  #[async_trait(?Send)]
  impl SavedNetworksManagerApi for SavedNetworksManager {
      async fn remove(&self, network_id: NetworkIdentifier) -> Result<bool, NetworkConfigError> {
+         let mut saved_networks = self.saved_networks.lock().await;
+-        if saved_networks.remove(&network_id).is_some() {
+-            // Update persistent storage
+-            self.store
++        if let Some(removed_config) = saved_networks.remove(&network_id) {
++            // Update persistent storage before publishing the mutation.
++            if let Err(e) = self
++                .store
+                 .lock()
+                 .await
+                 .write(persistent_data_from_config_map(&saved_networks))
+-                .map_err(|e| {
+-                    error!("error writing network to persistent storage: {}", e);
+-                    NetworkConfigError::FileWriteError
+-                })?;
++            {
++                #[cfg(feature = "host-selection")]
++                if failed_before_install(&e) {
++                    _ = saved_networks.insert(network_id, removed_config);
++                }
++                error!("error writing network to persistent storage: {}", e);
++                return Err(NetworkConfigError::FileWriteError);
++            }
+             return Ok(true);
+         } else {
+             // Check whether there is another network with the same SSID but different security
+@@ -287,16 +355,25 @@
+             return Err(NetworkConfigError::MaxSavedNetworksReached);
+         }
+
++        #[cfg(feature = "host-selection")]
++        let network_config = NetworkConfig::new(network_id.clone(), credential, false, None)?;
++        #[cfg(not(feature = "host-selection"))]
+         let network_config =
+             NetworkConfig::new(network_id.clone(), credential.clone(), false, None)?;
+-        let evicted_config = saved_networks.insert(network_id, network_config);
++        let evicted_config = saved_networks.insert(network_id.clone(), network_config);
+
+-        self.store.lock().await.write(persistent_data_from_config_map(&saved_networks)).map_err(
+-            |e| {
+-                error!("error writing network to persistent storage: {}", e);
+-                NetworkConfigError::FileWriteError
+-            },
+-        )?;
++        if let Err(e) = self.store.lock().await.write(persistent_data_from_config_map(&saved_networks))
++        {
++            #[cfg(feature = "host-selection")]
++            if failed_before_install(&e) {
++                match evicted_config {
++                    Some(config) => _ = saved_networks.insert(network_id, config),
++                    None => _ = saved_networks.remove(&network_id),
++                }
++            }
++            error!("error writing network to persistent storage: {}", e);
++            return Err(NetworkConfigError::FileWriteError);
++        }
+
+         Ok(evicted_config)
+     }
+@@ -317,6 +394,8 @@
+                 return;
+             }
+         };
++        #[cfg(feature = "host-selection")]
++        let previous_state = network.host_mutation_state();
+         if &network.credential == credential {
+             match (connect_result.code, connect_result.is_credential_rejected) {
+                 (fidl_ieee80211::StatusCode::Success, _) => {
+@@ -345,6 +424,12 @@
+                         // Update persistent storage since a config has changed.
+                         let data = persistent_data_from_config_map(&saved_networks);
+                         if let Err(e) = self.store.lock().await.write(data) {
++                            #[cfg(feature = "host-selection")]
++                            if failed_before_install(&e)
++                                && let Some(network) = saved_networks.get_mut(&id)
++                            {
++                                network.restore_host_mutation_state(previous_state);
++                            }
+                             info!("Failed to record successful connect in store: {}", e);
+                         }
+                     }
+@@ -414,6 +499,11 @@
+     ) {
+         let mut saved_networks = self.saved_networks.lock().await;
+         let mut has_change = false;
++        #[cfg(feature = "host-selection")]
++        let previous_states: HashMap<_, _> = saved_networks
++            .iter()
++            .map(|(id, config)| (id.clone(), config.host_mutation_state()))
++            .collect();
+
+         for (network, bss_list) in results {
+             // If there are BSSs seen with the same SSID but different security, it will be
+@@ -468,6 +558,14 @@
+         if has_change {
+             let data = persistent_data_from_config_map(&saved_networks);
+             if let Err(e) = self.store.lock().await.write(data) {
++                #[cfg(feature = "host-selection")]
++                if failed_before_install(&e) {
++                    for (id, state) in previous_states {
++                        if let Some(config) = saved_networks.get_mut(&id) {
++                            config.restore_host_mutation_state(state);
++                        }
++                    }
++                }
+                 info!("Failed to record scan result updates in store: {}", e);
+             }
+         }
 diff -ruN a/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs b/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs
---- a/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs	2026-08-09 22:11:17.630665577 +0000
-+++ b/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs	2026-08-09 22:11:17.659530086 +0000
+--- a/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs
++++ b/src/connectivity/wlan/wlancfg/src/config_management/network_config.rs
 @@ -7,6 +7,9 @@
  use arbitrary::Arbitrary;
  #[cfg(test)]
@@ -80,6 +248,76 @@ diff -ruN a/src/connectivity/wlan/wlancfg/src/config_management/network_config.r
  use fidl_fuchsia_wlan_policy as fidl_policy;
  use fuchsia_async as fasync;
  use log::info;
+@@ -242,6 +245,17 @@
+     NotSeenActive,
+ }
+
++/// Snapshot of mutable manager state, excluding credentials.
++#[cfg(feature = "host-selection")]
++#[derive(Clone, Copy)]
++pub(crate) struct HostMutationState {
++    has_ever_connected: bool,
++    hidden_probability: f32,
++    connected_active: bool,
++    have_seen_multi_bss: bool,
++    num_scans: usize,
++}
++
+ /// Saved data for networks, to remember how to connect to a network and determine if we should.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct NetworkConfig {
+@@ -266,6 +280,26 @@
+ }
+
+ impl NetworkConfig {
++    #[cfg(feature = "host-selection")]
++    pub(crate) fn host_mutation_state(&self) -> HostMutationState {
++        HostMutationState {
++            has_ever_connected: self.has_ever_connected,
++            hidden_probability: self.hidden_probability,
++            connected_active: self.hidden_probability_stats.connected_active,
++            have_seen_multi_bss: self.scan_stats.have_seen_multi_bss,
++            num_scans: self.scan_stats.num_scans,
++        }
++    }
++
++    #[cfg(feature = "host-selection")]
++    pub(crate) fn restore_host_mutation_state(&mut self, state: HostMutationState) {
++        self.has_ever_connected = state.has_ever_connected;
++        self.hidden_probability = state.hidden_probability;
++        self.hidden_probability_stats.connected_active = state.connected_active;
++        self.scan_stats.have_seen_multi_bss = state.have_seen_multi_bss;
++        self.scan_stats.num_scans = state.num_scans;
++    }
++
+     /// A new network config is created by loading from persistent storage on boot or when a new
+     /// network is saved.
+     pub fn new(
+@@ -362,13 +396,23 @@
+
+ /// The credential of a network connection. It mirrors the fidl_fuchsia_wlan_policy Credential
+ #[derive(Arbitrary)] // Derive Arbitrary for fuzzer
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, PartialEq)]
+ pub enum Credential {
+     None,
+     Password(Vec<u8>),
+     Psk(Vec<u8>),
+ }
+
++impl Debug for Credential {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::None => f.write_str("None"),
++            Self::Password(_) => f.write_str("Password(<redacted>)"),
++            Self::Psk(_) => f.write_str("Psk(<redacted>)"),
++        }
++    }
++}
++
+ impl Credential {
+     /// Returns:
+     /// - an Open-Credential instance iff `bytes` is empty,
 diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs
 --- a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs	2026-08-09 22:11:17.644255998 +0000
 +++ b/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs	2026-08-09 22:11:17.659804870 +0000

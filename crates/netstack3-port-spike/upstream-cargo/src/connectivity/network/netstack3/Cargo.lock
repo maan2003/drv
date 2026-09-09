@@ -3512,6 +3512,7 @@ dependencies = [
  "futures",
  "ieee80211",
  "itertools 0.14.0",
+ "libc",
  "log",
  "rand 0.9.4",
  "tokio",
