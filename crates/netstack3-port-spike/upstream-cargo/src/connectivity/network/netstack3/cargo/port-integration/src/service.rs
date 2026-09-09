@@ -335,6 +335,7 @@ impl DhcpService {
             status: DhcpStatus::Acquiring,
         }
     }
+
     pub fn status(&self) -> DhcpStatus {
         self.status
     }
@@ -343,6 +344,9 @@ impl DhcpService {
     }
     pub fn take_lookup(&mut self, h: DnsLookupHandle) -> Option<DnsLookupResult> {
         self.dns.take_result(h)
+    }
+    pub fn cancel_lookup(&mut self, h: DnsLookupHandle) {
+        self.dns.cancel_lookup(h)
     }
     pub fn socket_provider(&self) -> NativeSocketProvider {
         self.sockets.clone()
@@ -388,9 +392,12 @@ impl DhcpService {
             .collect();
         self.dns.configure(&servers).is_ok()
     }
-    fn effects(&mut self) -> usize {
+    fn effects(&mut self, budget: usize) -> usize {
         let mut n = 0;
-        while let Ok(e) = self.effects.try_recv() {
+        while n < budget {
+            let Ok(e) = self.effects.try_recv() else {
+                break;
+            };
             n += 1;
             match e {
                 Effect::Transition(TransitionEffect::DropLease { .. }) => {
@@ -486,15 +493,31 @@ impl NetworkServiceEndpoint for DhcpService {
             w.timers = p
         }
         self.rt.borrow_mut().set_now(now);
-        let n = self.rt.borrow_mut().dispatch_due(budget);
-        let effects = if self.dhcp_enabled {
+        let mut work = self.rt.borrow_mut().dispatch_due(budget);
+        if self.dhcp_enabled && work < budget {
+            // The single DHCP task only wakes for packet, address, or timer
+            // input. Drain its finite transition chain as one work quantum.
             self.pool.run_until_stalled();
-            self.effects()
-        } else {
-            0
-        };
-        let dns = self.dns.pump(&mut self.rt.borrow_mut(), d);
-        n + effects + dns
+            work += self.effects(budget.saturating_sub(work));
+        }
+        work += self
+            .dns
+            .pump(&mut self.rt.borrow_mut(), d, budget.saturating_sub(work));
+        work
+    }
+    fn next_timer_deadline(&self) -> Option<Duration> {
+        let dhcp = self
+            .wakes
+            .borrow()
+            .timers
+            .iter()
+            .map(|(deadline, _)| Duration::from_nanos(deadline.as_nanos()))
+            .min();
+        let runtime = self.rt.borrow().next_timer_deadline();
+        [dhcp, runtime, self.dns.next_timer_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
     fn on_device_event(&mut self, e: EthernetDeviceEvent) {
         match e {

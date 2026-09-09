@@ -123,6 +123,9 @@ pub trait NetworkServiceEndpoint: StackEthernetEndpoint {
     /// Runs due protocol/timer work and returns the number of work items done.
     fn poll_at(&mut self, now: Duration, budget: usize) -> usize;
 
+    /// Earliest absolute timer deadline in the epoch supplied to `poll_at`.
+    fn next_timer_deadline(&self) -> Option<Duration>;
+
     fn on_device_event(&mut self, event: EthernetDeviceEvent);
 }
 
@@ -419,6 +422,10 @@ mod tests {
         fn poll_at(&mut self, now: Duration, budget: usize) -> usize {
             self.now = now;
             usize::from(budget != 0)
+        }
+
+        fn next_timer_deadline(&self) -> Option<Duration> {
+            None
         }
 
         fn on_device_event(&mut self, event: EthernetDeviceEvent) {

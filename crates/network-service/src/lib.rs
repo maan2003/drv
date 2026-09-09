@@ -14,12 +14,14 @@ use netstack3_port_spike::{
     RemoteSocketAddress, RemoteSocketHandle, RemoteSocketProvider, SocketClientId,
 };
 use rand::{SeedableRng as _, rngs::StdRng};
-use std::collections::VecDeque;
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-use std::os::fd::AsRawFd as _;
-use std::time::Duration;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 mod child;
 mod ethernet_device;
@@ -46,38 +48,193 @@ pub struct NetstackProofConfig {
 /// port. This is a bounded driver, not a DHCP, DNS, or TCP implementation.
 struct BoundedNetstackProof {
     runner: EthernetRunner<DhcpService, ServiceEthernetDevice>,
+    poller: NetworkPoller,
     config: NetstackProofConfig,
     now: Duration,
     anchor: Option<std::time::Instant>,
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
+    proxy_client: SocketClientId,
+    frame_events: u32,
 }
 
-const MAX_SOCKS5_CLIENTS: usize = 24;
+// Admission and staging are separate budgets: idle clients consume descriptors
+// but cannot reserve the aggregate relay-buffer budget. This supports ordinary
+// fan-out without allowing an unbounded accepted-fd or heap attack.
+const MAX_SOCKS5_CLIENTS: usize = 64;
 const MAX_SOCKS5_PENDING_BYTES: usize = 256 * 1024;
+const MAX_SOCKS5_TOTAL_PENDING_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SOCKS5_HANDSHAKE_BYTES: usize = 512;
+const EVENT_BATCH: usize = 64;
+const CLIENT_WORK_BUDGET: usize = 64;
+const STACK_WORK_BUDGET: usize = 64;
+const FRAME_TOKEN: u64 = 1;
+const LISTENER_TOKEN: u64 = 2;
+const FIRST_CLIENT_TOKEN: u64 = 3;
+const BASE_EVENTS: u32 = (libc::EPOLLERR | libc::EPOLLHUP) as u32;
+const CLIENT_BASE_EVENTS: u32 = BASE_EVENTS | libc::EPOLLRDHUP as u32;
 
-fn set_nonblocking(stream: &TcpStream) -> std::io::Result<()> {
-    let fd = stream.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
+pub(crate) struct NetworkPoller {
+    fd: OwnedFd,
+    #[cfg(test)]
+    waits: Cell<(usize, usize)>,
+}
+
+impl NetworkPoller {
+    pub(crate) fn new() -> Result<Self, &'static str> {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err("network epoll creation failed");
+        }
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            #[cfg(test)]
+            waits: Cell::new((0, 0)),
+        })
     }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
+
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
-    Ok(())
+
+    fn update(
+        &self,
+        operation: i32,
+        fd: RawFd,
+        token: u64,
+        events: u32,
+    ) -> Result<(), &'static str> {
+        let mut event = libc::epoll_event { events, u64: token };
+        if unsafe { libc::epoll_ctl(self.fd.as_raw_fd(), operation, fd, &mut event) } < 0 {
+            return Err("network epoll registration failed");
+        }
+        Ok(())
+    }
+
+    fn add(&self, fd: RawFd, token: u64, events: u32) -> Result<(), &'static str> {
+        self.update(libc::EPOLL_CTL_ADD, fd, token, events)
+    }
+
+    fn modify(&self, fd: RawFd, token: u64, events: u32) -> Result<(), &'static str> {
+        self.update(libc::EPOLL_CTL_MOD, fd, token, events)
+    }
+
+    fn delete(&self, fd: RawFd) -> Result<(), &'static str> {
+        self.update(libc::EPOLL_CTL_DEL, fd, 0, 0)
+    }
+
+    fn wait(
+        &self,
+        events: &mut [libc::epoll_event],
+        timeout_ms: i32,
+    ) -> Result<usize, &'static str> {
+        #[cfg(test)]
+        {
+            let (total, blocking) = self.waits.get();
+            self.waits
+                .set((total + 1, blocking + usize::from(timeout_ms != 0)));
+        }
+        let ready = unsafe {
+            libc::syscall(
+                libc::SYS_epoll_pwait,
+                self.fd.as_raw_fd(),
+                events.as_mut_ptr(),
+                events.len() as i32,
+                timeout_ms,
+                std::ptr::null::<libc::sigset_t>(),
+                0usize,
+            )
+        };
+        if ready >= 0 {
+            Ok(ready as usize)
+        } else if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+            Ok(0)
+        } else {
+            Err("network epoll wait failed")
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_counts(&self) -> (usize, usize) {
+        self.waits.get()
+    }
+}
+
+fn accept_nonblocking(listener_fd: RawFd) -> Result<Option<(TcpStream, SocketAddr)>, &'static str> {
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut length = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let fd = unsafe {
+        libc::accept4(
+            listener_fd,
+            address.as_mut_ptr().cast(),
+            &mut length,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().kind() {
+            ErrorKind::WouldBlock => Ok(None),
+            _ => Err("SOCKS5 accept failed"),
+        };
+    }
+    let address = unsafe { address.assume_init() };
+    let peer = match i32::from(address.ss_family) {
+        libc::AF_INET => {
+            let address =
+                unsafe { *(&address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes())),
+                u16::from_be(address.sin_port),
+            )
+        }
+        libc::AF_INET6 => {
+            let address = unsafe {
+                *(&address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+            };
+            SocketAddr::new(
+                IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
+                u16::from_be(address.sin6_port),
+            )
+        }
+        _ => {
+            unsafe { libc::close(fd) };
+            return Err("SOCKS5 accepted unsupported peer family");
+        }
+    };
+    Ok(Some((unsafe { TcpStream::from_raw_fd(fd) }, peer)))
+}
+
+fn schedule_client(
+    queue: &mut VecDeque<u64>,
+    pending: &mut HashMap<u64, (u32, u8)>,
+    token: u64,
+    events: u32,
+    passes: u8,
+) {
+    match pending.get_mut(&token) {
+        Some((pending_events, pending_passes)) => {
+            *pending_events |= events;
+            *pending_passes = (*pending_passes).max(passes);
+        }
+        None => {
+            pending.insert(token, (events, passes));
+            queue.push_back(token);
+        }
+    }
 }
 
 struct Socks5Client {
+    token: u64,
     stream: TcpStream,
     peer: SocketAddr,
     phase: Socks5Phase,
     host_out: VecDeque<u8>,
     host_to_remote: VecDeque<u8>,
     remote_to_host: VecDeque<u8>,
-    socket_client: Option<SocketClientId>,
     socket: Option<RemoteSocketHandle>,
     idle_deadline: std::time::Instant,
+    registered_events: u32,
+    peer_half_closed: bool,
 }
 
 enum Socks5Phase {
@@ -97,71 +254,204 @@ enum Socks5Phase {
 }
 
 impl Socks5Client {
-    fn new(stream: TcpStream, peer: SocketAddr) -> Self {
+    fn new(token: u64, stream: TcpStream, peer: SocketAddr) -> Self {
         Self {
+            token,
             stream,
             peer,
             phase: Socks5Phase::Greeting(Vec::new()),
             host_out: VecDeque::new(),
             host_to_remote: VecDeque::new(),
             remote_to_host: VecDeque::new(),
-            socket_client: None,
             socket: None,
             idle_deadline: std::time::Instant::now() + Duration::from_secs(30),
+            registered_events: CLIENT_BASE_EVENTS | libc::EPOLLIN as u32,
+            peer_half_closed: false,
         }
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.host_to_remote.len() + self.remote_to_host.len()
+    }
+
+    fn epoll_events(&self, aggregate_has_space: bool) -> u32 {
+        let can_read = match self.phase {
+            Socks5Phase::Greeting(_) | Socks5Phase::Request(_) => true,
+            Socks5Phase::Relay => {
+                aggregate_has_space && self.host_to_remote.len() < MAX_SOCKS5_PENDING_BYTES
+            }
+            _ => false,
+        };
+        (CLIENT_BASE_EVENTS
+            & if self.peer_half_closed {
+                !libc::EPOLLRDHUP as u32
+            } else {
+                u32::MAX
+            })
+            | if can_read { libc::EPOLLIN as u32 } else { 0 }
+            | if self.host_out.is_empty() && self.remote_to_host.is_empty() {
+                0
+            } else {
+                libc::EPOLLOUT as u32
+            }
     }
 }
 
 impl BoundedNetstackProof {
+    #[cfg(test)]
+    fn poller_fd(&self) -> RawFd {
+        self.poller.raw_fd()
+    }
+
+    #[cfg(test)]
+    fn poller_wait_counts(&self) -> (usize, usize) {
+        self.poller.wait_counts()
+    }
+
+    #[cfg(test)]
     fn new(
         device: ServiceEthernetDevice,
         config: NetstackProofConfig,
     ) -> Result<Self, &'static str> {
+        Self::new_with_poller(device, config, NetworkPoller::new()?)
+    }
+
+    fn new_with_poller(
+        device: ServiceEthernetDevice,
+        config: NetstackProofConfig,
+        poller: NetworkPoller,
+    ) -> Result<Self, &'static str> {
         let mac = device.mac_address();
+        let frame_fd = device.raw_fd();
         let runtime = Runtime::new(
-            32,
+            MAX_SOCKS5_CLIENTS * 2 + 1,
             (0u8..=255).cycle().take(8192),
             NonZeroU64::new(1).unwrap(),
             mac,
             u32::from(SOFTMAC_ETHERNET_MTU),
         )
         .map_err(|_| "Netstack runtime initialization failed")?;
-        Ok(Self {
-            runner: EthernetRunner::new(
-                DhcpService::new(runtime, StdRng::seed_from_u64(7), mac),
-                device,
-            ),
+        let runner = EthernetRunner::new(
+            DhcpService::new(runtime, StdRng::seed_from_u64(7), mac),
+            device,
+        );
+        let proxy_client = RemoteSocketProvider::open_client(
+            &mut runner.stack().socket_provider(),
+            NonZeroUsize::new(MAX_SOCKS5_CLIENTS).unwrap(),
+        )
+        .map_err(|_| "SOCKS5 provider client initialization failed")?;
+        let proof = Self {
+            runner,
+            poller,
             config,
             now: Duration::ZERO,
             anchor: None,
             resolved: None,
             socket: None,
-        })
+            proxy_client,
+            frame_events: BASE_EVENTS | libc::EPOLLIN as u32,
+        };
+        proof
+            .poller
+            .add(frame_fd, FRAME_TOKEN, BASE_EVENTS | libc::EPOLLIN as u32)?;
+        Ok(proof)
     }
 
-    fn drive(&mut self, deadline: Option<std::time::Instant>) -> Result<(), &'static str> {
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+    fn drive_once(&mut self, deadline: Option<Instant>) -> Result<(bool, bool), &'static str> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err("Netstack service deadline");
         }
-        self.now = self
-            .anchor
-            .get_or_insert_with(std::time::Instant::now)
-            .elapsed();
-        for _ in 0..8 {
-            while let Some(event) = self.runner.device_mut().take_event() {
-                if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
-                    self.runner.discard_pending();
-                    self.resolved = None;
-                    self.socket = None;
-                    return Err("Ethernet frame seam closed");
-                }
-                self.runner.stack_mut().on_device_event(event);
+        self.now = self.anchor.get_or_insert_with(Instant::now).elapsed();
+        let mut events = 0;
+        while events < STACK_WORK_BUDGET {
+            let Some(event) = self.runner.device_mut().take_event() else {
+                break;
+            };
+            if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
+                self.runner.discard_pending();
+                self.resolved = None;
+                self.socket = None;
+                return Err("Ethernet frame seam closed");
             }
-            self.runner.stack_mut().poll_at(self.now, 64);
-            while self.runner.pump().transmitted != 0 {}
-            while self.runner.pump().received != 0 {}
+            self.runner.stack_mut().on_device_event(event);
+            events += 1;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        let service_work = self.runner.stack_mut().poll_at(self.now, STACK_WORK_BUDGET);
+        let mut frames = 0;
+        while frames < STACK_WORK_BUDGET {
+            let report = self.runner.pump();
+            frames += report.received.max(report.transmitted);
+            if report == netstack3_port_spike::PumpReport::default()
+                || report.ingress_blocked
+                || report.egress_blocked
+            {
+                break;
+            }
+        }
+        while events < STACK_WORK_BUDGET {
+            let Some(event) = self.runner.device_mut().take_event() else {
+                break;
+            };
+            if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
+                self.runner.discard_pending();
+                self.resolved = None;
+                self.socket = None;
+                return Err("Ethernet frame seam closed");
+            }
+            self.runner.stack_mut().on_device_event(event);
+            events += 1;
+        }
+        let frame_events = BASE_EVENTS
+            | libc::EPOLLIN as u32
+            | if self.runner.device().wants_write() {
+                libc::EPOLLOUT as u32
+            } else {
+                0
+            };
+        if frame_events != self.frame_events {
+            self.poller
+                .modify(self.runner.device().raw_fd(), FRAME_TOKEN, frame_events)?;
+            self.frame_events = frame_events;
+        }
+        Ok((
+            events == STACK_WORK_BUDGET
+                || service_work >= STACK_WORK_BUDGET
+                || frames >= STACK_WORK_BUDGET,
+            events != 0 || service_work != 0 || frames != 0,
+        ))
+    }
+
+    fn next_wait_timeout(&self, deadlines: impl IntoIterator<Item = Instant>) -> i32 {
+        let stack_deadline = self
+            .runner
+            .stack()
+            .next_timer_deadline()
+            .and_then(|deadline| self.anchor.and_then(|anchor| anchor.checked_add(deadline)));
+        let Some(deadline) = deadlines.into_iter().chain(stack_deadline).min() else {
+            return -1;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return 0;
+        }
+        let millis = remaining.as_nanos().saturating_add(999_999) / 1_000_000;
+        i32::try_from(millis).unwrap_or(i32::MAX)
+    }
+
+    fn drive(&mut self, deadline: Option<Instant>) -> Result<(), &'static str> {
+        let (exhausted, worked) = self.drive_once(deadline)?;
+        if exhausted || worked {
+            return Ok(());
+        }
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
+        let timeout = self.next_wait_timeout(deadline);
+        let ready = self.poller.wait(&mut events, timeout)?;
+        for event in &events[..ready] {
+            if event.u64 == FRAME_TOKEN {
+                self.runner.device_mut().notify_epoll(event.events);
+            }
+        }
+        let _ = self.drive_once(deadline)?;
         Ok(())
     }
 
@@ -245,70 +535,237 @@ impl BoundedNetstackProof {
     where
         F: FnMut() -> bool,
     {
-        let mut clients = Vec::new();
+        let mut clients = HashMap::new();
+        let mut next_token = FIRST_CLIENT_TOKEN;
+        let mut ready_clients = VecDeque::new();
+        let mut pending_clients = HashMap::new();
+        let listener_fd = listener.as_raw_fd();
+        self.poller.add(
+            listener_fd,
+            LISTENER_TOKEN,
+            BASE_EVENTS | libc::EPOLLIN as u32,
+        )?;
+        let mut listener_readable = false;
+        let mut listener_events = BASE_EVENTS | libc::EPOLLIN as u32;
+        let mut stack_pending = true;
         println!("internet_proxy_ready=true listen={listen}");
-        while !stop_requested()
-            && deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
-        {
-            // Exactly one shared Netstack3 drive precedes a bounded amount of
-            // work for every client. No client-specific wait can delay another.
-            if let Err(error) = self.drive(deadline) {
-                for client in &mut clients {
-                    self.close_socks5_client(client);
-                }
-                return Err(error);
-            }
-            for _ in 0..32 {
-                match listener.accept() {
-                    Ok((stream, peer)) if clients.len() < MAX_SOCKS5_CLIENTS => {
-                        if set_nonblocking(&stream).is_err() {
-                            println!(
-                                "internet_proxy_client_error=SOCKS5 client nonblocking setup failed peer={peer}"
-                            );
-                            continue;
+        while !stop_requested() && deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            if stack_pending {
+                match self.drive_once(deadline) {
+                    Ok((exhausted, worked)) => {
+                        // A productive pass may leave retained device egress or
+                        // newly queued protocol work. Run one terminating
+                        // no-work pass before sleeping.
+                        stack_pending = exhausted || worked;
+                        if worked {
+                            for token in clients.keys().copied() {
+                                schedule_client(
+                                    &mut ready_clients,
+                                    &mut pending_clients,
+                                    token,
+                                    0,
+                                    1,
+                                );
+                            }
                         }
-                        println!("internet_proxy_client=true peer={peer}");
-                        clients.push(Socks5Client::new(stream, peer));
                     }
-                    Ok((_stream, peer)) => {
-                        println!("internet_proxy_client_error=SOCKS5 client limit peer={peer}");
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        for client in &mut clients {
+                    Err(error) => {
+                        for client in clients.values_mut() {
                             self.close_socks5_client(client);
                         }
-                        return Err("SOCKS5 accept failed");
+                        return Err(error);
                     }
                 }
             }
 
-            let mut index = 0;
-            while index < clients.len() {
-                match self.poll_socks5_client(&mut clients[index]) {
-                    Ok(false) => index += 1,
-                    Ok(true) => {
-                        let mut client = clients.swap_remove(index);
+            for _ in 0..32 {
+                if !listener_readable || clients.len() >= MAX_SOCKS5_CLIENTS {
+                    break;
+                }
+                match accept_nonblocking(listener_fd) {
+                    Ok(Some((stream, peer))) => {
+                        let token = next_token;
+                        next_token = next_token
+                            .checked_add(1)
+                            .ok_or("SOCKS5 client token exhausted")?;
+                        self.poller.add(
+                            stream.as_raw_fd(),
+                            token,
+                            BASE_EVENTS | libc::EPOLLIN as u32,
+                        )?;
+                        println!("internet_proxy_client=true peer={peer}");
+                        clients.insert(token, Socks5Client::new(token, stream, peer));
+                        schedule_client(
+                            &mut ready_clients,
+                            &mut pending_clients,
+                            token,
+                            libc::EPOLLIN as u32,
+                            4,
+                        );
+                    }
+                    Ok(None) => {
+                        listener_readable = false;
+                        break;
+                    }
+                    Err(error) => {
+                        for client in clients.values_mut() {
+                            self.close_socks5_client(client);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            let expired: Vec<_> = clients
+                .iter()
+                .filter_map(|(token, client)| {
+                    (Instant::now() >= client.idle_deadline).then_some(*token)
+                })
+                .collect();
+            for token in expired {
+                if let Some(mut client) = clients.remove(&token) {
+                    pending_clients.remove(&token);
+                    self.poller.delete(client.stream.as_raw_fd())?;
+                    self.close_socks5_client(&mut client);
+                    println!(
+                        "internet_proxy_client_error=SOCKS5 client idle timeout peer={}",
+                        client.peer
+                    );
+                }
+            }
+
+            let mut client_mutated_stack = false;
+            for _ in 0..CLIENT_WORK_BUDGET {
+                let Some(token) = ready_clients.pop_front() else {
+                    break;
+                };
+                let Some((event_mask, passes)) = pending_clients.remove(&token) else {
+                    continue;
+                };
+                if event_mask & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+                    if let Some(mut client) = clients.remove(&token) {
+                        self.poller.delete(client.stream.as_raw_fd())?;
                         self.close_socks5_client(&mut client);
+                        client_mutated_stack = true;
+                    }
+                    continue;
+                }
+                let total_pending = clients.values().map(Socks5Client::pending_bytes).sum();
+                let Some(client) = clients.get_mut(&token) else {
+                    continue;
+                };
+                if event_mask & libc::EPOLLRDHUP as u32 != 0 {
+                    client.peer_half_closed = true;
+                }
+                let before_phase = std::mem::discriminant(&client.phase);
+                let result = self.poll_socks5_client(
+                    client,
+                    MAX_SOCKS5_TOTAL_PENDING_BYTES.saturating_sub(total_pending),
+                );
+                let phase_changed = before_phase != std::mem::discriminant(&client.phase);
+                match result {
+                    Ok(false) => {
+                        // Provider readiness sampling and socket operations can
+                        // queue local stack work without changing queue lengths.
+                        client_mutated_stack = true;
+                        if passes > 1 || phase_changed {
+                            schedule_client(
+                                &mut ready_clients,
+                                &mut pending_clients,
+                                token,
+                                event_mask,
+                                passes.saturating_sub(1).max(1),
+                            );
+                        }
+                    }
+                    Ok(true) => {
+                        let mut client = clients.remove(&token).expect("client exists");
+                        pending_clients.remove(&token);
+                        self.poller.delete(client.stream.as_raw_fd())?;
+                        self.close_socks5_client(&mut client);
+                        client_mutated_stack = true;
                         println!("internet_proxy_transfer_complete=true peer={}", client.peer);
                     }
                     Err(error) => {
-                        let mut client = clients.swap_remove(index);
+                        let mut client = clients.remove(&token).expect("client exists");
+                        pending_clients.remove(&token);
+                        self.poller.delete(client.stream.as_raw_fd())?;
                         self.close_socks5_client(&mut client);
+                        client_mutated_stack = true;
                         println!("internet_proxy_client_error={error} peer={}", client.peer);
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(1));
+            stack_pending |= client_mutated_stack;
+
+            let total_pending: usize = clients.values().map(Socks5Client::pending_bytes).sum();
+            for client in clients.values_mut() {
+                let events = client.epoll_events(total_pending < MAX_SOCKS5_TOTAL_PENDING_BYTES);
+                if events != client.registered_events {
+                    self.poller
+                        .modify(client.stream.as_raw_fd(), client.token, events)?;
+                    client.registered_events = events;
+                }
+            }
+            let desired_listener_events = BASE_EVENTS
+                | if clients.len() < MAX_SOCKS5_CLIENTS {
+                    libc::EPOLLIN as u32
+                } else {
+                    0
+                };
+            if desired_listener_events != listener_events {
+                self.poller
+                    .modify(listener_fd, LISTENER_TOKEN, desired_listener_events)?;
+                listener_events = desired_listener_events;
+            }
+
+            if stack_pending || !ready_clients.is_empty() {
+                continue;
+            }
+            let timeout = self.next_wait_timeout(
+                deadline
+                    .into_iter()
+                    .chain(clients.values().map(|client| client.idle_deadline)),
+            );
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
+            let ready = self.poller.wait(&mut events, timeout)?;
+            if ready == 0 {
+                stack_pending = true;
+                continue;
+            }
+            for event in &events[..ready] {
+                match event.u64 {
+                    FRAME_TOKEN => {
+                        self.runner.device_mut().notify_epoll(event.events);
+                        stack_pending = true;
+                    }
+                    LISTENER_TOKEN => listener_readable = true,
+                    token => {
+                        schedule_client(
+                            &mut ready_clients,
+                            &mut pending_clients,
+                            token,
+                            event.events,
+                            4,
+                        );
+                    }
+                }
+            }
         }
-        for client in &mut clients {
+        self.poller.delete(listener_fd)?;
+        for client in clients.values_mut() {
+            self.poller.delete(client.stream.as_raw_fd())?;
             self.close_socks5_client(client);
         }
         println!("internet_proxy_stopped=true");
         Ok(())
     }
 
-    fn poll_socks5_client(&mut self, client: &mut Socks5Client) -> Result<bool, &'static str> {
+    fn poll_socks5_client(
+        &mut self,
+        client: &mut Socks5Client,
+        aggregate_remaining: usize,
+    ) -> Result<bool, &'static str> {
         if std::time::Instant::now() >= client.idle_deadline {
             return Err("SOCKS5 client idle timeout");
         }
@@ -316,7 +773,7 @@ impl BoundedNetstackProof {
         let phase = std::mem::replace(&mut client.phase, Socks5Phase::Closing);
         client.phase = match phase {
             Socks5Phase::Greeting(mut bytes) => {
-                if Self::read_host_once(client, &mut bytes)? {
+                if Self::read_host_once(client, &mut bytes, MAX_SOCKS5_HANDSHAKE_BYTES)? {
                     return Ok(true);
                 }
                 if bytes.len() < 2 {
@@ -338,7 +795,9 @@ impl BoundedNetstackProof {
                 }
             }
             Socks5Phase::Request(mut bytes) => {
-                if bytes.len() < 4 && Self::read_host_once(client, &mut bytes)? {
+                if bytes.len() < 4
+                    && Self::read_host_once(client, &mut bytes, MAX_SOCKS5_HANDSHAKE_BYTES)?
+                {
                     return Ok(true);
                 }
                 if bytes.len() < 4 {
@@ -356,7 +815,9 @@ impl BoundedNetstackProof {
                         }
                         _ => return Err("SOCKS5 address type is unsupported"),
                     };
-                    if bytes.len() < needed && Self::read_host_once(client, &mut bytes)? {
+                    if bytes.len() < needed
+                        && Self::read_host_once(client, &mut bytes, MAX_SOCKS5_HANDSHAKE_BYTES)?
+                    {
                         return Ok(true);
                     }
                     if bytes.len() < needed {
@@ -420,20 +881,9 @@ impl BoundedNetstackProof {
             Socks5Phase::Connecting { address, port } => 'connecting: {
                 let mut provider = self.runner.stack().socket_provider();
                 if client.socket.is_none() {
-                    let socket_client = match RemoteSocketProvider::open_client(
-                        &mut provider,
-                        NonZeroUsize::new(1).unwrap(),
-                    ) {
-                        Ok(socket_client) => socket_client,
-                        Err(error) => break 'connecting Self::socks5_failure(client, error),
-                    };
-                    let socket = match provider.tcp_socket(socket_client, RemoteIpVersion::V4) {
+                    let socket = match provider.tcp_socket(self.proxy_client, RemoteIpVersion::V4) {
                         Ok(socket) => socket,
-                        Err(error) => {
-                            let _ =
-                                RemoteSocketProvider::close_client(&mut provider, socket_client);
-                            break 'connecting Self::socks5_failure(client, error);
-                        }
+                        Err(error) => break 'connecting Self::socks5_failure(client, error),
                     };
                     if let Err(error) = RemoteSocketProviderV2::connect(
                         &mut provider,
@@ -445,10 +895,8 @@ impl BoundedNetstackProof {
                     ) && error != netstack3_port_spike::RemoteSocketError::InProgress
                     {
                         let _ = RemoteSocketProviderV2::close(&mut provider, socket);
-                        let _ = RemoteSocketProvider::close_client(&mut provider, socket_client);
                         break 'connecting Self::socks5_failure(client, error);
                     }
-                    client.socket_client = Some(socket_client);
                     client.socket = Some(socket);
                     client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 }
@@ -489,12 +937,16 @@ impl BoundedNetstackProof {
             Socks5Phase::Relay => {
                 let socket = client.socket.ok_or("SOCKS5 relay socket missing")?;
                 let mut buffer = [0; 16 * 1024];
-                if client.host_to_remote.len() < MAX_SOCKS5_PENDING_BYTES {
+                let read_capacity = MAX_SOCKS5_PENDING_BYTES
+                    .saturating_sub(client.host_to_remote.len())
+                    .min(aggregate_remaining)
+                    .min(buffer.len());
+                if read_capacity != 0 {
                     let read = unsafe {
                         libc::read(
                             client.stream.as_raw_fd(),
                             buffer.as_mut_ptr().cast(),
-                            buffer.len(),
+                            read_capacity,
                         )
                     };
                     match read {
@@ -536,11 +988,16 @@ impl BoundedNetstackProof {
                 }
                 if ready.readiness.0 & ProviderReadinessV2::READABLE != 0
                     && client.remote_to_host.len() < MAX_SOCKS5_PENDING_BYTES
+                    && aggregate_remaining != 0
                 {
+                    let receive_capacity = MAX_SOCKS5_PENDING_BYTES
+                        .saturating_sub(client.remote_to_host.len())
+                        .min(aggregate_remaining)
+                        .min(buffer.len());
                     match RemoteSocketProviderV2::recv_msg(
                         &mut provider,
                         socket,
-                        buffer.len() as u32,
+                        receive_capacity as u32,
                         0,
                     ) {
                         Ok(message) if message.eof => Socks5Phase::Closing,
@@ -575,13 +1032,18 @@ impl BoundedNetstackProof {
     fn read_host_once(
         client: &mut Socks5Client,
         bytes: &mut Vec<u8>,
+        limit: usize,
     ) -> Result<bool, &'static str> {
         let mut buffer = [0; 16 * 1024];
+        let capacity = limit.saturating_sub(bytes.len()).min(buffer.len());
+        if capacity == 0 {
+            return Err("SOCKS5 handshake exceeds buffer budget");
+        }
         let read = unsafe {
             libc::read(
                 client.stream.as_raw_fd(),
                 buffer.as_mut_ptr().cast(),
-                buffer.len(),
+                capacity,
             )
         };
         match read {
@@ -626,12 +1088,12 @@ impl BoundedNetstackProof {
     }
 
     fn close_socks5_client(&mut self, client: &mut Socks5Client) {
+        if let Socks5Phase::Dns { lookup, .. } = client.phase {
+            self.runner.stack_mut().cancel_lookup(lookup);
+        }
         let mut provider = self.runner.stack().socket_provider();
         if let Some(socket) = client.socket.take() {
             let _ = RemoteSocketProviderV2::close(&mut provider, socket);
-        }
-        if let Some(socket_client) = client.socket_client.take() {
-            let _ = RemoteSocketProvider::close_client(&mut provider, socket_client);
         }
     }
 
@@ -651,5 +1113,39 @@ impl BoundedNetstackProof {
         };
         client.host_out.extend([5, reply, 0, 1, 0, 0, 0, 0, 0, 0]);
         Socks5Phase::Closing
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn runnable_queue_coalesces_and_preserves_round_robin_order() {
+        let mut queue = VecDeque::new();
+        let mut pending = HashMap::new();
+        for token in FIRST_CLIENT_TOKEN..FIRST_CLIENT_TOKEN + 64 {
+            schedule_client(&mut queue, &mut pending, token, 0, 1);
+            schedule_client(&mut queue, &mut pending, token, libc::EPOLLIN as u32, 4);
+        }
+        assert_eq!(queue.len(), 64);
+        assert_eq!(pending.len(), 64);
+        assert_eq!(queue.pop_front(), Some(FIRST_CLIENT_TOKEN));
+        assert_eq!(queue.pop_back(), Some(FIRST_CLIENT_TOKEN + 63));
+        assert_eq!(pending[&FIRST_CLIENT_TOKEN], (libc::EPOLLIN as u32, 4));
+    }
+
+    #[test]
+    fn epoll_interests_apply_relay_backpressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, address) = listener.accept().unwrap();
+        let mut client = Socks5Client::new(FIRST_CLIENT_TOKEN, stream, address);
+        client.phase = Socks5Phase::Relay;
+        assert_ne!(client.epoll_events(true) & libc::EPOLLIN as u32, 0);
+        assert_eq!(client.epoll_events(false) & libc::EPOLLIN as u32, 0);
+        client.host_out.push_back(1);
+        assert_ne!(client.epoll_events(false) & libc::EPOLLOUT as u32, 0);
+        drop(peer);
     }
 }

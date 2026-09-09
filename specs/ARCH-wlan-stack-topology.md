@@ -11,7 +11,8 @@ self-sandboxed process reached only through a bounded Unix `SOCK_SEQPACKET`
 frame channel. The netstack process has an empty filesystem root, a private
 network namespace, no capabilities or device-backed mappings, and a seccomp
 allowlist; its run-state descriptors are only standard streams, the frame
-channel, the pre-bound SOCKS listener, and accepted clients. The separate DNS
+channel, the pre-bound SOCKS listener, one internal readiness poller, and
+accepted clients. The separate DNS
 process in the mature topology below remains future work. A separate,
 self-sandboxing wlancfg daemon now owns durable saved networks and drives the
 pinned Fuchsia selector and client state machine over bounded, fd-free policy

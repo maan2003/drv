@@ -3,7 +3,7 @@ use crate::{Runtime, TcpSocketHandle, UdpSocketHandle};
 use async_trait::async_trait;
 use futures::{
     executor::LocalPool,
-    future::{Either, select},
+    future::{AbortHandle, Abortable, Either, select},
     task::LocalSpawnExt as _,
 };
 use futures_io::{AsyncRead, AsyncWrite};
@@ -313,12 +313,16 @@ type Resolver = AsyncResolver<GenericConnection, GenericConnectionProvider<Nativ
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DnsLookupHandle(u64);
 pub type DnsLookupResult = Result<Vec<IpAddr>, String>;
+struct DnsLookupSlot {
+    result: Option<DnsLookupResult>,
+    abort: AbortHandle,
+}
 pub struct NativeDnsBridge {
     b: Arc<Bus>,
     pool: LocalPool,
     resolver: Option<Resolver>,
     next_query: u64,
-    results: Rc<RefCell<HashMap<u64, DnsLookupResult>>>,
+    results: Rc<RefCell<HashMap<u64, DnsLookupSlot>>>,
     udp: HashMap<u64, (UdpSocketHandle, SocketAddr, NonZeroU16, Arc<End>)>,
     tcp: HashMap<u64, (TcpSocketHandle, Arc<End>)>,
 }
@@ -366,64 +370,112 @@ impl NativeDnsBridge {
             .checked_add(1)
             .expect("DNS query id exhausted");
         let results = self.results.clone();
+        if results.borrow().len() == LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "DNS lookup table full",
+            ));
+        }
+        let (abort, registration) = AbortHandle::new_pair();
+        results.borrow_mut().insert(
+            id,
+            DnsLookupSlot {
+                result: None,
+                abort,
+            },
+        );
         let name = name.into();
-        self.pool
-            .spawner()
-            .spawn_local(async move {
-                let result = resolver
-                    .lookup_ip(name)
-                    .await
-                    .map(|v| v.iter().collect())
-                    .map_err(|e| e.to_string());
-                results.borrow_mut().insert(id, result);
-            })
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        if let Err(error) = self.pool.spawner().spawn_local(async move {
+            let result = Abortable::new(resolver.lookup_ip(name), registration).await;
+            if let (Ok(result), Some(slot)) = (result, results.borrow_mut().get_mut(&id)) {
+                slot.result = Some(
+                    result
+                        .map(|addresses| addresses.iter().collect())
+                        .map_err(|error| error.to_string()),
+                );
+            }
+        }) {
+            self.results.borrow_mut().remove(&id);
+            return Err(io::Error::other(error.to_string()));
+        }
         Ok(DnsLookupHandle(id))
     }
     pub fn take_result(&mut self, h: DnsLookupHandle) -> Option<DnsLookupResult> {
-        self.results.borrow_mut().remove(&h.0)
+        let mut results = self.results.borrow_mut();
+        if results.get(&h.0)?.result.is_none() {
+            return None;
+        }
+        results.remove(&h.0).and_then(|slot| slot.result)
+    }
+    pub fn cancel_lookup(&mut self, h: DnsLookupHandle) {
+        if let Some(slot) = self.results.borrow_mut().remove(&h.0) {
+            slot.abort.abort();
+        }
+    }
+    pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
+        self.b
+            .timers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(deadline, _)| Duration::from_nanos(*deadline))
+            .min()
     }
     pub fn spawner(&self) -> futures::executor::LocalSpawner {
         self.pool.spawner()
     }
-    pub fn pump(&mut self, rt: &mut Runtime, now: Duration) -> usize {
+    pub fn pump(&mut self, rt: &mut Runtime, now: Duration, budget: usize) -> usize {
         let now = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
         self.b.now.store(now, Ordering::Relaxed);
+        let mut n = 0;
         {
             let mut t = self.b.timers.lock().unwrap();
             let mut p = vec![];
             for (d, w) in t.drain(..) {
-                if d <= now { w.wake() } else { p.push((d, w)) }
+                if d <= now && n < budget {
+                    w.wake();
+                    n += 1;
+                } else {
+                    p.push((d, w));
+                }
             }
             *t = p
         }
-        while let Some(t) = self.b.tasks.lock().unwrap().pop_front() {
+        while n < budget {
+            let Some(t) = self.b.tasks.lock().unwrap().pop_front() else {
+                break;
+            };
             self.pool
                 .spawner()
                 .spawn_local(async move {
                     let _ = t.await;
                 })
-                .unwrap()
+                .unwrap();
+            n += 1;
         }
-        let mut n = 0;
         for _ in 0..2 {
+            if n >= budget {
+                break;
+            }
+            // DNS futures only wake for bounded bus commands, socket input,
+            // or timers. Drain the finite ready chain as one work quantum.
             let g = Guard::enter(self.b.clone());
             self.pool.run_until_stalled();
             drop(g);
-            loop {
+            while n < budget {
                 let c = { self.b.cmd.lock().unwrap().pop_front() };
                 let Some(c) = c else { break };
                 n += 1;
                 self.apply(rt, c)
             }
         }
-        for (h, _, _, e) in self.udp.values() {
+        for (h, _, _, e) in self.udp.values().take(budget.saturating_sub(n)) {
             if let Ok(Some(b)) = rt.udp_receive(*h) {
                 e.push(b);
                 n += 1
             }
         }
-        for (h, e) in self.tcp.values() {
+        for (h, e) in self.tcp.values().take(budget.saturating_sub(n)) {
             let mut b = vec![0; 2048];
             if let Ok(x) = rt.tcp_read(*h, &mut b) {
                 if x > 0 {
@@ -433,7 +485,7 @@ impl NativeDnsBridge {
                 }
             }
         }
-        n
+        n.min(budget)
     }
     fn apply(&mut self, rt: &mut Runtime, c: Cmd) {
         match c {
@@ -522,7 +574,7 @@ mod tests {
 
         let mut work = 0;
         for _ in 0..8 {
-            work += bridge.pump(&mut runtime, Duration::ZERO);
+            work += bridge.pump(&mut runtime, Duration::ZERO, LIMIT);
         }
         assert!(work > 0);
         let frame = runtime
@@ -581,8 +633,10 @@ mod tests {
         let mut bridge = NativeDnsBridge::new();
         bridge.configure(&[IpAddr::from([192, 0, 2, 53])]).unwrap();
         let query = bridge.lookup_ip("native.test.").unwrap();
+        assert!(bridge.take_result(query).is_none());
+        assert!(bridge.take_result(query).is_none());
         for _ in 0..8 {
-            bridge.pump(&mut client, Duration::ZERO);
+            bridge.pump(&mut client, Duration::ZERO, LIMIT);
             exchange(&mut client, &mut server);
         }
         let request = server
@@ -611,7 +665,7 @@ mod tests {
             .unwrap();
         for _ in 0..8 {
             exchange(&mut client, &mut server);
-            bridge.pump(&mut client, Duration::ZERO);
+            bridge.pump(&mut client, Duration::ZERO, LIMIT);
         }
         assert_eq!(
             bridge.take_result(query).unwrap().unwrap(),

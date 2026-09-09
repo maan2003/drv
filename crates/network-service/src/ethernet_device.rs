@@ -8,23 +8,9 @@ use std::os::fd::{AsRawFd, OwnedFd};
 const MSG_DONTWAIT: i32 = 0x40;
 const MSG_TRUNC: i32 = 0x20;
 const MSG_NOSIGNAL: i32 = 0x4000;
-const POLLIN: i16 = 0x001;
-const POLLOUT: i16 = 0x004;
-const POLLERR: i16 = 0x008;
-const POLLHUP: i16 = 0x010;
-const POLLNVAL: i16 = 0x020;
-
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
 unsafe extern "C" {
     fn send(fd: i32, bytes: *const u8, len: usize, flags: i32) -> isize;
     fn recv(fd: i32, bytes: *mut u8, len: usize, flags: i32) -> isize;
-    fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
 }
 
 pub(crate) struct ServiceEthernetDevice {
@@ -34,6 +20,8 @@ pub(crate) struct ServiceEthernetDevice {
     link_closed: bool,
     link_close_notified: bool,
     receive_notified: bool,
+    receive_ready: bool,
+    transmit_ready: bool,
     transmit_blocked: bool,
 }
 
@@ -52,6 +40,8 @@ impl ServiceEthernetDevice {
             link_closed: false,
             link_close_notified: false,
             receive_notified: false,
+            receive_ready: false,
+            transmit_ready: false,
             transmit_blocked: false,
         }
     }
@@ -59,23 +49,53 @@ impl ServiceEthernetDevice {
     pub(crate) fn mac_address(&self) -> [u8; 6] {
         self.mac_address
     }
+
+    pub(crate) fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    pub(crate) fn wants_write(&self) -> bool {
+        self.transmit_blocked
+    }
+
+    pub(crate) fn notify_epoll(&mut self, events: u32) {
+        if events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+            self.link_closed = true;
+        }
+        if events & libc::EPOLLIN as u32 != 0 {
+            self.receive_ready = true;
+        }
+        if events & libc::EPOLLOUT as u32 != 0 {
+            self.transmit_ready = true;
+        }
+    }
 }
 
 impl EthernetDevice for ServiceEthernetDevice {
     fn receive(&mut self) -> Option<EthernetFrame> {
         let mut bytes = [0u8; 1515];
-        let received = unsafe {
-            recv(
-                self.fd.as_raw_fd(),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                MSG_DONTWAIT | MSG_TRUNC,
-            )
-        };
-        if received < 0 {
+        let received = loop {
+            let received = unsafe {
+                recv(
+                    self.fd.as_raw_fd(),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    MSG_DONTWAIT | MSG_TRUNC,
+                )
+            };
+            if received >= 0 {
+                break received;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             self.receive_notified = false;
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                self.link_closed = true;
+            }
             return None;
-        }
+        };
         if received == 0 {
             self.link_closed = true;
             return None;
@@ -88,13 +108,27 @@ impl EthernetDevice for ServiceEthernetDevice {
 
     fn transmit(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame> {
         let bytes = frame.as_bytes();
-        let sent = unsafe {
-            send(
-                self.fd.as_raw_fd(),
-                bytes.as_ptr(),
-                bytes.len(),
-                MSG_DONTWAIT | MSG_NOSIGNAL,
-            )
+        let sent = loop {
+            let sent = unsafe {
+                send(
+                    self.fd.as_raw_fd(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    MSG_DONTWAIT | MSG_NOSIGNAL,
+                )
+            };
+            if sent >= 0 {
+                break sent;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            self.transmit_blocked = error.kind() == std::io::ErrorKind::WouldBlock;
+            if !self.transmit_blocked {
+                self.link_closed = true;
+            }
+            return Err(frame);
         };
         if sent == bytes.len() as isize {
             self.transmit_blocked = false;
@@ -119,24 +153,13 @@ impl EthernetEventSource for ServiceEthernetDevice {
             self.link_close_notified = true;
             return Some(EthernetDeviceEvent::LinkStateChanged(false));
         }
-        let mut descriptor = PollFd {
-            fd: self.fd.as_raw_fd(),
-            events: POLLIN | if self.transmit_blocked { POLLOUT } else { 0 },
-            revents: 0,
-        };
-        if unsafe { poll(&mut descriptor, 1, 0) } <= 0 {
-            return None;
-        }
-        if descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
-            self.link_closed = true;
-            self.link_close_notified = true;
-            return Some(EthernetDeviceEvent::LinkStateChanged(false));
-        }
-        if descriptor.revents & POLLIN != 0 && !self.receive_notified {
+        if self.receive_ready && !self.receive_notified {
+            self.receive_ready = false;
             self.receive_notified = true;
             return Some(EthernetDeviceEvent::ReceiveReady);
         }
-        if descriptor.revents & POLLOUT != 0 {
+        if self.transmit_ready && self.transmit_blocked {
+            self.transmit_ready = false;
             self.transmit_blocked = false;
             return Some(EthernetDeviceEvent::TransmitReady);
         }

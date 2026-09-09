@@ -93,6 +93,159 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
 }
 
 #[test]
+fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
+    const CLIENTS: usize = 32;
+    let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 256).unwrap();
+    let frame = device_capability.into_frame_fd();
+    let frame_fd = frame.as_raw_fd();
+    let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
+    let mut service = BoundedNetstackProof::new(
+        device,
+        NetstackProofConfig {
+            dns_name: "unused.invalid.".into(),
+            server_port: NonZeroU16::new(80).unwrap(),
+        },
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listen = listener.local_addr().unwrap();
+    let mut clients: Vec<_> = (0..CLIENTS)
+        .map(|index| {
+            let mut client = TcpStream::connect(listen).unwrap();
+            if index == 0 {
+                client.write_all(&[4, 1, 0]).unwrap();
+            } else {
+                client
+                    .write_all(&[
+                        5, 1, 0, // greeting
+                        5, 1, 0, 1, 192, 0, 2, 1, 0, 80, // offline CONNECT
+                    ])
+                    .unwrap();
+            }
+            client
+        })
+        .collect();
+    let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
+    if filtered {
+        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+            .unwrap();
+    }
+
+    service
+        .serve_socks5_listener(
+            listener,
+            listen,
+            Some(std::time::Instant::now() + Duration::from_millis(300)),
+            || false,
+        )
+        .unwrap();
+    for (index, client) in clients.iter_mut().enumerate() {
+        if index == 0 {
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(client.as_raw_fd(), (&mut byte as *mut u8).cast(), 1,) },
+                0
+            );
+            continue;
+        }
+        let mut response = [0; 12];
+        read_exact_raw(client.as_raw_fd(), &mut response);
+        assert_eq!(&response[..2], &[5, 0]);
+        assert_eq!(response[3], 3);
+    }
+    if filtered {
+        drop((clients, service));
+        unsafe { libc::_exit(0) }
+    }
+}
+
+#[test]
+fn idle_epoll_waits_for_deadline_without_busy_polling() {
+    let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let frame = device_capability.into_frame_fd();
+    let frame_fd = frame.as_raw_fd();
+    let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
+    let mut service = BoundedNetstackProof::new(
+        device,
+        NetstackProofConfig {
+            dns_name: "unused.invalid.".into(),
+            server_port: NonZeroU16::new(80).unwrap(),
+        },
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listen = listener.local_addr().unwrap();
+    let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
+    if filtered {
+        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+            .unwrap();
+    }
+    let before_waits = service.poller_wait_counts();
+    let before_cpu = (!filtered).then(thread_cpu_time);
+    let started = std::time::Instant::now();
+    service
+        .serve_socks5_listener(
+            listener,
+            listen,
+            Some(started + Duration::from_millis(120)),
+            || false,
+        )
+        .unwrap();
+    let wall = started.elapsed();
+    let cpu = before_cpu.map(|before| thread_cpu_time().saturating_sub(before));
+    let waits = service.poller_wait_counts();
+    let total_waits = waits.0 - before_waits.0;
+    let blocking_waits = waits.1 - before_waits.1;
+    eprintln!(
+        "idle_epoll wall_us={} cpu_us={} waits={total_waits} blocking_waits={blocking_waits}",
+        wall.as_micros(),
+        cpu.unwrap_or_default().as_micros()
+    );
+    assert!(wall >= Duration::from_millis(100));
+    if let Some(cpu) = cpu {
+        assert!(cpu < Duration::from_millis(30), "idle CPU time: {cpu:?}");
+    }
+    assert!((1..=3).contains(&total_waits), "idle waits: {total_waits}");
+    assert_eq!(blocking_waits, total_waits);
+    if filtered {
+        drop(service);
+        unsafe { libc::_exit(0) }
+    }
+}
+
+fn read_exact_raw(fd: i32, mut bytes: &mut [u8]) {
+    while !bytes.is_empty() {
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read > 0 {
+            bytes = &mut bytes[read as usize..];
+        } else if read < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            panic!(
+                "raw client read failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+fn thread_cpu_time() -> Duration {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) },
+        0
+    );
+    let usage = unsafe { usage.assume_init() };
+    let micros = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
+        + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
+    Duration::from_micros(micros)
+}
+
+#[test]
 fn revoked_frame_generation_exits_and_replacement_starts() {
     let make_service = || {
         let (capability, driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
@@ -355,7 +508,8 @@ fn drive(
         ap.collect_server_frames();
         while let Some(frame) = ap.pending.pop_front() {
             match sink.deliver(frame.as_bytes()) {
-                Ok(()) | Err(EthernetIngressError::LinkDown) => {}
+                Ok(()) => runner.device_mut().notify_epoll(libc::EPOLLIN as u32),
+                Err(EthernetIngressError::LinkDown) => {}
                 Err(error) => panic!("unexpected associated RX failure: {error:?}"),
             }
         }
@@ -468,7 +622,8 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
         .unwrap();
     client.set_nonblocking(true).unwrap();
     if std::env::var_os("DRV_NETWORK_RELAY_FILTER_FIXTURE").is_some() {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd()).unwrap();
+        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+            .unwrap();
     }
     let mut response = Vec::new();
     service

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use crate::{BoundedNetstackProof, NetstackProofConfig, ServiceEthernetDevice};
+use crate::{BoundedNetstackProof, NetstackProofConfig, NetworkPoller, ServiceEthernetDevice};
 use std::env;
 use std::ffi::c_void;
 use std::net::{SocketAddr, TcpListener};
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 const FRAME_FD: i32 = 3;
 const LISTENER_FD: i32 = 4;
+const EPOLL_FD: i32 = 6;
+const EPOLL_EVENT_BATCH: u32 = 64;
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWNET: i32 = 0x4000_0000;
 const MS_REC: usize = 0x4000;
@@ -47,8 +49,6 @@ const SYS_IOCTL: i64 = 16;
 const SYS_SOCKET: i64 = 41;
 #[cfg(target_arch = "x86_64")]
 const SYS_OPENAT: i64 = 257;
-#[cfg(target_arch = "x86_64")]
-const SYS_READINESS: i64 = libc::SYS_poll;
 #[cfg(target_arch = "aarch64")]
 const SYS_READ: i64 = 63;
 #[cfg(target_arch = "aarch64")]
@@ -59,8 +59,6 @@ const SYS_IOCTL: i64 = 29;
 const SYS_SOCKET: i64 = 198;
 #[cfg(target_arch = "aarch64")]
 const SYS_OPENAT: i64 = 56;
-#[cfg(target_arch = "aarch64")]
-const SYS_READINESS: i64 = libc::SYS_ppoll;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("wlan netstack seccomp is supported only on x86_64 and aarch64");
 
@@ -135,12 +133,11 @@ fn append_fd_and_flags(filter: &mut Vec<SockFilter>, syscall: i64, fd: RawFd, fl
 }
 
 fn append_accept4(filter: &mut Vec<SockFilter>, listener_fd: RawFd) {
-    filter.push(jump(libc::SYS_accept4 as u32, 0, 9));
+    filter.push(jump(libc::SYS_accept4 as u32, 0, 7));
     filter.push(arg(0));
     filter.push(jump(listener_fd as u32, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     filter.push(arg(3));
-    filter.push(jump(libc::SOCK_CLOEXEC as u32, 2, 0));
     filter.push(jump(
         (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32,
         1,
@@ -167,12 +164,66 @@ fn append_io_except_capabilities(
 }
 
 fn append_fcntl_commands(filter: &mut Vec<SockFilter>) {
-    filter.push(jump(libc::SYS_fcntl as u32, 0, 7));
+    filter.push(jump(libc::SYS_fcntl as u32, 0, 5));
     filter.push(arg(1));
-    filter.push(jump(libc::F_GETFL as u32, 3, 0));
-    filter.push(jump(libc::F_SETFL as u32, 2, 0));
     // Rust's owned-socket teardown checks that the descriptor is still open.
     filter.push(jump(libc::F_GETFD as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_epoll_ctl(filter: &mut Vec<SockFilter>, epoll_fd: RawFd) {
+    filter.push(jump(libc::SYS_epoll_ctl as u32, 0, 21));
+    filter.push(arg(0));
+    filter.push(jump(epoll_fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(0));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(1));
+    filter.push(jump(libc::EPOLL_CTL_ADD as u32, 3, 0));
+    filter.push(jump(libc::EPOLL_CTL_MOD as u32, 2, 0));
+    filter.push(jump(libc::EPOLL_CTL_DEL as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(1));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(2));
+    filter.push(jump(epoll_fd as u32, 0, 1));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(2));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_epoll_pwait(filter: &mut Vec<SockFilter>, epoll_fd: RawFd) {
+    filter.push(jump(libc::SYS_epoll_pwait as u32, 0, 25));
+    filter.push(arg(0));
+    filter.push(jump(epoll_fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(0));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(2));
+    filter.push(jump(EPOLL_EVENT_BATCH, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(2));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(4));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(4));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(5));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(5));
+    filter.push(jump(0, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
@@ -294,7 +345,7 @@ fn setup(expected_parent: i32) -> Result<(), String> {
     Ok(())
 }
 
-fn network_filter(frame_fd: RawFd, listener_fd: RawFd) -> Vec<SockFilter> {
+fn network_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
@@ -328,16 +379,16 @@ fn network_filter(frame_fd: RawFd, listener_fd: RawFd) -> Vec<SockFilter> {
     // Accepted streams are made nonblocking; no descriptor duplication,
     // ownership, or advisory-lock fcntl commands are needed at runtime.
     append_fcntl_commands(&mut filter);
+    append_epoll_ctl(&mut filter, epoll_fd);
+    append_epoll_pwait(&mut filter, epoll_fd);
     // Heap growth/reclamation is allowed, but executable memory is not.
     append_no_exec_memory(&mut filter, libc::SYS_mmap);
     append_no_exec_memory(&mut filter, libc::SYS_mprotect);
 
     // Runtime and teardown operations, grouped by the role that requires them.
-    // read/write/close cover bootstrap fd 5, logs, and dynamic accepted clients;
-    // poll drives the frame readiness loop.
+    // read/write/close cover bootstrap fd 5, logs, and dynamic accepted clients.
     let allowed = [
         libc::SYS_close,
-        SYS_READINESS,
         // Rust allocation and deallocation after executable mappings are denied.
         libc::SYS_munmap,
         libc::SYS_brk,
@@ -374,11 +425,11 @@ fn network_filter(frame_fd: RawFd, listener_fd: RawFd) -> Vec<SockFilter> {
 }
 
 fn lockdown() -> Result<(), String> {
-    install_filter(FRAME_FD, LISTENER_FD)
+    install_filter(FRAME_FD, LISTENER_FD, EPOLL_FD)
 }
 
-fn install_filter(frame_fd: RawFd, listener_fd: RawFd) -> Result<(), String> {
-    let filter = network_filter(frame_fd, listener_fd);
+fn install_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Result<(), String> {
+    let filter = network_filter(frame_fd, listener_fd, epoll_fd);
     let program = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
@@ -398,12 +449,16 @@ fn install_filter(frame_fd: RawFd, listener_fd: RawFd) -> Result<(), String> {
 }
 
 #[cfg(test)]
-pub(crate) fn install_test_filter(frame_fd: RawFd, listener_fd: RawFd) -> Result<(), String> {
+pub(crate) fn install_test_filter(
+    frame_fd: RawFd,
+    listener_fd: RawFd,
+    epoll_fd: RawFd,
+) -> Result<(), String> {
     syscall_ok(
         unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1usize, 0usize, 0usize, 0usize) },
         "test no-new-privileges",
     )?;
-    install_filter(frame_fd, listener_fd)
+    install_filter(frame_fd, listener_fd, epoll_fd)
 }
 
 fn write_all_fd(fd: i32, mut bytes: &[u8], operation: &'static str) -> Result<(), String> {
@@ -480,6 +535,13 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
     let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
     let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
     setup(expected_parent)?;
+    let poller = NetworkPoller::new().map_err(str::to_string)?;
+    if poller.raw_fd() != EPOLL_FD {
+        return Err(format!(
+            "network epoll descriptor mismatch: expected {EPOLL_FD}, got {}",
+            poller.raw_fd()
+        ));
+    }
     lockdown()?;
     println!(
         "netstack_sandbox_ready=true pid={} uid=65534 gid=65534 no_new_privs=true seccomp_default=kill empty_root=true own_netns=true inherited_frame_only=true inherited_listener_only=true",
@@ -499,12 +561,13 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
         return Ok(());
     }
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, mac) };
-    let mut proof = BoundedNetstackProof::new(
+    let mut proof = BoundedNetstackProof::new_with_poller(
         device,
         NetstackProofConfig {
             dns_name: "example.com.".into(),
             server_port: NonZeroU16::new(80).unwrap(),
         },
+        poller,
     )
     .map_err(str::to_string)?;
     if !lab_proof {
@@ -578,18 +641,16 @@ mod tests {
         if std::env::var_os("DRV_NETWORK_FILTER_FIXTURE").is_none() {
             return;
         }
+        let poller = NetworkPoller::new().unwrap();
         child_require(
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
             10,
         );
-        child_require(lockdown().is_ok(), 11);
+        child_require(
+            install_filter(FRAME_FD, LISTENER_FD, poller.raw_fd()).is_ok(),
+            11,
+        );
 
-        let mut pollfd = libc::pollfd {
-            fd: FRAME_FD,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        child_require(unsafe { libc::poll(&mut pollfd, 1, 0) } == 1, 20);
         let mut frame = [0u8; 14];
         child_require(
             unsafe {
@@ -627,11 +688,30 @@ mod tests {
             )
         };
         child_require(accepted >= 0, 23);
-        let flags = unsafe { libc::fcntl(accepted, libc::F_GETFL) };
-        child_require(flags >= 0, 24);
+        child_require(unsafe { libc::fcntl(accepted, libc::F_GETFD) } >= 0, 24);
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 7,
+        };
         child_require(
-            unsafe { libc::fcntl(accepted, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+            unsafe { libc::epoll_ctl(poller.raw_fd(), libc::EPOLL_CTL_ADD, accepted, &mut event) }
+                == 0,
             25,
+        );
+        let mut ready = [libc::epoll_event { events: 0, u64: 0 }; EPOLL_EVENT_BATCH as usize];
+        child_require(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_epoll_pwait,
+                    poller.raw_fd(),
+                    ready.as_mut_ptr(),
+                    EPOLL_EVENT_BATCH,
+                    0,
+                    std::ptr::null::<libc::sigset_t>(),
+                    0usize,
+                )
+            } >= 0,
+            41,
         );
         let mut request = [0u8; 4];
         child_require(
@@ -643,6 +723,11 @@ mod tests {
         child_require(
             unsafe { libc::write(accepted, b"PONG".as_ptr().cast(), 4) } == 4,
             27,
+        );
+        child_require(
+            unsafe { libc::epoll_ctl(poller.raw_fd(), libc::EPOLL_CTL_DEL, accepted, &mut event) }
+                == 0,
+            42,
         );
 
         let mut go = [0u8; 2];
@@ -703,20 +788,25 @@ mod tests {
         if std::env::var_os("DRV_NETWORK_SERVICE_FILTER_FIXTURE").is_none() {
             return;
         }
+        let poller = NetworkPoller::new().unwrap();
         child_require(
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
             45,
         );
-        child_require(lockdown().is_ok(), 46);
+        child_require(
+            install_filter(FRAME_FD, LISTENER_FD, poller.raw_fd()).is_ok(),
+            46,
+        );
         let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
         let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
         let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };
-        let mut service = match BoundedNetstackProof::new(
+        let mut service = match BoundedNetstackProof::new_with_poller(
             device,
             NetstackProofConfig {
                 dns_name: "unused.invalid.".into(),
                 server_port: NonZeroU16::new(80).unwrap(),
             },
+            poller,
         ) {
             Ok(service) => service,
             Err(_) => child_exit(47),
@@ -803,6 +893,55 @@ mod tests {
                 "fcntl-dup" => {
                     libc::syscall(libc::SYS_fcntl, FRAME_FD, libc::F_DUPFD_CLOEXEC, 10);
                 }
+                "fcntl-getfl" => {
+                    libc::syscall(libc::SYS_fcntl, FRAME_FD, libc::F_GETFL);
+                }
+                "epoll-ctl-fd" => {
+                    libc::syscall(
+                        libc::SYS_epoll_ctl,
+                        LISTENER_FD,
+                        libc::EPOLL_CTL_ADD,
+                        FRAME_FD,
+                        0,
+                    );
+                }
+                "epoll-ctl-operation" => {
+                    libc::syscall(libc::SYS_epoll_ctl, EPOLL_FD, 99, FRAME_FD, 0);
+                }
+                "epoll-ctl-self" => {
+                    libc::syscall(
+                        libc::SYS_epoll_ctl,
+                        EPOLL_FD,
+                        libc::EPOLL_CTL_ADD,
+                        EPOLL_FD,
+                        0,
+                    );
+                }
+                "epoll-wait-fd" => {
+                    libc::syscall(
+                        libc::SYS_epoll_pwait,
+                        LISTENER_FD,
+                        0,
+                        EPOLL_EVENT_BATCH,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                "epoll-wait-batch" => {
+                    libc::syscall(libc::SYS_epoll_pwait, EPOLL_FD, 0, 1, 0, 0, 0);
+                }
+                "epoll-wait-signal-mask" => {
+                    libc::syscall(
+                        libc::SYS_epoll_pwait,
+                        EPOLL_FD,
+                        0,
+                        EPOLL_EVENT_BATCH,
+                        0,
+                        1,
+                        8,
+                    );
+                }
                 "executable-memory" => {
                     libc::syscall(
                         libc::SYS_mmap,
@@ -843,6 +982,13 @@ mod tests {
             "wrong-accept-fd",
             "accept-flags",
             "fcntl-dup",
+            "fcntl-getfl",
+            "epoll-ctl-fd",
+            "epoll-ctl-operation",
+            "epoll-ctl-self",
+            "epoll-wait-fd",
+            "epoll-wait-batch",
+            "epoll-wait-signal-mask",
             "executable-memory",
             "executable-mprotect",
             "unknown",
@@ -929,6 +1075,27 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "filtered SOCKS relay failed: {status}");
+    }
+
+    #[test]
+    fn epoll_scaling_idle_and_deadline_run_under_network_filter() {
+        for test in [
+            "integration_test::epoll_serves_more_than_twenty_four_clients_with_isolated_failures",
+            "integration_test::idle_epoll_waits_for_deadline_without_busy_polling",
+        ] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env("DRV_NETWORK_EPOLL_FILTER_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "filtered epoll fixture failed: {test}: {status}"
+            );
+        }
     }
 
     #[test]

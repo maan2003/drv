@@ -330,6 +330,11 @@ impl NativeBindingsCtx {
         }
         count
     }
+    pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
+        self.timers
+            .first_key_value()
+            .map(|((instant, _), _)| Duration::from_nanos(instant.as_nanos()))
+    }
     pub fn take_udp<I: IpExt>(
         &mut self,
         id: &UdpSocketId<I, WeakDeviceId<Self>, Self>,
@@ -1212,6 +1217,10 @@ impl Runtime {
             stack,
             bindings,
         })
+    }
+
+    pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
+        self.bindings.next_timer_deadline()
     }
 
     pub fn ipv4_address(&self) -> Option<[u8; 4]> {
@@ -2412,6 +2421,10 @@ impl NetworkServiceEndpoint for Runtime {
         let nanos = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
         self.set_now(NativeInstant::from_nanos(nanos));
         self.dispatch_due(budget)
+    }
+
+    fn next_timer_deadline(&self) -> Option<Duration> {
+        self.bindings.next_timer_deadline()
     }
 
     fn on_device_event(&mut self, event: EthernetDeviceEvent) {
