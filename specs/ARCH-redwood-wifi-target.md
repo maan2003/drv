@@ -4,15 +4,18 @@
 
 Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
 association, DHCP, and proved Internet connectivity before production hardening.
-The QMI-only discovery run reported BAR address `0x61e00000` and size
-`0x200000`, then stopped before MMIO/CE/HTC/WMI. The DT-assisted region-selection
-runner is merged but not physically validated. Automatic recovery for that
-no-reset VFIO experiment now uses a process timeout plus a local forced-reboot
-deadline and reboots on runner exit instead of attempting a native-driver
-rebind. Its stalled-runner and successful-exit paths pass a host-only test. An
-ordinary pre-release runner failure physically forced reboot to the unchanged
-Linux 7.2.0 #1 system, which was unlocked and reached running state over the
-healthy USB control path. The QMI region-selection path remains unvalidated.
+The DT-assisted physical run proved a running WPSS, a 2 MiB VFIO region 1, QMI
+DeviceInfo BAR `0x61e00000`/`0x200000`, and an exact region-1 match and map. It
+stopped at the software QMI-to-core seam before MMIO or CE, so neither is yet
+physically proved. Source now continues the selected QMI region into core, but
+that continuation (revision `0c71becf`, now in master) has only deterministic
+build/test evidence and remains pending physical validation. Automatic recovery
+for the no-reset VFIO experiment uses a process timeout plus a local
+forced-reboot deadline and
+reboots on runner exit instead of attempting a native-driver rebind. Its
+stalled-runner and successful-exit paths pass a host-only test; an ordinary
+pre-release runner failure also physically forced reboot to the unchanged,
+reachable Linux 7.2.0 #1 system.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

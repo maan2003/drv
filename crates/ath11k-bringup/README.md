@@ -17,115 +17,189 @@ NixOS system configuration lives in `~/src/nixos` (locally
 np access with the MT7921/substrate owner. Kernel/DTB experiments are kexec-only:
 no flashing, partition/slot changes, or encryption-key changes.
 
-### Run B starting-kernel precondition
+### Known-good Redwood operation
 
-The 32-byte region-1 DT has only booted through a two-hop sequence. A direct
-flashed `7.2.0 #1` to forced-legacy candidate hop is **not validated** and most
-recently failed to return USB; do not retry it. This is a validation gap, not a
-proved kernel root cause. The observed sequence used these exact inputs:
-
-- `stage3/Image`, SHA-256
-  `97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885`
-- `stage7/initrd-watchdog`, SHA-256
-  `654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f`
-- `stage10/runB-region1.fdt`, SHA-256
-  `8a5d019f7c258b654dffa180215f5d17cb5d95d04561a59a470d27cf33707b67`
-- `stage7/kexec-transaction/command-line`, exactly 1540 bytes.
-
-The successful observation started after Run A on `#9`: the operator forced a
-SysRq reboot, unlocked the returned flashed `#1`, waited for userspace to report
-`running`, and then made hop one. Run A's earlier no-`--dtb` boot into `#9` is
-inherited context without its original transcript. Neither history establishes
-a generally reproducible starting state.
-
-From unlocked, running flashed `#1`, hop first in auto mode:
+The validated route to the 32-byte region-1 DT is two orderly kexec hops. Run
+the phone-side blocks directly in a root shell; do not wrap them in another
+remote `sh -c`. First identify the recovered flashed kernel before changing
+anything:
 
 ```sh
-set -e
-test "$(systemctl is-system-running)" = running
+cat /proc/version
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
 test ! -e /run/redwood-lab-watchdog/armed
-kexec -l /var/lib/ath11k-redwood-lab/stage3/Image \
-  --initrd=/var/lib/ath11k-redwood-lab/stage7/initrd-watchdog \
-  --dtb=/var/lib/ath11k-redwood-lab/stage10/runB-region1.fdt \
-  --command-line="$(cat /var/lib/ath11k-redwood-lab/stage7/kexec-transaction/command-line)"
-sync
-kexec -e
 ```
 
-The one successful observation reached `7.2.0+ #9` but ignored the DTB
-argument. A later attempt from a `degraded`, rather than `running`, flashed
-userspace reset back to flashed `#1`; no retained evidence distinguishes a
-reset before candidate entry from a candidate failure before USB. Do not treat
-the first hop as reproducible or proceed from a degraded system. A diagnostic
-retry from `running` userspace also failed to return USB and required a manual
-power-cycle; its exact inputs and successful `kexec_loaded` transition do not
-show whether the candidate kernel began executing. The pinned initrd contains
-a 120-second `boot-watchdog.service` that writes diagnostics to `/dev/pmsg0`,
-tries its embedded rescue kexec, and finally forces a reboot. No diagnostic was
-retained after the failed retry, and USB did not return, so neither candidate
-entry nor rescue execution is proved. The DT does have a working 2 MiB ramoops
-reservation at `0xa9000000`; `systemd-pstore` archives records and then empties
-the live `/sys/fs/pstore`, so an empty live directory is not evidence that the
-backend is absent. The post-recovery archive contained historical flashed `#1`
-records but no candidate `7.2.0+ #9` record from either failed hop. A diagnostic
-Image with panic-on-oops and soft-lockup, hung-task, and workqueue watchdogs is
-available to retain detector-triggered failures in ramoops, but it cannot prove
-entry before ramoops or diagnose an undetected hang. A no-`--dtb`, sleep-
-inhibited, detached attempt with that Image returned to a new flashed `#1` boot
-with no new ramoops record; it did not establish instrumented-kernel entry. The
-old kernel did prove that `kexec_file_load` loaded the diagnostic kernel,
-initrd, and an automatically generated DTB. Its journal ends before the
-detached unit's eight-second delay elapsed. This is expected to lack a systemd
-shutdown sequence: kexec-tools 2.0.32 implements `kexec -e` as `sync()`,
-interface shutdown, then the kexec reboot syscall. Therefore neither the USB
-transition nor the final journal line locates the failure within the handoff.
-Do not repeat this path without a phase-discriminating change. The retained
-journal, post-return state, and pstore snapshot are on np at
-`/var/lib/poco-linux/redwood/work/artifacts/redwood-bootdiag-kexec-20260909T031206Z`.
-A subsequent one-variable experiment kept the same stock file-load inputs but
-used sleep-inhibited `systemctl kexec`. The retained stock journal proves that
-PID 1 stopped userspace, unmounted filesystems, reached `kexec.target`, and shut
-down; it then reached `#9` with the expected 16-byte Wi-Fi `reg`. This shows the
-orderly path can work from a fully running flashed `#1`, but does not locate the
-failure within the earlier direct handoff. Exact commands and results are on np
-at
-`/var/lib/poco-linux/redwood/work/artifacts/redwood-kexec-orderly-20260908T215500Z`.
-Require a 16-byte Wi-Fi `reg` and live-FDT SHA-256
-`d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35`.
-After the approved stdin-only unlock and return to `#9` userspace, the exact
-legacy second hop that was observed to succeed once was:
+The first line must identify flashed `7.2.0 #1`. Unlock only by streaming the
+protected key from np to the phone process's stdin. Resolve the phone's trusted
+`systemd-cryptsetup` path first, substitute it for `SYSTEMD_CRYPTSETUP`, and do
+not enable shell tracing, log or `tee` the pipe, or put key bytes or the np key
+path in the phone command line:
 
 ```sh
-set -e
-test ! -e /run/redwood-lab-watchdog/armed
+ssh PHONE 'command -v systemd-cryptsetup'
+ssh PHONE \
+  'systemctl stop systemd-cryptsetup@redwood\\x2droot.service'
+ssh NP 'exec cat "$PROTECTED_KEY"' |
+  ssh PHONE 'exec SYSTEMD_CRYPTSETUP attach redwood-root /dev/sda33 /dev/stdin'
+ssh PHONE \
+  'systemctl reset-failed systemd-cryptsetup@redwood\\x2droot.service; \
+   systemctl start systemd-cryptsetup@redwood\\x2droot.service; \
+   systemctl default'
+```
+
+This stop/attach/reset/start/default sequence is the unlock; repeat all of it
+after each hop. A bare attach can race the generated unit and does not switch
+to the real root. Wait until `test "$(systemctl is-system-running)" = running`
+succeeds on flashed `#1`. Then load hop 1 through
+`kexec_file_load` with **no explicit DTB**, then let PID 1 shut down userspace:
+
+```sh
+LAB=/var/lib/ath11k-redwood-lab
 kexec -u || true
-kexec -c -l /var/lib/ath11k-redwood-lab/stage3/Image \
-  --initrd=/var/lib/ath11k-redwood-lab/stage7/initrd-watchdog \
-  --dtb=/var/lib/ath11k-redwood-lab/stage10/runB-region1.fdt \
-  --command-line="$(cat /var/lib/ath11k-redwood-lab/stage7/kexec-transaction/command-line)"
+kexec -l "$LAB/stage3/Image" \
+  --initrd="$LAB/stage7/initrd-watchdog" \
+  --command-line="$(cat "$LAB/stage7/kexec-transaction/command-line")"
 sync
-kexec -e
+systemd-inhibit --what=sleep --mode=block --why='Redwood orderly kexec hop 1' \
+  systemctl kexec
 ```
 
-A later exact repetition from the verified `#9`, 16-byte-reg state loaded the
-legacy image successfully and entered `kexec -e`, but USB did not return before
-the 120-second watchdog deadline and subsequent recovery allowance. It did not
-reach Run B and requires a manual power-cycle. Do not repeat this second hop
-without a new discriminator. Its preflight, exact command, and host-side output
-are on np at
-`/var/lib/poco-linux/redwood/work/artifacts/redwood-runB-hop2-20260908T220000Z`.
+After USB and stdin-only unlock return, require `7.2.0+ #9`, a 16-byte Wi-Fi
+`reg`, and the hop-1 live-FDT digest from the validated last-tested manifest.
+Then force the legacy loader for hop 2, this time passing the candidate DTB,
+and again use the orderly PID-1 path:
 
-Before unlocking the second hop, require `#9`, a 146776-byte live FDT with
-SHA-256
-`99b5b3161106ac79a06f252607598e1de995610b72095044ff914f9f99365cfb`,
-and the exact 32-byte Wi-Fi `reg` ending in
-`61 e0 00 00 ... 00 20 00 00`. This runtime FDT hash is not the staged file's
-`8a5d...` hash because kexec updates `/chosen`. The staged candidate proof is
-on np at
-`/var/lib/poco-linux/redwood/work/artifacts/runB-dtb-20260908T221230Z`.
-The first hop's ignored DTB and the successful second hop are observed facts;
-neither hop accessed VFIO or QMI. Do not infer that another starting kernel or
-memory context is safe.
+```sh
+LAB=/var/lib/ath11k-redwood-lab
+cat /proc/version
+systemctl reset-failed unl0kr-agent.path unl0kr-agent.service \
+  unl0kr.service unl0kr-stop.service nftables.service 2>/dev/null || true
+test "$(systemctl is-system-running)" = running
+test -z "$(systemctl --failed --no-legend --plain --no-pager | \
+  awk '$1 ~ /\.(service|path)$/ { print $1 }')"
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
+test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
+  d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35
+kexec -u || true
+kexec -c -l "$LAB/stage3/Image" \
+  --initrd="$LAB/stage7/initrd-watchdog" \
+  --dtb="$LAB/stage10/runB-region1.fdt" \
+  --command-line="$(cat "$LAB/stage7/kexec-transaction/command-line")"
+sync
+systemd-inhibit --what=sleep --mode=block --why='Redwood orderly kexec hop 2' \
+  systemctl kexec
+```
+
+Unlock once more, then require the last-tested candidate state explicitly:
+
+```sh
+cat /proc/version                         # must identify 7.2.0+ #9
+systemctl reset-failed unl0kr-agent.path unl0kr-agent.service \
+  unl0kr.service unl0kr-stop.service nftables.service 2>/dev/null || true
+test "$(systemctl is-system-running)" = running
+test -z "$(systemctl --failed --no-legend --plain --no-pager | \
+  awk '$1 ~ /\.(service|path)$/ { print $1 }')"
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
+od -An -tx1 -v /proc/device-tree/soc@0/wifi@17a10040/reg
+test "$(wc -c </sys/firmware/fdt)" = 146776
+test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
+  99b5b3161106ac79a06f252607598e1de995610b72095044ff914f9f99365cfb
+```
+
+The `reg` dump must end `61 e0 00 00 ... 00 20 00 00`. These live-FDT hashes
+and size identify the last-tested artifact set; they are not eternal
+compatibility constants. Before either hop, stage the checked-in payload under
+its executable name, then generate and verify a per-stage SHA-256 manifest with
+absolute staged paths. The payload verifies this exact file and copies it into
+the durable run directory before device mutation:
+
+```sh
+# From the repository checkout on np:
+scp scripts/redwood/redwood-runB-core-once PHONE:/tmp/redwood-runB-core-once
+
+# In the root phone shell:
+LAB=/var/lib/ath11k-redwood-lab
+install -m 0755 /tmp/redwood-runB-core-once \
+  "$LAB/stage12/redwood-runB-core-once"
+rm /tmp/redwood-runB-core-once
+sha256sum \
+  "$LAB/stage12/redwood-runB-core-once" \
+  "$LAB/stage10/ath11k-bringup-runB" \
+  "$LAB/stage3/Image" \
+  "$LAB/stage7/initrd-watchdog" \
+  "$LAB/stage10/runB-region1.fdt" \
+  "$LAB/stage7/kexec-transaction/command-line" \
+  "$LAB/stage7/modules/vfio-platform-base.ko" \
+  "$LAB/stage7/modules/vfio-platform.ko" \
+  "$LAB/stage10/redwood-wifi-transaction" \
+  "$LAB/watchdog-acceptance/redwood-lab-watchdog" \
+  >"$LAB/stage12/SHA256SUMS"
+sha256sum -c "$LAB/stage12/SHA256SUMS"
+```
+
+Archive the manifest with the run. Do not silently reuse it after replacing an
+input. The last physically tested Image, initrd, command line, and staged DTB
+digests begin `97efd9fa`, `654f1c6f`, `578c`, and `8a5d019f`, respectively;
+the full values belong in that validated manifest.
+
+The transaction payload's source of truth is
+[`scripts/redwood/redwood-runB-core-once`](../../scripts/redwood/redwood-runB-core-once).
+Persist that exact executable on the phone and pass it as the wrapper's sole
+payload argument--never inline it, detach a temporary heredoc, or add a nested
+remote `sh -c`:
+
+```sh
+systemd-run --unit=redwood-ath11k-runB --collect \
+  /var/lib/ath11k-redwood-lab/stage10/redwood-wifi-transaction --run \
+  /var/lib/ath11k-redwood-lab/stage12/redwood-runB-core-once
+```
+
+The wrapper's self-test checks that boundary and the payload rejects positional
+arguments. The wrapper installs a deadline, inhibits sleep, and forces reboot
+on timeout or any payload exit. The payload validates the manifest and
+candidate live FDT before mutation, asks kernel remoteproc/PIL to load and start
+WPSS, waits for `remoteproc2` to be `running`, loads and binds VFIO only
+afterward, arms and preflights the watchdog, and runs through `core` with region
+1. Do not append a watchdog stop: forced reboot is the no-reset VFIO recovery
+path. Use `REDWOOD_*` overrides only when their values and replacement inputs
+are captured in the run's manifest.
+
+After recovery and stdin-only unlock, retrieve the durable payload logs, the
+live pstore view, and systemd's archive before another run (run these on np):
+
+```sh
+OUT=artifacts/runB-recovered-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+scp -rp PHONE:/var/lib/ath11k-redwood-lab/runs/runB-core-region1-orderly \
+  "$OUT/run"
+scp -rp PHONE:/sys/fs/pstore "$OUT/live-pstore"
+scp -rp PHONE:/var/lib/systemd/pstore "$OUT/archived-pstore"
+```
+
+The current physical proof is retained on np at
+`/var/lib/poco-linux/redwood/work/artifacts/runB-core-region1-qmi-match-20260909T043223Z`:
+WPSS reached `running`, VFIO region 1 was 2 MiB, QMI DeviceInfo returned BAR
+`0x61e00000`/`0x200000`, and region 1 matched and mapped. That pre-fix run then
+stopped at the software QMI-to-core seam before any MMIO or CE. Revision
+`0c71becf` (now in master) fixes and tests that continuation in software, but it
+has not been physically rerun; there is still no MMIO/CE proof. The preceding
+WPSS-offline discriminator is retained at
+`/var/lib/poco-linux/redwood/work/artifacts/runB-core-region1-remoteproc-offline-20260909T042108Z`.
+
+### Failed variants are not the procedure
+
+Do not retry direct flashed-`#1` to forced-legacy candidate, direct `kexec -e`,
+explicit-DTB hop 1, detached delayed execution, or nested-shell transaction
+variants. They variously failed to return USB, bypassed the proved orderly
+shutdown, had their DTB ignored, or lost the executable/argv boundary. Relevant
+retained evidence on np is at
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-kexec-orderly-20260908T215500Z`,
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-runB-hop2-20260908T220000Z`,
+and
+`/var/lib/poco-linux/redwood/work/artifacts/redwood-runB-hop2-recovery-20260909T035711Z`.
+An empty `/sys/fs/pstore` does not prove ramoops was absent: `systemd-pstore`
+may already have moved records to `/var/lib/systemd/pstore`.
 
 ## Safe use
 
@@ -134,31 +208,11 @@ deadline and automatic recovery for runner failure, timeout, or session loss;
 Wi-Fi restoration is not required to collect logs or recover USB access. Manual
 power-cycle is an accepted exception for a genuine kernel hang, not ordinary
 runner failure. Use the smallest applicable recovery procedure, not a mandated
-number of timers. The existing rebind-only
-`scripts/redwood/redwood-wifi-transaction` is not valid unchanged for the
-no-reset VFIO experiment; its fake restore test does not model device ownership.
-The updated automatic recovery procedure must be established before that run.
+number of timers.
 
-`scripts/redwood/redwood-wifi-transaction` supplies that procedure for the
-no-reset VFIO run. Launch it as the detached runner unit; it installs a local
-deadline reboot before starting the command, applies a process timeout even
-while the runner's independent heartbeat is advancing, and forces reboot on
-both success and failure. Keep the initrd watchdog armed throughout. For
-example, after setup has recorded `RUN` and discovered `CDEV`:
-
-```sh
-systemd-run --unit=redwood-ath11k-runB --collect \
-  /var/lib/ath11k-redwood-lab/stage10/redwood-wifi-transaction --run \
-  /bin/sh -c 'exec "$1" --vfio-device "$2" \
-    --containment remoteproc:remoteproc2 --register-region 1 --stop-after qmi \
-    --wmi-log "$3/runB.wmi.jsonl" >"$3/runB.log" 2>&1' \
-  sh /var/lib/ath11k-redwood-lab/stage10/ath11k-bringup-runB "$CDEV" "$RUN"
-```
-
-Do not append `redwood-lab-watchdog stop`: this no-reset transaction ends in
-automatic reboot, and reboot is the cleanup that releases VFIO/WPSS state.
-Run the host-only recovery check with
-`scripts/redwood/redwood-wifi-transaction --self-test`.
+`scripts/redwood/redwood-wifi-transaction` supplies the deadline and forced
+reboot used by the persisted payload above. Run its host-only recovery and argv
+boundary checks with `scripts/redwood/redwood-wifi-transaction --self-test`.
 
 Start with the fully fake-backed path. It opens no VFIO/QRTR resources and
 does not read firmware. It writes a deterministic WMI command/event fixture to
