@@ -187,8 +187,13 @@ impl UnixSeqpacketEndpoint {
         header.msg_iovlen = 1;
         header.msg_control = control.as_mut_ptr().cast();
         header.msg_controllen = size_of::<[usize; 8]>();
-        let received =
-            unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut header, libc::MSG_DONTWAIT) };
+        let received = unsafe {
+            libc::recvmsg(
+                self.fd.as_raw_fd(),
+                &mut header,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
         if received < 0 {
             let error = io::Error::last_os_error();
             return if error.kind() == io::ErrorKind::WouldBlock {
@@ -204,27 +209,29 @@ impl UnixSeqpacketEndpoint {
             )));
         }
         let mut fds = Vec::new();
+        let mut invalid_ancillary = false;
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&header);
             while !cmsg.is_null() {
                 if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-                    return Err(EndpointError::WrongFdCount {
-                        expected: 0,
-                        actual: usize::MAX,
-                    });
-                }
-                let header_len = libc::CMSG_LEN(0) as usize;
-                if (*cmsg).cmsg_len < header_len {
-                    return Err(EndpointError::TruncatedAncillary);
-                }
-                let payload = (*cmsg).cmsg_len - header_len;
-                if !payload.is_multiple_of(size_of::<RawFd>()) {
-                    return Err(EndpointError::TruncatedAncillary);
-                }
-                let count = payload / size_of::<RawFd>();
-                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                for index in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(*data.add(index)));
+                    invalid_ancillary = true;
+                } else {
+                    let header_len = libc::CMSG_LEN(0) as usize;
+                    if (*cmsg).cmsg_len < header_len {
+                        return Err(EndpointError::TruncatedAncillary);
+                    }
+                    let payload = (*cmsg).cmsg_len - header_len;
+                    if !payload.is_multiple_of(size_of::<RawFd>()) {
+                        return Err(EndpointError::TruncatedAncillary);
+                    }
+                    let count = payload / size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                    for index in 0..count {
+                        // SAFETY: SCM_RIGHTS installs each received descriptor
+                        // into this process. Owning every one before reporting
+                        // any ancillary error ensures all error paths close it.
+                        fds.push(OwnedFd::from_raw_fd(*data.add(index)));
+                    }
                 }
                 cmsg = libc::CMSG_NXTHDR(&header, cmsg);
             }
@@ -234,6 +241,12 @@ impl UnixSeqpacketEndpoint {
         }
         if header.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(EndpointError::TruncatedAncillary);
+        }
+        if invalid_ancillary {
+            return Err(EndpointError::WrongFdCount {
+                expected: 0,
+                actual: usize::MAX,
+            });
         }
         let packet = decode(&bytes[..received as usize])?;
         let expected = required_fd_count(&packet.message);

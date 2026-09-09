@@ -93,12 +93,53 @@ fn endpoint_rejects_truncated_rights() {
     ));
 }
 
+#[test]
+fn policy_endpoint_rejects_and_closes_received_rights() {
+    let (receiver, sender) = pair();
+    let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(receiver).unwrap();
+    let ready = encode(&Packet {
+        generation: GENERATION,
+        request_id: 2,
+        message: Message::Ready,
+    })
+    .unwrap();
+    let (capability, peer) = pair();
+    send_fds(sender.as_raw_fd(), &ready, &[capability.as_raw_fd()]);
+    drop(capability);
+
+    assert!(matches!(
+        endpoint.try_receive_packet(),
+        Err(EndpointError::WrongFdCount {
+            expected: 0,
+            actual: 1
+        })
+    ));
+    let mut byte = 0u8;
+    assert_eq!(
+        unsafe {
+            libc::recv(
+                peer.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        },
+        0,
+        "rejected SCM_RIGHTS descriptor remained installed"
+    );
+}
+
 fn send_many_fds(socket: i32, bytes: &[u8], count: usize) {
+    send_fds(socket, bytes, &vec![socket; count]);
+}
+
+fn send_fds(socket: i32, bytes: &[u8], fds: &[i32]) {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
-    let control_bytes = unsafe { libc::CMSG_SPACE((count * size_of::<i32>()) as u32) } as usize;
+    let control_bytes =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
     let words = control_bytes.div_ceil(size_of::<usize>());
     let mut control = vec![0usize; words];
     let mut header: libc::msghdr = unsafe { zeroed() };
@@ -110,10 +151,10 @@ fn send_many_fds(socket: i32, bytes: &[u8], count: usize) {
         let cmsg = libc::CMSG_FIRSTHDR(&header);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN((count * size_of::<i32>()) as u32) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as usize;
         let data = libc::CMSG_DATA(cmsg).cast::<i32>();
-        for index in 0..count {
-            *data.add(index) = socket;
+        for (index, fd) in fds.iter().enumerate() {
+            *data.add(index) = *fd;
         }
         assert_eq!(
             libc::sendmsg(socket, &header, libc::MSG_NOSIGNAL),
