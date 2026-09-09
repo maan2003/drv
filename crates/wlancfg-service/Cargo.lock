@@ -212,6 +212,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "fdf"
+version = "0.1.0"
+
+[[package]]
 name = "fidl"
 version = "0.1.0"
 
@@ -316,6 +320,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuchsia-softmac-port"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eapol",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-softmac",
+ "ieee80211",
+ "wlan-common",
+ "wlan-frame-writer",
+ "wlan-rsn",
+]
+
+[[package]]
 name = "fuchsia-sync"
 version = "0.1.0"
 dependencies = [
@@ -323,6 +343,10 @@ dependencies = [
  "parking_lot",
  "parking_lot_core",
 ]
+
+[[package]]
+name = "fuchsia-trace"
+version = "0.1.0"
 
 [[package]]
 name = "futures"
@@ -521,6 +545,10 @@ version = "0.1.0"
 dependencies = [
  "bssl-sys",
 ]
+
+[[package]]
+name = "netstack3-port-spike"
+version = "0.1.0"
 
 [[package]]
 name = "nom"
@@ -927,6 +955,7 @@ dependencies = [
  "linux-self-sandbox",
  "wifi-supervisor-wire",
  "wlan-control-wire",
+ "wlan-softmac-host",
 ]
 
 [[package]]
@@ -1011,6 +1040,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-fidl-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fidl",
+ "itertools",
+ "paste",
+]
+
+[[package]]
+name = "wlan-frame-writer"
+version = "0.1.0"
+dependencies = [
+ "wlan-common",
+ "wlan-frame-writer-macro",
+ "zerocopy",
+]
+
+[[package]]
+name = "wlan-frame-writer-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "wlan-mlme"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fdf",
+ "fidl",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-minstrel",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fidl-fuchsia-wlan-softmac",
+ "fidl-fuchsia-wlan-stats",
+ "fuchsia-async",
+ "fuchsia-softmac-port",
+ "fuchsia-sync",
+ "fuchsia-trace",
+ "futures",
+ "ieee80211",
+ "log",
+ "paste",
+ "rand 0.9.4",
+ "thiserror",
+ "wlan-common",
+ "wlan-fidl-ext",
+ "wlan-frame-writer",
+ "wlan-sme",
+ "wlan-statemachine",
+ "wlan-trace",
+ "zerocopy",
+ "zx",
+]
+
+[[package]]
 name = "wlan-rsn"
 version = "0.1.0"
 dependencies = [
@@ -1065,6 +1158,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-softmac-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fdf",
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-mlme",
+ "fidl-fuchsia-wlan-sme",
+ "fidl-fuchsia-wlan-softmac",
+ "fuchsia-inspect",
+ "fuchsia-trace",
+ "futures",
+ "netstack3-port-spike",
+ "tokio",
+ "wlan-common",
+ "wlan-mlme",
+ "wlan-sme",
+ "zx",
+]
+
+[[package]]
 name = "wlan-statemachine"
 version = "0.1.0"
 dependencies = [
@@ -1078,6 +1194,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "wlan-trace"
+version = "0.1.0"
+dependencies = [
+ "fuchsia-trace",
 ]
 
 [[package]]

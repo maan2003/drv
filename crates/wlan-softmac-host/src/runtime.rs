@@ -549,6 +549,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         &self.sme
     }
 
+    /// Stable MAC identity published with each Ethernet generation.
+    pub fn public_mac(&self) -> [u8; 6] {
+        self.io.lock().unwrap().ethernet_mac_address
+    }
+
     /// Transfers the next Ethernet generation to the network service.
     /// Link-down revokes the transferred descriptor with HUP; a later link-up
     /// publishes a fresh descriptor while the runtime retains its driver peer.
@@ -779,21 +784,32 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     /// Advance post-association SME/MLME control, timers, hardware RX, and one
     /// driver-bound Ethernet frame. No backend lock is held across MLME TX.
     pub async fn pump_associated_once(&mut self) -> Result<bool, ConnectError> {
+        self.drive_service_once().await
+    }
+
+    /// Advance retained connection state and, only while the post-pump
+    /// controlled port remains up, one driver-bound Ethernet frame. This is
+    /// the service-loop entry point for connected, roaming, and reconnecting
+    /// states; connect and scan attempts retain their dedicated drivers.
+    pub async fn drive_service_once(&mut self) -> Result<bool, ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
+        if self.connect_attempt.is_some() || self.scan_attempt.is_some() {
+            return Ok(false);
+        }
         let mut progressed = self.pump_once().await?;
-        let frame = self
-            .io
-            .lock()
-            .unwrap()
-            .ethernet
-            .take_transmit()
-            .map_err(|error| {
+        let frame = {
+            let mut io = self.io.lock().unwrap();
+            if !io.ethernet.is_link_up() {
+                return Ok(progressed);
+            }
+            io.ethernet.take_transmit().map_err(|error| {
                 let status = ethernet_status(error);
                 println!("client_data_seam_error direction=netstack_to_driver status={status}");
                 ConnectError::Driver(DriverError::Ethernet(status))
-            })?;
+            })?
+        };
         if let Some(frame) = frame {
             if let Err(error) = wlan_mlme::MlmeImpl::handle_eth_frame_tx(
                 &mut self.mlme,
@@ -2119,6 +2135,33 @@ mod tests {
             wlan_sme::client::ClientSmeStatus::Roaming(_)
         ));
         assert!(runtime.connection.is_some());
+        for _ in 0..1_000 {
+            futures::executor::block_on(runtime.drive_service_once()).unwrap();
+            if runtime.sme().status().is_connected() {
+                break;
+            }
+        }
+        assert!(
+            runtime.sme().status().is_connected(),
+            "service driving did not advance roaming"
+        );
+    }
+
+    #[test]
+    fn service_drive_treats_a_revoked_ethernet_generation_as_idle() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().simulate_ap = true;
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        futures::executor::block_on(runtime.connect(
+            connect_request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        runtime.io.lock().unwrap().ethernet.set_link(false);
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_service_once()),
+            Ok(false)
+        );
     }
 
     #[test]

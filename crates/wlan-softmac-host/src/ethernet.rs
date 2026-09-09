@@ -365,6 +365,11 @@ impl DriverEthernetPort {
         self.seam.fd.is_none()
     }
 
+    pub(crate) fn is_link_up(&self) -> bool {
+        let state = self.lifecycle.lock().unwrap();
+        state.properties.is_some() && state.link_up
+    }
+
     pub fn deliver(&mut self, bytes: &[u8]) -> Result<(), EthernetIngressError> {
         let frame =
             EthernetFrame::copy_from_slice(bytes).map_err(EthernetIngressError::InvalidFrame)?;

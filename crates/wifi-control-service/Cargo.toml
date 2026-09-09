@@ -24,7 +24,13 @@ libc = "=0.2.189"
 linux-self-sandbox = { path = "../linux-self-sandbox" }
 wlan-control-wire = { path = "../wlan-control-wire" }
 wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
+wlan-softmac-host = { path = "../wlan-softmac-host" }
 
 [dev-dependencies]
 fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-driver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.driver" }
 fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-softmac = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
+fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
+zx = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }

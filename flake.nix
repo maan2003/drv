@@ -134,7 +134,7 @@
           cargoRoot = "crates/wifi-control-service";
           buildAndTestSubdir = "crates/wifi-control-service";
           cargoLock.lockFile = ./crates/wifi-control-service/Cargo.lock;
-          nativeBuildInputs = [ pkgs.clippy ];
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''

@@ -37,9 +37,10 @@ pub enum RuntimeError {
 
 /// Narrow service seam matching the retained production client operations.
 ///
-/// An adapter for `Mt7921ProductionClient` only converts its
-/// `HostEthernetDevice::into_frame_fd()` result in `take_ethernet_device`; it
-/// must not reproduce runtime state or physical construction here.
+/// [`wlan_softmac_host::runtime::ClientRuntime`] implements this seam directly;
+/// chip-specific construction and all SME policy remain outside this service.
+/// The Ethernet method only converts the runtime's one-shot generation into
+/// the descriptor transferred to the network supervisor.
 pub trait WifiRuntime {
     fn public_mac(&self) -> [u8; 6];
     fn take_ethernet_device(&mut self) -> Option<OwnedFd>;
@@ -72,6 +73,86 @@ pub trait WifiRuntime {
         reason: sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Result<(), RuntimeError>;
+}
+
+fn host_runtime_error(error: wlan_softmac_host::runtime::ConnectError) -> RuntimeError {
+    match error {
+        wlan_softmac_host::runtime::ConnectError::Failed(result) => RuntimeError::Failed(result),
+        wlan_softmac_host::runtime::ConnectError::Timeout => RuntimeError::Timeout,
+        wlan_softmac_host::runtime::ConnectError::Driver(_) => RuntimeError::DriverFault,
+        wlan_softmac_host::runtime::ConnectError::Containment => RuntimeError::ContainmentFault,
+    }
+}
+
+impl<D> WifiRuntime for wlan_softmac_host::runtime::ClientRuntime<D>
+where
+    D: wlan_softmac_host::WlanSoftmac
+        + wlan_softmac_host::WlanSoftmacLifecycle
+        + wlan_softmac_host::ClientRuntimeDriver,
+{
+    fn public_mac(&self) -> [u8; 6] {
+        self.public_mac()
+    }
+
+    fn take_ethernet_device(&mut self) -> Option<OwnedFd> {
+        self.take_ethernet_device().map(|device| device.into_frame_fd())
+    }
+
+    fn begin_connect(
+        &mut self,
+        request: sme::ConnectRequest,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.begin_connect(request, deadline).map_err(host_runtime_error)
+    }
+
+    async fn drive_connect_once(&mut self) -> Result<Option<sme::ConnectResult>, RuntimeError> {
+        self.drive_connect_once().await.map_err(host_runtime_error)
+    }
+
+    async fn cancel_connect(
+        &mut self,
+        reason: sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<sme::ConnectResult, RuntimeError> {
+        self.cancel_connect(reason, deadline).await.map_err(host_runtime_error)
+    }
+
+    fn roam(&mut self, request: sme::RoamRequest) -> Result<(), RuntimeError> {
+        self.roam(request).map_err(host_runtime_error)
+    }
+
+    fn begin_scan(
+        &mut self,
+        request: sme::ScanRequest,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.begin_scan(request, deadline).map_err(host_runtime_error)
+    }
+
+    async fn drive_scan_once(
+        &mut self,
+    ) -> Result<Option<Result<Vec<sme::ScanResult>, sme::ScanErrorCode>>, RuntimeError> {
+        self.drive_scan_once().await.map_err(host_runtime_error)
+    }
+
+    async fn drive_once(&mut self) -> Result<bool, RuntimeError> {
+        self.drive_service_once().await.map_err(host_runtime_error)
+    }
+
+    fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<sme::ConnectTransactionEvent>, RuntimeError> {
+        self.next_connection_event().map_err(host_runtime_error)
+    }
+
+    async fn disconnect(
+        &mut self,
+        reason: sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.disconnect(reason, deadline).await.map_err(host_runtime_error)
+    }
 }
 
 #[derive(Debug)]
