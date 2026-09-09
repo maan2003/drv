@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+
+//! UNSANDBOXED TEST FIXTURE ONLY.
+//!
+//! This subprocess creates its own test Ethernet socketpair and deliberately
+//! bypasses `linux-self-sandbox` so deterministic protocol tests can run under
+//! outer kernels that deny namespace creation. It is not a service entrypoint
+//! and holds only the policy, supervisor, and test-created Ethernet fds.
 use std::os::fd::{FromRawFd, OwnedFd};
 use wifi_control_service::{PreparedServer, SimulatedWifiRuntime};
 

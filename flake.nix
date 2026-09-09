@@ -137,8 +137,8 @@
           checkPhase = ''
             runHook preCheck
             cd crates/wifi-control-service
-            cargo test --locked --offline
-            cargo clippy --locked --offline --all-targets -- -D warnings
+            cargo test --locked --offline --features test-fixture
+            cargo clippy --locked --offline --all-targets --features test-fixture -- -D warnings
             runHook postCheck
           '';
           installPhase = ''

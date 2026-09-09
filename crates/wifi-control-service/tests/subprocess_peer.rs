@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#![cfg(feature = "test-fixture")]
+
 use fidl_fuchsia_wlan_common::ScanType;
 use fidl_fuchsia_wlan_ieee80211 as ieee;
 use fidl_fuchsia_wlan_internal as internal;
@@ -68,7 +70,7 @@ fn spawn_peer(policy_fd: &OwnedFd, supervisor_fd: &OwnedFd) -> Child {
     const CHILD_SUPERVISOR_FD: i32 = 4;
     let policy_raw = policy_fd.as_raw_fd();
     let supervisor_raw = supervisor_fd.as_raw_fd();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_wifi-control-simulated-peer"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wifi-control-unsandboxed-test-fixture"));
     command
         .arg(CHILD_POLICY_FD.to_string())
         .arg(CHILD_SUPERVISOR_FD.to_string())

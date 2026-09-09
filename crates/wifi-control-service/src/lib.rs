@@ -157,6 +157,11 @@ impl UnixSeqpacketEndpoint {
         self.try_receive()
     }
 
+    /// Returns the validated inherited capability without reading from it.
+    pub fn into_owned_fd(self) -> OwnedFd {
+        self.fd
+    }
+
     pub fn try_send_packet(
         &self,
         packet: &Packet,
