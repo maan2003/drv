@@ -97,6 +97,7 @@ pub struct Cli {
     pub containment_remoteproc: Option<String>,
     pub stop_remoteproc_on_exit: bool,
     pub manual_recovery: bool,
+    pub post_ready_quiet_drain: bool,
 }
 
 impl Default for Cli {
@@ -115,6 +116,7 @@ impl Default for Cli {
             containment_remoteproc: None,
             stop_remoteproc_on_exit: false,
             manual_recovery: false,
+            post_ready_quiet_drain: false,
         }
     }
 }
@@ -171,6 +173,7 @@ impl Cli {
                 }
                 "--stop-remoteproc-on-exit" => cli.stop_remoteproc_on_exit = true,
                 "--manual-recovery" => cli.manual_recovery = true,
+                "--post-ready-quiet-drain" => cli.post_ready_quiet_drain = true,
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -204,7 +207,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--manual-recovery] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--manual-recovery] [--post-ready-quiet-drain] [--broker]"
 }
 
 #[derive(Debug)]
@@ -1018,6 +1021,7 @@ pub struct RealHost {
     summary: Option<ScanSummary>,
     dp_poll_log: Vec<String>,
     stop_remoteproc_on_exit: Option<String>,
+    post_ready_quiet_drain: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1181,6 +1185,7 @@ impl Host for RealHost {
         self.qrtr = Some(qrtr);
         self.register_region = config.register_region;
         self.wmi_log = config.wmi_log.clone();
+        self.post_ready_quiet_drain = config.post_ready_quiet_drain;
         self.stop_remoteproc_on_exit = config
             .stop_remoteproc_on_exit
             .then(|| config.containment_remoteproc.clone())
@@ -1289,7 +1294,11 @@ impl Host for RealHost {
                 dp_interrupts,
                 control_deadline as fn() -> u64,
                 JsonTrace(WmiJsonl::new(BufWriter::new(file))),
-            );
+            )
+            .with_post_ready_quiet_drain(self.post_ready_quiet_drain);
+            if self.post_ready_quiet_drain {
+                println!("post_ready_quiet_drain=enabled");
+            }
             let mut device = ath11k_core::WCN6750.device(subsystems);
             device.probe().map_err(Error::Core)?;
             self.device = Some(device);
@@ -1571,10 +1580,12 @@ mod tests {
             "--vfio-device",
             "/dev/vfio/devices/vfio7",
             "--manual-recovery",
+            "--post-ready-quiet-drain",
         ])
         .unwrap();
         assert!(preflight.preflight);
         assert!(preflight.manual_recovery);
+        assert!(preflight.post_ready_quiet_drain);
     }
 
     #[test]

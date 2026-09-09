@@ -382,6 +382,7 @@ where
     dp: Option<RealDp<B>>,
     trace: Option<S>,
     deadline: D,
+    post_ready_quiet_drain: bool,
     service_ready: Option<ath11k_wmi::event::ServiceReadyState>,
     pending_mgmt_tx: Vec<(u32, StreamingDma<B, ToDevice>)>,
 }
@@ -421,9 +422,17 @@ where
             dp: None,
             trace: Some(trace),
             deadline,
+            post_ready_quiet_drain: false,
             service_ready: None,
             pending_mgmt_tx: Vec::new(),
         }
+    }
+
+    /// Enable the lab diagnostic that drains HTC traffic until the control
+    /// deadline after WMI unified-ready, before sending the HTT version request.
+    pub fn with_post_ready_quiet_drain(mut self, enabled: bool) -> Self {
+        self.post_ready_quiet_drain = enabled;
+        self
     }
 
     fn protocol<T>(value: Option<T>) -> Result<T, CoreError> {
@@ -897,6 +906,7 @@ where
             }
             Operation::WmiWaitUnifiedReady => loop {
                 match Self::protocol(self.wmi.as_mut())?.wait_for_unified_ready((self.deadline)()) {
+                    Ok(_) if self.post_ready_quiet_drain => break self.pump(),
                     Ok(_) => break Ok(()),
                     Err(WmiError::Timeout) if self.pump_bounded(1)? != 0 => {}
                     Err(_) => break Err(CoreError::Protocol),
