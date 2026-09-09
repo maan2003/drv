@@ -17585,9 +17585,8 @@ fn run_production_firmware_bootstrap() -> Result<(), String> {
     let watchdog = verify_external_watchdog_armed()?;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
-    let config =
-        Mt7921HardwareSessionConfig::setup(vfio, format!("/sys/bus/pci/devices/{bdf}/config"))
-            .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
+    let config = Mt7921HardwareSessionConfig::setup(vfio, &bdf)
+        .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
     std::hint::black_box(watchdog.deadline);
     std::hint::black_box((&config, &images));
     Err("production firmware bootstrap refused: QEMU edu does not advertise or complete VFIO_DEVICE_RESET, so the MT7921 locked lifecycle lacks required reset proof".into())

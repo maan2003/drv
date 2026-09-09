@@ -39,7 +39,11 @@ use mt7921_core::{
 use mt7921_core::{OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, acquire_driver_ownership};
 #[cfg(test)]
 use std::time::Duration;
-use std::{fmt, path::Path, time::Instant};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 const PAGE: usize = 4096;
 const MT7921_BAR0_BYTES: usize = 0x10_0000;
@@ -61,12 +65,103 @@ impl Mt7921HardwareSessionConfig {
     /// device access. Pass the result to [`run_firmware_bootstrap`] after lockdown.
     pub fn setup(
         vfio_cdev: impl AsRef<Path>,
-        pci_config: impl AsRef<Path>,
+        bdf: &str,
     ) -> Result<Mt7921HardwareSessionSetup, LinuxVfioError> {
+        let paths = verified_vfio_pci_paths(
+            vfio_cdev.as_ref(),
+            bdf,
+            Path::new("/sys/bus/pci/devices"),
+            Path::new("/dev/vfio/devices"),
+        )?;
         Ok(Mt7921HardwareSessionSetup {
-            vfio: LinuxVfioPciCapabilities::open(vfio_cdev, pci_config)?,
+            vfio: LinuxVfioPciCapabilities::open(paths.vfio_cdev, paths.pci_config)?,
         })
     }
+}
+
+#[derive(Debug)]
+struct VerifiedVfioPciPaths {
+    vfio_cdev: PathBuf,
+    pci_config: PathBuf,
+}
+
+fn verified_vfio_pci_paths(
+    configured_cdev: &Path,
+    bdf: &str,
+    pci_devices: &Path,
+    vfio_devices: &Path,
+) -> Result<VerifiedVfioPciPaths, LinuxVfioError> {
+    let valid_bdf = bdf.len() == 12
+        && bdf.as_bytes()[4] == b':'
+        && bdf.as_bytes()[7] == b':'
+        && bdf.as_bytes()[10] == b'.'
+        && bdf.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10) || byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+        });
+    if !valid_bdf {
+        return Err(LinuxVfioError::Setup(
+            "PCI BDF is not canonical dddd:bb:dd.f".into(),
+        ));
+    }
+    let device = std::fs::canonicalize(pci_devices.join(bdf))
+        .map_err(|error| LinuxVfioError::Setup(format!("resolve PCI BDF {bdf}: {error}")))?;
+    if device.file_name().and_then(|name| name.to_str()) != Some(bdf) {
+        return Err(LinuxVfioError::Setup(
+            "PCI BDF symlink resolved to a different endpoint".into(),
+        ));
+    }
+
+    let mut cdevs = std::fs::read_dir(device.join("vfio-dev"))
+        .map_err(|error| LinuxVfioError::Setup(format!("enumerate VFIO cdev for {bdf}: {error}")))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            LinuxVfioError::Setup(format!("enumerate VFIO cdev for {bdf}: {error}"))
+        })?;
+    cdevs.sort();
+    if cdevs.len() != 1
+        || !cdevs[0]
+            .as_encoded_bytes()
+            .strip_prefix(b"vfio")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit))
+    {
+        return Err(LinuxVfioError::Setup(
+            "PCI endpoint does not expose exactly one VFIO cdev".into(),
+        ));
+    }
+    let derived_cdev = std::fs::canonicalize(vfio_devices.join(&cdevs[0]))
+        .map_err(|error| LinuxVfioError::Setup(format!("resolve derived VFIO cdev: {error}")))?;
+    let configured_cdev = std::fs::canonicalize(configured_cdev)
+        .map_err(|error| LinuxVfioError::Setup(format!("resolve configured VFIO cdev: {error}")))?;
+    if configured_cdev != derived_cdev {
+        return Err(LinuxVfioError::Setup(
+            "configured VFIO cdev does not belong to the requested PCI BDF".into(),
+        ));
+    }
+
+    let group = std::fs::canonicalize(device.join("iommu_group"))
+        .map_err(|error| LinuxVfioError::Setup(format!("resolve IOMMU group: {error}")))?;
+    let members = std::fs::read_dir(group.join("devices"))
+        .map_err(|error| LinuxVfioError::Setup(format!("enumerate IOMMU group: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LinuxVfioError::Setup(format!("enumerate IOMMU group: {error}")))?;
+    if members.len() != 1 || members[0].file_name() != std::ffi::OsStr::new(bdf) {
+        return Err(LinuxVfioError::Setup(
+            "PCI endpoint does not exclusively own its complete IOMMU group".into(),
+        ));
+    }
+    let driver = std::fs::canonicalize(members[0].path().join("driver"))
+        .map_err(|error| LinuxVfioError::Setup(format!("resolve IOMMU member driver: {error}")))?;
+    if driver.file_name().and_then(|name| name.to_str()) != Some("vfio-pci") {
+        return Err(LinuxVfioError::Setup(
+            "IOMMU group member is not bound to vfio-pci".into(),
+        ));
+    }
+
+    Ok(VerifiedVfioPciPaths {
+        vfio_cdev: derived_cdev,
+        pci_config: device.join("config"),
+    })
 }
 
 impl Mt7921HardwareSessionSetup {
@@ -774,12 +869,9 @@ fn close_after_transaction_error<T, E>(
     }
 }
 
-fn park_uncontained<R, P>(resources: &mut Option<R>, pci: &mut Option<P>) {
-    if let Some(resources) = resources.take() {
-        std::mem::forget(resources);
-    }
-    if let Some(pci) = pci.take() {
-        std::mem::forget(pci);
+fn hold_for_manual_recovery<R, P>(_resources: &mut Option<R>, _pci: &mut Option<P>) -> ! {
+    loop {
+        std::thread::park();
     }
 }
 
@@ -789,7 +881,10 @@ fn finish_active_drop<R, P>(
     pci: &mut Option<P>,
 ) {
     if lifecycle != SessionLifecycle::Contained {
-        park_uncontained(resources, pci);
+        // The complete owning graph remains in these stack slots. Production
+        // never returns from this hold; an operator-controlled recovery can
+        // reset or power-cycle the machine without Rust releasing live DMA.
+        hold_for_manual_recovery(resources, pci);
     }
 }
 
@@ -811,10 +906,7 @@ mod tests {
     use drv_hardware_backends::{
         DeterministicBackend, DeterministicRelease, DeterministicResourceProbe,
     };
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-    };
+    use std::{cell::RefCell, rc::Rc};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ContainmentCall {
@@ -822,6 +914,49 @@ mod tests {
         Reset,
         PostResetRegisters,
         PostResetPci,
+    }
+
+    #[test]
+    fn bdf_provenance_binds_exact_cdev_and_exclusive_vfio_group() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("mt7921-vfio-provenance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bdf = "0000:01:00.0";
+        let endpoint = root.join("pci").join(bdf);
+        let group = root.join("groups/7");
+        let driver = root.join("drivers/vfio-pci");
+        let cdev = root.join("dev/vfio7");
+        std::fs::create_dir_all(endpoint.join("vfio-dev/vfio7")).unwrap();
+        std::fs::create_dir_all(group.join("devices").join(bdf)).unwrap();
+        std::fs::create_dir_all(&driver).unwrap();
+        std::fs::create_dir_all(cdev.parent().unwrap()).unwrap();
+        std::fs::write(endpoint.join("config"), []).unwrap();
+        std::fs::write(&cdev, []).unwrap();
+        symlink(&group, endpoint.join("iommu_group")).unwrap();
+        symlink(&driver, group.join("devices").join(bdf).join("driver")).unwrap();
+
+        let paths =
+            verified_vfio_pci_paths(&cdev, bdf, &root.join("pci"), &root.join("dev")).unwrap();
+        assert_eq!(paths.vfio_cdev, std::fs::canonicalize(&cdev).unwrap());
+        assert_eq!(paths.pci_config, endpoint.join("config"));
+
+        let wrong = root.join("dev/vfio8");
+        std::fs::write(&wrong, []).unwrap();
+        assert!(
+            verified_vfio_pci_paths(&wrong, bdf, &root.join("pci"), &root.join("dev"))
+                .unwrap_err()
+                .to_string()
+                .contains("does not belong")
+        );
+        std::fs::create_dir_all(group.join("devices/0000:02:00.0")).unwrap();
+        assert!(
+            verified_vfio_pci_paths(&cdev, bdf, &root.join("pci"), &root.join("dev"))
+                .unwrap_err()
+                .to_string()
+                .contains("exclusively own")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1320,52 +1455,56 @@ mod tests {
     }
 
     #[test]
-    fn uncontained_graph_is_parked_instead_of_normally_released() {
-        struct ReleaseProbe(Rc<Cell<usize>>);
+    fn failed_containment_holds_owners_until_external_termination() {
+        if std::env::var_os("MT7921_HOLD_TEST_CHILD").is_none() {
+            use std::io::{BufRead, Read};
+            use std::process::Stdio;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tests::failed_containment_holds_owners_until_external_termination")
+                .arg("--nocapture")
+                .env("MT7921_HOLD_TEST_CHILD", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    stdout.read_line(&mut line).unwrap(),
+                    0,
+                    "hold child exited early"
+                );
+                if line.contains("uncontained_hold_entering") {
+                    break;
+                }
+                line.clear();
+            }
+            assert_eq!(line, "uncontained_hold_entering owners=2 dropped=0\n");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            assert!(child.try_wait().unwrap().is_none(), "hold returned");
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let mut rest = String::new();
+            stdout.read_to_string(&mut rest).unwrap();
+            assert!(!rest.contains("OWNER_DROPPED"));
+            return;
+        }
+
+        struct ReleaseProbe;
         impl Drop for ReleaseProbe {
             fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
+                println!("OWNER_DROPPED");
             }
         }
 
-        let releases = Rc::new(Cell::new(0));
-        {
-            let (mut containment, mut pci_control, _) = fake_pair(None);
-            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
-            let mut ledger = initial_containment();
-            advance_containment(
-                &mut containment,
-                &mut pci_control,
-                &mut lifecycle,
-                &mut ledger,
-            )
-            .unwrap();
-            let mut resources = Some(ReleaseProbe(releases.clone()));
-            let mut pci = Some(ReleaseProbe(releases.clone()));
-            finish_active_drop(lifecycle, &mut resources, &mut pci);
-        }
-        assert_eq!(releases.get(), 2, "contained graph releases normally");
-
-        {
-            let (mut containment, mut pci_control, _) =
-                fake_pair(Some(InjectedFailure::ResetIoctl));
-            let mut lifecycle = SessionLifecycle::LoaderTransportActive;
-            let mut ledger = initial_containment();
-            assert!(
-                advance_containment(
-                    &mut containment,
-                    &mut pci_control,
-                    &mut lifecycle,
-                    &mut ledger,
-                )
-                .is_err()
-            );
-            let mut resources = Some(ReleaseProbe(releases.clone()));
-            let mut pci = Some(ReleaseProbe(releases.clone()));
-            finish_active_drop(lifecycle, &mut resources, &mut pci);
-            assert!(resources.is_none() && pci.is_none());
-        }
-        assert_eq!(releases.get(), 2, "uncontained graph was parked");
+        use std::io::Write;
+        let mut resources = Some(ReleaseProbe);
+        let mut pci = Some(ReleaseProbe);
+        println!("uncontained_hold_entering owners=2 dropped=0");
+        std::io::stdout().flush().unwrap();
+        finish_active_drop(SessionLifecycle::Closing, &mut resources, &mut pci);
     }
 
     #[test]
