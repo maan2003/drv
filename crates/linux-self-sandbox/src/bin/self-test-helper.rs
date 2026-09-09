@@ -22,7 +22,7 @@ fn main() {
 
 fn run() -> Result<(), Error> {
     let mode = std::env::var("SANDBOX_HELPER_MODE").expect("helper mode");
-    let retained_fds = if mode == "mt7921-vfio" {
+    let retained_fds = if mode == "mt7921-vfio" || mode == "wlancfg" {
         std::env::var("SANDBOX_RETAINED_FDS")
             .unwrap()
             .split(',')
@@ -35,7 +35,11 @@ fn run() -> Result<(), Error> {
     let unwanted = std::env::var("SANDBOX_UNWANTED_FD")
         .ok()
         .map(|v| v.parse().unwrap());
-    let persistence = (mode == "wlancfg").then_some(retained);
+    let persistence = if mode == "wlancfg" {
+        Some(retained_fds[1])
+    } else {
+        None
+    };
     let setup = Sandbox::new().setup(&retained_fds, persistence)?;
     for &fd in &retained_fds {
         assert!(
@@ -68,7 +72,11 @@ fn run() -> Result<(), Error> {
                 println!("sandbox_self_test=PASS profile=wifi-simulated retained_fd=true unwanted_fd_closed=true setup_socket_unread=true");
             });
         }
-        "wlancfg" => setup.lockdown(Profile::Wlancfg { persistence_dir_fd: retained })?.run(|| {
+        "wlancfg" => setup.lockdown(Profile::Wlancfg {
+            control_fd: retained_fds[0],
+            persistence_dir_fd: retained_fds[1],
+        })?.run(|| {
+            let retained = retained_fds[1];
             let temporary = CString::new("saved-networks.tmp").unwrap();
             let installed = CString::new("saved-networks.bin").unwrap();
             let create_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;

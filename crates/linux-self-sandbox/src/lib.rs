@@ -22,7 +22,10 @@ compile_error!("WLAN self-sandbox seccomp supports only x86_64 and aarch64");
 #[derive(Clone, Copy, Debug)]
 pub enum Profile {
     /// WLAN policy IPC and the sole-writer saved-network directory capability.
-    Wlancfg { persistence_dir_fd: RawFd },
+    Wlancfg {
+        control_fd: RawFd,
+        persistence_dir_fd: RawFd,
+    },
     /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
     /// One MT7921 PCI function and its precreated inert IRQ eventfd.
@@ -250,10 +253,19 @@ impl Sandbox<SetupComplete> {
         if matches!(profile, Profile::WifiSimulated) && self.persistence_dir_fd.is_some() {
             return Err(Error::ProfileAuthorityMismatch);
         }
-        if let Profile::Wlancfg { persistence_dir_fd } = profile
-            && self.persistence_dir_fd != Some(persistence_dir_fd)
+        if let Profile::Wlancfg {
+            control_fd,
+            persistence_dir_fd,
+        } = profile
         {
-            return Err(Error::PersistenceFdNotInherited(persistence_dir_fd));
+            if self.persistence_dir_fd != Some(persistence_dir_fd) {
+                return Err(Error::PersistenceFdNotInherited(persistence_dir_fd));
+            }
+            let mut expected = vec![control_fd, persistence_dir_fd];
+            expected.sort_unstable();
+            if expected != self.inherited {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
         }
         if let Profile::Mt7921Vfio {
             pci_config_fd,
@@ -528,13 +540,14 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         stmt(LD_W_ABS, 0),
     ];
     if let Profile::Wlancfg {
+        control_fd,
         persistence_dir_fd: fd,
     } = profile
     {
-        append_protected_close(&mut f, fd);
         append_openat(&mut f, fd);
         append_renameat(&mut f, fd);
         append_unlinkat(&mut f, fd);
+        append_wlancfg_packet_io(&mut f, control_fd);
     }
     if let Profile::Mt7921Vfio {
         pci_config_fd,
@@ -576,8 +589,6 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
     }
     match profile {
         Profile::Wlancfg { .. } => {
-            append_eventfd(&mut f);
-            append_epoll_create(&mut f);
             append_epoll_ctl(&mut f);
         }
         Profile::WifiSimulated | Profile::Mt7921Vfio { .. } => {}
@@ -860,26 +871,6 @@ fn append_mt_ppoll(f: &mut Vec<Filter>) {
         .expect("small ppoll filter");
 }
 
-fn append_eventfd(f: &mut Vec<Filter>) {
-    f.push(jump(libc::SYS_eventfd2 as u32, 0, 7));
-    f.push(arg(0));
-    f.push(jump(0, 0, 4));
-    f.push(arg(1));
-    f.push(jump((libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) as u32, 0, 1));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_epoll_create(f: &mut Vec<Filter>) {
-    f.push(jump(libc::SYS_epoll_create1 as u32, 0, 5));
-    f.push(arg(0));
-    f.push(jump(libc::EPOLL_CLOEXEC as u32, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
 fn append_epoll_ctl(f: &mut Vec<Filter>) {
     let dispatch = f.len();
     f.push(jump(libc::SYS_epoll_ctl as u32, 0, 0));
@@ -912,6 +903,59 @@ fn append_epoll_pwait(f: &mut Vec<Filter>) {
     f[dispatch].jf = (reload - dispatch - 1)
         .try_into()
         .expect("small epoll_pwait filter");
+}
+
+fn append_wlancfg_packet_io(f: &mut Vec<Filter>, control_fd: RawFd) {
+    // The policy protocol is capped at MAX_PACKET=8192. Connected seqpacket
+    // transport needs no address and deliberately supplies no ancillary buffer.
+    for (syscall, flags) in [
+        (
+            libc::SYS_sendto,
+            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32,
+        ),
+        (
+            libc::SYS_recvfrom,
+            (libc::MSG_DONTWAIT | libc::MSG_TRUNC) as u32,
+        ),
+    ] {
+        let dispatch = f.len();
+        f.push(jump(syscall as u32, 0, 0));
+        let mut failures = Vec::new();
+        for (argument, expected) in [(0, control_fd as u32), (3, flags), (4, 0), (5, 0)] {
+            f.push(arg_high(argument));
+            failures.push(f.len());
+            f.push(jump(0, 0, 0));
+            f.push(arg(argument));
+            failures.push(f.len());
+            f.push(jump(expected, 0, 0));
+        }
+        f.push(arg_high(2));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(2));
+        let oversized = f.len();
+        f.push(Filter {
+            code: 0x25,
+            jt: 0,
+            jf: 1,
+            k: 8192,
+        });
+        f.push(stmt(RET_K, KILL_PROCESS));
+        f.push(stmt(RET_K, ALLOW));
+        let denied = f.len();
+        f.push(stmt(RET_K, KILL_PROCESS));
+        let reload = f.len();
+        f.push(stmt(LD_W_ABS, 0));
+        for failure in failures {
+            f[failure].jf = (denied - failure - 1)
+                .try_into()
+                .expect("small packet I/O filter");
+        }
+        f[oversized].jt = 0;
+        f[dispatch].jf = (reload - dispatch - 1)
+            .try_into()
+            .expect("small packet I/O filter");
+    }
 }
 
 fn append_sigaltstack_teardown(f: &mut Vec<Filter>) {
@@ -1035,15 +1079,6 @@ fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
     f.push(stmt(LD_W_ABS, 0));
 }
 
-fn append_protected_close(f: &mut Vec<Filter>, fd: RawFd) {
-    f.push(jump(libc::SYS_close as u32, 0, 5));
-    f.push(arg(0));
-    f.push(jump(fd as u32, 0, 1));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
 fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     // Exactly the read and atomic-create flag sets used by HostPolicyStorage at
     // revision 96e37e09. O_NOFOLLOW is mandatory; O_PATH/device-style expansion
@@ -1126,8 +1161,6 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
             libc::SYS_write,
             // Tokio's current-thread time driver and the bounded control owner.
             libc::SYS_fstat,
-            libc::SYS_recvmsg,
-            libc::SYS_sendmsg,
             // HostPolicyStorage reads/writes newly constrained regular files
             // and durably syncs the file and inherited state directory.
             libc::SYS_fsync,
@@ -1173,6 +1206,28 @@ mod filter_tests {
     }
 
     #[test]
+    fn wlancfg_profile_rejects_missing_aliasing_or_extra_capabilities() {
+        for (inherited, control_fd, persistence_dir_fd) in [
+            (vec![3, 4], 5, 4),
+            (vec![3, 4], 4, 4),
+            (vec![3, 4, 5], 3, 4),
+        ] {
+            let setup = Sandbox::<SetupComplete> {
+                inherited,
+                persistence_dir_fd: Some(4),
+                _state: PhantomData,
+            };
+            assert!(matches!(
+                setup.lockdown(Profile::Wlancfg {
+                    control_fd,
+                    persistence_dir_fd,
+                }),
+                Err(Error::ProfileAuthorityMismatch)
+            ));
+        }
+    }
+
+    #[test]
     fn role_positive_paths_execute() {
         if let Ok(role) = std::env::var("DRV_SANDBOX_POSITIVE") {
             positive_body(&role);
@@ -1203,7 +1258,19 @@ mod filter_tests {
             "wlancfg:sigmask-wrong-size",
             "wlancfg:poll-one",
             "wlancfg:poll-count-high",
-            "wlancfg:close-persistence",
+            "wlancfg:recvmsg",
+            "wlancfg:recvmmsg",
+            "wlancfg:sendmsg",
+            "wlancfg:fcntl",
+            "wlancfg:sendto-wrong-fd",
+            "wlancfg:sendto-fd-high",
+            "wlancfg:sendto-wrong-flags",
+            "wlancfg:sendto-address",
+            "wlancfg:sendto-oversized",
+            "wlancfg:recvfrom-wrong-fd",
+            "wlancfg:recvfrom-wrong-flags",
+            "wlancfg:recvfrom-address",
+            "wlancfg:recvfrom-oversized",
             "mt:wrong-ioctl-fd",
             "mt:fcntl",
             "mt:dup",
@@ -1246,6 +1313,13 @@ mod filter_tests {
 
     fn positive_body(role: &str) -> ! {
         let fds = resources();
+        if role == "wlancfg" {
+            let byte = b'R';
+            assert_eq!(
+                unsafe { libc::send(fds[1], (&byte as *const u8).cast(), 1, 0) },
+                1
+            );
+        }
         enable_filter(profile(role, fds));
         let mapping = unsafe {
             libc::mmap(
@@ -1283,22 +1357,42 @@ mod filter_tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             "wlancfg" => {
-                let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-                assert!(event >= 0);
-                let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-                assert!(epoll >= 0);
+                let mut received = 0_u8;
+                assert_eq!(
+                    unsafe {
+                        libc::recvfrom(
+                            fds[0],
+                            (&mut received as *mut u8).cast(),
+                            1,
+                            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    1
+                );
+                assert_eq!(received, b'R');
+                let sent = b'S';
+                assert_eq!(
+                    unsafe {
+                        libc::sendto(
+                            fds[0],
+                            (&sent as *const u8).cast(),
+                            1,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                            std::ptr::null(),
+                            0,
+                        )
+                    },
+                    1
+                );
                 let mut epoll_event: libc::epoll_event = unsafe { std::mem::zeroed() };
                 assert_eq!(
-                    unsafe { libc::epoll_pwait(epoll, &mut epoll_event, 1, 0, std::ptr::null()) },
-                    0
-                );
-                let count = 1_u64;
-                assert_eq!(
-                    unsafe { libc::write(event, (&count as *const u64).cast(), 8) },
-                    8
+                    unsafe { libc::epoll_pwait(fds[1], &mut epoll_event, 1, 0, std::ptr::null()) },
+                    -1
                 );
                 let pollfd = libc::pollfd {
-                    fd: event,
+                    fd: fds[3],
                     events: libc::POLLIN,
                     revents: 0,
                 };
@@ -1318,6 +1412,42 @@ mod filter_tests {
                     },
                     0
                 );
+                assert_eq!(unsafe { libc::close(fds[2]) }, 0);
+                let read_flags =
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+                let replacement =
+                    unsafe { libc::openat(fds[2], c"/dev/null".as_ptr(), read_flags) };
+                assert_eq!(
+                    replacement, fds[2],
+                    "absolute openat should demonstrate slot reuse"
+                );
+                assert_eq!(
+                    unsafe { libc::openat(replacement, c"relative".as_ptr(), read_flags) },
+                    -1
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOTDIR)
+                );
+                assert_eq!(
+                    unsafe {
+                        libc::renameat(replacement, c"old".as_ptr(), replacement, c"new".as_ptr())
+                    },
+                    -1
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOTDIR)
+                );
+                assert_eq!(
+                    unsafe { libc::unlinkat(replacement, c"relative".as_ptr(), 0) },
+                    -1
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOTDIR)
+                );
+                assert_eq!(unsafe { libc::close(replacement) }, 0);
             }
             "mt" => {
                 let request = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
@@ -1402,7 +1532,8 @@ mod filter_tests {
         match role {
             "wifi" => Profile::WifiSimulated,
             "wlancfg" => Profile::Wlancfg {
-                persistence_dir_fd: fds[0],
+                control_fd: fds[0],
+                persistence_dir_fd: fds[2],
             },
             "mt" => Profile::Mt7921Vfio {
                 pci_config_fd: fds[0],
@@ -1537,8 +1668,116 @@ mod filter_tests {
                         8,
                     );
                 }
-                "close-persistence" => {
-                    libc::close(fds[0]);
+                "recvmsg" => {
+                    let mut message: libc::msghdr = std::mem::zeroed();
+                    libc::recvmsg(fds[0], &mut message, libc::MSG_DONTWAIT);
+                }
+                "recvmmsg" => {
+                    let mut messages: [libc::mmsghdr; 1] = std::mem::zeroed();
+                    libc::recvmmsg(
+                        fds[0],
+                        messages.as_mut_ptr(),
+                        1,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    );
+                }
+                "sendmsg" => {
+                    let message: libc::msghdr = std::mem::zeroed();
+                    libc::sendmsg(fds[0], &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
+                }
+                "sendto-wrong-fd" => {
+                    libc::sendto(
+                        fds[1],
+                        std::ptr::null(),
+                        0,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        std::ptr::null(),
+                        0,
+                    );
+                }
+                "sendto-fd-high" => {
+                    libc::syscall(
+                        libc::SYS_sendto,
+                        (1_u64 << 32) | fds[0] as u32 as u64,
+                        std::ptr::null::<u8>(),
+                        0,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        std::ptr::null::<libc::sockaddr>(),
+                        0,
+                    );
+                }
+                "sendto-wrong-flags" => {
+                    libc::sendto(
+                        fds[0],
+                        std::ptr::null(),
+                        0,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null(),
+                        0,
+                    );
+                }
+                "sendto-address" => {
+                    let address: libc::sockaddr = std::mem::zeroed();
+                    libc::sendto(
+                        fds[0],
+                        std::ptr::null(),
+                        0,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        &address,
+                        0,
+                    );
+                }
+                "sendto-oversized" => {
+                    libc::sendto(
+                        fds[0],
+                        std::ptr::null(),
+                        8193,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        std::ptr::null(),
+                        0,
+                    );
+                }
+                "recvfrom-wrong-fd" => {
+                    libc::recvfrom(
+                        fds[1],
+                        std::ptr::null_mut(),
+                        0,
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                "recvfrom-wrong-flags" => {
+                    libc::recvfrom(
+                        fds[0],
+                        std::ptr::null_mut(),
+                        0,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                "recvfrom-address" => {
+                    let mut address: libc::sockaddr = std::mem::zeroed();
+                    libc::recvfrom(
+                        fds[0],
+                        std::ptr::null_mut(),
+                        0,
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        &mut address,
+                        std::ptr::null_mut(),
+                    );
+                }
+                "recvfrom-oversized" => {
+                    libc::recvfrom(
+                        fds[0],
+                        std::ptr::null_mut(),
+                        8193,
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
                 }
                 "wrong-ioctl-fd" => {
                     libc::ioctl(fds[0], userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2], 0);
@@ -1665,10 +1904,6 @@ mod filter_tests {
                         revents: 0,
                     }; 2];
                     libc::ppoll(pollfds.as_mut_ptr(), 2, std::ptr::null(), std::ptr::null());
-                }
-                "recvmsg" => {
-                    let mut message: libc::msghdr = std::mem::zeroed();
-                    libc::recvmsg(fds[1], &mut message, libc::MSG_DONTWAIT);
                 }
                 _ => unreachable!(),
             };

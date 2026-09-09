@@ -19,7 +19,7 @@ fn setup_preserves_only_capabilities_without_consuming_them_and_lockdown_denies_
         unsafe { libc::send(pair[0], b"X".as_ptr().cast(), 1, 0) },
         1
     );
-    let output = helper("simulated", pair[1], Some(unwanted[0]));
+    let output = helper("simulated", &[pair[1]], Some(unwanted[0]));
     unsafe {
         libc::close(pair[0]);
         libc::close(pair[1]);
@@ -49,8 +49,16 @@ fn wlancfg_allows_only_directory_relative_atomic_persistence() {
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
     assert!(fd >= 0);
     clear_cloexec(fd);
-    let output = helper("wlancfg", fd, None);
+    let mut control = [0; 2];
+    assert_eq!(
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, control.as_mut_ptr()) },
+        0
+    );
+    clear_cloexec(control[1]);
+    let output = helper("wlancfg", &[control[1], fd], None);
     unsafe {
+        libc::close(control[0]);
+        libc::close(control[1]);
         libc::close(fd);
     }
     std::fs::remove_file(path.join("escape")).unwrap();
@@ -126,11 +134,21 @@ fn mt7921_vfio_subprocess_has_only_its_runtime_authority() {
     );
 }
 
-fn helper(mode: &str, retained: RawFd, unwanted: Option<RawFd>) -> Output {
+fn helper(mode: &str, retained: &[RawFd], unwanted: Option<RawFd>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_self-test-helper"));
-    command
-        .env("SANDBOX_HELPER_MODE", mode)
-        .env("SANDBOX_RETAINED_FD", retained.to_string());
+    command.env("SANDBOX_HELPER_MODE", mode);
+    if retained.len() == 1 {
+        command.env("SANDBOX_RETAINED_FD", retained[0].to_string());
+    } else {
+        command.env(
+            "SANDBOX_RETAINED_FDS",
+            retained
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     if let Some(fd) = unwanted {
         command.env("SANDBOX_UNWANTED_FD", fd.to_string());
     }
