@@ -220,8 +220,16 @@ testers.runNixOSTest {
         machine.succeed(f"test -c /dev/vfio/devices/{cdev}")
         machine.succeed(f"vfio-iommufd-probe /dev/vfio/devices/{cdev}")
 
-    with subtest("safe Rust capability API drives QEMU edu through VFIO/iommufd"):
-        machine.succeed(f"vfio_edu /dev/vfio/devices/{cdev}")
+    with subtest("MT7921 lockdown admits exact real-kernel VFIO/iommufd mechanics"):
+        proof = machine.succeed(
+            f"vfio_edu --locked-proof /dev/vfio/devices/{cdev} "
+            f"/sys/bus/pci/devices/{bdf}/config"
+        )
+        assert "locked_vfio_edu=PASS" in proof
+        assert "irq=2" not in proof, "QEMU edu unexpectedly skipped the IRQ fallback path"
+        assert "reset_supported=false reset_succeeded=false" in proof
+        assert "denial_injection=true clean_teardown=true" in proof
+        assert "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw" in proof
 
     with subtest("VFIO ownership can be torn down and restored"):
         machine.succeed(f"echo {bdf} > /sys/bus/pci/drivers/vfio-pci/unbind")

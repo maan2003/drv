@@ -1934,7 +1934,7 @@ fn read_fixed_registers<B: Backend>(device: &Device<B>) -> Result<FixedRegisterS
 
 fn run_typed_fixed_read(vfio: &str, bdf: &str) -> Result<(), String> {
     let config = format!("/sys/bus/pci/devices/{bdf}/config");
-    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+    let opened = drv_hardware_backends::unconfined_vfio::open_pci_coherent(vfio, config)
         .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
     let (backend, _pci, attached) = opened.into_parts();
     if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
@@ -2218,7 +2218,7 @@ fn install_disable_msi0_on_device<B: Backend>(device: &Device<B>) -> Result<(), 
 
 fn open_typed_mt7921(vfio: &str, bdf: &str) -> Result<(Device<LinuxVfio>, PciControl), String> {
     let config = format!("/sys/bus/pci/devices/{bdf}/config");
-    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+    let opened = drv_hardware_backends::unconfined_vfio::open_pci_coherent(vfio, config)
         .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
     let (backend, _pci, attached) = opened.into_parts();
     if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
@@ -2248,7 +2248,7 @@ fn run_typed_install_disable_msi0(vfio: &str, bdf: &str) -> Result<(), String> {
 
 fn run_typed_disabled_firmware_stage(vfio: &str, bdf: &str) -> Result<(), String> {
     let config = format!("/sys/bus/pci/devices/{bdf}/config");
-    let opened = LinuxVfio::open_pci_coherent(vfio, config)
+    let opened = drv_hardware_backends::unconfined_vfio::open_pci_coherent(vfio, config)
         .map_err(|error| format!("open typed PCI VFIO device: {error}"))?;
     let (backend, _pci, attached) = opened.into_parts();
     if attached.vendor_id() != 0x14c3 || attached.device_id() != 0x7961 {
@@ -17582,14 +17582,15 @@ fn run_production_firmware_bootstrap() -> Result<(), String> {
         },
     )
     .map_err(|error| format!("verify production firmware images: {error:?}"))?;
+    let watchdog = verify_external_watchdog_armed()?;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     let config =
         Mt7921HardwareSessionConfig::setup(vfio, format!("/sys/bus/pci/devices/{bdf}/config"))
             .map_err(|error| format!("prepare production MT7921 authority: {error}"))?;
-    let watchdog = verify_external_watchdog_armed()?;
-    std::hint::black_box((&config, &images, watchdog.deadline));
-    Err("production firmware bootstrap refused: MT7921 VFIO lockdown lacks real-kernel lifecycle proof because QEMU edu has no PCI power-management capability".into())
+    std::hint::black_box(watchdog.deadline);
+    std::hint::black_box((&config, &images));
+    Err("production firmware bootstrap refused: QEMU edu does not advertise or complete VFIO_DEVICE_RESET, so the MT7921 locked lifecycle lacks required reset proof".into())
 }
 
 fn decompress_ram() -> Result<Vec<u8>, String> {
@@ -20309,7 +20310,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(boundary.contains("verify_external_watchdog_armed()?"));
-        assert!(boundary.contains("lacks real-kernel lifecycle proof"));
+        assert!(boundary.contains("lacks required reset proof"));
         assert!(!boundary.contains("run_firmware_bootstrap(config, images)"));
         for forbidden in [
             "ioctl",
@@ -21432,10 +21433,10 @@ mod tests {
             .next()
             .unwrap();
         let verify = dispatch.find("VerifiedFirmwareImages::verify").unwrap();
-        let setup = dispatch.find("Mt7921HardwareSessionConfig::setup").unwrap();
         let watchdog = dispatch.find("verify_external_watchdog_armed()?").unwrap();
-        let refusal = dispatch.find("lacks real-kernel lifecycle proof").unwrap();
-        assert!(verify < setup && setup < watchdog && watchdog < refusal);
+        let setup = dispatch.find("Mt7921HardwareSessionConfig::setup").unwrap();
+        let refusal = dispatch.find("lacks required reset proof").unwrap();
+        assert!(verify < watchdog && watchdog < setup && setup < refusal);
         assert!(!dispatch.contains("run_firmware_bootstrap(config, images)"));
     }
 

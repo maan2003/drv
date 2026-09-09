@@ -137,6 +137,66 @@ pub struct PlatformDeviceInfo {
     pub reset_supported: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciDeviceInfo {
+    pub num_regions: u32,
+    pub num_irqs: u32,
+    pub reset_supported: bool,
+}
+
+pub fn pci_device_info(device: &File) -> Result<PciDeviceInfo, String> {
+    let mut info = DeviceInfo {
+        argsz: size::<DeviceInfo>(),
+        ..Default::default()
+    };
+    ioctl_mut(
+        device.as_raw_fd(),
+        VFIO_DEVICE_GET_INFO,
+        &mut info,
+        "query VFIO PCI device",
+    )?;
+    if info.flags & VFIO_DEVICE_FLAGS_PCI == 0 {
+        return Err("VFIO device does not advertise PCI support".into());
+    }
+    Ok(PciDeviceInfo {
+        num_regions: info.num_regions,
+        num_irqs: info.num_irqs,
+        reset_supported: info.flags & VFIO_DEVICE_FLAGS_RESET != 0,
+    })
+}
+
+/// Prove that the MT7921 seccomp filter rejects requests on the wrong authority.
+pub fn prove_mt7921_sandbox_ioctl_denials(
+    pci: &File,
+    device: &File,
+    iommu: &File,
+) -> Result<(), String> {
+    for (fd, request, name) in [
+        (
+            device.as_raw_fd(),
+            IOMMU_IOAS_ALLOC,
+            "iommufd request on VFIO fd",
+        ),
+        (
+            iommu.as_raw_fd(),
+            VFIO_DEVICE_GET_INFO,
+            "VFIO request on iommufd",
+        ),
+        (
+            pci.as_raw_fd(),
+            VFIO_DEVICE_GET_INFO,
+            "VFIO request on PCI config",
+        ),
+        (device.as_raw_fd(), u64::MAX, "unknown request on VFIO fd"),
+    ] {
+        let result = unsafe { ioctl(fd, request, std::ptr::null_mut::<u8>()) };
+        if result != -1 || std::io::Error::last_os_error().raw_os_error() != Some(1) {
+            return Err(format!("seccomp admitted {name}"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_platform_info(info: &DeviceInfo) -> Result<(), String> {
     if info.flags & VFIO_DEVICE_FLAGS_PLATFORM == 0 || info.flags & VFIO_DEVICE_FLAGS_PCI != 0 {
         return Err("VFIO cdev is not a platform device".into());

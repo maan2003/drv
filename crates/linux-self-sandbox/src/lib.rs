@@ -33,6 +33,10 @@ pub enum Profile {
     },
 }
 
+/// Review trace for the MT7921 profile. Request values are owned by
+/// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read,write,close,fstat,poll,ppoll,mmap-noexec-anon-or-vfio,mprotect-noexec,munmap,madvise,brk,rt_sigaction,rt_sigprocmask,rt_sigreturn,sigaltstack,futex,set_robust_list,rseq,sched_yield,clock_gettime,clock_nanosleep,nanosleep,timerfd_create,timerfd_settime,timerfd_gettime,epoll_create1,epoll_ctl,epoll_pwait,epoll_wait-x86_64,eventfd2,fcntl,getrandom,getpid,gettid,tgkill-self-tgid,clone-thread-only,clone3-enosys,lseek-pci-only,exit,exit_group; denied=open,openat,socket,connect,exec,fork,process-clone,sendmsg,recvmsg,tgkill-other-tgid,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+
 #[derive(Debug)]
 pub enum Error {
     InvalidCapabilityFd(RawFd),
@@ -538,6 +542,7 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         iommufd,
     } = profile
     {
+        append_tgkill_self(&mut f, unsafe { libc::getpid() });
         append_mt7921_ioctl(&mut f, vfio_fd, iommufd);
         append_mt7921_mmap(&mut f, vfio_fd);
         append_no_exec_mprotect(&mut f);
@@ -570,6 +575,10 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
             io::Error::last_os_error(),
         ))
     }
+}
+
+fn append_tgkill_self(f: &mut Vec<Filter>, tgid: libc::pid_t) {
+    append_fd_only(f, libc::SYS_tgkill, tgid);
 }
 
 fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
@@ -671,13 +680,12 @@ fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     // and all ambient/absolute opens are therefore excluded.
     const READ_FLAGS: u32 =
         (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u32;
-    const CREATE_FLAGS: u32 =
-        (libc::O_WRONLY
-            | libc::O_CREAT
-            | libc::O_EXCL
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK) as u32;
+    const CREATE_FLAGS: u32 = (libc::O_WRONLY
+        | libc::O_CREAT
+        | libc::O_EXCL
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK) as u32;
     f.push(jump(libc::SYS_openat as u32, 0, 7));
     f.push(arg(0));
     f.push(jump(fd as u32, 0, 4));
@@ -777,7 +785,6 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
         libc::SYS_getrandom,
         libc::SYS_getpid,
         libc::SYS_gettid,
-        libc::SYS_tgkill,
         libc::SYS_exit,
         libc::SYS_exit_group,
     ];
@@ -787,6 +794,7 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
             libc::SYS_sendmsg,
             libc::SYS_mmap,
             libc::SYS_mprotect,
+            libc::SYS_tgkill,
         ]);
     }
     #[cfg(target_arch = "x86_64")]

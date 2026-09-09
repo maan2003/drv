@@ -137,6 +137,10 @@ impl PciControl {
         std::os::fd::AsRawFd::as_raw_fd(&self.config)
     }
 
+    pub(crate) fn bus_master_enabled(&mut self) -> Result<bool, PciControlError> {
+        Ok(read_command(&mut self.config)? & PCI_COMMAND_MASTER != 0)
+    }
+
     pub fn verify_dma_disabled(&mut self) -> Result<PciConfigSnapshot, PciControlError> {
         verify_dma_disabled(&mut self.config)
     }

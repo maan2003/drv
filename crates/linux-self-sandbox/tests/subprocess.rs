@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 use std::os::fd::RawFd;
-use std::process::{Command, Output};
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Output, Stdio};
 
 #[test]
 fn setup_preserves_only_capabilities_without_consuming_them_and_lockdown_denies_ambient_syscalls() {
@@ -58,6 +59,68 @@ fn wlancfg_allows_only_directory_relative_atomic_persistence() {
     assert_helper(output, "profile=wlancfg");
 }
 
+#[test]
+fn mt7921_vfio_subprocess_has_only_its_runtime_authority() {
+    let parent_mount_namespace = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+    let parent_network_namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+    let retained = [open_dev_null(), open_dev_null(), open_dev_null()];
+    for fd in retained {
+        clear_cloexec(fd);
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_self-test-helper"))
+        .env("SANDBOX_HELPER_MODE", "mt7921-vfio")
+        .env(
+            "SANDBOX_RETAINED_FDS",
+            retained.map(|fd| fd.to_string()).join(","),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for fd in retained {
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    use std::io::{BufRead, Read, Write};
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).unwrap();
+    if first_line.contains("sandbox_self_test=READY") {
+        let pid = child.id();
+        let child_mount_namespace = std::fs::read_link(format!("/proc/{pid}/ns/mnt")).unwrap();
+        let child_network_namespace = std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+        assert_ne!(child_mount_namespace, parent_mount_namespace);
+        assert_ne!(child_network_namespace, parent_network_namespace);
+
+        let root = format!("/proc/{pid}/root");
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        child.stdin.take().unwrap().write_all(b"X").unwrap();
+    }
+
+    let mut output = Output {
+        status: child.wait().unwrap(),
+        stdout: first_line.into_bytes(),
+        stderr: Vec::new(),
+    };
+    stdout.read_to_end(&mut output.stdout).unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut output.stderr)
+        .unwrap();
+    assert_helper(
+        output,
+        "profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+3 no_new_privs=true seccomp=true open_denied=true socket_denied=true fork_denied=true exec_denied=true sendmsg_denied=true recvmsg_denied=true tgkill_other_denied=true cross_fd_ioctls_denied=true allocator=true thread=true timer=true eventfd=true read_write=true",
+    );
+}
+
 fn helper(mode: &str, retained: RawFd, unwanted: Option<RawFd>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_self-test-helper"));
     command
@@ -71,6 +134,12 @@ fn helper(mode: &str, retained: RawFd, unwanted: Option<RawFd>) -> Output {
 
 fn clear_cloexec(fd: RawFd) {
     assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+}
+
+fn open_dev_null() -> RawFd {
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    assert!(fd >= 0);
+    fd
 }
 
 fn assert_helper(output: Output, expected: &str) {

@@ -22,16 +22,27 @@ fn main() {
 
 fn run() -> Result<(), Error> {
     let mode = std::env::var("SANDBOX_HELPER_MODE").expect("helper mode");
-    let retained = fd_env("SANDBOX_RETAINED_FD");
+    let retained_fds = if mode == "mt7921-vfio" {
+        std::env::var("SANDBOX_RETAINED_FDS")
+            .unwrap()
+            .split(',')
+            .map(|fd| fd.parse().unwrap())
+            .collect::<Vec<_>>()
+    } else {
+        vec![fd_env("SANDBOX_RETAINED_FD")]
+    };
+    let retained = retained_fds[0];
     let unwanted = std::env::var("SANDBOX_UNWANTED_FD")
         .ok()
         .map(|v| v.parse().unwrap());
     let persistence = (mode == "wlancfg").then_some(retained);
-    let setup = Sandbox::new().setup(&[retained], persistence)?;
-    assert!(
-        unsafe { libc::fcntl(retained, libc::F_GETFD) } >= 0,
-        "retained fd was closed"
-    );
+    let setup = Sandbox::new().setup(&retained_fds, persistence)?;
+    for &fd in &retained_fds {
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+            "retained fd was closed"
+        );
+    }
     if let Some(fd) = unwanted {
         assert_eq!(
             unsafe { libc::fcntl(fd, libc::F_GETFD) },
@@ -86,9 +97,219 @@ fn run() -> Result<(), Error> {
             assert_eq!(unsafe { libc::unlinkat(retained, installed.as_ptr(), 0) }, 0);
             println!("sandbox_self_test=PASS profile=wlancfg ambient_open_denied=true parent_escape_denied=true symlink_escape_denied=true directory_create=true atomic_replace=true");
         }),
+        "mt7921-vfio" => {
+            assert_eq!(retained_fds.len(), 3);
+            pre_lockdown_probes(&retained_fds);
+            println!("sandbox_self_test=READY");
+            use std::io::{Read, Write};
+            std::io::stdout().flush().unwrap();
+            let mut start = [0];
+            std::io::stdin().read_exact(&mut start).unwrap();
+            assert_eq!(start, [b'X']);
+            setup.lockdown(Profile::Mt7921Vfio {
+                pci_config_fd: retained_fds[0],
+                vfio_fd: retained_fds[1],
+                iommufd: retained_fds[2],
+            })?.run(|| {
+                mt7921_denied_probes(&retained_fds);
+                positive_runtime_probes();
+                println!("sandbox_self_test=PASS profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+3 no_new_privs=true seccomp=true open_denied=true socket_denied=true fork_denied=true exec_denied=true sendmsg_denied=true recvmsg_denied=true tgkill_other_denied=true cross_fd_ioctls_denied=true allocator=true thread=true timer=true eventfd=true read_write=true");
+            });
+        }
         _ => panic!("unknown helper mode"),
     }
     Ok(())
+}
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn pre_lockdown_probes(retained: &[RawFd]) {
+    let mut uids = [0; 3];
+    let mut gids = [0; 3];
+    assert_eq!(
+        unsafe { libc::getresuid(&mut uids[0], &mut uids[1], &mut uids[2]) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::getresgid(&mut gids[0], &mut gids[1], &mut gids[2]) },
+        0
+    );
+    assert_eq!(uids, [65534; 3]);
+    assert_eq!(gids, [65534; 3]);
+    assert_eq!(unsafe { libc::getgroups(0, std::ptr::null_mut()) }, 0);
+
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let mut header = CapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapabilityData::default(), CapabilityData::default()];
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) },
+        0
+    );
+    assert!(
+        data.iter()
+            .all(|word| word.effective == 0 && word.permitted == 0 && word.inheritable == 0)
+    );
+    for capability in 0..64 {
+        let bounded = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if bounded == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            break;
+        }
+        assert_eq!(
+            bounded, 0,
+            "capability {capability} remains in bounding set"
+        );
+        assert_eq!(
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_IS_SET,
+                    capability,
+                    0,
+                    0,
+                )
+            },
+            0,
+            "capability {capability} remains ambient"
+        );
+    }
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+        1
+    );
+
+    let root_entries = std::fs::read_dir("/").unwrap().count();
+    assert_eq!(root_entries, 0);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata("/").unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    for fd in 0..limit.rlim_cur {
+        let open = unsafe { libc::fcntl(fd as RawFd, libc::F_GETFD) } >= 0;
+        assert_eq!(
+            open,
+            fd < 3 || retained.contains(&(fd as RawFd)),
+            "unexpected descriptor {fd}"
+        );
+    }
+}
+
+fn mt7921_denied_probes(retained: &[RawFd]) {
+    denied_open();
+    assert_errno(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } as i64);
+    assert_errno(unsafe { libc::fork() } as i64);
+    assert_errno(unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            libc::getpid().saturating_add(1),
+            libc::gettid(),
+            0,
+        )
+    });
+    let argv = [c"true".as_ptr(), std::ptr::null()];
+    assert_errno(
+        unsafe { libc::execve(c"/bin/true".as_ptr(), argv.as_ptr(), argv[1..].as_ptr()) } as i64,
+    );
+    let message: libc::msghdr = unsafe { std::mem::zeroed() };
+    assert_errno(unsafe { libc::sendmsg(retained[1], &message, 0) } as i64);
+    assert_errno(unsafe {
+        libc::recvmsg(retained[1], (&message as *const libc::msghdr).cast_mut(), 0)
+    } as i64);
+
+    let vfio_request = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
+    let iommu_request = userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS[0];
+    for (fd, request) in [
+        (retained[0], vfio_request),
+        (retained[0], iommu_request),
+        (retained[1], iommu_request),
+        (retained[2], vfio_request),
+    ] {
+        assert_errno(unsafe { libc::ioctl(fd, request, 0) } as i64);
+    }
+}
+
+fn assert_errno(result: i64) {
+    assert_eq!(result, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    );
+}
+
+fn positive_runtime_probes() {
+    let allocated = vec![0x5a_u8; 256 * 1024];
+    assert_eq!(
+        allocated
+            .iter()
+            .map(|&byte| usize::from(byte))
+            .sum::<usize>(),
+        0x5a * 256 * 1024
+    );
+    assert_eq!(std::thread::spawn(|| 42).join().unwrap(), 42);
+
+    let timer = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+    assert!(timer >= 0);
+    let setting = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        },
+    };
+    assert_eq!(
+        unsafe { libc::timerfd_settime(timer, 0, &setting, std::ptr::null_mut()) },
+        0
+    );
+    let mut expirations = 0_u64;
+    assert_eq!(
+        unsafe { libc::read(timer, (&mut expirations as *mut u64).cast(), 8) },
+        8
+    );
+    assert!(expirations >= 1);
+    assert_eq!(unsafe { libc::close(timer) }, 0);
+
+    let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    assert!(event >= 0);
+    let written = 7_u64;
+    assert_eq!(
+        unsafe { libc::write(event, (&written as *const u64).cast(), 8) },
+        8
+    );
+    let mut read = 0_u64;
+    assert_eq!(
+        unsafe { libc::read(event, (&mut read as *mut u64).cast(), 8) },
+        8
+    );
+    assert_eq!(read, written);
+    assert_eq!(unsafe { libc::close(event) }, 0);
 }
 
 fn fd_env(name: &str) -> RawFd {

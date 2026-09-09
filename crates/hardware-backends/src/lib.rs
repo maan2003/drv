@@ -11,9 +11,11 @@ use std::{
 #[cfg(target_os = "linux")]
 mod linux_vfio;
 #[cfg(target_os = "linux")]
+pub use linux_vfio::unconfined as unconfined_vfio;
+#[cfg(target_os = "linux")]
 pub use linux_vfio::{
     LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LockedLinuxVfioPciCapabilities,
-    OpenedPciCoherent,
+    LockedVfioEduReport, OpenedPciCoherent, run_locked_vfio_edu_mechanics,
 };
 #[cfg(target_os = "linux")]
 pub fn monotonic_time_ns() -> Result<u64> {

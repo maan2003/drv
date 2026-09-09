@@ -79,6 +79,96 @@ pub struct LinuxVfioPciCapabilities {
 /// The same inert authority after the exact MT7921 sandbox profile is active.
 pub struct LockedLinuxVfioPciCapabilities(LinuxVfioPciCapabilities);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedVfioEduReport {
+    pub region_index: u32,
+    pub irq_index: u32,
+    pub reset_supported: bool,
+    pub reset_succeeded: bool,
+}
+
+/// Exercise real VFIO/iommufd mechanics under the MT7921 filter while bypassing
+/// only endpoint identity and PCI power-management policy that QEMU edu cannot
+/// satisfy. This is proof tooling, not a production device constructor.
+pub fn run_locked_vfio_edu_mechanics(
+    capabilities: LockedLinuxVfioPciCapabilities,
+) -> std::result::Result<LockedVfioEduReport, String> {
+    let LinuxVfioPciCapabilities {
+        mut pci,
+        device,
+        iommu,
+    } = capabilities.0;
+    if pci
+        .bus_master_enabled()
+        .map_err(|error| error.to_string())?
+    {
+        return Err("QEMU edu entered proof with PCI bus mastering enabled".into());
+    }
+    let pci = pci.into_file();
+    userspace_vfio::bind_iommufd(&device, &iommu)?;
+    let mut ioas = userspace_vfio::allocate_ioas(&iommu)?;
+    userspace_vfio::attach_ioas(&device, ioas.id())?;
+    let info = userspace_vfio::pci_device_info(&device)?;
+
+    let mut mapped_region = None;
+    for index in 0..info.num_regions {
+        let Ok(region) = userspace_vfio::region_info(&device, index) else {
+            continue;
+        };
+        let len = usize::try_from(region.size).unwrap_or(0).min(4096);
+        if len == 4096
+            && let Ok(mapping) = userspace_vfio::RegionMapping::map(&device, &region, 0, len, true)
+        {
+            mapped_region = Some((index, mapping));
+            break;
+        }
+    }
+    let (region_index, mut region) =
+        mapped_region.ok_or_else(|| "QEMU edu exposes no writable mmap BAR".to_string())?;
+
+    let mut dma = userspace_vfio::DmaMapping::map(&iommu, ioas.id(), 0x0100_0000, 4096, 4096)?;
+    dma.write(0, b"locked-vfio-edu")?;
+
+    let mut installed_irq = None;
+    for index in [2, 1] {
+        let Ok(capability) = userspace_vfio::irq_capability(&device, index) else {
+            continue;
+        };
+        if capability.count == 0 || !capability.eventfd {
+            continue;
+        }
+        if let Ok(irq) = userspace_vfio::VfioIrq::install(&device, capability) {
+            installed_irq = Some((index, irq));
+            break;
+        }
+    }
+    let (irq_index, mut irq) =
+        installed_irq.ok_or_else(|| "QEMU edu exposes no installable eventfd IRQ".to_string())?;
+
+    userspace_vfio::prove_mt7921_sandbox_ioctl_denials(&pci, &device, &iommu)?;
+    let reset = userspace_vfio::reset_device_unchecked(&device);
+    if let Err(error) = &reset
+        && error.contains("Operation not permitted")
+    {
+        return Err("seccomp rejected VFIO_DEVICE_RESET".into());
+    }
+
+    irq.disable()?;
+    region.teardown()?;
+    dma.teardown()?;
+    drop(irq);
+    drop(region);
+    drop(dma);
+    drop(device);
+    ioas.teardown()?;
+    Ok(LockedVfioEduReport {
+        region_index,
+        irq_index,
+        reset_supported: info.reset_supported,
+        reset_succeeded: reset.is_ok(),
+    })
+}
+
 impl LinuxVfioPciCapabilities {
     /// Adopt the three PCI/VFIO descriptors without inspecting or activating
     /// them.
@@ -280,14 +370,6 @@ impl LinuxVfio {
     /// [`LinuxVfioPciCapabilities::open`], call
     /// [`LinuxVfioPciCapabilities::lock_down`], and then pass the result to
     /// [`LinuxVfio::activate_locked_pci_coherent`].
-    pub fn open_pci_coherent(
-        path: impl AsRef<Path>,
-        pci_config_path: impl AsRef<Path>,
-    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
-        let capabilities = LinuxVfioPciCapabilities::open(path, pci_config_path)?;
-        Self::activate_pci_coherent(capabilities)
-    }
-
     /// Compatibility activation for callers that establish confinement elsewhere.
     ///
     /// Self-sandboxed production callers must use
@@ -298,7 +380,7 @@ impl LinuxVfio {
     /// backend. These operations issue VFIO/iommufd ioctls and PCI config
     /// read/lseek; later device operation may issue PCI config writes/lseek,
     /// mmap/munmap, eventfd/read/ppoll, clocks/futex, and telemetry write/close.
-    pub fn activate_pci_coherent(
+    fn activate_pci_coherent(
         capabilities: LinuxVfioPciCapabilities,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
         let LinuxVfioPciCapabilities { pci, device, iommu } = capabilities;
@@ -499,6 +581,19 @@ impl LinuxVfio {
                 DmaMemory::Ioas(_) => unreachable!("broker backend owns no IOAS DMA"),
             }
         }
+    }
+}
+
+/// Explicitly unconfined compatibility entrypoints for diagnostic spikes.
+pub mod unconfined {
+    use super::*;
+
+    pub fn open_pci_coherent(
+        path: impl AsRef<Path>,
+        pci_config_path: impl AsRef<Path>,
+    ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
+        let capabilities = LinuxVfioPciCapabilities::open(path, pci_config_path)?;
+        LinuxVfio::activate_pci_coherent(capabilities)
     }
 }
 
