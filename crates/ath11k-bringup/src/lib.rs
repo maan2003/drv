@@ -959,6 +959,12 @@ impl ath11k_core::WmiTraceSink for JsonTrace {
     }
 }
 
+fn control_deadline() -> u64 {
+    userspace_vfio::monotonic_time_ns()
+        .unwrap_or(0)
+        .saturating_add(10_000_000_000)
+}
+
 type LiveSubsystems = ath11k_core::Wcn6750Subsystems<
     LinuxVfio,
     QrtrTransport,
@@ -1158,6 +1164,8 @@ impl Host for RealHost {
     }
 
     fn qmi(&mut self) -> Result<(), Error> {
+        use ath11k_core::Lifecycle as _;
+
         let transport = self.qrtr.take().ok_or(Error::Unsupported(
             "QMI requested before resource acquisition",
         ))?;
@@ -1170,9 +1178,9 @@ impl Host for RealHost {
             .take()
             .ok_or(Error::Unsupported("QMI requested before firmware loading"))?;
         let memory = if let Some(region) = self.register_region {
-            ath11k_core::HardwareMemoryProvider::new(hardware, region)
+            ath11k_core::HardwareMemoryProvider::new(hardware.clone(), region)
         } else {
-            ath11k_core::HardwareMemoryProvider::discover_device_bar(hardware)
+            ath11k_core::HardwareMemoryProvider::discover_device_bar(hardware.clone())
         };
         let mut qmi = ath11k_core::Wcn6750QmiSession::new(transport, assets, memory);
         qmi.discover_device_bar().map_err(|error| {
@@ -1197,7 +1205,7 @@ impl Host for RealHost {
         }
         if let Some(selected) = self.register_region {
             let region = matching_region.filter(|region| region.index == u32::from(selected));
-            let mapped = qmi.take_device_bar().ok_or_else(|| {
+            let mapped = qmi.memory().device_bar().ok_or_else(|| {
                 Error::Hardware(format!(
                     "QMI DeviceInfo did not map selected VFIO region {selected}"
                 ))
@@ -1208,10 +1216,34 @@ impl Host for RealHost {
                 ))
             })?;
             println!(
-                "qmi_device_bar_mapped index={} size={:#x}; stopping before BDF/MMIO/CE/HTC",
+                "qmi_device_bar_mapped index={} size={:#x}",
                 region.index,
                 mapped.len()
             );
+            let waiter = self.waiter.take().ok_or(Error::Unsupported(
+                "QMI requested before interrupt acquisition",
+            ))?;
+            let dp_interrupts = self.dp_interrupts.take().ok_or(Error::Unsupported(
+                "QMI requested before DP interrupt acquisition",
+            ))?;
+            let path = self.wmi_log.as_ref().ok_or(Error::Unsupported(
+                "real mode requires a WMI run-record destination",
+            ))?;
+            let file = File::create(path).map_err(|source| Error::Io {
+                action: "create WMI JSONL run record",
+                source,
+            })?;
+            let subsystems = ath11k_core::Wcn6750Subsystems::new(
+                qmi,
+                hardware,
+                waiter,
+                dp_interrupts,
+                control_deadline as fn() -> u64,
+                JsonTrace(WmiJsonl::new(BufWriter::new(file))),
+            );
+            let mut device = ath11k_core::WCN6750.device(subsystems);
+            device.probe().map_err(Error::Core)?;
+            self.device = Some(device);
         }
         Ok(())
     }
