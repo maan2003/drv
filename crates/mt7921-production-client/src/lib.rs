@@ -10,12 +10,14 @@
 //! owner. Policy/effects and lab telemetry deliberately remain outside this
 //! crate.
 
+mod active_mcu;
 mod setup_inputs;
 pub use setup_inputs::{
     CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
     FirmwareVerificationError, RegulatorySnapshotFile, VerifiedFirmware, VerifiedFirmwareImages,
 };
 
+use active_mcu::{ActiveMcuProtocol, ActiveMcuViews, CompletionKind, TransactionError};
 use drv_hardware::{
     Backend, Bidirectional, CoherentDma, Device, DmaConstraints, FromDevice, Interrupt, MmioRegion,
     ToDevice,
@@ -530,13 +532,15 @@ fn advance_containment(
 /// DMA, and IRQ handle shares that same backend identity without borrowing the
 /// session, so this type has no self-referential lifetime.
 pub struct Mt7921HardwareSession {
-    resources: OwnedHardwareResources<LinuxVfio>,
+    resources: Option<OwnedHardwareResources<LinuxVfio>>,
     pci_snapshot: PciConfigSnapshot,
     acquisition: AcquisitionLedger,
     containment: ContainmentLedger,
     lifecycle: SessionLifecycle,
+    potentially_active: bool,
+    mcu: ActiveMcuProtocol,
     // Dropped after resources so the PCI control owner spans their lifetime.
-    pci: PciControl,
+    pci: Option<PciControl>,
 }
 
 impl Mt7921HardwareSession {
@@ -564,7 +568,7 @@ impl Mt7921HardwareSession {
                 }
             })?;
         Ok(Self {
-            resources,
+            resources: Some(resources),
             pci_snapshot,
             acquisition,
             containment: ContainmentLedger {
@@ -579,7 +583,9 @@ impl Mt7921HardwareSession {
                 post_reset_pci: None,
             },
             lifecycle: SessionLifecycle::Active,
-            pci,
+            potentially_active: false,
+            mcu: ActiveMcuProtocol::default(),
+            pci: Some(pci),
         })
     }
 
@@ -596,20 +602,28 @@ impl Mt7921HardwareSession {
     }
 
     pub fn generation(&self) -> u64 {
-        self.resources.device.generation()
+        self.resources
+            .as_ref()
+            .expect("live session resources")
+            .device
+            .generation()
     }
 
     pub fn verify_dma_disabled(
         &mut self,
     ) -> Result<PciConfigSnapshot, drv_hardware_backends::PciControlError> {
-        self.pci.verify_dma_disabled()
+        self.pci
+            .as_mut()
+            .expect("live PCI authority")
+            .verify_dma_disabled()
     }
 
     /// Read the bounded status registers without exposing their BAR pages.
     pub fn read_only_status(&self) -> Result<ReadOnlyStatus, drv_hardware::Error> {
         self.ensure_active()?;
-        let wfdma = self.resources.bar0.slice(0xd4000, PAGE)?;
-        let conn = self.resources.bar0.slice(0xe0000, PAGE)?;
+        let resources = self.resources.as_ref().expect("live session resources");
+        let wfdma = resources.bar0.slice(0xd4000, PAGE)?;
+        let conn = resources.bar0.slice(0xe0000, PAGE)?;
         Ok(ReadOnlyStatus::decode(
             conn.read_u32(0xf0)?,
             conn.read_u32(0x10)?,
@@ -629,6 +643,8 @@ impl Mt7921HardwareSession {
         let mut transport = DriverOwnershipIo {
             conn: self
                 .resources
+                .as_ref()
+                .expect("live session resources")
                 .bar0
                 .slice(0xe0000, PAGE)
                 .map_err(OwnershipError::Transport)?,
@@ -641,18 +657,96 @@ impl Mt7921HardwareSession {
         ensure_operational(self.lifecycle)
     }
 
+    /// Private and intentionally incomplete until the firmware-loader raw
+    /// transaction path is cut over atomically to this executor.
+    #[allow(dead_code)]
+    fn transact_mcu(
+        &mut self,
+        template: &[u8],
+        completion: CompletionKind,
+        deadline_ns: u64,
+    ) -> Result<Option<mt7921_core::FirmwareRx>, TransactionError<drv_hardware::Error>> {
+        self.ensure_active().map_err(TransactionError::Io)?;
+        // Publication below is meaningful only for an active device.  Mark
+        // retention first, just as the eventual BME/WFDMA enable path must.
+        self.potentially_active = true;
+        let result = {
+            let resources = self.resources.as_mut().expect("live session resources");
+            let mut views = ActiveMcuViews {
+                wfdma: resources
+                    .bar0
+                    .slice(0xd4000, PAGE)
+                    .map_err(TransactionError::Io)?,
+                tx_ring: &mut resources.dma.mcu_tx_ring,
+                payloads: &mut resources.dma.command_payloads,
+                wm_ring: &mut resources.dma.mcu_rx_ring,
+                wm_buffers: &mut resources.dma.mcu_rx_buffers,
+                wm2_ring: &mut resources.dma.wa_rx_ring,
+                wm2_buffers: &mut resources.dma.wa_rx_buffers,
+                interrupt: &resources.interrupt,
+            };
+            self.mcu
+                .transact(&mut views, template, completion, deadline_ns)
+        };
+        close_after_transaction_error(&mut self.lifecycle, &result);
+        result
+    }
+
     /// Progress containment from the first unverified milestone.
     ///
     /// Failures retain the complete resource graph and PCI owner so callers
     /// can retry. Once contained, repeated calls are idempotent.
     pub fn contain(&mut self) -> Result<ContainmentLedger, Mt7921ContainmentError> {
         advance_containment(
-            &mut self.resources,
-            &mut self.pci,
+            self.resources.as_mut().expect("live session resources"),
+            self.pci.as_mut().expect("live PCI authority"),
             &mut self.lifecycle,
             &mut self.containment,
         )?;
         Ok(self.containment)
+    }
+}
+
+fn close_after_transaction_error<T, E>(
+    lifecycle: &mut SessionLifecycle,
+    result: &Result<T, TransactionError<E>>,
+) {
+    if result
+        .as_ref()
+        .is_err_and(TransactionError::requires_containment)
+    {
+        *lifecycle = SessionLifecycle::Closing;
+    }
+}
+
+fn park_uncontained<R, P>(resources: &mut Option<R>, pci: &mut Option<P>) {
+    if let Some(resources) = resources.take() {
+        std::mem::forget(resources);
+    }
+    if let Some(pci) = pci.take() {
+        std::mem::forget(pci);
+    }
+}
+
+fn finish_active_drop<R, P>(
+    lifecycle: SessionLifecycle,
+    resources: &mut Option<R>,
+    pci: &mut Option<P>,
+) {
+    if lifecycle != SessionLifecycle::Contained {
+        park_uncontained(resources, pci);
+    }
+}
+
+impl Drop for Mt7921HardwareSession {
+    fn drop(&mut self) {
+        if !self.potentially_active || self.lifecycle == SessionLifecycle::Contained {
+            return;
+        }
+        let _ = self.contain();
+        // Releasing VFIO/IOAS/BAR/DMA/IRQ after unproved containment is less
+        // safe than deliberately retaining the complete graph.
+        finish_active_drop(self.lifecycle, &mut self.resources, &mut self.pci);
     }
 }
 
@@ -662,7 +756,10 @@ mod tests {
     use drv_hardware_backends::{
         DeterministicBackend, DeterministicRelease, DeterministicResourceProbe,
     };
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ContainmentCall {
@@ -1048,5 +1145,97 @@ mod tests {
             ensure_operational(SessionLifecycle::Contained),
             Err(drv_hardware::Error::StaleHandle)
         );
+    }
+
+    #[test]
+    fn active_failure_retains_authority_for_resumable_containment() {
+        let (mut resources, mut pci, calls) = fake_pair(Some(InjectedFailure::ResetIoctl));
+        let mut lifecycle = SessionLifecycle::Active;
+        let mut ledger = initial_containment();
+        assert!(
+            advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).is_err()
+        );
+        assert_eq!(lifecycle, SessionLifecycle::Closing);
+        assert_eq!(ledger.bme_disabled_command(), Some(0x2));
+        advance_containment(&mut resources, &mut pci, &mut lifecycle, &mut ledger).unwrap();
+        assert_eq!(lifecycle, SessionLifecycle::Contained);
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == ContainmentCall::DisableBme)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn uncontained_graph_is_parked_instead_of_normally_released() {
+        struct ReleaseProbe(Rc<Cell<usize>>);
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let releases = Rc::new(Cell::new(0));
+        {
+            let (mut containment, mut pci_control, _) = fake_pair(None);
+            let mut lifecycle = SessionLifecycle::Active;
+            let mut ledger = initial_containment();
+            advance_containment(
+                &mut containment,
+                &mut pci_control,
+                &mut lifecycle,
+                &mut ledger,
+            )
+            .unwrap();
+            let mut resources = Some(ReleaseProbe(releases.clone()));
+            let mut pci = Some(ReleaseProbe(releases.clone()));
+            finish_active_drop(lifecycle, &mut resources, &mut pci);
+        }
+        assert_eq!(releases.get(), 2, "contained graph releases normally");
+
+        {
+            let (mut containment, mut pci_control, _) =
+                fake_pair(Some(InjectedFailure::ResetIoctl));
+            let mut lifecycle = SessionLifecycle::Active;
+            let mut ledger = initial_containment();
+            assert!(
+                advance_containment(
+                    &mut containment,
+                    &mut pci_control,
+                    &mut lifecycle,
+                    &mut ledger,
+                )
+                .is_err()
+            );
+            let mut resources = Some(ReleaseProbe(releases.clone()));
+            let mut pci = Some(ReleaseProbe(releases.clone()));
+            finish_active_drop(lifecycle, &mut resources, &mut pci);
+            assert!(resources.is_none() && pci.is_none());
+        }
+        assert_eq!(releases.get(), 2, "uncontained graph was parked");
+    }
+
+    #[test]
+    fn containment_required_transaction_error_closes_session_operations() {
+        for error in [
+            TransactionError::ContainmentRequiredTimeout,
+            TransactionError::InvalidDmaIndex {
+                ring: mt7921_core::McuRxIrqRing::Wm,
+                index: 8,
+            },
+            TransactionError::Descriptor,
+        ] {
+            let mut lifecycle = SessionLifecycle::Active;
+            let result: Result<(), TransactionError<drv_hardware::Error>> = Err(error);
+            close_after_transaction_error(&mut lifecycle, &result);
+            assert_eq!(lifecycle, SessionLifecycle::Closing);
+            assert_eq!(
+                ensure_operational(lifecycle),
+                Err(drv_hardware::Error::StaleHandle)
+            );
+        }
     }
 }
