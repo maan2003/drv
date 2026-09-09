@@ -23,6 +23,17 @@ test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 test "$(cat "$RPROC/state")" = offline
 test "$CYCLES" -ge 2
 
+# Keep USB control reachable after the clean final cycle leaves this candidate
+# idle. The active-run transaction's inhibitor ends with that transaction and
+# does not cover the retained same-kernel iteration window.
+if ! systemctl is-active --quiet ath11k-redwood-sleep-inhibit.service; then
+  systemctl reset-failed ath11k-redwood-sleep-inhibit.service 2>/dev/null || true
+  systemd-run --quiet --unit=ath11k-redwood-sleep-inhibit \
+    systemd-inhibit --what=sleep --who=ath11k-redwood-lab \
+      --why='retain USB control of inert candidate' --mode=block sleep infinity
+fi
+systemctl is-active --quiet ath11k-redwood-sleep-inhibit.service
+
 "$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
 systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=120s \
   "$TRANSACTION" --recover fast_cycle_deadline

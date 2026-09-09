@@ -197,7 +197,10 @@ states. The retained physical run
 successful VFIO unbind; the second full QMI handshake proves QRTR/WPSS service
 reappearance. After the final verified offline/reaped/unbound boundary, the
 wrapper disarms its emergency fallbacks and retains the inert candidate kernel
-for the next userspace cycle. An earlier failure leaves those fallbacks armed.
+for the next userspace cycle. A separate systemd sleep inhibitor remains active
+for that retained-candidate session so idle suspend cannot remove USB control;
+it ends when the candidate reboots. An earlier failure leaves the reboot
+fallbacks armed.
 
 The current physical proof is retained on np at
 `/var/lib/poco-linux/redwood/work/artifacts/runB-core-region1-qmi-match-20260909T043223Z`:
