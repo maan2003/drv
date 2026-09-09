@@ -12,7 +12,7 @@ resolver = "3"
 fidl-fuchsia-wlan-sme = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.sme" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.ieee80211" }
 futures = "=0.3.32"
-libc = "=0.2.183"
+libc = "=0.2.189"
 wlan-control-wire = { path = "../wlan-control-wire" }
 wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
 
