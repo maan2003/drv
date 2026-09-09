@@ -1097,8 +1097,9 @@ fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
 
 fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     // Exactly the read and atomic-create flag sets used by HostPolicyStorage at
-    // revision 96e37e09. O_NOFOLLOW is mandatory; O_PATH/device-style expansion
-    // and all ambient/absolute opens are therefore excluded.
+    // revision 96e37e09. O_NOFOLLOW is mandatory and excludes symlink-following
+    // and O_PATH/device-style expansion. Absolute paths remain confined by the
+    // sealed filesystem namespace; seccomp cannot inspect pathname contents.
     const READ_FLAGS: u32 =
         (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u32;
     const CREATE_FLAGS: u32 = (libc::O_WRONLY
