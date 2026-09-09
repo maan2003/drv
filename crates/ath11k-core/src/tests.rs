@@ -818,9 +818,14 @@ fn actual_qmi_handshake_runs_through_fake_qrtr_peer() {
         sent: Vec<MessageId>,
         transaction: u16,
         service: Option<(u32, u32)>,
+        start_failures: usize,
     }
     impl Transport for FakeQrtr {
         fn start_service(&mut self, version: u32, instance: u32) -> Result<(), QmiError> {
+            if self.start_failures != 0 {
+                self.start_failures -= 1;
+                return Err(QmiError::Transport);
+            }
             self.service = Some((version, instance));
             Ok(())
         }
@@ -902,6 +907,7 @@ fn actual_qmi_handshake_runs_through_fake_qrtr_peer() {
         sent: Vec::new(),
         transaction: 0,
         service: None,
+        start_failures: 1,
     };
     let mut assets = Wcn6750FirmwareAssets {
         board: vec![1, 2, 3],
@@ -913,7 +919,11 @@ fn actual_qmi_handshake_runs_through_fake_qrtr_peer() {
     assert_eq!(assets.board_data(7).unwrap(), vec![1, 2, 3]);
     let mut memory = FakeMemory { bar: None };
     let mut qmi = Wcn6750QmiSession::new(qrtr, &mut assets, &mut memory);
+    // A failed service start must remain retryable, while the completed
+    // discovery path must make the lifecycle's repeated init idempotent.
+    assert_eq!(qmi.init_service(), Err(QmiError::Transport));
     let ready = qmi.wait_for_firmware_ready().unwrap();
+    qmi.init_service().unwrap();
     assert_eq!(ready.firmware_version, 0x1122_3344);
     qmi.firmware_start(&WlanConfigRequest::default(), 0, false)
         .unwrap();

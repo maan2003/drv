@@ -180,6 +180,9 @@ where
     }
 
     pub fn init_service(&mut self) -> Result<(), QmiError> {
+        if self.service_started {
+            return Ok(());
+        }
         self.handshake.init_service(&mut self.transport)?;
         self.service_started = true;
         Ok(())
