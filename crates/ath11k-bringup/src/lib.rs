@@ -976,6 +976,10 @@ fn control_deadline() -> u64 {
         .saturating_add(10_000_000_000)
 }
 
+fn monotonic_now() -> u64 {
+    userspace_vfio::monotonic_time_ns().unwrap_or(0)
+}
+
 type LiveSubsystems = ath11k_core::Wcn6750Subsystems<
     LinuxVfio,
     QrtrTransport,
@@ -1151,9 +1155,13 @@ impl Host for RealHost {
             source,
         })?;
         let hardware = HardwareDevice::from_backend(vfio);
-        let (waiter, dp_interrupts) = ath11k_core::Wcn6750Interrupts::configure(hardware.clone())
-            .map_err(|error| Error::Hardware(format!("configure WCN6750 interrupts: {error:?}")))?
-            .split();
+        let (waiter, dp_interrupts) = ath11k_core::Wcn6750Interrupts::configure_with_ce_polling(
+            hardware.clone(),
+            monotonic_now,
+            10_000_000,
+        )
+        .map_err(|error| Error::Hardware(format!("configure WCN6750 interrupts: {error:?}")))?
+        .split();
         self.hardware = Some(hardware);
         self.waiter = Some(waiter);
         self.dp_interrupts = Some(dp_interrupts);

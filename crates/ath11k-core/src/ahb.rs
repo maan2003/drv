@@ -127,6 +127,29 @@ impl<B: Backend> Wcn6750Interrupts<B> {
     /// Configure the request-IRQ equivalent. CE routes are live immediately;
     /// external DP routes retain their device capability until `enable`.
     pub fn configure(device: Device<B>) -> Result<Self, Error> {
+        Self::configure_inner(device, None, 0)
+    }
+
+    /// Configure CE eventfds with a bounded polling fallback. Some WCN6750
+    /// completions update the CE status ring without waking the VFIO eventfd;
+    /// periodically returning to the ring poll avoids delaying visible work
+    /// until the full control deadline.
+    pub fn configure_with_ce_polling(
+        device: Device<B>,
+        clock: fn() -> u64,
+        interval_ns: u64,
+    ) -> Result<Self, Error> {
+        if interval_ns == 0 {
+            return Err(Error::Invalid);
+        }
+        Self::configure_inner(device, Some(clock), interval_ns)
+    }
+
+    fn configure_inner(
+        device: Device<B>,
+        poll_clock: Option<fn() -> u64>,
+        poll_interval_ns: u64,
+    ) -> Result<Self, Error> {
         let mut interrupts = Vec::with_capacity(WCN6750_CE_INTERRUPT_ROUTES.len());
         for route in WCN6750_CE_INTERRUPT_ROUTES {
             interrupts.push(device.open_interrupt(u32::from(route.vector))?);
@@ -135,6 +158,8 @@ impl<B: Backend> Wcn6750Interrupts<B> {
             ce: Wcn6750CeWaiter {
                 routes: &WCN6750_CE_INTERRUPT_ROUTES,
                 interrupts,
+                poll_clock,
+                poll_interval_ns,
             },
             dp: Wcn6750DpInterrupts {
                 device,
@@ -152,6 +177,8 @@ impl<B: Backend> Wcn6750Interrupts<B> {
 pub struct Wcn6750CeWaiter<B: Backend> {
     routes: &'static [InterruptRoute],
     interrupts: Vec<Interrupt<B>>,
+    poll_clock: Option<fn() -> u64>,
+    poll_interval_ns: u64,
 }
 
 impl<B: Backend> Wcn6750CeWaiter<B> {
@@ -172,7 +199,18 @@ impl<B: Backend> Wcn6750CeWaiter<B> {
 
 impl<B: Backend> ath11k_ce::CeCompletionWait for Wcn6750CeWaiter<B> {
     fn wait_for_ce(&mut self, deadline_ns: u64) -> Result<bool, ath11k_ce::CeError> {
-        Ok(!self.wait_any(deadline_ns)?.is_empty())
+        let wait_deadline = self
+            .poll_clock
+            .map(|clock| {
+                clock()
+                    .saturating_add(self.poll_interval_ns)
+                    .min(deadline_ns)
+            })
+            .unwrap_or(deadline_ns);
+        if !self.wait_any(wait_deadline)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(wait_deadline < deadline_ns)
     }
 }
 
@@ -310,6 +348,7 @@ mod tests {
         released: Vec<u32>,
         ready: Vec<u32>,
         wait_sets: Vec<Vec<u32>>,
+        wait_deadlines: Vec<u64>,
     }
 
     struct IrqBackend(Rc<RefCell<IrqState>>);
@@ -391,6 +430,7 @@ mod tests {
             state
                 .wait_sets
                 .push(interrupts.iter().map(|interrupt| **interrupt).collect());
+            state.wait_deadlines.push(deadline_ns);
             Ok(state
                 .ready
                 .iter()
@@ -472,5 +512,28 @@ mod tests {
         state.borrow_mut().ready = vec![0];
         assert!(CeCompletionWait::wait_for_ce(&mut ce, 43).unwrap());
         assert_eq!(state.borrow().wait_sets.len(), 2);
+    }
+
+    fn clock_at_40() -> u64 {
+        40
+    }
+
+    #[test]
+    fn ce_polling_returns_to_ring_before_the_control_deadline() {
+        let state = Rc::new(RefCell::new(IrqState::default()));
+        assert_eq!(
+            Wcn6750Interrupts::configure_with_ce_polling(irq_device(&state), clock_at_40, 0,).err(),
+            Some(Error::Invalid)
+        );
+
+        let (mut ce, _) =
+            Wcn6750Interrupts::configure_with_ce_polling(irq_device(&state), clock_at_40, 10)
+                .unwrap()
+                .split();
+        assert!(ce.wait_for_ce(100).unwrap());
+        assert_eq!(state.borrow().wait_deadlines, vec![50]);
+
+        assert!(!ce.wait_for_ce(45).unwrap());
+        assert_eq!(state.borrow().wait_deadlines, vec![50, 45]);
     }
 }
