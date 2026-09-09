@@ -5,9 +5,9 @@
 //! The client MLME, not this module, owns 802.11 encapsulation/decapsulation,
 //! controlled-port policy, and selection of protected data frames.
 
-use netstack3_port_spike::{EthernetDeviceEvent, EthernetFrame, FrameSizeError};
 #[cfg(any(test, feature = "conformance"))]
 use netstack3_port_spike::{EthernetDevice, EthernetEventSource};
+use netstack3_port_spike::{EthernetDeviceEvent, EthernetFrame, FrameSizeError};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::ErrorKind;
@@ -311,6 +311,10 @@ pub fn ethernet_port(
 }
 
 impl HostEthernetDevice {
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.seam.raw_fd()
+    }
+
     pub fn properties(&self) -> Option<EthernetPortProperties> {
         self.lifecycle.lock().unwrap().properties
     }
@@ -361,6 +365,10 @@ impl<D: wlan_mlme::device::DeviceOps> AssociatedSoftmacTx for wlan_mlme::client:
 }
 
 impl DriverEthernetPort {
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.seam.raw_fd()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.seam.fd.is_none()
     }

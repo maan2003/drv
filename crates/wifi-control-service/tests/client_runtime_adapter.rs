@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use wifi_control_service::{PreparedServer, UnixSeqpacketEndpoint};
 use wifi_supervisor_wire::{LifecycleKind, LifecycleMessage};
-use wlan_control_wire::{ConnectReply, Message, Packet};
+use wlan_control_wire::{CommandReply, ConnectReply, Message, Packet};
 use wlan_softmac_host::runtime::ClientRuntime;
 use wlan_softmac_host::{
     ClientRuntimeDriver, WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls,
@@ -228,6 +228,35 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     send(
         &policy,
         2,
+        Message::Roam(sme::RoamRequest {
+            bss_description: connect_request().bss_description,
+        }),
+    );
+    let mut roam_rejected = false;
+    for _ in 0..100 {
+        futures::executor::block_on(server.drive_once()).unwrap();
+        while let Some(packet) = policy.try_receive_packet().unwrap() {
+            if matches!(
+                packet.packet.message,
+                Message::RoamReply(wlan_control_wire::Reply {
+                    result: CommandReply::Unsupported,
+                    ..
+                })
+            ) {
+                roam_rejected = true;
+            }
+        }
+        if roam_rejected {
+            break;
+        }
+    }
+    assert!(roam_rejected, "unsupported SoftMAC roam was not rejected");
+    assert!(effects.lock().unwrap().links.ends_with(&[true]));
+    assert!(!poll_hup(frame.as_raw_fd()), "roam rejection revoked link");
+
+    send(
+        &policy,
+        3,
         Message::Disconnect(sme::UserDisconnectReason::FidlStopClientConnectionsRequest),
     );
     let mut disconnected = false;
@@ -249,13 +278,22 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     );
     assert!(effects.lock().unwrap().links.ends_with(&[false]));
 
-    send(&policy, 3, Message::Connect(connect_request()));
+    send(&policy, 4, Message::Connect(connect_request()));
     let mut reconnected = false;
     let mut replacement = None;
     for _ in 0..2_000 {
         futures::executor::block_on(server.drive_once()).unwrap();
         while let Some(packet) = policy.try_receive_packet().unwrap() {
-            if matches!(packet.packet.message, Message::ConnectReply(wlan_control_wire::Reply { result: ConnectReply::Completed(sme::ConnectResult { code: ieee::StatusCode::Success, .. }), .. })) {
+            if matches!(
+                packet.packet.message,
+                Message::ConnectReply(wlan_control_wire::Reply {
+                    result: ConnectReply::Completed(sme::ConnectResult {
+                        code: ieee::StatusCode::Success,
+                        ..
+                    }),
+                    ..
+                })
+            ) {
                 reconnected = true;
             }
         }

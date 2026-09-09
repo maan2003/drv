@@ -8,10 +8,14 @@ hardening. Physical bring-up now completes QMI, the full core lifecycle,
 passive scanning, and scan-result collection. A bounded physical run delivered
 management frames and four BSS summaries across channels 1, 6, and 11. The
 same run proved normal scan-result cleanup with WPSS stopped before VFIO
-release and no SMMU or WPSS fault. Association is not yet proved: observed
-BSSes require RSN, while the ath11k SoftMAC adapter still blocks key
-installation until the device's REO packet-number replay and peer
-security-index effects are ported.
+release and no SMMU or WPSS fault. Association is not yet proved. The ath11k
+SoftMAC adapter now carries association security provenance into the ported
+key, peer-security-index, and REO replay effects, and a separate production
+service composes it behind a fatal WCN6750-specific sandbox, but that path
+still needs renewed physical association and Internet acceptance. An explicitly
+labelled operator diagnostic mode bypasses only that confinement gate while
+retaining the same wlancfg, MLME/SME, key/data-path, and orderly WPSS-stop path;
+the production default remains fail-closed and sandboxed.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
@@ -35,7 +39,8 @@ the device driver above them:
   vfio-platform reset handler; pinned ath11k AHB contains the firmware through
   the WPSS remoteproc lifecycle instead. A no-RESET cdev is admitted only for
   the polling diagnostic after the supervisor/operator externally restarts
-  WPSS before DMA and arms independent reboot fallbacks. On a runner error, the
+  WPSS before DMA and accepts manual recovery. On an ordinary runner error
+  returned through control flow, the
   runner requests and verifies a synchronous WPSS stop through remoteproc while
   it still owns every VFIO mapping. The privileged authentication and stop
   implementation remain kernel-owned in remoteproc/PIL; userspace owns the
@@ -65,29 +70,27 @@ coverage, production abstractions, and deferred interrupt/broker designs are
 not prerequisites for each polling experiment. Keep stage and native transcript
 evidence honest; source-derived fixtures are not physical captures.
 
-Before a stateful experiment, verify USB SSH through `usb0` at 172.16.42.1/24
-and coordinate exclusive hardware access through no-plastic (`np`). Wi-Fi loss
-is expected. Preserve reports locally and retrieve them over USB; restoring
+Before a stateful experiment, verify a working control path and coordinate
+exclusive hardware access through no-plastic (`np`). USB SSH through `usb0` at
+172.16.42.1/24 is useful but does not gate a run when the existing Tailscale
+control path works. Wi-Fi loss is expected. Preserve reports locally; restoring
 `wlan0` is not a prerequisite for recovery or evidence collection.
 
-Experiments normally have a bounded duration and automatic recovery to a
-reachable, known state on ordinary runner failure, timeout, or control-session
-loss. Operator-attended diagnostics may instead select explicit manual recovery
-when automatic reboot is itself under investigation and the operator accepts a
-manual reboot. At the current proved core and passive-scan stages, the runner
+Experiments have a bounded duration and operator-attended manual recovery; no
+automatic Redwood reboot watchdog is armed. At the current proved core and
+passive-scan stages, the runner
 retains all VFIO authority while it stops WPSS and verifies `offline`; the
 wrapper then verifies the child is reaped and no cdev descriptor remains before
 unbinding VFIO. A stop or verification failure holds that authority rather than
-dropping live DMA mappings. Automatic mode leaves its independent reboot
-fallbacks armed; manual mode leaves recovery to the operator. After normal
+dropping live DMA mappings. Recovery remains with the operator. After normal
 verified cleanup, the wrapper retains the inert candidate for another userspace
-cycle. A session-lifetime sleep inhibitor keeps USB control available while
-that candidate is idle.
+cycle.
 
-The current initrd userspace watchdog can recover process/control-path loss,
-not a hung kernel. An independently ticking runner heartbeat is not evidence
-that the device operation is progressing; the experiment deadline must still
-bound a stalled runner. Genuine kernel hangs may require a manual power-cycle:
+No automatic Redwood reboot watchdog is used. The experiment deadline bounds
+cooperative stalls, but an uncatchable process kill cannot run same-process
+WPSS cleanup; production needs a surviving external containment owner before
+claiming orderly cleanup for fatal parent death or seccomp failure. Genuine
+kernel hangs may require a manual power-cycle:
 the project owner explicitly accepts that residual risk. Additional machinery
 to eliminate it is not required for bring-up. Tests should exercise the failure
 path being relied on; a fake test that omits VFIO ownership/reset/remoteproc

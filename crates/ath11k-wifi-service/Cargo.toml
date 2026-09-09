@@ -1,0 +1,26 @@
+[package]
+name = "ath11k-wifi-service"
+description = "Sandboxed WCN6750 Wi-Fi service composition"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+ath11k-core = { path = "../ath11k-core" }
+ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }
+ath11k-softmac-adapter = { path = "../ath11k-softmac-adapter" }
+drv-hardware = { path = "../hardware-api" }
+drv-hardware-backends = { path = "../hardware-backends" }
+fidl-fuchsia-wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.mlme" }
+fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
+futures = "=0.3.32"
+libc = "=0.2.189"
+linux-self-sandbox = { path = "../linux-self-sandbox" }
+qrtr-socket = { path = "../qrtr-socket" }
+userspace-vfio = { path = "../userspace-vfio" }
+wifi-control-service = { path = "../wifi-control-service" }
+wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
+wlan-softmac-host = { path = "../wlan-softmac-host" }

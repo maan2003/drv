@@ -12,7 +12,7 @@ use fidl_fuchsia_wlan_sme as sme;
 use std::collections::VecDeque;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 use wifi_supervisor_wire::{LifecycleKind, LifecycleMessage};
 use wlan_control_wire::{
@@ -31,6 +31,7 @@ pub enum RuntimeError {
     /// that the old transaction and event route are quiescent.
     Failed(sme::ConnectResult),
     Timeout,
+    Unsupported,
     DriverFault,
     ContainmentFault,
 }
@@ -79,6 +80,9 @@ fn host_runtime_error(error: wlan_softmac_host::runtime::ConnectError) -> Runtim
     match error {
         wlan_softmac_host::runtime::ConnectError::Failed(result) => RuntimeError::Failed(result),
         wlan_softmac_host::runtime::ConnectError::Timeout => RuntimeError::Timeout,
+        wlan_softmac_host::runtime::ConnectError::Driver(
+            wlan_softmac_host::runtime::DriverError::RoamUnsupported,
+        ) => RuntimeError::Unsupported,
         wlan_softmac_host::runtime::ConnectError::Driver(_) => RuntimeError::DriverFault,
         wlan_softmac_host::runtime::ConnectError::Containment => RuntimeError::ContainmentFault,
     }
@@ -95,7 +99,8 @@ where
     }
 
     fn take_ethernet_device(&mut self) -> Option<OwnedFd> {
-        self.take_ethernet_device().map(|device| device.into_frame_fd())
+        self.take_ethernet_device()
+            .map(|device| device.into_frame_fd())
     }
 
     fn begin_connect(
@@ -103,7 +108,8 @@ where
         request: sme::ConnectRequest,
         deadline: Instant,
     ) -> Result<(), RuntimeError> {
-        self.begin_connect(request, deadline).map_err(host_runtime_error)
+        self.begin_connect(request, deadline)
+            .map_err(host_runtime_error)
     }
 
     async fn drive_connect_once(&mut self) -> Result<Option<sme::ConnectResult>, RuntimeError> {
@@ -115,7 +121,9 @@ where
         reason: sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Result<sme::ConnectResult, RuntimeError> {
-        self.cancel_connect(reason, deadline).await.map_err(host_runtime_error)
+        self.cancel_connect(reason, deadline)
+            .await
+            .map_err(host_runtime_error)
     }
 
     fn roam(&mut self, request: sme::RoamRequest) -> Result<(), RuntimeError> {
@@ -127,7 +135,8 @@ where
         request: sme::ScanRequest,
         deadline: Instant,
     ) -> Result<(), RuntimeError> {
-        self.begin_scan(request, deadline).map_err(host_runtime_error)
+        self.begin_scan(request, deadline)
+            .map_err(host_runtime_error)
     }
 
     async fn drive_scan_once(
@@ -151,7 +160,9 @@ where
         reason: sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Result<(), RuntimeError> {
-        self.disconnect(reason, deadline).await.map_err(host_runtime_error)
+        self.disconnect(reason, deadline)
+            .await
+            .map_err(host_runtime_error)
     }
 }
 
@@ -161,6 +172,7 @@ pub enum EndpointError {
     NotUnix,
     NotSeqpacket,
     NotConnected,
+    AliasedEndpoints,
     TruncatedPacket,
     TruncatedAncillary,
     WrongFdCount { expected: usize, actual: usize },
@@ -263,7 +275,6 @@ impl UnixSeqpacketEndpoint {
 
     fn try_receive(&self) -> Result<Option<ReceivedPacket>, EndpointError> {
         let mut bytes = [0u8; MAX_PACKET];
-        let mut control = [0usize; 8];
         let mut iov = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
@@ -271,8 +282,9 @@ impl UnixSeqpacketEndpoint {
         let mut header: libc::msghdr = unsafe { zeroed() };
         header.msg_iov = &mut iov;
         header.msg_iovlen = 1;
-        header.msg_control = control.as_mut_ptr().cast();
-        header.msg_controllen = size_of::<[usize; 8]>();
+        // Policy messages never carry capabilities. Leaving ancillary storage
+        // null makes the kernel discard SCM_RIGHTS instead of installing an
+        // attacker-supplied descriptor in this locked process.
         let received = unsafe {
             libc::recvmsg(
                 self.fd.as_raw_fd(),
@@ -294,55 +306,24 @@ impl UnixSeqpacketEndpoint {
                 "control peer closed",
             )));
         }
-        let mut fds = Vec::new();
-        let mut invalid_ancillary = false;
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&header);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-                    invalid_ancillary = true;
-                } else {
-                    let header_len = libc::CMSG_LEN(0) as usize;
-                    if (*cmsg).cmsg_len < header_len {
-                        return Err(EndpointError::TruncatedAncillary);
-                    }
-                    let payload = (*cmsg).cmsg_len - header_len;
-                    if !payload.is_multiple_of(size_of::<RawFd>()) {
-                        return Err(EndpointError::TruncatedAncillary);
-                    }
-                    let count = payload / size_of::<RawFd>();
-                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                    for index in 0..count {
-                        // SAFETY: SCM_RIGHTS installs each received descriptor
-                        // into this process. Owning every one before reporting
-                        // any ancillary error ensures all error paths close it.
-                        fds.push(OwnedFd::from_raw_fd(*data.add(index)));
-                    }
-                }
-                cmsg = libc::CMSG_NXTHDR(&header, cmsg);
-            }
-        }
         if header.msg_flags & libc::MSG_TRUNC != 0 {
             return Err(EndpointError::TruncatedPacket);
         }
         if header.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(EndpointError::TruncatedAncillary);
         }
-        if invalid_ancillary {
-            return Err(EndpointError::WrongFdCount {
-                expected: 0,
-                actual: usize::MAX,
-            });
-        }
         let packet = decode(&bytes[..received as usize])?;
         let expected = required_fd_count(&packet.message);
-        if fds.len() != expected {
+        if expected != 0 {
             return Err(EndpointError::WrongFdCount {
                 expected,
-                actual: fds.len(),
+                actual: 0,
             });
         }
-        Ok(Some(ReceivedPacket { packet, fds }))
+        Ok(Some(ReceivedPacket {
+            packet,
+            fds: Vec::new(),
+        }))
     }
 
     fn try_send(&self, packet: &OutboundPacket) -> Result<bool, EndpointError> {
@@ -356,12 +337,12 @@ impl UnixSeqpacketEndpoint {
         header.msg_iovlen = 1;
         if let Some(fd) = &packet.fd {
             header.msg_control = control.as_mut_ptr().cast();
-            header.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
+            header.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as _;
             unsafe {
                 let cmsg = libc::CMSG_FIRSTHDR(&header);
                 (*cmsg).cmsg_level = libc::SOL_SOCKET;
                 (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
                 *libc::CMSG_DATA(cmsg).cast::<RawFd>() = fd.as_raw_fd();
             }
         }
@@ -434,6 +415,61 @@ pub struct PreparedServer<R> {
     generation: [u8; 16],
 }
 
+/// Validated inert IPC endpoints retained across lockdown before a physical
+/// runtime exists. Construction never receives a policy packet.
+pub struct PreparedServerEndpoints {
+    policy_endpoint: UnixSeqpacketEndpoint,
+    supervisor_endpoint: UnixSeqpacketEndpoint,
+    generation: [u8; 16],
+}
+
+impl PreparedServerEndpoints {
+    pub fn new(
+        policy_fd: OwnedFd,
+        supervisor_fd: OwnedFd,
+        generation: [u8; 16],
+    ) -> Result<Self, EndpointError> {
+        let policy_endpoint = UnixSeqpacketEndpoint::from_inherited_fd(policy_fd)?;
+        let supervisor_endpoint = UnixSeqpacketEndpoint::from_inherited_fd(supervisor_fd)?;
+        if fd_identity(policy_endpoint.fd.as_raw_fd())?
+            == fd_identity(supervisor_endpoint.fd.as_raw_fd())?
+        {
+            return Err(EndpointError::AliasedEndpoints);
+        }
+        Ok(Self {
+            policy_endpoint,
+            supervisor_endpoint,
+            generation,
+        })
+    }
+
+    pub fn fd_identities(&self) -> [RawFd; 2] {
+        [
+            self.policy_endpoint.fd.as_raw_fd(),
+            self.supervisor_endpoint.fd.as_raw_fd(),
+        ]
+    }
+
+    /// Bind a post-lockdown physical runtime without further endpoint syscalls.
+    pub fn bind_runtime<R>(self, runtime: R) -> PreparedServer<R> {
+        PreparedServer {
+            policy_endpoint: self.policy_endpoint,
+            supervisor_endpoint: self.supervisor_endpoint,
+            runtime,
+            generation: self.generation,
+        }
+    }
+}
+
+fn fd_identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat: libc::stat = unsafe { zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok((stat.st_dev, stat.st_ino))
+    }
+}
+
 impl<R: WifiRuntime> PreparedServer<R> {
     pub fn new(
         policy_fd: OwnedFd,
@@ -441,12 +477,10 @@ impl<R: WifiRuntime> PreparedServer<R> {
         generation: [u8; 16],
         runtime: R,
     ) -> Result<Self, EndpointError> {
-        Ok(Self {
-            policy_endpoint: UnixSeqpacketEndpoint::from_inherited_fd(policy_fd)?,
-            supervisor_endpoint: UnixSeqpacketEndpoint::from_inherited_fd(supervisor_fd)?,
-            runtime,
-            generation,
-        })
+        Ok(
+            PreparedServerEndpoints::new(policy_fd, supervisor_fd, generation)?
+                .bind_runtime(runtime),
+        )
     }
 
     /// Caller-controlled lifecycle gate. Call only after self-lockdown is open.
@@ -525,12 +559,24 @@ impl<R: WifiRuntime> ControlServer<R> {
     }
 
     pub fn run(mut self) -> Result<(), ServiceError> {
+        self.run_to_terminal()
+    }
+
+    /// Drive until the generation is terminal while retaining runtime
+    /// ownership for hardware-specific orderly shutdown.
+    pub fn run_to_terminal(&mut self) -> Result<(), ServiceError> {
         while !self.is_terminal() {
             if !futures::executor::block_on(self.drive_once())? {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
         Ok(())
+    }
+
+    /// Recover the runtime after [`Self::run_to_terminal`] so a physical
+    /// service can stop firmware before releasing device capabilities.
+    pub fn into_runtime(self) -> R {
+        self.runtime
     }
 
     async fn dispatch(&mut self, packet: Packet) -> Result<(), GenerationEndReason> {
@@ -596,6 +642,7 @@ impl<R: WifiRuntime> ControlServer<R> {
             Message::Roam(request) => {
                 let reply = match self.runtime.roam(request) {
                     Ok(()) => CommandReply::Success,
+                    Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
                     Err(error) => return Err(runtime_end(error)),
                 };
                 self.queue(
@@ -839,6 +886,7 @@ fn runtime_end(error: RuntimeError) -> GenerationEndReason {
     match error {
         RuntimeError::Failed(_) | RuntimeError::DriverFault => GenerationEndReason::DriverFault,
         RuntimeError::Timeout => GenerationEndReason::Timeout,
+        RuntimeError::Unsupported => GenerationEndReason::ProtocolViolation,
         RuntimeError::ContainmentFault => GenerationEndReason::ContainmentFault,
     }
 }

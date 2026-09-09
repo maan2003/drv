@@ -18,10 +18,20 @@ self-sandboxing wlancfg daemon now owns durable saved networks and drives the
 pinned Fuchsia selector and client state machine over bounded, fd-free policy
 IPC to a separate simulated Wi-Fi service. Deterministic process tests cover
 selection, exact retry classification and timing, connection events, and
-persistence across policy restart. The production launcher and physical Wi-Fi
-service composition remain future work, as does physical Wi-Fi process
-sandboxing. The typed hardware-resource migration
-is incomplete; production mechanics still share the lab runner. The
+persistence across policy restart. The WCN6750 production service now adopts
+inert VFIO-platform, iommufd-or-broker, QRTR, interrupt, runtime-reactor,
+Ethernet, policy, network-lifecycle, and remoteproc capabilities before
+installing its fatal role-specific seccomp filter. Only then does it activate
+QMI, firmware, the ath11k adapter, and pinned Fuchsia MLME/SME; Ethernet
+generations flow to the existing network supervisor lifecycle seam. This
+composition and its exact ARM64 artifact are build-tested but have not yet
+received physical association or Internet acceptance on Redwood. Its
+same-process WPSS-first cleanup covers ordinary returned errors, not
+uncatchable parent death or fatal-filter termination; production still needs a
+surviving external containment owner for that case, and diagnostic association
+does not wait on it. Explicit
+SoftMAC roam is reported unsupported without disturbing the current link;
+the pinned SoftMAC MLME does not implement the fullmac roam request. The
 current MT7921 path deliberately leaves BCNFT disabled, retains
 `MT_WF_RFCR_DROP_OTHER_BEACON`, and keeps the MLME's host lost-BSS monitor
 active: firmware beacon-loss event `0x13` is recognized but not yet routed into

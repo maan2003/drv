@@ -19,7 +19,7 @@ use std::os::fd::RawFd;
 compile_error!("WLAN self-sandbox seccomp supports only x86_64 and aarch64");
 
 /// The only supported runtime authority sets.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Profile {
     /// WLAN policy IPC and the sole-writer saved-network directory capability.
     Wlancfg {
@@ -35,7 +35,30 @@ pub enum Profile {
         iommufd: RawFd,
         irq_eventfd: RawFd,
     },
+    /// One WCN6750 VFIO-platform device, its QRTR control plane, and the two
+    /// process IPC seams. All interrupt eventfds must be created before setup.
+    Ath11kWcn6750 {
+        control_fd: RawFd,
+        supervisor_fd: RawFd,
+        vfio_fd: RawFd,
+        dma: Wcn6750Dma,
+        qrtr_fd: RawFd,
+        irq_eventfds: [RawFd; WCN6750_IRQ_EVENTFD_COUNT],
+        ethernet_fds: Vec<RawFd>,
+        runtime_fds: Vec<RawFd>,
+        remoteproc_state_fd: Option<RawFd>,
+    },
 }
+
+pub const WCN6750_IRQ_EVENTFD_COUNT: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Wcn6750Dma {
+    Coherent { iommufd: RawFd },
+    Broker,
+}
+
+pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket,network-lifecycle-seqpacket,vfio-platform-cdev,qrtr,16-selected-irq-eventfds,ethernet-socketpair,precreated-runtime-reactor,optional-iommufd,remoteproc-state; vfio-ioctl=DEVICE_BIND_IOMMUFD(coherent),DEVICE_ATTACH_IOMMUFD_PT(coherent),DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET,DEVICE_FEATURE(broker); iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY(coherent); qrtr=bind,connect,getsockname,getpeername,sendto,recvfrom,ppoll; ipc=bounded-policy-sendmsg-recvmsg,supervisor-sendmsg,ethernet-sendto-recvfrom; runtime=fd-bound-epoll-and-wake; memory=mmap-rw-private-anon-or-shared-vfio,noexec; denied=fd-creators,open,socket,dup,exec,clone,other-ioctl,other-fd-io,executable-memory";
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
@@ -250,18 +273,18 @@ impl Sandbox<Initial> {
 impl Sandbox<SetupComplete> {
     /// Installs the architecture-checked seccomp program for a named service.
     pub fn lockdown(self, profile: Profile) -> Result<Sandbox<LockedDown>, Error> {
-        if matches!(profile, Profile::WifiSimulated) && self.persistence_dir_fd.is_some() {
+        if matches!(&profile, Profile::WifiSimulated) && self.persistence_dir_fd.is_some() {
             return Err(Error::ProfileAuthorityMismatch);
         }
         if let Profile::Wlancfg {
             control_fd,
             persistence_dir_fd,
-        } = profile
+        } = &profile
         {
-            if self.persistence_dir_fd != Some(persistence_dir_fd) {
-                return Err(Error::PersistenceFdNotInherited(persistence_dir_fd));
+            if self.persistence_dir_fd != Some(*persistence_dir_fd) {
+                return Err(Error::PersistenceFdNotInherited(*persistence_dir_fd));
             }
-            let mut expected = vec![control_fd, persistence_dir_fd];
+            let mut expected = vec![*control_fd, *persistence_dir_fd];
             expected.sort_unstable();
             if expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
@@ -272,18 +295,46 @@ impl Sandbox<SetupComplete> {
             vfio_fd,
             iommufd,
             irq_eventfd,
-        } = profile
+        } = &profile
         {
             if self.persistence_dir_fd.is_some() {
                 return Err(Error::ProfileAuthorityMismatch);
             }
-            let mut expected = vec![pci_config_fd, vfio_fd, iommufd, irq_eventfd];
+            let mut expected = vec![*pci_config_fd, *vfio_fd, *iommufd, *irq_eventfd];
             expected.sort_unstable();
             if expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
             }
         }
-        install_filter(profile)?;
+        if let Profile::Ath11kWcn6750 {
+            control_fd,
+            supervisor_fd,
+            vfio_fd,
+            dma,
+            qrtr_fd,
+            irq_eventfds,
+            ethernet_fds,
+            runtime_fds,
+            remoteproc_state_fd,
+        } = &profile
+        {
+            if self.persistence_dir_fd.is_some() {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
+            let mut expected = vec![*control_fd, *supervisor_fd, *vfio_fd, *qrtr_fd];
+            expected.extend(irq_eventfds);
+            expected.extend(ethernet_fds);
+            expected.extend(runtime_fds);
+            if let Wcn6750Dma::Coherent { iommufd } = dma {
+                expected.push(*iommufd);
+            }
+            expected.extend(remoteproc_state_fd.iter().copied());
+            expected.sort_unstable();
+            if expected != self.inherited {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
+        }
+        install_filter(&profile)?;
         Ok(Sandbox {
             inherited: self.inherited,
             persistence_dir_fd: self.persistence_dir_fd,
@@ -532,7 +583,7 @@ fn arg_high(index: usize) -> Filter {
     stmt(LD_W_ABS, 20 + (index * 8) as u32)
 }
 
-fn install_filter(profile: Profile) -> Result<(), Error> {
+fn install_filter(profile: &Profile) -> Result<(), Error> {
     let mut f = vec![
         stmt(LD_W_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
@@ -544,10 +595,10 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         persistence_dir_fd: fd,
     } = profile
     {
-        append_openat(&mut f, fd);
-        append_renameat(&mut f, fd);
-        append_unlinkat(&mut f, fd);
-        append_wlancfg_packet_io(&mut f, control_fd);
+        append_openat(&mut f, *fd);
+        append_renameat(&mut f, *fd);
+        append_unlinkat(&mut f, *fd);
+        append_wlancfg_packet_io(&mut f, *control_fd);
     }
     if let Profile::Mt7921Vfio {
         pci_config_fd,
@@ -556,16 +607,48 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         irq_eventfd,
     } = profile
     {
-        append_mt7921_ioctl(&mut f, vfio_fd, iommufd);
-        append_fd_only(&mut f, libc::SYS_lseek, pci_config_fd);
-        append_fd_set(&mut f, libc::SYS_read, &[pci_config_fd, irq_eventfd]);
-        append_fd_set(&mut f, libc::SYS_write, &[pci_config_fd, 1, 2]);
+        append_mt7921_ioctl(&mut f, *vfio_fd, *iommufd);
+        append_fd_only(&mut f, libc::SYS_lseek, *pci_config_fd);
+        append_fd_set(&mut f, libc::SYS_read, &[*pci_config_fd, *irq_eventfd]);
+        append_fd_set(&mut f, libc::SYS_write, &[*pci_config_fd, 1, 2]);
         append_mt_ppoll(&mut f);
+    }
+    if let Profile::Ath11kWcn6750 {
+        control_fd,
+        supervisor_fd,
+        vfio_fd,
+        dma,
+        qrtr_fd,
+        irq_eventfds,
+        ethernet_fds,
+        runtime_fds,
+        remoteproc_state_fd,
+    } = profile
+    {
+        append_wcn6750_ioctl(&mut f, *vfio_fd, *dma);
+        append_fd_sendmsg(&mut f, &[*control_fd, *supervisor_fd]);
+        append_fd_recvmsg(&mut f, *control_fd);
+        append_qrtr_and_ethernet_io(&mut f, *qrtr_fd, ethernet_fds);
+        append_runtime_poller(&mut f, runtime_fds);
+        let mut readable = irq_eventfds.to_vec();
+        readable.extend(runtime_fds);
+        let mut writable = vec![1, 2];
+        writable.extend(runtime_fds);
+        if let Some(fd) = *remoteproc_state_fd {
+            append_fd_only(&mut f, libc::SYS_lseek, fd);
+            readable.push(fd);
+            writable.push(fd);
+        }
+        append_fd_set(&mut f, libc::SYS_read, &readable);
+        append_fd_set(&mut f, libc::SYS_write, &writable);
+        append_bounded_ppoll(&mut f, WCN6750_IRQ_EVENTFD_COUNT + 1);
     }
     append_runtime_mmap(
         &mut f,
         match profile {
-            Profile::Mt7921Vfio { vfio_fd, .. } => Some(vfio_fd),
+            Profile::Mt7921Vfio { vfio_fd, .. } | Profile::Ath11kWcn6750 { vfio_fd, .. } => {
+                Some(*vfio_fd)
+            }
             _ => None,
         },
     );
@@ -591,7 +674,7 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         Profile::Wlancfg { .. } => {
             append_epoll_ctl(&mut f);
         }
-        Profile::WifiSimulated | Profile::Mt7921Vfio { .. } => {}
+        Profile::WifiSimulated | Profile::Mt7921Vfio { .. } | Profile::Ath11kWcn6750 { .. } => {}
     }
     for number in allowed(profile) {
         f.push(jump(number as u32, 0, 1));
@@ -633,7 +716,7 @@ pub fn install_runtime_filter_for_integration_test(profile: Profile) -> Result<(
         unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
         "set integration-test no_new_privs",
     )?;
-    install_filter(profile)
+    install_filter(&profile)
 }
 
 fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
@@ -644,6 +727,43 @@ fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
     f.push(jump(0, 0, 0));
     append_ioctl_fd_requests(f, vfio_fd, userspace_vfio::mt7921_seccomp::VFIO_REQUESTS);
     append_ioctl_fd_requests(f, iommufd, userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS);
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small ioctl filter");
+    f[fd_high].jf = (denied - fd_high - 1)
+        .try_into()
+        .expect("small ioctl filter");
+}
+
+fn append_wcn6750_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, dma: Wcn6750Dma) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_ioctl as u32, 0, 0));
+    f.push(arg_high(0));
+    let fd_high = f.len();
+    f.push(jump(0, 0, 0));
+    match dma {
+        Wcn6750Dma::Coherent { iommufd } => {
+            append_ioctl_fd_requests(
+                f,
+                vfio_fd,
+                userspace_vfio::wcn6750_seccomp::COHERENT_VFIO_REQUESTS,
+            );
+            append_ioctl_fd_requests(
+                f,
+                iommufd,
+                userspace_vfio::wcn6750_seccomp::COHERENT_IOMMUFD_REQUESTS,
+            );
+        }
+        Wcn6750Dma::Broker => append_ioctl_fd_requests(
+            f,
+            vfio_fd,
+            userspace_vfio::wcn6750_seccomp::BROKER_VFIO_REQUESTS,
+        ),
+    }
     let denied = f.len();
     f.push(stmt(RET_K, KILL_PROCESS));
     let reload = f.len();
@@ -859,6 +979,238 @@ fn append_fd_set(f: &mut Vec<Filter>, syscall: libc::c_long, fds: &[RawFd]) {
     let reload = f.len();
     f.push(stmt(LD_W_ABS, 0));
     f[dispatch].jf = (reload - dispatch - 1).try_into().expect("small fd filter");
+}
+
+fn append_fd_sendmsg(f: &mut Vec<Filter>, fds: &[RawFd]) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_sendmsg as u32, 0, 0));
+    let mut failures = Vec::new();
+    f.push(arg_high(0));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(0));
+    let mut fd_matches = Vec::new();
+    for &fd in fds {
+        fd_matches.push(f.len());
+        f.push(jump(fd as u32, 0, 0));
+    }
+    let wrong_fd = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let flags_start = f.len();
+    for matched in fd_matches {
+        f[matched].jt = (flags_start - matched - 1)
+            .try_into()
+            .expect("small sendmsg fd inventory");
+    }
+    f.push(arg_high(2));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(2));
+    failures.push(f.len());
+    f.push(jump((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32, 0, 0));
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small sendmsg filter");
+    }
+    debug_assert!(wrong_fd < denied);
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small sendmsg filter");
+}
+
+fn append_fd_recvmsg(f: &mut Vec<Filter>, fd: RawFd) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_recvmsg as u32, 0, 0));
+    let mut failures = Vec::new();
+    for (argument, expected) in [
+        (0, fd as u32),
+        (2, (libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) as u32),
+    ] {
+        f.push(arg_high(argument));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        failures.push(f.len());
+        f.push(jump(expected, 0, 0));
+    }
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small recvmsg filter");
+    }
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small recvmsg filter");
+}
+
+fn append_qrtr_and_ethernet_io(f: &mut Vec<Filter>, qrtr_fd: RawFd, ethernet_fds: &[RawFd]) {
+    for syscall in [
+        libc::SYS_bind,
+        libc::SYS_connect,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+    ] {
+        append_fd_only(f, syscall, qrtr_fd);
+    }
+    let ethernet_send_flags = (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32;
+    let qrtr_send_flags = [0, libc::MSG_DONTWAIT as u32];
+    let ethernet_send_flags = [ethernet_send_flags];
+    let mut send_pairs = vec![(qrtr_fd, &qrtr_send_flags[..])];
+    send_pairs.extend(
+        ethernet_fds
+            .iter()
+            .map(|fd| (*fd, &ethernet_send_flags[..])),
+    );
+    append_fd_flag_pairs(f, libc::SYS_sendto, &send_pairs);
+    let receive_flags = (libc::MSG_TRUNC | libc::MSG_DONTWAIT) as u32;
+    let receive_flags = [receive_flags];
+    let mut receive_pairs = vec![(qrtr_fd, &receive_flags[..])];
+    receive_pairs.extend(ethernet_fds.iter().map(|fd| (*fd, &receive_flags[..])));
+    append_fd_flag_pairs(f, libc::SYS_recvfrom, &receive_pairs);
+}
+
+fn append_fd_flag_pairs(f: &mut Vec<Filter>, syscall: libc::c_long, pairs: &[(RawFd, &[u32])]) {
+    let dispatch = f.len();
+    f.push(jump(syscall as u32, 0, 0));
+    f.push(arg_high(0));
+    let fd_high = f.len();
+    f.push(jump(0, 0, 0));
+    f.push(arg(0));
+    let mut fd_dispatches = Vec::new();
+    for &(fd, _) in pairs {
+        fd_dispatches.push(f.len());
+        f.push(jump(fd as u32, 0, 0));
+    }
+    let wrong_fd = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    for ((_, flags), fd_dispatch) in pairs.iter().zip(fd_dispatches) {
+        let branch = f.len();
+        f[fd_dispatch].jt = (branch - fd_dispatch - 1)
+            .try_into()
+            .expect("small fd/flags inventory");
+        f.push(arg_high(3));
+        f.push(jump(0, 1, 0));
+        f.push(stmt(RET_K, KILL_PROCESS));
+        f.push(arg(3));
+        for &value in *flags {
+            f.push(jump(value, 0, 1));
+            f.push(stmt(RET_K, ALLOW));
+        }
+        f.push(stmt(RET_K, KILL_PROCESS));
+    }
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[fd_high].jf = (wrong_fd - fd_high - 1)
+        .try_into()
+        .expect("small fd/flags filter");
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small fd/flags filter");
+}
+
+fn append_bounded_ppoll(f: &mut Vec<Filter>, maximum_fds: usize) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
+    let mut failures = Vec::new();
+    // The monotonic timeout pointer is runtime data. The optional signal-mask
+    // pointer must remain null so ppoll cannot mutate signal handling.
+    f.push(arg_high(3));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(3));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg_high(1));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(1));
+    let oversized = f.len();
+    f.push(Filter {
+        code: 0x25, // BPF_JMP | BPF_JGT | BPF_K
+        jt: 0,
+        jf: 1,
+        k: maximum_fds.try_into().expect("small descriptor inventory"),
+    });
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small ppoll filter");
+    }
+    f[oversized].jt = 0;
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small ppoll filter");
+}
+
+fn append_runtime_poller(f: &mut Vec<Filter>, runtime_fds: &[RawFd]) {
+    if runtime_fds.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    append_fd_set(f, libc::SYS_epoll_wait, runtime_fds);
+    append_epoll_pwait_fds(f, runtime_fds);
+}
+
+fn append_epoll_pwait_fds(f: &mut Vec<Filter>, fds: &[RawFd]) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_epoll_pwait as u32, 0, 0));
+    let mut failures = Vec::new();
+    f.push(arg_high(0));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(0));
+    let mut matches = Vec::new();
+    for &fd in fds {
+        matches.push(f.len());
+        f.push(jump(fd as u32, 0, 0));
+    }
+    let wrong_fd = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let mask_check = f.len();
+    for matched in matches {
+        f[matched].jt = (mask_check - matched - 1)
+            .try_into()
+            .expect("small runtime fd inventory");
+    }
+    for argument in [4, 5] {
+        f.push(arg_high(argument));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+    }
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small runtime epoll filter");
+    }
+    debug_assert!(wrong_fd < denied);
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small runtime epoll filter");
 }
 
 fn append_mt_ppoll(f: &mut Vec<Filter>) {
@@ -1157,7 +1509,7 @@ fn append_unlinkat(f: &mut Vec<Filter>, fd: RawFd) {
     f.push(stmt(LD_W_ABS, 0));
 }
 
-fn allowed(profile: Profile) -> Vec<libc::c_long> {
+fn allowed(profile: &Profile) -> Vec<libc::c_long> {
     // Authority-bearing calls are dispatched above;
     // role-specific IPC and waits are appended below. open/socket/connect,
     // fcntl/dup, executable mappings, exec, and process creation stay denied.
@@ -1189,7 +1541,7 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
             libc::SYS_recvmsg,
             libc::SYS_sendmsg,
         ]),
-        Profile::Mt7921Vfio { .. } => {}
+        Profile::Mt7921Vfio { .. } | Profile::Ath11kWcn6750 { .. } => {}
     }
     #[cfg(target_arch = "x86_64")]
     if matches!(profile, Profile::Wlancfg { .. }) {
@@ -1220,6 +1572,37 @@ mod filter_tests {
             }),
             Err(Error::ProfileAuthorityMismatch)
         ));
+    }
+
+    #[test]
+    fn wcn6750_profile_requires_its_exact_non_aliasing_capabilities() {
+        let irq_eventfds = std::array::from_fn(|index| 8 + index as RawFd);
+        let profile = Profile::Ath11kWcn6750 {
+            control_fd: 3,
+            supervisor_fd: 4,
+            vfio_fd: 5,
+            dma: Wcn6750Dma::Coherent { iommufd: 6 },
+            qrtr_fd: 7,
+            irq_eventfds,
+            ethernet_fds: vec![24, 25],
+            runtime_fds: Vec::new(),
+            remoteproc_state_fd: Some(26),
+        };
+        for inherited in [
+            (3..26).collect(),
+            (3..=27).collect(),
+            (3..=25).chain(std::iter::once(3)).collect(),
+        ] {
+            let setup = Sandbox::<SetupComplete> {
+                inherited,
+                persistence_dir_fd: None,
+                _state: PhantomData,
+            };
+            assert!(matches!(
+                setup.lockdown(profile.clone()),
+                Err(Error::ProfileAuthorityMismatch)
+            ));
+        }
     }
 
     #[test]
@@ -1310,6 +1693,257 @@ mod filter_tests {
             "mt:recvmsg",
         ] {
             kill_child(probe);
+        }
+    }
+
+    #[test]
+    fn wcn6750_filtered_activation_and_argument_denials() {
+        if let Ok(mode) = std::env::var("DRV_WCN6750_FILTER_PROBE") {
+            wcn6750_filter_body(&mode);
+        }
+        wcn6750_filter_child("allowed", true);
+        for operation in [
+            "wrong-ioctl-request",
+            "ioctl-wrong-fd",
+            "qrtr-wrong-fd",
+            "qrtr-wrong-flags",
+            "supervisor-wrong-flags",
+            "ppoll-too-many",
+            "epoll-wrong-fd",
+            "eventfd",
+            "socketpair",
+        ] {
+            wcn6750_filter_child(operation, false);
+        }
+    }
+
+    fn wcn6750_filter_child(operation: &str, succeeds: bool) {
+        const TEST: &str = "filter_tests::wcn6750_filtered_activation_and_argument_denials";
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST)
+            .env("DRV_WCN6750_FILTER_PROBE", operation)
+            .status()
+            .unwrap();
+        if succeeds {
+            assert!(status.success(), "WCN6750 allowed probe failed: {status}");
+        } else {
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGSYS),
+                "WCN6750 {operation} did not die with SIGSYS: {status}"
+            );
+        }
+    }
+
+    fn wcn6750_filter_body(operation: &str) -> ! {
+        let mut pairs = [[0; 2]; 7];
+        for pair in &mut pairs {
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, pair.as_mut_ptr())
+                },
+                0
+            );
+        }
+        let vfio = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        let iommufd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        let remoteproc_state =
+            unsafe { libc::memfd_create(c"remoteproc-state".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(remoteproc_state >= 0);
+        assert_eq!(
+            unsafe { libc::write(remoteproc_state, b"running\n".as_ptr().cast(), 8) },
+            8
+        );
+        let runtime_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        let runtime_wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(runtime_epoll >= 0 && runtime_wake >= 0);
+        let mut registration = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: runtime_wake as u64,
+        };
+        assert_eq!(
+            unsafe {
+                libc::epoll_ctl(
+                    runtime_epoll,
+                    libc::EPOLL_CTL_ADD,
+                    runtime_wake,
+                    &mut registration,
+                )
+            },
+            0
+        );
+        let irq_eventfds = std::array::from_fn(|_| {
+            let fd = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            assert!(fd >= 0);
+            fd
+        });
+        let profile = Profile::Ath11kWcn6750 {
+            control_fd: pairs[0][0],
+            supervisor_fd: pairs[1][0],
+            vfio_fd: vfio,
+            dma: Wcn6750Dma::Coherent { iommufd },
+            qrtr_fd: pairs[2][0],
+            irq_eventfds,
+            ethernet_fds: pairs[3..].iter().flatten().copied().collect(),
+            runtime_fds: vec![runtime_epoll, runtime_wake],
+            remoteproc_state_fd: Some(remoteproc_state),
+        };
+        enable_filter(profile);
+        let request = userspace_vfio::wcn6750_seccomp::COHERENT_VFIO_REQUESTS[2];
+        unsafe {
+            match operation {
+                "allowed" => {
+                    assert_eq!(libc::ioctl(vfio, request, 0), -1);
+                    assert_eq!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENOTTY)
+                    );
+                    let byte = b'X';
+                    assert_eq!(
+                        libc::sendto(
+                            pairs[2][0],
+                            (&byte as *const u8).cast(),
+                            1,
+                            0,
+                            std::ptr::null(),
+                            0,
+                        ),
+                        1
+                    );
+                    for ethernet in &pairs[3..] {
+                        assert_eq!(
+                            libc::sendto(
+                                ethernet[0],
+                                (&byte as *const u8).cast(),
+                                1,
+                                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                                std::ptr::null(),
+                                0,
+                            ),
+                            1
+                        );
+                        let mut received = 0_u8;
+                        assert_eq!(
+                            libc::recvfrom(
+                                ethernet[1],
+                                (&mut received as *mut u8).cast(),
+                                1,
+                                libc::MSG_TRUNC | libc::MSG_DONTWAIT,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            ),
+                            1
+                        );
+                        assert_eq!(received, byte);
+                    }
+                    let mut iov = libc::iovec {
+                        iov_base: (&byte as *const u8).cast_mut().cast(),
+                        iov_len: 1,
+                    };
+                    let mut message: libc::msghdr = std::mem::zeroed();
+                    message.msg_iov = &mut iov;
+                    message.msg_iovlen = 1;
+                    assert_eq!(
+                        libc::sendmsg(
+                            pairs[1][0],
+                            &message,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        ),
+                        1
+                    );
+                    let mut pollfds = irq_eventfds.map(|fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    assert_eq!(
+                        libc::ppoll(
+                            pollfds.as_mut_ptr(),
+                            pollfds.len() as libc::nfds_t,
+                            &timeout,
+                            std::ptr::null(),
+                        ),
+                        WCN6750_IRQ_EVENTFD_COUNT as i32
+                    );
+                    assert_eq!(libc::lseek(remoteproc_state, 0, libc::SEEK_SET), 0);
+                    assert_eq!(
+                        libc::write(remoteproc_state, b"stop\n".as_ptr().cast(), 5),
+                        5
+                    );
+                    assert_eq!(libc::lseek(remoteproc_state, 0, libc::SEEK_SET), 0);
+                    let mut state = [0_u8; 8];
+                    assert!(libc::read(remoteproc_state, state.as_mut_ptr().cast(), 8) > 0);
+                    let one = 1_u64;
+                    assert_eq!(libc::write(runtime_wake, (&one as *const u64).cast(), 8), 8);
+                    let mut event: libc::epoll_event = std::mem::zeroed();
+                    assert_eq!(libc::epoll_wait(runtime_epoll, &mut event, 1, 0), 1);
+                    let mut observed = 0_u64;
+                    assert_eq!(
+                        libc::read(runtime_wake, (&mut observed as *mut u64).cast(), 8),
+                        8
+                    );
+                }
+                "wrong-ioctl-request" => {
+                    libc::ioctl(vfio, 0, 0);
+                }
+                "ioctl-wrong-fd" => {
+                    libc::ioctl(pairs[2][0], request, 0);
+                }
+                "qrtr-wrong-fd" => {
+                    libc::sendto(vfio, std::ptr::null(), 0, 0, std::ptr::null(), 0);
+                }
+                "qrtr-wrong-flags" => {
+                    libc::sendto(
+                        pairs[2][0],
+                        std::ptr::null(),
+                        0,
+                        libc::MSG_NOSIGNAL,
+                        std::ptr::null(),
+                        0,
+                    );
+                }
+                "supervisor-wrong-flags" => {
+                    let message: libc::msghdr = std::mem::zeroed();
+                    libc::sendmsg(pairs[1][0], &message, 0);
+                }
+                "ppoll-too-many" => {
+                    let mut pollfds = [libc::pollfd {
+                        fd: irq_eventfds[0],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }; WCN6750_IRQ_EVENTFD_COUNT + 2];
+                    libc::ppoll(
+                        pollfds.as_mut_ptr(),
+                        pollfds.len() as libc::nfds_t,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
+                }
+                "epoll-wrong-fd" => {
+                    let mut event: libc::epoll_event = std::mem::zeroed();
+                    libc::epoll_wait(vfio, &mut event, 1, 0);
+                }
+                "eventfd" => {
+                    libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
+                }
+                "socketpair" => {
+                    let mut fds = [-1; 2];
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr());
+                }
+                _ => unreachable!(),
+            }
+            let disable_stack = libc::stack_t {
+                ss_sp: std::ptr::null_mut(),
+                ss_flags: libc::SS_DISABLE,
+                ss_size: libc::SIGSTKSZ,
+            };
+            assert_eq!(libc::sigaltstack(&disable_stack, std::ptr::null_mut()), 0);
+            libc::_exit(0)
         }
     }
 
@@ -1567,7 +2201,7 @@ mod filter_tests {
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
             0
         );
-        install_filter(profile).unwrap();
+        install_filter(&profile).unwrap();
     }
 
     fn violate(operation: &str, fds: [RawFd; 4]) {

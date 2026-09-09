@@ -443,7 +443,10 @@ impl Owner {
                 let _ = reply.send(result);
             }
             (Pending::Roam, Message::RoamReply(reply_body)) => {
-                command_result(reply_body.result, "roam").map_err(|e| e.to_string())?;
+                match reply_body.result {
+                    CommandReply::Success | CommandReply::Unsupported => {}
+                    other => return Err(format!("roam rejected: {}", command_reply_name(other))),
+                }
             }
             (Pending::Scan(reply), Message::ScanReply(reply_body)) => {
                 let result = reply_body.result.map(|results| sme::ScanResultVector { results });
@@ -476,7 +479,7 @@ fn command_result(result: CommandReply, operation: &str) -> anyhow::Result<()> {
 }
 
 fn command_reply_name(result: CommandReply) -> &'static str {
-    match result { CommandReply::Success => "success", CommandReply::Busy => "busy", CommandReply::NotConnected => "not connected" }
+    match result { CommandReply::Success => "success", CommandReply::Busy => "busy", CommandReply::NotConnected => "not connected", CommandReply::Unsupported => "unsupported" }
 }
 fn reason_name(reason: GenerationEndReason) -> &'static str {
     match reason { GenerationEndReason::Shutdown => "shutdown", GenerationEndReason::Timeout => "timeout", GenerationEndReason::DriverFault => "driver fault", GenerationEndReason::ContainmentFault => "containment fault", GenerationEndReason::Backpressure => "backpressure", GenerationEndReason::ProtocolViolation => "protocol violation" }
@@ -752,6 +755,23 @@ mod tests {
         let (_result, _first_events) = futures::executor::block_on(client.connect(&request)).unwrap();
         futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::Startup)).unwrap();
         let (_result, _second_events) = futures::executor::block_on(client.connect(&request)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unsupported_roam_does_not_end_policy_generation() {
+        let (client_fd, server_fd) = sockets();
+        let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
+        let server = thread::spawn(move || {
+            let roam = receive(server_fd.as_raw_fd());
+            assert!(matches!(roam.message, Message::Roam(_)));
+            send_packet(server_fd.as_raw_fd(), 1, Message::RoamReply(Reply { in_reply_to: roam.request_id, result: CommandReply::Unsupported }), &[]);
+            let disconnect = receive(server_fd.as_raw_fd());
+            assert!(matches!(disconnect.message, Message::Disconnect(_)));
+            send_packet(server_fd.as_raw_fd(), 2, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
+        });
+        client.roam(&sme::RoamRequest { bss_description: connect_request().bss_description }).unwrap();
+        futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::Startup)).unwrap();
         server.join().unwrap();
     }
 

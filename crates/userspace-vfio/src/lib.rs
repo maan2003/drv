@@ -43,6 +43,37 @@ pub mod mt7921_seccomp {
         super::IOMMU_DESTROY,
     ];
 }
+
+/// Exact ioctl request inventories used by the WCN6750 VFIO-platform service.
+///
+/// The coherent path binds an iommufd and owns an IOAS. The DMA-broker path
+/// instead uses the device's narrowly versioned `VFIO_DEVICE_FEATURE` ABI and
+/// has no iommufd authority.
+pub mod wcn6750_seccomp {
+    pub const COHERENT_VFIO_REQUESTS: &[u64] = &[
+        super::VFIO_DEVICE_BIND_IOMMUFD,
+        super::VFIO_DEVICE_ATTACH_IOMMUFD_PT,
+        super::VFIO_DEVICE_GET_INFO,
+        super::VFIO_DEVICE_GET_REGION_INFO,
+        super::VFIO_DEVICE_GET_IRQ_INFO,
+        super::VFIO_DEVICE_SET_IRQS,
+        super::VFIO_DEVICE_RESET,
+    ];
+    pub const COHERENT_IOMMUFD_REQUESTS: &[u64] = &[
+        super::IOMMU_IOAS_ALLOC,
+        super::IOMMU_IOAS_MAP,
+        super::IOMMU_IOAS_UNMAP,
+        super::IOMMU_DESTROY,
+    ];
+    pub const BROKER_VFIO_REQUESTS: &[u64] = &[
+        super::VFIO_DEVICE_GET_INFO,
+        super::VFIO_DEVICE_GET_REGION_INFO,
+        super::VFIO_DEVICE_GET_IRQ_INFO,
+        super::VFIO_DEVICE_SET_IRQS,
+        super::VFIO_DEVICE_RESET,
+        super::VFIO_DEVICE_FEATURE,
+    ];
+}
 const IOMMU_MAP_FIXED: u32 = 1;
 const IOMMU_MAP_WRITEABLE: u32 = 2;
 const IOMMU_MAP_READABLE: u32 = 4;

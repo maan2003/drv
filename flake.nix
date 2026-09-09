@@ -151,6 +151,33 @@
           '';
         };
 
+      checks.x86_64-linux.ath11k-wifi-service =
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+          mt7921FuchsiaSource = pkgs.callPackage ./nix/mt7921-fuchsia-source.nix { };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "ath11k-wifi-service-check";
+          version = "0.1.0";
+          src = mt7921FuchsiaSource;
+          cargoRoot = "crates/ath11k-wifi-service";
+          buildAndTestSubdir = "crates/ath11k-wifi-service";
+          cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
+          dontBuild = true;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cd crates/ath11k-wifi-service
+            cargo test --locked --offline
+            cargo clippy --locked --offline --all-targets -- -D warnings
+            runHook postCheck
+          '';
+          installPhase = ''
+            touch "$out"
+          '';
+        };
+
       checks.x86_64-linux.wlancfg-service =
         let
           pkgs = nixpkgs.legacyPackages.x86_64-linux;
@@ -405,6 +432,18 @@
             doCheck = false;
           };
 
+          ath11k-wifi-service = pkgs.rustPlatform.buildRustPackage {
+            pname = "ath11k-wifi-service";
+            version = "0.1.0";
+            src = mt7921FuchsiaSource;
+            cargoRoot = "crates/ath11k-wifi-service";
+            buildAndTestSubdir = "crates/ath11k-wifi-service";
+            cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+            nativeBuildInputs = [ pkgs.cmake pkgs.perl ];
+            doCheck = false;
+            meta.mainProgram = "ath11k-wifi-service";
+          };
+
           audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
 
           netstack3-provider-daemon = pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix { };
@@ -457,6 +496,30 @@
               '';
               nativeBuildInputs = [ pkgs.gnugrep ];
               meta.mainProgram = "ath11k-bringup";
+            };
+
+          ath11k-wifi-service-aarch64 =
+            let
+              cross = pkgs.pkgsCross.aarch64-multiplatform;
+            in
+            cross.pkgsStatic.rustPlatform.buildRustPackage {
+              pname = "ath11k-wifi-service-aarch64";
+              version = "0.1.0";
+              src = mt7921FuchsiaSource;
+              cargoRoot = "crates/ath11k-wifi-service";
+              buildAndTestSubdir = "crates/ath11k-wifi-service";
+              cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+              cargoBuildFlags = [ "--bin" "ath11k-wifi-service" ];
+              nativeBuildInputs = [ pkgs.cmake pkgs.perl pkgs.gnugrep ];
+              doCheck = false;
+              postInstall = ''
+                test -x "$out/bin/ath11k-wifi-service"
+                ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -h \
+                  "$out/bin/ath11k-wifi-service" | grep -F 'Machine:' | grep -F 'AArch64'
+                ! ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -l \
+                  "$out/bin/ath11k-wifi-service" | grep -F 'Requesting program interpreter'
+              '';
+              meta.mainProgram = "ath11k-wifi-service";
             };
 
           mt7921-patch-table-gate = pkgs.stdenv.mkDerivation {

@@ -15,7 +15,7 @@ use fidl_fuchsia_wlan_sme as fidl_sme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, Stream, StreamExt};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use wlan_mlme::MlmeImpl;
@@ -24,6 +24,9 @@ use wlan_sme::Station;
 
 const UPCALL_QUEUE_CAPACITY: usize = 256;
 const ETHERNET_QUEUE_CAPACITY: usize = 256;
+/// Bounded Ethernet generations created before production lockdown. Exhaustion
+/// terminates the runtime cleanly rather than creating a descriptor post-lock.
+pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
 
 struct StartedDevice<D> {
     device: D,
@@ -33,10 +36,10 @@ struct StartedDevice<D> {
 
 struct HostIo {
     ethernet: DriverEthernetPort,
+    replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
     unpublished_ethernet_device: Option<HostEthernetDevice>,
     pending_ethernet_devices: VecDeque<HostEthernetDevice>,
     ethernet_mac_address: [u8; 6],
-    ethernet_queue_capacity: usize,
     minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
@@ -233,9 +236,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
             let mut io = self.io.lock().unwrap();
             if io.ethernet.is_closed() {
                 io.pending_ethernet_devices.clear();
-                let (host, driver) =
-                    ethernet_port(io.ethernet_mac_address, io.ethernet_queue_capacity)
-                        .map_err(|_| zx::Status::NO_RESOURCES)?;
+                let (host, driver) = io
+                    .replacement_ethernet
+                    .pop_front()
+                    .ok_or(zx::Status::NO_RESOURCES)?;
                 io.ethernet = driver;
                 Some(host)
             } else {
@@ -386,7 +390,10 @@ pub enum ConnectError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DriverError {
-    MlmeRequest { name: &'static str, detail: String },
+    MlmeRequest {
+        name: &'static str,
+        detail: String,
+    },
     ClientRx(zx::Status),
     Ethernet(zx::Status),
     RequestStreamClosed,
@@ -395,6 +402,9 @@ pub enum DriverError {
     ConnectStateMismatch,
     AlreadyConnected,
     NotConnected,
+    /// Pinned Fuchsia SoftMAC MLME does not implement SME's fullmac Roam
+    /// request. Reject it before SME leaves the healthy Associated state.
+    RoamUnsupported,
     ConnectInProgress,
     NoConnectInProgress,
     ScanInProgress,
@@ -436,6 +446,82 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     revoked: bool,
 }
 
+/// Inert host runtime capabilities created before process lockdown.
+///
+/// This owns the Tokio timer reactor and Ethernet socketpair, the only
+/// descriptor-creating parts of [`ClientRuntime`] construction. Device,
+/// firmware, QMI, and RX activation are deliberately absent.
+pub struct PreparedRuntimeResources {
+    timer_runtime: tokio::runtime::Runtime,
+    ethernet_device: HostEthernetDevice,
+    ethernet: DriverEthernetPort,
+    replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    mac_address: [u8; 6],
+    runtime_fds: Vec<std::os::fd::RawFd>,
+}
+
+impl PreparedRuntimeResources {
+    pub fn new(mac_address: [u8; 6]) -> Result<Self, anyhow::Error> {
+        Self::with_ethernet_capacity(mac_address, ETHERNET_QUEUE_CAPACITY)
+    }
+
+    pub fn with_ethernet_capacity(
+        mac_address: [u8; 6],
+        ethernet_queue_capacity: usize,
+    ) -> Result<Self, anyhow::Error> {
+        let before = open_fd_snapshot()?;
+        let timer_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let runtime_fds = open_fd_snapshot()?.difference(&before).copied().collect();
+        let mut generations = (0..PREPARED_ETHERNET_GENERATIONS)
+            .map(|_| ethernet_port(mac_address, ethernet_queue_capacity))
+            .collect::<Result<VecDeque<_>, _>>()
+            .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
+        let (ethernet_device, ethernet) = generations.pop_front().unwrap();
+        Ok(Self {
+            timer_runtime,
+            ethernet_device,
+            ethernet,
+            replacement_ethernet: generations,
+            mac_address,
+            runtime_fds,
+        })
+    }
+
+    /// The bounded inert Ethernet generations that sandbox setup must retain.
+    /// They remain owned by this value and are never duplicated.
+    pub fn fd_identities(&self) -> Vec<std::os::fd::RawFd> {
+        let mut fds = vec![self.ethernet_device.raw_fd(), self.ethernet.raw_fd()];
+        for (host, driver) in &self.replacement_ethernet {
+            fds.extend([host.raw_fd(), driver.raw_fd()]);
+        }
+        fds
+    }
+
+    pub fn runtime_fd_identities(&self) -> &[std::os::fd::RawFd] {
+        &self.runtime_fds
+    }
+}
+
+fn open_fd_snapshot() -> Result<BTreeSet<std::os::fd::RawFd>, anyhow::Error> {
+    let entries = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_string_lossy()
+                .parse::<std::os::fd::RawFd>()
+                .map_err(std::io::Error::other)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // The directory stream's own descriptor is closed when read_dir is
+    // dropped. Exclude that now-stale number from the retained inventory.
+    Ok(entries
+        .into_iter()
+        .filter(|fd| std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok())
+        .collect())
+}
+
 impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<D> {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -468,12 +554,45 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         inspector: fuchsia_inspect::Inspector,
         ethernet_queue_capacity: usize,
     ) -> Result<Self, anyhow::Error> {
-        let timer_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?;
-        let (ethernet_device, ethernet) =
-            ethernet_port(device_info.sta_addr, ethernet_queue_capacity)
-                .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
+        let resources = PreparedRuntimeResources::with_ethernet_capacity(
+            device_info.sta_addr,
+            ethernet_queue_capacity,
+        )?;
+        Self::new_with_prepared_resources(
+            device,
+            sme_config,
+            device_info,
+            security,
+            spectrum,
+            inspector,
+            resources,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_prepared_resources(
+        device: D,
+        sme_config: wlan_sme::client::ClientConfig,
+        device_info: fidl_mlme::DeviceInfo,
+        security: fidl_common::SecuritySupport,
+        spectrum: fidl_common::SpectrumManagementSupport,
+        inspector: fuchsia_inspect::Inspector,
+        resources: PreparedRuntimeResources,
+    ) -> Result<Self, anyhow::Error> {
+        if device_info.sta_addr != resources.mac_address {
+            return Err(anyhow::anyhow!(
+                "prepared Ethernet MAC differs from queried SoftMAC MAC"
+            ));
+        }
+        let PreparedRuntimeResources {
+            timer_runtime,
+            ethernet_device,
+            ethernet,
+            replacement_ethernet,
+            mac_address,
+            runtime_fds: _,
+        } = resources;
         let upcalls = Arc::new(Mutex::new(UpcallQueue {
             live: true,
             overflowed: false,
@@ -486,10 +605,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            replacement_ethernet,
             unpublished_ethernet_device: Some(ethernet_device),
             pending_ethernet_devices: VecDeque::new(),
-            ethernet_mac_address: device_info.sta_addr,
-            ethernet_queue_capacity,
+            ethernet_mac_address: mac_address,
             minstrel: None,
         }));
         let mut mlme_device = HostMlmeDevice::new(device.clone(), io.clone());
@@ -881,9 +1000,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }
     }
 
-    /// Submit one policy-selected roam to the pinned SME. Completion remains
-    /// ordered on the retained connection transaction and is returned by
-    /// [`Self::next_connection_event`].
+    /// Reject explicit roaming without changing the current connection.
+    /// Pinned Fuchsia SoftMAC MLME ignores SME's fullmac-only `Roam` request;
+    /// entering SME Roaming here would otherwise wedge the association.
     pub fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
@@ -894,8 +1013,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.connection.is_none() || !self.sme.status().is_connected() {
             return Err(ConnectError::Driver(DriverError::NotConnected));
         }
-        self.sme.on_roam_command(request);
-        Ok(())
+        let _ = request;
+        Err(ConnectError::Driver(DriverError::RoamUnsupported))
     }
 
     /// Start one SME discovery scan while retaining its response in the
@@ -1493,10 +1612,10 @@ mod tests {
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            replacement_ethernet: VecDeque::new(),
             unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
-            ethernet_queue_capacity: 4,
             minstrel: None,
         }));
         (HostMlmeDevice::new(device, io), effects)
@@ -2109,7 +2228,7 @@ mod tests {
     }
 
     #[test]
-    fn roam_is_owned_by_the_connected_runtime_transaction() {
+    fn unsupported_roam_preserves_the_current_connection() {
         let (fake, effects) = Fake::new(0);
         effects.lock().unwrap().simulate_ap = true;
         let mut runtime = runtime_with_device_info(fake, retry_device_info());
@@ -2125,25 +2244,17 @@ mod tests {
         ))
         .unwrap();
 
-        runtime
-            .roam(fidl_sme::RoamRequest {
+        assert_eq!(
+            runtime.roam(fidl_sme::RoamRequest {
                 bss_description: connect_request().bss_description,
-            })
-            .unwrap();
-        assert!(matches!(
-            runtime.sme().status(),
-            wlan_sme::client::ClientSmeStatus::Roaming(_)
-        ));
+            }),
+            Err(ConnectError::Driver(DriverError::RoamUnsupported))
+        );
         assert!(runtime.connection.is_some());
-        for _ in 0..1_000 {
-            futures::executor::block_on(runtime.drive_service_once()).unwrap();
-            if runtime.sme().status().is_connected() {
-                break;
-            }
-        }
-        assert!(
-            runtime.sme().status().is_connected(),
-            "service driving did not advance roaming"
+        assert!(runtime.sme().status().is_connected());
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_service_once()),
+            Ok(false)
         );
     }
 
@@ -2221,6 +2332,9 @@ mod tests {
         let mac = [2, 0, 0, 0, 0, 1];
         let capacity = 3;
         let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
+        let replacements = (0..2)
+            .map(|_| ethernet_port(mac, capacity).unwrap())
+            .collect();
         let (fake, effects) = Fake::new(0);
         let device = Arc::new(Mutex::new(StartedDevice {
             device: fake,
@@ -2228,10 +2342,10 @@ mod tests {
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
+            replacement_ethernet: replacements,
             unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: mac,
-            ethernet_queue_capacity: capacity,
             minstrel: None,
         }));
         let mut host_device = HostMlmeDevice::new(device, io.clone());
@@ -2261,6 +2375,11 @@ mod tests {
 
         futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
         assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
+        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::DOWN)).unwrap();
+        assert_eq!(
+            futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)),
+            Err(zx::Status::NO_RESOURCES)
+        );
     }
 
     #[test]
@@ -2275,10 +2394,10 @@ mod tests {
             }));
             let io = Arc::new(Mutex::new(HostIo {
                 ethernet,
+                replacement_ethernet: VecDeque::new(),
                 unpublished_ethernet_device: Some(host),
                 pending_ethernet_devices: VecDeque::new(),
                 ethernet_mac_address: mac,
-                ethernet_queue_capacity: 3,
                 minstrel: None,
             }));
             (HostMlmeDevice::new(device, io.clone()), io)

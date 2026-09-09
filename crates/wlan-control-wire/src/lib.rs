@@ -43,6 +43,7 @@ pub enum CommandReply {
     Success,
     Busy,
     NotConnected,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -921,6 +922,7 @@ fn command_reply(v: CommandReply) -> u8 {
         CommandReply::Success => 1,
         CommandReply::Busy => 2,
         CommandReply::NotConnected => 3,
+        CommandReply::Unsupported => 4,
     }
 }
 fn dec_command_reply(n: u8) -> Result<CommandReply, Error> {
@@ -928,6 +930,7 @@ fn dec_command_reply(n: u8) -> Result<CommandReply, Error> {
         1 => CommandReply::Success,
         2 => CommandReply::Busy,
         3 => CommandReply::NotConnected,
+        4 => CommandReply::Unsupported,
         _ => return Err(Error::UnknownDiscriminant("CommandReply", n.into())),
     })
 }
@@ -1368,6 +1371,7 @@ mod tests {
             CommandReply::Success,
             CommandReply::Busy,
             CommandReply::NotConnected,
+            CommandReply::Unsupported,
         ] {
             roundtrip(Message::DisconnectReply(self::reply(reply)));
             roundtrip(Message::RoamReply(self::reply(reply)));

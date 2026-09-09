@@ -94,7 +94,7 @@ fn endpoint_rejects_truncated_rights() {
 }
 
 #[test]
-fn policy_endpoint_rejects_and_closes_received_rights() {
+fn policy_endpoint_rejects_rights_without_installing_them() {
     let (receiver, sender) = pair();
     let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(receiver).unwrap();
     let ready = encode(&Packet {
@@ -109,10 +109,7 @@ fn policy_endpoint_rejects_and_closes_received_rights() {
 
     assert!(matches!(
         endpoint.try_receive_packet(),
-        Err(EndpointError::WrongFdCount {
-            expected: 0,
-            actual: 1
-        })
+        Err(EndpointError::TruncatedAncillary)
     ));
     let mut byte = 0u8;
     assert_eq!(
@@ -129,6 +126,20 @@ fn policy_endpoint_rejects_and_closes_received_rights() {
     );
 }
 
+#[test]
+fn prepared_server_rejects_aliased_policy_and_supervisor_endpoints() {
+    let (policy, _peer) = pair();
+    let alias = unsafe { libc::dup(policy.as_raw_fd()) };
+    assert!(alias >= 0);
+    let result = PreparedServer::new(
+        policy,
+        unsafe { OwnedFd::from_raw_fd(alias) },
+        GENERATION,
+        SimulatedWifiRuntime::new([2, 0, 0, 0, 0, 1]),
+    );
+    assert!(matches!(result, Err(EndpointError::AliasedEndpoints)));
+}
+
 fn send_many_fds(socket: i32, bytes: &[u8], count: usize) {
     send_fds(socket, bytes, &vec![socket; count]);
 }
@@ -138,8 +149,7 @@ fn send_fds(socket: i32, bytes: &[u8], fds: &[i32]) {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
-    let control_bytes =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
+    let control_bytes = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
     let words = control_bytes.div_ceil(size_of::<usize>());
     let mut control = vec![0usize; words];
     let mut header: libc::msghdr = unsafe { zeroed() };
