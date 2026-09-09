@@ -23,19 +23,20 @@ compile_error!("WLAN self-sandbox seccomp supports only x86_64 and aarch64");
 pub enum Profile {
     /// WLAN policy IPC and the sole-writer saved-network directory capability.
     Wlancfg { persistence_dir_fd: RawFd },
-    /// Simulated Wi-Fi IPC, memory, timers, and worker threads.
+    /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
-    /// One MT7921 PCI function, represented only by its three inert descriptors.
+    /// One MT7921 PCI function and its precreated inert IRQ eventfd.
     Mt7921Vfio {
         pci_config_fd: RawFd,
         vfio_fd: RawFd,
         iommufd: RawFd,
+        irq_eventfd: RawFd,
     },
 }
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
-pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read,write,close,fstat,poll,ppoll,mmap-noexec-anon-or-vfio,mprotect-noexec,munmap,madvise,brk,rt_sigaction,rt_sigprocmask,rt_sigreturn,sigaltstack,futex,set_robust_list,rseq,sched_yield,clock_gettime,clock_nanosleep,nanosleep,timerfd_create,timerfd_settime,timerfd_gettime,epoll_create1,epoll_ctl,epoll_pwait,epoll_wait-x86_64,eventfd2,fcntl,getrandom,getpid,gettid,tgkill-self-tgid,clone-thread-only,clone3-enosys,lseek-pci-only,exit,exit_group; denied=open,openat,socket,connect,exec,fork,process-clone,sendmsg,recvmsg,tgkill-other-tgid,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg,recvmsg,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
 
 #[derive(Debug)]
 pub enum Error {
@@ -258,12 +259,13 @@ impl Sandbox<SetupComplete> {
             pci_config_fd,
             vfio_fd,
             iommufd,
+            irq_eventfd,
         } = profile
         {
             if self.persistence_dir_fd.is_some() {
                 return Err(Error::ProfileAuthorityMismatch);
             }
-            let mut expected = vec![pci_config_fd, vfio_fd, iommufd];
+            let mut expected = vec![pci_config_fd, vfio_fd, iommufd, irq_eventfd];
             expected.sort_unstable();
             if expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
@@ -473,9 +475,7 @@ const LD_W_ABS: u16 = 0x20;
 const JMP_JEQ_K: u16 = 0x15;
 const RET_K: u16 = 0x06;
 const ALLOW: u32 = 0x7fff_0000;
-const KILL: u32 = 0x8000_0000;
-const EPERM: u32 = 0x0005_0000 | libc::EPERM as u32;
-const ENOSYS: u32 = 0x0005_0000 | libc::ENOSYS as u32;
+const KILL_PROCESS: u32 = 0x8000_0000;
 
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH: u32 = 0xc000_003e;
@@ -524,7 +524,7 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
     let mut f = vec![
         stmt(LD_W_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
-        stmt(RET_K, KILL),
+        stmt(RET_K, KILL_PROCESS),
         stmt(LD_W_ABS, 0),
     ];
     if let Profile::Wlancfg {
@@ -540,21 +540,53 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
         pci_config_fd,
         vfio_fd,
         iommufd,
+        irq_eventfd,
     } = profile
     {
-        append_tgkill_self(&mut f, unsafe { libc::getpid() });
         append_mt7921_ioctl(&mut f, vfio_fd, iommufd);
-        append_mt7921_mmap(&mut f, vfio_fd);
-        append_no_exec_mprotect(&mut f);
         append_fd_only(&mut f, libc::SYS_lseek, pci_config_fd);
+        append_fd_set(&mut f, libc::SYS_read, &[pci_config_fd, irq_eventfd]);
+        append_fd_set(&mut f, libc::SYS_write, &[pci_config_fd, 1, 2]);
+        append_mt_ppoll(&mut f);
     }
-    append_errno(&mut f, libc::SYS_clone3, ENOSYS);
-    append_clone_thread_only(&mut f);
+    append_runtime_mmap(
+        &mut f,
+        match profile {
+            Profile::Mt7921Vfio { vfio_fd, .. } => Some(vfio_fd),
+            _ => None,
+        },
+    );
+    append_no_exec_mprotect(&mut f);
+    append_monotonic_clock(&mut f);
+    append_monotonic_sleep(&mut f);
+    append_madvise(&mut f);
+    append_getrandom(&mut f);
+    append_sigaltstack_teardown(&mut f);
+    #[cfg(target_arch = "x86_64")]
+    if matches!(profile, Profile::Wlancfg { .. }) {
+        append_wlancfg_poll(&mut f);
+    }
+    if matches!(profile, Profile::Wlancfg { .. }) {
+        append_epoll_pwait(&mut f);
+        append_wlancfg_thread_exit_sigmask(&mut f);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if matches!(profile, Profile::Wlancfg { .. }) {
+        append_wlancfg_ppoll(&mut f);
+    }
+    match profile {
+        Profile::Wlancfg { .. } => {
+            append_eventfd(&mut f);
+            append_epoll_create(&mut f);
+            append_epoll_ctl(&mut f);
+        }
+        Profile::WifiSimulated | Profile::Mt7921Vfio { .. } => {}
+    }
     for number in allowed(profile) {
         f.push(jump(number as u32, 0, 1));
         f.push(stmt(RET_K, ALLOW));
     }
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     let program = Program {
         len: f.len().try_into().expect("small seccomp program"),
         filter: f.as_ptr(),
@@ -577,10 +609,6 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
     }
 }
 
-fn append_tgkill_self(f: &mut Vec<Filter>, tgid: libc::pid_t) {
-    append_fd_only(f, libc::SYS_tgkill, tgid);
-}
-
 fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
     let dispatch = f.len();
     f.push(jump(libc::SYS_ioctl as u32, 0, 0));
@@ -590,7 +618,7 @@ fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
     append_ioctl_fd_requests(f, vfio_fd, userspace_vfio::mt7921_seccomp::VFIO_REQUESTS);
     append_ioctl_fd_requests(f, iommufd, userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS);
     let denied = f.len();
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     let reload = f.len();
     f.push(stmt(LD_W_ABS, 0));
     f[dispatch].jf = (reload - dispatch - 1)
@@ -613,26 +641,81 @@ fn append_ioctl_fd_requests(f: &mut Vec<Filter>, fd: RawFd, requests: &[u64]) {
     }
 }
 
-fn append_mt7921_mmap(f: &mut Vec<Filter>, vfio_fd: RawFd) {
-    f.push(jump(libc::SYS_mmap as u32, 0, 12));
-    f.push(arg(2));
-    f.push(Filter {
-        code: 0x45,
-        jt: 0,
-        jf: 1,
-        k: libc::PROT_EXEC as u32,
-    });
-    f.push(stmt(RET_K, EPERM));
+fn append_runtime_mmap(f: &mut Vec<Filter>, device_fd: Option<RawFd>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_mmap as u32, 0, 0));
+
+    // Linux's mmap ABI consumes a 32-bit fd and libc leaves the seccomp
+    // argument's upper word zero, including for fd -1.
     f.push(arg_high(4));
-    f.push(jump(0, 2, 0));
-    f.push(jump(u32::MAX, 1, 0));
-    f.push(stmt(RET_K, EPERM));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(arg(4));
-    f.push(jump(u32::MAX, 2, 0));
-    f.push(jump(vfio_fd as u32, 1, 0));
-    f.push(stmt(RET_K, EPERM));
+    let anonymous_fd = f.len();
+    f.push(jump(u32::MAX, 0, 0));
+    let device_fd_check = device_fd.map(|fd| {
+        let check = f.len();
+        f.push(jump(fd as u32, 0, 0));
+        check
+    });
+    f.push(stmt(RET_K, KILL_PROCESS));
+
+    let anonymous = f.len();
+    let mut anonymous_failures = Vec::new();
+    for (argument, expected) in [
+        (2, (libc::PROT_READ | libc::PROT_WRITE) as u32),
+        (3, (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u32),
+        (5, 0),
+    ] {
+        f.push(arg_high(argument));
+        anonymous_failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        anonymous_failures.push(f.len());
+        f.push(jump(expected, 0, 0));
+    }
     f.push(stmt(RET_K, ALLOW));
+    let anonymous_denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+
+    let device = f.len();
+    let mut device_failures = Vec::new();
+    for (argument, expected) in [
+        (2, (libc::PROT_READ | libc::PROT_WRITE) as u32),
+        (3, libc::MAP_SHARED as u32),
+    ] {
+        f.push(arg_high(argument));
+        device_failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        device_failures.push(f.len());
+        f.push(jump(expected, 0, 0));
+    }
+    f.push(stmt(RET_K, ALLOW));
+    let device_denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+
+    let reload = f.len();
     f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small mmap filter");
+    f[anonymous_fd].jt = (anonymous - anonymous_fd - 1)
+        .try_into()
+        .expect("small mmap filter");
+    for failure in anonymous_failures {
+        f[failure].jf = (anonymous_denied - failure - 1)
+            .try_into()
+            .expect("small mmap filter");
+    }
+    if let Some(check) = device_fd_check {
+        f[check].jt = (device - check - 1).try_into().expect("small mmap filter");
+    }
+    for failure in device_failures {
+        f[failure].jf = (device_denied - failure - 1)
+            .try_into()
+            .expect("small mmap filter");
+    }
 }
 
 fn append_no_exec_mprotect(f: &mut Vec<Filter>) {
@@ -644,9 +727,301 @@ fn append_no_exec_mprotect(f: &mut Vec<Filter>) {
         jf: 1,
         k: libc::PROT_EXEC as u32,
     });
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(RET_K, ALLOW));
     f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_monotonic_clock(f: &mut Vec<Filter>) {
+    f.push(jump(libc::SYS_clock_gettime as u32, 0, 6));
+    f.push(arg_high(0));
+    f.push(jump(0, 0, 2));
+    f.push(arg(0));
+    f.push(jump(libc::CLOCK_MONOTONIC as u32, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_monotonic_sleep(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_clock_nanosleep as u32, 0, 0));
+    f.push(arg_high(0));
+    f.push(jump(0, 0, 4));
+    f.push(arg(0));
+    f.push(jump(libc::CLOCK_MONOTONIC as u32, 0, 2));
+    f.push(arg(1));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small sleep filter");
+}
+
+fn append_madvise(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_madvise as u32, 0, 0));
+    f.push(arg(2));
+    for advice in [
+        libc::MADV_DONTNEED,
+        libc::MADV_DONTDUMP,
+        libc::MADV_FREE,
+        libc::MADV_NOHUGEPAGE,
+    ] {
+        f.push(jump(advice as u32, 0, 1));
+        f.push(stmt(RET_K, ALLOW));
+    }
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small madvise filter");
+}
+
+fn append_getrandom(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_getrandom as u32, 0, 0));
+    f.push(arg_high(2));
+    f.push(jump(0, 0, 4));
+    f.push(arg(2));
+    f.push(jump(0, 1, 0));
+    f.push(jump(libc::GRND_NONBLOCK, 0, 1));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small getrandom filter");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_wlancfg_poll(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_poll as u32, 0, 0));
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 4));
+    f.push(arg(1));
+    f.push(jump(2, 0, 2));
+    f.push(arg(2));
+    f.push(jump(u32::MAX, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small poll filter");
+}
+
+fn append_fd_set(f: &mut Vec<Filter>, syscall: libc::c_long, fds: &[RawFd]) {
+    let dispatch = f.len();
+    f.push(jump(syscall as u32, 0, 0));
+    f.push(arg_high(0));
+    f.push(jump(0, 0, (fds.len() * 2 + 1) as u8));
+    f.push(arg(0));
+    for &fd in fds {
+        f.push(jump(fd as u32, 0, 1));
+        f.push(stmt(RET_K, ALLOW));
+    }
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1).try_into().expect("small fd filter");
+}
+
+fn append_mt_ppoll(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 6));
+    f.push(arg(1));
+    // One precreated IRQ eventfd is the complete MT interrupt inventory.
+    f.push(Filter {
+        code: 0x25,
+        jt: 4,
+        jf: 0,
+        k: 1,
+    });
+    f.push(arg_high(3));
+    f.push(jump(0, 0, 2));
+    f.push(arg(3));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small ppoll filter");
+}
+
+fn append_eventfd(f: &mut Vec<Filter>) {
+    f.push(jump(libc::SYS_eventfd2 as u32, 0, 7));
+    f.push(arg(0));
+    f.push(jump(0, 0, 4));
+    f.push(arg(1));
+    f.push(jump((libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) as u32, 0, 1));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_epoll_create(f: &mut Vec<Filter>) {
+    f.push(jump(libc::SYS_epoll_create1 as u32, 0, 5));
+    f.push(arg(0));
+    f.push(jump(libc::EPOLL_CLOEXEC as u32, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_epoll_ctl(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_epoll_ctl as u32, 0, 0));
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 4));
+    f.push(arg(1));
+    f.push(jump(libc::EPOLL_CTL_ADD as u32, 3, 0));
+    f.push(jump(libc::EPOLL_CTL_MOD as u32, 2, 0));
+    f.push(jump(libc::EPOLL_CTL_DEL as u32, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small epoll_ctl filter");
+}
+
+fn append_epoll_pwait(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_epoll_pwait as u32, 0, 0));
+    f.push(arg_high(4));
+    f.push(jump(0, 0, 2));
+    f.push(arg(4));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small epoll_pwait filter");
+}
+
+fn append_sigaltstack_teardown(f: &mut Vec<Filter>) {
+    // Rust's stack-overflow guard removes its alternate stack while returning
+    // from main. Classic seccomp cannot inspect the pointed-to SS_DISABLE
+    // structure, but it can require a new-stack pointer and forbid querying
+    // the old stack. Handler installation and signal delivery remain denied.
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_sigaltstack as u32, 0, 0));
+    f.push(arg_high(0));
+    let new_high = f.len();
+    f.push(jump(0, 0, 0));
+    let old_stack = f.len();
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 2));
+    f.push(arg(1));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let check_new_low = f.len();
+    f.push(arg(0));
+    f.push(jump(0, 0, 1));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 2));
+    f.push(arg(1));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[new_high].jt = (check_new_low - new_high - 1)
+        .try_into()
+        .expect("small sigaltstack filter");
+    f[new_high].jf = (old_stack - new_high - 1)
+        .try_into()
+        .expect("small sigaltstack filter");
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small sigaltstack filter");
+}
+
+fn append_wlancfg_thread_exit_sigmask(f: &mut Vec<Filter>) {
+    // glibc blocks all signals except its internal cancellation signal while
+    // the pre-lockdown owner thread exits. Seccomp cannot inspect the mask's
+    // pointee, but every scalar and pointer direction remains constrained.
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_rt_sigprocmask as u32, 0, 0));
+    let mut failures = Vec::new();
+    for (argument, expected) in [(0, libc::SIG_BLOCK as u32), (2, 0), (3, 8)] {
+        f.push(arg_high(argument));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        failures.push(f.len());
+        f.push(jump(expected, 0, 0));
+    }
+    // arg1 is the one required non-null pointer. Either half may carry it.
+    f.push(arg_high(1));
+    let set_high = f.len();
+    f.push(jump(0, 0, 0));
+    f.push(stmt(RET_K, ALLOW));
+    let set_low = f.len();
+    f.push(arg(1));
+    f.push(jump(0, 0, 1));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small sigprocmask filter");
+    }
+    f[set_high].jt = (set_low - set_high - 1)
+        .try_into()
+        .expect("small sigprocmask filter");
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small sigprocmask filter");
+}
+
+#[cfg(target_arch = "aarch64")]
+fn append_wlancfg_ppoll(f: &mut Vec<Filter>) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
+    let mut failures = Vec::new();
+    for (argument, expected) in [(1, 2_u32), (2, 0), (3, 0)] {
+        f.push(arg_high(argument));
+        failures.push(f.len());
+        f.push(jump(0, 0, 0));
+        f.push(arg(argument));
+        failures.push(f.len());
+        f.push(jump(expected, 0, 0));
+    }
+    f.push(stmt(RET_K, ALLOW));
+    let denied = f.len();
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    for failure in failures {
+        f[failure].jf = (denied - failure - 1)
+            .try_into()
+            .expect("small ppoll filter");
+    }
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small ppoll filter");
 }
 
 fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
@@ -655,7 +1030,7 @@ fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
     f.push(jump(0, 0, 2));
     f.push(arg(0));
     f.push(jump(fd as u32, 1, 0));
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(RET_K, ALLOW));
     f.push(stmt(LD_W_ABS, 0));
 }
@@ -664,14 +1039,9 @@ fn append_protected_close(f: &mut Vec<Filter>, fd: RawFd) {
     f.push(jump(libc::SYS_close as u32, 0, 5));
     f.push(arg(0));
     f.push(jump(fd as u32, 0, 1));
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(RET_K, ALLOW));
     f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_errno(f: &mut Vec<Filter>, syscall: libc::c_long, errno: u32) {
-    f.push(jump(syscall as u32, 0, 1));
-    f.push(stmt(RET_K, errno));
 }
 
 fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
@@ -693,7 +1063,7 @@ fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     f.push(jump(READ_FLAGS, 1, 0));
     f.push(jump(CREATE_FLAGS, 0, 1));
     f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(LD_W_ABS, 0));
 }
 
@@ -706,7 +1076,7 @@ fn append_renameat(f: &mut Vec<Filter>, fd: RawFd) {
         f.push(arg(2));
         f.push(jump(fd as u32, 0, 1));
         f.push(stmt(RET_K, ALLOW));
-        f.push(stmt(RET_K, EPERM));
+        f.push(stmt(RET_K, KILL_PROCESS));
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -719,7 +1089,7 @@ fn append_renameat(f: &mut Vec<Filter>, fd: RawFd) {
         f.push(arg(2));
         f.push(jump(fd as u32, 0, 1));
         f.push(stmt(RET_K, ALLOW));
-        f.push(stmt(RET_K, EPERM));
+        f.push(stmt(RET_K, KILL_PROCESS));
     }
     f.push(stmt(LD_W_ABS, 0));
 }
@@ -731,85 +1101,49 @@ fn append_unlinkat(f: &mut Vec<Filter>, fd: RawFd) {
     f.push(arg(2));
     f.push(jump(0, 0, 1));
     f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, EPERM));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_clone_thread_only(f: &mut Vec<Filter>) {
-    // clone is admitted only with CLONE_THREAD, never as fork/process creation.
-    f.push(jump(libc::SYS_clone as u32, 0, 5));
-    f.push(arg(0));
-    f.push(Filter {
-        code: 0x45,
-        jt: 0,
-        jf: 1,
-        k: libc::CLONE_THREAD as u32,
-    });
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, EPERM));
+    f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(LD_W_ABS, 0));
 }
 
 fn allowed(profile: Profile) -> Vec<libc::c_long> {
-    // Explicitly excludes open/openat, socket/connect, ioctl, exec and fork.
+    // Authority-bearing calls are dispatched above;
+    // role-specific IPC and waits are appended below. open/socket/connect,
+    // fcntl/dup, executable mappings, exec, and process creation stay denied.
     let mut calls = vec![
-        libc::SYS_read,
-        libc::SYS_write,
         libc::SYS_close,
-        libc::SYS_fstat,
-        libc::SYS_ppoll,
-        // MT7921's mmap/mprotect and lseek have argument filters above.
         libc::SYS_munmap,
-        libc::SYS_madvise,
         libc::SYS_brk,
-        libc::SYS_rt_sigaction,
-        libc::SYS_rt_sigprocmask,
-        libc::SYS_rt_sigreturn,
-        libc::SYS_sigaltstack,
         libc::SYS_futex,
-        libc::SYS_set_robust_list,
-        libc::SYS_rseq,
         libc::SYS_sched_yield,
-        libc::SYS_clock_gettime,
-        libc::SYS_clock_nanosleep,
-        libc::SYS_nanosleep,
-        libc::SYS_timerfd_create,
-        libc::SYS_timerfd_settime,
-        libc::SYS_timerfd_gettime,
-        libc::SYS_epoll_create1,
-        libc::SYS_epoll_ctl,
-        libc::SYS_epoll_pwait,
-        libc::SYS_eventfd2,
-        libc::SYS_fcntl,
-        libc::SYS_getrandom,
         libc::SYS_getpid,
         libc::SYS_gettid,
         libc::SYS_exit,
         libc::SYS_exit_group,
     ];
-    // aarch64 has no legacy poll syscall; libc implements poll through ppoll.
-    #[cfg(target_arch = "x86_64")]
-    calls.push(libc::SYS_poll);
-    if !matches!(profile, Profile::Mt7921Vfio { .. }) {
-        calls.extend([
+    match profile {
+        Profile::Wlancfg { .. } => calls.extend([
+            libc::SYS_read,
+            libc::SYS_write,
+            // Tokio's current-thread time driver and the bounded control owner.
+            libc::SYS_fstat,
             libc::SYS_recvmsg,
             libc::SYS_sendmsg,
-            libc::SYS_mmap,
-            libc::SYS_mprotect,
-            libc::SYS_tgkill,
-        ]);
+            // HostPolicyStorage reads/writes newly constrained regular files
+            // and durably syncs the file and inherited state directory.
+            libc::SYS_fsync,
+        ]),
+        Profile::WifiSimulated => calls.extend([
+            libc::SYS_read,
+            libc::SYS_write,
+            // Its two prevalidated seqpacket seams are its only runtime I/O.
+            libc::SYS_recvmsg,
+            libc::SYS_sendmsg,
+        ]),
+        Profile::Mt7921Vfio { .. } => {}
     }
     #[cfg(target_arch = "x86_64")]
-    calls.push(libc::SYS_epoll_wait);
     if matches!(profile, Profile::Wlancfg { .. }) {
-        calls.extend([
-            libc::SYS_lseek,
-            libc::SYS_pread64,
-            libc::SYS_pwrite64,
-            libc::SYS_fsync,
-            libc::SYS_fdatasync,
-            libc::SYS_ftruncate,
-        ]);
+        calls.push(libc::SYS_epoll_wait);
     }
     calls
 }
@@ -817,12 +1151,13 @@ fn allowed(profile: Profile) -> Vec<libc::c_long> {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
 
     #[test]
-    fn mt7921_profile_rejects_persistence_authority() {
+    fn mt7921_profile_requires_exactly_four_capabilities() {
         let setup = Sandbox::<SetupComplete> {
-            inherited: vec![3, 4, 5],
+            inherited: vec![3, 4, 5, 6],
             persistence_dir_fd: Some(3),
             _state: PhantomData,
         };
@@ -831,204 +1166,252 @@ mod filter_tests {
                 pci_config_fd: 3,
                 vfio_fd: 4,
                 iommufd: 5,
+                irq_eventfd: 6,
             }),
             Err(Error::ProfileAuthorityMismatch)
         ));
     }
 
     #[test]
-    fn wifi_filter_denials_and_thread_fallback_execute() {
-        subprocess(
-            "wifi",
-            "filter_tests::wifi_filter_denials_and_thread_fallback_execute",
-            || {
-                enable_filter(Profile::WifiSimulated);
-                assert_errno(
-                    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::open(c"/etc/passwd".as_ptr(), libc::O_RDONLY) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(0, 0x5413, std::ptr::null_mut::<libc::c_void>()) } as i64,
-                    libc::EPERM,
-                );
-                std::thread::spawn(|| {}).join().unwrap();
-            },
-        );
+    fn role_positive_paths_execute() {
+        if let Ok(role) = std::env::var("DRV_SANDBOX_POSITIVE") {
+            positive_body(&role);
+        }
+        for role in ["wifi", "wlancfg", "mt"] {
+            positive_child(role);
+        }
     }
 
     #[test]
-    fn wlancfg_filter_checks_every_persistence_argument() {
-        subprocess(
-            "wlancfg",
-            "filter_tests::wlancfg_filter_checks_every_persistence_argument",
-            || {
-                let fd =
-                    unsafe { libc::open(c"/tmp".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-                assert!(fd >= 0);
-                let temporary =
-                    std::ffi::CString::new(format!("drv-filter-{}.tmp", std::process::id()))
-                        .unwrap();
-                let installed =
-                    std::ffi::CString::new(format!("drv-filter-{}.bin", std::process::id()))
-                        .unwrap();
-                enable_filter(Profile::Wlancfg {
-                    persistence_dir_fd: fd,
-                });
-                let read_flags =
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-                let create_flags = libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK;
-                assert_errno(
-                    unsafe { libc::openat(libc::AT_FDCWD, temporary.as_ptr(), read_flags) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::openat(fd, temporary.as_ptr(), libc::O_RDONLY) } as i64,
-                    libc::EPERM,
-                );
-                let file = unsafe { libc::openat(fd, temporary.as_ptr(), create_flags, 0o600) };
-                assert!(file >= 0);
-                assert_eq!(unsafe { libc::write(file, b"x".as_ptr().cast(), 1) }, 1);
-                assert_eq!(unsafe { libc::fsync(file) }, 0);
-                assert_eq!(unsafe { libc::close(file) }, 0);
-                assert_errno(
-                    unsafe {
-                        libc::renameat(fd, temporary.as_ptr(), libc::AT_FDCWD, installed.as_ptr())
-                    } as i64,
-                    libc::EPERM,
-                );
-                assert_eq!(
-                    unsafe { libc::renameat(fd, temporary.as_ptr(), fd, installed.as_ptr()) },
-                    0
-                );
-                assert_eq!(unsafe { libc::fsync(fd) }, 0);
-                assert_errno(
-                    unsafe { libc::unlinkat(fd, installed.as_ptr(), libc::AT_REMOVEDIR) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(unsafe { libc::close(fd) } as i64, libc::EPERM);
-                assert_eq!(unsafe { libc::unlinkat(fd, installed.as_ptr(), 0) }, 0);
-            },
+    fn forbidden_syscalls_and_arguments_kill_the_process() {
+        if let Ok(probe) = std::env::var("DRV_SANDBOX_KILL_PROBE") {
+            kill_body(&probe);
+        }
+        for probe in [
+            "wifi:open",
+            "wifi:eventfd",
+            "wifi:clone3",
+            "wlancfg:open",
+            "wlancfg:bad-eventfd-flags",
+            "wlancfg:bad-epoll-flags",
+            "wlancfg:bad-epoll-operation",
+            "wlancfg:bad-epoll-operation-high",
+            "wlancfg:epoll-pwait-signal-mask",
+            "wlancfg:sigmask-wrong-how",
+            "wlancfg:sigmask-null-set",
+            "wlancfg:sigmask-old-set",
+            "wlancfg:sigmask-wrong-size",
+            "wlancfg:poll-one",
+            "wlancfg:poll-count-high",
+            "wlancfg:close-persistence",
+            "mt:wrong-ioctl-fd",
+            "mt:fcntl",
+            "mt:dup",
+            "mt:eventfd",
+            "mt:timerfd",
+            "mt:clone",
+            "mt:clone3",
+            "mt:rt-sigaction",
+            "mt:sigaltstack",
+            "mt:sigaltstack-query",
+            "mt:tgkill",
+            "mt:mmap-exec",
+            "mt:mmap-fd-high-alias",
+            "mt:mmap-vfio-cross-alias",
+            "mt:mmap-anonymous-offset",
+            "mt:mmap-anonymous-read-only",
+            "mt:realtime-sleep",
+            "mt:sleep-clock-high",
+            "mt:ppoll-two",
+            "mt:recvmsg",
+        ] {
+            kill_child(probe);
+        }
+    }
+
+    fn positive_child(role: &str) {
+        const TEST: &str = "filter_tests::role_positive_paths_execute";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST)
+            .env("DRV_SANDBOX_POSITIVE", role)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{role} positive child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    #[test]
-    fn mt7921_filter_is_exact_by_fd_request_and_mapping_protection() {
-        subprocess(
-            "mt7921",
-            "filter_tests::mt7921_filter_is_exact_by_fd_request_and_mapping_protection",
-            || {
-                let vfio_get_info = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
-                let ioas_alloc = userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS[0];
-                let pci = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
-                let vfio = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
-                let iommu = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
-                assert!(pci >= 0 && vfio >= 0 && iommu >= 0);
-                enable_filter(Profile::Mt7921Vfio {
-                    pci_config_fd: pci,
-                    vfio_fd: vfio,
-                    iommufd: iommu,
-                });
-                // Allowed pairs reach /dev/null and therefore fail with ENOTTY,
-                // proving seccomp did not replace the result with EPERM.
-                assert_errno(
-                    unsafe { libc::ioctl(vfio, vfio_get_info, 0) } as i64,
-                    libc::ENOTTY,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(iommu, ioas_alloc, 0) } as i64,
-                    libc::ENOTTY,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(vfio, ioas_alloc, 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(iommu, vfio_get_info, 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(pci, vfio_get_info, 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(vfio, 0xffff_u64, 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::ioctl(vfio, vfio_get_info | (1_u64 << 32), 0) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe {
-                        libc::mmap(
-                            std::ptr::null_mut(),
-                            4096,
-                            libc::PROT_READ | libc::PROT_EXEC,
-                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                            -1,
-                            0,
-                        )
-                    } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe {
-                        libc::mmap(
-                            std::ptr::null_mut(),
-                            4096,
-                            libc::PROT_READ,
-                            libc::MAP_PRIVATE,
-                            pci,
-                            0,
-                        )
-                    } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } as i64,
-                    libc::EPERM,
-                );
-                let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-                assert_errno(
-                    unsafe { libc::recvmsg(vfio, &mut message, libc::MSG_DONTWAIT) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::sendmsg(vfio, &message, libc::MSG_DONTWAIT) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(
-                    unsafe { libc::open(c"/etc/passwd".as_ptr(), libc::O_RDONLY) } as i64,
-                    libc::EPERM,
-                );
-                assert_errno(unsafe { libc::fork() } as i64, libc::EPERM);
-                let argv = [c"/bin/true".as_ptr(), std::ptr::null()];
-                assert_errno(
-                    unsafe {
-                        libc::execve(c"/bin/true".as_ptr(), argv.as_ptr(), argv[1..].as_ptr())
-                    } as i64,
-                    libc::EPERM,
-                );
-                let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-                assert_eq!(
-                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
-                    0
-                );
-                std::thread::spawn(|| {}).join().unwrap();
-                let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    fn positive_body(role: &str) -> ! {
+        let fds = resources();
+        enable_filter(profile(role, fds));
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
+        match role {
+            "wifi" => {
+                let byte = b'W';
+                let mut send_iov = libc::iovec {
+                    iov_base: (&byte as *const u8).cast_mut().cast(),
+                    iov_len: 1,
+                };
+                let mut send: libc::msghdr = unsafe { std::mem::zeroed() };
+                send.msg_iov = &mut send_iov;
+                send.msg_iovlen = 1;
+                assert_eq!(unsafe { libc::sendmsg(fds[0], &send, 0) }, 1);
+                let mut received = 0_u8;
+                let mut recv_iov = libc::iovec {
+                    iov_base: (&mut received as *mut u8).cast(),
+                    iov_len: 1,
+                };
+                let mut recv: libc::msghdr = unsafe { std::mem::zeroed() };
+                recv.msg_iov = &mut recv_iov;
+                recv.msg_iovlen = 1;
+                assert_eq!(unsafe { libc::recvmsg(fds[1], &mut recv, 0) }, 1);
+                assert_eq!(received, byte);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            "wlancfg" => {
+                let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
                 assert!(event >= 0);
-                assert_eq!(unsafe { libc::close(event) }, 0);
-            },
+                let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                assert!(epoll >= 0);
+                let mut epoll_event: libc::epoll_event = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::epoll_pwait(epoll, &mut epoll_event, 1, 0, std::ptr::null()) },
+                    0
+                );
+                let count = 1_u64;
+                assert_eq!(
+                    unsafe { libc::write(event, (&count as *const u64).cast(), 8) },
+                    8
+                );
+                let pollfd = libc::pollfd {
+                    fd: event,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut pollfds = [pollfd; 2];
+                assert_eq!(unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) }, 2);
+                let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::sigfillset(&mut mask) }, 0);
+                assert_eq!(
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_rt_sigprocmask,
+                            libc::SIG_BLOCK,
+                            &mask,
+                            std::ptr::null_mut::<libc::sigset_t>(),
+                            8,
+                        )
+                    },
+                    0
+                );
+            }
+            "mt" => {
+                let request = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
+                assert_eq!(unsafe { libc::ioctl(fds[1], request, 0) }, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOTTY)
+                );
+                let mut pollfd = libc::pollfd {
+                    fd: fds[3],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::ppoll(&mut pollfd, 1, &timeout, std::ptr::null()) },
+                    1
+                );
+                let mut count = 0_u64;
+                assert_eq!(
+                    unsafe { libc::read(fds[3], (&mut count as *mut u64).cast(), 8) },
+                    8
+                );
+                assert_eq!(count, 1);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => unreachable!(),
+        }
+        let disable_stack = libc::stack_t {
+            ss_sp: std::ptr::null_mut(),
+            ss_flags: libc::SS_DISABLE,
+            ss_size: libc::SIGSTKSZ,
+        };
+        assert_eq!(
+            unsafe { libc::sigaltstack(&disable_stack, std::ptr::null_mut()) },
+            0
         );
+        unsafe { libc::_exit(0) }
+    }
+
+    fn kill_child(probe: &str) {
+        const TEST: &str = "filter_tests::forbidden_syscalls_and_arguments_kill_the_process";
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST)
+            .env("DRV_SANDBOX_KILL_PROBE", probe)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGSYS),
+            "{probe} did not die with SIGSYS: {status}"
+        );
+    }
+
+    fn kill_body(probe: &str) -> ! {
+        let (role, operation) = probe.split_once(':').unwrap();
+        let fds = resources();
+        enable_filter(profile(role, fds));
+        violate(operation, fds);
+        unsafe { libc::_exit(99) }
+    }
+
+    fn resources() -> [RawFd; 4] {
+        let mut sockets = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sockets.as_mut_ptr())
+            },
+            0
+        );
+        let third = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        let irq = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(third >= 0 && irq >= 0);
+        [sockets[0], sockets[1], third, irq]
+    }
+
+    fn profile(role: &str, fds: [RawFd; 4]) -> Profile {
+        match role {
+            "wifi" => Profile::WifiSimulated,
+            "wlancfg" => Profile::Wlancfg {
+                persistence_dir_fd: fds[0],
+            },
+            "mt" => Profile::Mt7921Vfio {
+                pci_config_fd: fds[0],
+                vfio_fd: fds[1],
+                iommufd: fds[2],
+                irq_eventfd: fds[3],
+            },
+            _ => unreachable!(),
+        }
     }
 
     fn enable_filter(profile: Profile) {
@@ -1039,27 +1422,256 @@ mod filter_tests {
         install_filter(profile).unwrap();
     }
 
-    fn assert_errno(result: i64, errno: i32) {
-        assert_eq!(result, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(errno));
-    }
-
-    fn subprocess(name: &str, test_name: &str, body: impl FnOnce()) {
-        let variable = format!("DRV_SANDBOX_FILTER_CHILD_{name}");
-        if std::env::var_os(&variable).is_some() {
-            body();
-            unsafe { libc::_exit(0) };
+    fn violate(operation: &str, fds: [RawFd; 4]) {
+        unsafe {
+            match operation {
+                "open" => {
+                    libc::open(c"/etc/passwd".as_ptr(), libc::O_RDONLY);
+                }
+                "bad-eventfd-flags" => {
+                    libc::eventfd(0, libc::EFD_CLOEXEC);
+                }
+                "bad-epoll-flags" => {
+                    libc::epoll_create1(0);
+                }
+                "bad-epoll-operation" => {
+                    libc::epoll_ctl(fds[1], 99, fds[0], std::ptr::null_mut());
+                }
+                "bad-epoll-operation-high" => {
+                    let operation =
+                        ((libc::SYS_write as u64) << 32) | libc::EPOLL_CTL_ADD as u32 as u64;
+                    libc::syscall(
+                        libc::SYS_epoll_ctl,
+                        fds[1],
+                        operation,
+                        fds[0],
+                        std::ptr::null_mut::<libc::epoll_event>(),
+                    );
+                }
+                "epoll-pwait-signal-mask" => {
+                    let mask: libc::sigset_t = std::mem::zeroed();
+                    libc::syscall(
+                        libc::SYS_epoll_pwait,
+                        fds[1],
+                        std::ptr::null_mut::<libc::epoll_event>(),
+                        1,
+                        0,
+                        &mask,
+                        8,
+                    );
+                }
+                "sigmask-wrong-how" => {
+                    let mask: libc::sigset_t = std::mem::zeroed();
+                    libc::syscall(libc::SYS_rt_sigprocmask, libc::SIG_SETMASK, &mask, 0, 8);
+                }
+                "sigmask-null-set" => {
+                    libc::syscall(libc::SYS_rt_sigprocmask, libc::SIG_BLOCK, 0, 0, 8);
+                }
+                "sigmask-old-set" => {
+                    let mask: libc::sigset_t = std::mem::zeroed();
+                    let mut old: libc::sigset_t = std::mem::zeroed();
+                    libc::syscall(
+                        libc::SYS_rt_sigprocmask,
+                        libc::SIG_BLOCK,
+                        &mask,
+                        &mut old,
+                        8,
+                    );
+                }
+                "sigmask-wrong-size" => {
+                    let mask: libc::sigset_t = std::mem::zeroed();
+                    libc::syscall(libc::SYS_rt_sigprocmask, libc::SIG_BLOCK, &mask, 0, 16);
+                }
+                #[cfg(target_arch = "x86_64")]
+                "poll-one" => {
+                    let mut pollfd = libc::pollfd {
+                        fd: fds[3],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::syscall(libc::SYS_poll, &mut pollfd, 1_u64, -1_i64);
+                }
+                #[cfg(target_arch = "aarch64")]
+                "poll-one" => {
+                    let mut pollfd = libc::pollfd {
+                        fd: fds[3],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::syscall(
+                        libc::SYS_ppoll,
+                        &mut pollfd,
+                        1_u64,
+                        std::ptr::null::<libc::timespec>(),
+                        std::ptr::null::<libc::sigset_t>(),
+                        8,
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                "poll-count-high" => {
+                    let mut pollfds = [libc::pollfd {
+                        fd: fds[3],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }; 2];
+                    libc::syscall(
+                        libc::SYS_poll,
+                        pollfds.as_mut_ptr(),
+                        (1_u64 << 32) | 2,
+                        -1_i64,
+                    );
+                }
+                #[cfg(target_arch = "aarch64")]
+                "poll-count-high" => {
+                    let mut pollfds = [libc::pollfd {
+                        fd: fds[3],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }; 2];
+                    libc::syscall(
+                        libc::SYS_ppoll,
+                        pollfds.as_mut_ptr(),
+                        (1_u64 << 32) | 2,
+                        std::ptr::null::<libc::timespec>(),
+                        std::ptr::null::<libc::sigset_t>(),
+                        8,
+                    );
+                }
+                "close-persistence" => {
+                    libc::close(fds[0]);
+                }
+                "wrong-ioctl-fd" => {
+                    libc::ioctl(fds[0], userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2], 0);
+                }
+                "fcntl" => {
+                    libc::fcntl(fds[0], libc::F_GETFD);
+                }
+                "dup" => {
+                    libc::dup(fds[0]);
+                }
+                "eventfd" => {
+                    libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
+                }
+                "timerfd" => {
+                    libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC);
+                }
+                "clone" => {
+                    libc::syscall(libc::SYS_clone, 0, 0, 0, 0, 0);
+                }
+                "clone3" => {
+                    libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0);
+                }
+                "rt-sigaction" => {
+                    libc::syscall(libc::SYS_rt_sigaction, libc::SIGRTMIN() + 1, 0, 0, 8);
+                }
+                "sigaltstack" => {
+                    libc::sigaltstack(std::ptr::null(), std::ptr::null_mut());
+                }
+                "sigaltstack-query" => {
+                    let new_stack = libc::stack_t {
+                        ss_sp: std::ptr::null_mut(),
+                        ss_flags: libc::SS_DISABLE,
+                        ss_size: libc::SIGSTKSZ,
+                    };
+                    let mut old_stack: libc::stack_t = std::mem::zeroed();
+                    libc::sigaltstack(&new_stack, &mut old_stack);
+                }
+                "tgkill" => {
+                    libc::syscall(libc::SYS_tgkill, libc::getpid(), libc::gettid(), 0);
+                }
+                "mmap-exec" => {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    );
+                }
+                "mmap-fd-high-alias" => {
+                    libc::syscall(
+                        libc::SYS_mmap,
+                        std::ptr::null_mut::<u8>(),
+                        4096,
+                        libc::PROT_READ,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        (1_u64 << 32) | u32::MAX as u64,
+                        0,
+                    );
+                }
+                "mmap-vfio-cross-alias" => {
+                    libc::syscall(
+                        libc::SYS_mmap,
+                        std::ptr::null_mut::<u8>(),
+                        4096,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        (u32::MAX as u64) << 32 | fds[1] as u32 as u64,
+                        0,
+                    );
+                }
+                "mmap-anonymous-offset" => {
+                    libc::syscall(
+                        libc::SYS_mmap,
+                        std::ptr::null_mut::<u8>(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        u32::MAX as u64,
+                        4096,
+                    );
+                }
+                "mmap-anonymous-read-only" => {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    );
+                }
+                "realtime-sleep" => {
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1,
+                    };
+                    libc::syscall(
+                        libc::SYS_clock_nanosleep,
+                        libc::CLOCK_REALTIME,
+                        0,
+                        &timeout,
+                        0,
+                    );
+                }
+                "sleep-clock-high" => {
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1,
+                    };
+                    libc::syscall(
+                        libc::SYS_clock_nanosleep,
+                        (1_u64 << 32) | libc::CLOCK_MONOTONIC as u32 as u64,
+                        0,
+                        &timeout,
+                        0,
+                    );
+                }
+                "ppoll-two" => {
+                    let mut pollfds = [libc::pollfd {
+                        fd: fds[3],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }; 2];
+                    libc::ppoll(pollfds.as_mut_ptr(), 2, std::ptr::null(), std::ptr::null());
+                }
+                "recvmsg" => {
+                    let mut message: libc::msghdr = std::mem::zeroed();
+                    libc::recvmsg(fds[1], &mut message, libc::MSG_DONTWAIT);
+                }
+                _ => unreachable!(),
+            };
         }
-        let output = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg(test_name)
-            .env(variable, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "filter child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }

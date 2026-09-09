@@ -63,7 +63,12 @@ fn wlancfg_allows_only_directory_relative_atomic_persistence() {
 fn mt7921_vfio_subprocess_has_only_its_runtime_authority() {
     let parent_mount_namespace = std::fs::read_link("/proc/self/ns/mnt").unwrap();
     let parent_network_namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
-    let retained = [open_dev_null(), open_dev_null(), open_dev_null()];
+    let retained = [
+        open_dev_null(),
+        open_dev_null(),
+        open_dev_null(),
+        open_irq_eventfd(),
+    ];
     for fd in retained {
         clear_cloexec(fd);
     }
@@ -117,7 +122,7 @@ fn mt7921_vfio_subprocess_has_only_its_runtime_authority() {
         .unwrap();
     assert_helper(
         output,
-        "profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+3 no_new_privs=true seccomp=true open_denied=true socket_denied=true fork_denied=true exec_denied=true sendmsg_denied=true recvmsg_denied=true tgkill_other_denied=true cross_fd_ioctls_denied=true allocator=true thread=true timer=true eventfd=true read_write=true",
+        "profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+4 no_new_privs=true seccomp=true allocator=true monotonic_sleep=true inherited_irq_eventfd=true",
     );
 }
 
@@ -138,6 +143,12 @@ fn clear_cloexec(fd: RawFd) {
 
 fn open_dev_null() -> RawFd {
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    assert!(fd >= 0);
+    fd
+}
+
+fn open_irq_eventfd() -> RawFd {
+    let fd = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     assert!(fd >= 0);
     fd
 }

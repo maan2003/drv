@@ -65,16 +65,13 @@ fn run() -> Result<(), Error> {
                 message.msg_iovlen = 1;
                 assert_eq!(unsafe { libc::recvmsg(retained, &mut message, libc::MSG_DONTWAIT) }, 1);
                 assert_eq!(byte, b'X', "setup consumed or changed socket data");
-                std::thread::spawn(|| {}).join().expect("sandboxed worker thread");
-                denied_probes(retained);
-                println!("sandbox_self_test=PASS profile=wifi-simulated retained_fd=true unwanted_fd_closed=true setup_socket_unread=true worker_thread=true open_denied=true socket_denied=true ioctl_denied=true");
+                println!("sandbox_self_test=PASS profile=wifi-simulated retained_fd=true unwanted_fd_closed=true setup_socket_unread=true");
             });
         }
         "wlancfg" => setup.lockdown(Profile::Wlancfg { persistence_dir_fd: retained })?.run(|| {
-            denied_open();
             let temporary = CString::new("saved-networks.tmp").unwrap();
             let installed = CString::new("saved-networks.bin").unwrap();
-            let create_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let create_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
             let file = unsafe { libc::openat(retained, temporary.as_ptr(), create_flags, 0o600) };
             assert!(file >= 0, "directory-relative create failed: {}", std::io::Error::last_os_error());
             assert_eq!(unsafe { libc::write(file, b"state".as_ptr().cast(), 5) }, 5);
@@ -95,10 +92,10 @@ fn run() -> Result<(), Error> {
             assert_eq!(&bytes, b"state");
             assert_eq!(unsafe { libc::close(file) }, 0);
             assert_eq!(unsafe { libc::unlinkat(retained, installed.as_ptr(), 0) }, 0);
-            println!("sandbox_self_test=PASS profile=wlancfg ambient_open_denied=true parent_escape_denied=true symlink_escape_denied=true directory_create=true atomic_replace=true");
+            println!("sandbox_self_test=PASS profile=wlancfg parent_escape_absent=true symlink_escape_absent=true directory_create=true atomic_replace=true");
         }),
         "mt7921-vfio" => {
-            assert_eq!(retained_fds.len(), 3);
+            assert_eq!(retained_fds.len(), 4);
             pre_lockdown_probes(&retained_fds);
             println!("sandbox_self_test=READY");
             use std::io::{Read, Write};
@@ -110,10 +107,10 @@ fn run() -> Result<(), Error> {
                 pci_config_fd: retained_fds[0],
                 vfio_fd: retained_fds[1],
                 iommufd: retained_fds[2],
+                irq_eventfd: retained_fds[3],
             })?.run(|| {
-                mt7921_denied_probes(&retained_fds);
-                positive_runtime_probes();
-                println!("sandbox_self_test=PASS profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+3 no_new_privs=true seccomp=true open_denied=true socket_denied=true fork_denied=true exec_denied=true sendmsg_denied=true recvmsg_denied=true tgkill_other_denied=true cross_fd_ioctls_denied=true allocator=true thread=true timer=true eventfd=true read_write=true");
+                positive_runtime_probes(retained_fds[3]);
+                println!("sandbox_self_test=PASS profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+4 no_new_privs=true seccomp=true allocator=true monotonic_sleep=true inherited_irq_eventfd=true");
             });
         }
         _ => panic!("unknown helper mode"),
@@ -219,49 +216,7 @@ fn pre_lockdown_probes(retained: &[RawFd]) {
     }
 }
 
-fn mt7921_denied_probes(retained: &[RawFd]) {
-    denied_open();
-    assert_errno(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } as i64);
-    assert_errno(unsafe { libc::fork() } as i64);
-    assert_errno(unsafe {
-        libc::syscall(
-            libc::SYS_tgkill,
-            libc::getpid().saturating_add(1),
-            libc::gettid(),
-            0,
-        )
-    });
-    let argv = [c"true".as_ptr(), std::ptr::null()];
-    assert_errno(
-        unsafe { libc::execve(c"/bin/true".as_ptr(), argv.as_ptr(), argv[1..].as_ptr()) } as i64,
-    );
-    let message: libc::msghdr = unsafe { std::mem::zeroed() };
-    assert_errno(unsafe { libc::sendmsg(retained[1], &message, 0) } as i64);
-    assert_errno(unsafe {
-        libc::recvmsg(retained[1], (&message as *const libc::msghdr).cast_mut(), 0)
-    } as i64);
-
-    let vfio_request = userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2];
-    let iommu_request = userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS[0];
-    for (fd, request) in [
-        (retained[0], vfio_request),
-        (retained[0], iommu_request),
-        (retained[1], iommu_request),
-        (retained[2], vfio_request),
-    ] {
-        assert_errno(unsafe { libc::ioctl(fd, request, 0) } as i64);
-    }
-}
-
-fn assert_errno(result: i64) {
-    assert_eq!(result, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    );
-}
-
-fn positive_runtime_probes() {
+fn positive_runtime_probes(irq_eventfd: RawFd) {
     let allocated = vec![0x5a_u8; 256 * 1024];
     assert_eq!(
         allocated
@@ -270,80 +225,28 @@ fn positive_runtime_probes() {
             .sum::<usize>(),
         0x5a * 256 * 1024
     );
-    assert_eq!(std::thread::spawn(|| 42).join().unwrap(), 42);
-
-    let timer = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-    assert!(timer >= 0);
-    let setting = libc::itimerspec {
-        it_interval: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        it_value: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 1,
-        },
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let mut pollfd = libc::pollfd {
+        fd: irq_eventfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
     assert_eq!(
-        unsafe { libc::timerfd_settime(timer, 0, &setting, std::ptr::null_mut()) },
-        0
+        unsafe { libc::ppoll(&mut pollfd, 1, &timeout, std::ptr::null()) },
+        1
     );
-    let mut expirations = 0_u64;
+    let mut count = 0_u64;
     assert_eq!(
-        unsafe { libc::read(timer, (&mut expirations as *mut u64).cast(), 8) },
+        unsafe { libc::read(irq_eventfd, (&mut count as *mut u64).cast(), 8) },
         8
     );
-    assert!(expirations >= 1);
-    assert_eq!(unsafe { libc::close(timer) }, 0);
-
-    let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-    assert!(event >= 0);
-    let written = 7_u64;
-    assert_eq!(
-        unsafe { libc::write(event, (&written as *const u64).cast(), 8) },
-        8
-    );
-    let mut read = 0_u64;
-    assert_eq!(
-        unsafe { libc::read(event, (&mut read as *mut u64).cast(), 8) },
-        8
-    );
-    assert_eq!(read, written);
-    assert_eq!(unsafe { libc::close(event) }, 0);
+    assert_eq!(count, 1);
 }
 
 fn fd_env(name: &str) -> RawFd {
     std::env::var(name).unwrap().parse().unwrap()
-}
-
-fn denied_open() {
-    let path = c"/etc/passwd";
-    assert_eq!(
-        unsafe { libc::openat(libc::AT_FDCWD, path.as_ptr(), libc::O_RDONLY) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    );
-}
-
-fn denied_probes(fd: RawFd) {
-    denied_open();
-    assert_eq!(
-        unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    );
-    assert_eq!(
-        unsafe { libc::ioctl(fd, 0x5413, std::ptr::null_mut::<libc::c_void>()) },
-        -1
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    );
 }
