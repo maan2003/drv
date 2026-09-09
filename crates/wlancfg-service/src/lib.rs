@@ -85,12 +85,39 @@ impl Drop for ClientInner {
 #[derive(Clone)]
 pub struct HostControlClient(Arc<ClientInner>);
 
-impl HostControlClient {
-    /// Takes ownership of an already-connected inherited AF_UNIX
-    /// SOCK_SEQPACKET endpoint and starts its bounded I/O owner.
+/// Setup-phase policy endpoint. Construction only validates and adopts the
+/// inherited descriptor; this type has no operation that can receive bytes.
+pub struct PreparedHostControlClient {
+    fd: OwnedFd,
+    generation: [u8; 16],
+}
+
+impl PreparedHostControlClient {
+    /// Takes ownership of and validates an already-connected inherited AF_UNIX
+    /// SOCK_SEQPACKET endpoint without starting I/O or creating a thread.
     pub fn from_inherited_socket(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
         validate_socket(&fd)?;
         set_nonblocking(&fd)?;
+
+        Ok(Self { fd, generation })
+    }
+
+    /// Starts the bounded I/O owner. Call only from the service's locked-down
+    /// run phase, after all setup-only namespace and privilege work completes.
+    pub fn start_after_lockdown(self) -> anyhow::Result<HostControlClient> {
+        HostControlClient::start(self.fd, self.generation)
+    }
+}
+
+impl HostControlClient {
+    /// Convenience constructor for already-confined callers and tests.
+    /// Service startup should use [`PreparedHostControlClient`] so the type
+    /// boundary preserves the no-receive-before-lockdown invariant.
+    pub fn from_inherited_socket(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
+        PreparedHostControlClient::from_inherited_socket(fd, generation)?.start_after_lockdown()
+    }
+
+    fn start(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
 
         let (wake_read, wake_write) = pipe()?;
         let (command_tx, command_rx) = sync_mpsc::sync_channel(QUEUE_PACKETS);
@@ -537,6 +564,24 @@ mod tests {
         let size = unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) };
         assert!(size > 0, "recv: {}", io::Error::last_os_error());
         wire::decode(&bytes[..size as usize]).unwrap()
+    }
+
+    #[test]
+    fn prepared_client_leaves_inbound_bytes_queued_until_started() {
+        let (client_fd, server_fd) = sockets();
+        let prepared =
+            PreparedHostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
+        assert_eq!(
+            unsafe { libc::send(server_fd.as_raw_fd(), b"bad".as_ptr().cast(), 3, 0) },
+            3
+        );
+        // A setup-phase prepared endpoint has no worker and cannot consume the
+        // queued untrusted packet. Starting the owner later observes it and
+        // terminates the generation.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let client = prepared.start_after_lockdown().unwrap();
+        let mut liveness = client.take_event_stream();
+        assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
     }
 
     fn send_packet(fd: RawFd, sequence: u64, message: Message, rights: &[RawFd]) {
