@@ -17,6 +17,7 @@ CYCLES=${REDWOOD_FAST_CYCLES:-2}
 STOP_AFTER=${REDWOOD_STOP_AFTER:-core}
 MANUAL_RECOVERY=${REDWOOD_MANUAL_RECOVERY:-0}
 POST_READY_QUIET_DRAIN=${REDWOOD_POST_READY_QUIET_DRAIN:-0}
+DMA_TRACE=${REDWOOD_DMA_TRACE:-0}
 
 mkdir -p "$RUN"
 exec >>"$RUN/fast-cycle.log" 2>&1
@@ -37,6 +38,10 @@ esac
 case "$POST_READY_QUIET_DRAIN" in
   0|1) ;;
   *) echo "unsupported REDWOOD_POST_READY_QUIET_DRAIN=$POST_READY_QUIET_DRAIN"; exit 2 ;;
+esac
+case "$DMA_TRACE" in
+  0|1) ;;
+  *) echo "unsupported REDWOOD_DMA_TRACE=$DMA_TRACE"; exit 2 ;;
 esac
 
 # Keep USB control reachable after the clean final cycle leaves this candidate
@@ -135,6 +140,10 @@ while test "$i" -le "$CYCLES"; do
   if test "$POST_READY_QUIET_DRAIN" = 1; then
     post_ready_arg=--post-ready-quiet-drain
   fi
+  dma_trace_arg=
+  if test "$DMA_TRACE" = 1; then
+    dma_trace_arg=--dma-trace
+  fi
   "$RUNNER" preflight --vfio-device "$cdev" $manual_arg $post_ready_arg >"$RUN/preflight-$i.log" 2>&1
   if test "$MANUAL_RECOVERY" = 0; then
     touch /run/redwood-lab-watchdog/run
@@ -146,7 +155,7 @@ while test "$i" -le "$CYCLES"; do
   set +e
   "$RUNNER" --vfio-device "$cdev" --containment remoteproc:remoteproc2 \
     --stop-remoteproc-on-exit --register-region 1 --stop-after "$STOP_AFTER" \
-    --wmi-log "$RUN/runB-$i.wmi.jsonl" $manual_arg $post_ready_arg >"$RUN/runB-$i.log" 2>&1
+    --wmi-log "$RUN/runB-$i.wmi.jsonl" $manual_arg $post_ready_arg $dma_trace_arg >"$RUN/runB-$i.log" 2>&1
   rc=$?
   set -e
   record_flight_state

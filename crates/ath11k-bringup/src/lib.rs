@@ -98,6 +98,7 @@ pub struct Cli {
     pub stop_remoteproc_on_exit: bool,
     pub manual_recovery: bool,
     pub post_ready_quiet_drain: bool,
+    pub dma_trace: bool,
 }
 
 impl Default for Cli {
@@ -117,6 +118,7 @@ impl Default for Cli {
             stop_remoteproc_on_exit: false,
             manual_recovery: false,
             post_ready_quiet_drain: false,
+            dma_trace: false,
         }
     }
 }
@@ -174,6 +176,7 @@ impl Cli {
                 "--stop-remoteproc-on-exit" => cli.stop_remoteproc_on_exit = true,
                 "--manual-recovery" => cli.manual_recovery = true,
                 "--post-ready-quiet-drain" => cli.post_ready_quiet_drain = true,
+                "--dma-trace" => cli.dma_trace = true,
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -207,7 +210,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--manual-recovery] [--post-ready-quiet-drain] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-exit] [--manual-recovery] [--post-ready-quiet-drain] [--dma-trace] [--broker]"
 }
 
 #[derive(Debug)]
@@ -1159,7 +1162,7 @@ where
 
 impl Host for RealHost {
     fn resources(&mut self, config: &Cli) -> Result<(), Error> {
-        let vfio = if config.broker {
+        let mut vfio = if config.broker {
             LinuxVfio::open_broker(config.vfio_device.as_ref().ok_or(Error::Unsupported(
                 "real mode requires an explicit VFIO cdev path",
             ))?)
@@ -1176,6 +1179,9 @@ impl Host for RealHost {
                 diagnose_iommufd_open(&error)
             })
         })?;
+        if config.dma_trace {
+            vfio.enable_dma_trace();
+        }
         let resources = vfio
             .inspect_wcn6750_resources()
             .map_err(|error| Error::Hardware(format!("inspect WCN6750 VFIO resources: {error}")))?;

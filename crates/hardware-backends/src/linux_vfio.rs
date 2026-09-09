@@ -337,6 +337,7 @@ pub struct LinuxVfio {
     quarantined_dmas: HashMap<u64, Dma>,
     interrupts: HashMap<u64, (u32, VfioIrq)>,
     ambiguous_irq_indices: HashSet<u32>,
+    dma_trace: bool,
     prepared_irq: Option<OwnedFd>,
 }
 
@@ -392,6 +393,12 @@ impl LinuxVfio {
         &self,
     ) -> std::result::Result<userspace_vfio::PlatformDeviceInfo, LinuxVfioError> {
         userspace_vfio::validate_wcn6750_platform_cdev(&self.device).map_err(LinuxVfioError::Setup)
+    }
+
+    /// Emit successful IOAS map/unmap facts to stderr for attended hardware
+    /// diagnosis. Disabled by default so production users do not expose IOVAs.
+    pub fn enable_dma_trace(&mut self) {
+        self.dma_trace = true;
     }
 
     /// Query one enumerated region while preserving the ioctl's exact error.
@@ -561,6 +568,7 @@ impl LinuxVfio {
             quarantined_dmas: HashMap::new(),
             interrupts: HashMap::new(),
             ambiguous_irq_indices: HashSet::new(),
+            dma_trace: false,
             prepared_irq,
         }
     }
@@ -586,6 +594,13 @@ impl LinuxVfio {
         match &mut dma.memory {
             DmaMemory::Ioas(mapping) => {
                 mapping.teardown().map_err(|_| Error::DeviceFault)?;
+                if self.dma_trace {
+                    eprintln!(
+                        "vfio_dma_unmap iova={:#x} mapped_len={:#x}",
+                        dma.iova,
+                        mapping.len()
+                    );
+                }
             }
             DmaMemory::BrokerCoherent(mapping) => {
                 // FREE is required to fail while the shared mapping exists.
@@ -916,6 +931,19 @@ impl Backend for LinuxVfio {
             }
         };
         self.dmas.insert(id, dma);
+        if self.dma_trace
+            && let Some(dma) = self.dmas.get(&id)
+            && let DmaMemory::Ioas(mapping) = &dma.memory
+        {
+            eprintln!(
+                "vfio_dma_map id={id} ioas={} iova={:#x} logical_len={:#x} mapped_len={:#x} direction={:?}",
+                self.ioas.as_ref().map_or(0, Ioas::id),
+                dma.iova,
+                dma.len,
+                mapping.len(),
+                dma.direction
+            );
+        }
         Ok(id)
     }
 
