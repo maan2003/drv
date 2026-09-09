@@ -95,10 +95,15 @@ sleep 125
 test "$(systemctl show -P LoadState boot-watchdog.service)" = masked
 ```
 
-After stdin-only unlock returns, require `7.2.0+ #9`, a 16-byte Wi-Fi `reg`,
-and the hop-1 live-FDT digest from the validated last-tested manifest.
-Then force the legacy loader for hop 2, this time passing the candidate DTB,
-and again use the orderly PID-1 path:
+After stdin-only unlock returns, require `7.2.0+ #9` and a 16-byte Wi-Fi
+`reg`. A whole-blob live-FDT digest is not by itself a topology identity:
+`/chosen/bootargs` contains the required manual-recovery masks and
+bootloader-supplied values can change across cold boots. Decode the live FDT
+and the manifested candidate with `dtc`; require their complete topology to
+be identical except for `/chosen/bootargs` and the expected Wi-Fi `reg`
+widening below. Validate the command line separately by its staged SHA-256 and
+require both watchdog-mask tokens. Then force the legacy loader for hop 2,
+this time passing the candidate DTB, and again use the orderly PID-1 path:
 
 ```sh
 LAB=/var/lib/ath11k-redwood-lab
@@ -109,8 +114,6 @@ test "$(systemctl is-system-running)" = running
 test -z "$(systemctl --failed --no-legend --plain --no-pager | \
   awk '$1 ~ /\.(service|path)$/ { print $1 }')"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
-test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
-  62c375d195061179d75f5d2a022c062d228d575c352858f0e8cc0bd36ca9d74a
 kexec -u || true
 kexec -c -l "$LAB/stage3/Image" \
   --initrd="$LAB/stage7/initrd-watchdog" \
@@ -141,9 +144,10 @@ test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
   23245887d50adaaa02586778567444ad24c111d6314ce0782324aa1949671b4f
 ```
 
-The `reg` dump must end `61 e0 00 00 ... 00 20 00 00`. These live-FDT hashes
-and size identify the last-tested artifact set; they are not eternal
-compatibility constants. Before either hop, stage the checked-in payload under
+The `reg` dump must end `61 e0 00 00 ... 00 20 00 00`. The candidate
+live-FDT hash and size identify the last-tested hop-2 artifact; a hop-1
+whole-blob hash is provenance rather than a topology gate. Before either hop,
+stage the checked-in payload under
 its executable name, then generate and verify a per-stage SHA-256 manifest with
 absolute staged paths. The payload verifies this exact file and copies it into
 the durable run directory before device mutation:

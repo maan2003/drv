@@ -218,6 +218,13 @@ fn management_rx_status_accepted(status: u32) -> bool {
     status & MGMT_RX_STATUS_ERROR_MASK == 0
 }
 
+fn wcn6750_event_pdev_is_primary(pdev_id: u32) -> bool {
+    // Pinned DP_HW2SW_MACID maps both the SoC ID (0) and first hardware
+    // radio ID (1) to the single host pdev. Physical WCN6750 management RX
+    // events use the latter.
+    pdev_id <= 1
+}
+
 pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart {
     use ath11k_wmi::cmd::{ScanControlFlags, ScanEventFlags, ScanStart};
     ScanStart {
@@ -765,7 +772,7 @@ where
                     let received = Decoder::<MgmtRx>::new(id)
                         .decode(event)
                         .map_err(|_| CoreError::Protocol)?;
-                    if received.pdev_id != 0 {
+                    if !wcn6750_event_pdev_is_primary(received.pdev_id) {
                         continue;
                     }
                     // Match the pinned C receive path's CRC, decrypt, and key
@@ -780,7 +787,7 @@ where
                     let completion = Decoder::<MgmtTxCompletion>::new(id)
                         .decode(event)
                         .map_err(|_| CoreError::Protocol)?;
-                    if completion.pdev_id != 0 {
+                    if !wcn6750_event_pdev_is_primary(completion.pdev_id) {
                         continue;
                     }
                     let Some(index) = self
@@ -1504,5 +1511,12 @@ mod tests {
         for status in [0x01, 0x08, 0x10, 0x20, 0x29] {
             assert!(!management_rx_status_accepted(status));
         }
+    }
+
+    #[test]
+    fn wcn6750_event_pdev_maps_soc_and_first_hardware_radio() {
+        assert!(wcn6750_event_pdev_is_primary(0));
+        assert!(wcn6750_event_pdev_is_primary(1));
+        assert!(!wcn6750_event_pdev_is_primary(2));
     }
 }

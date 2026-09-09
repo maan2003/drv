@@ -4,13 +4,14 @@
 
 Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
 association, DHCP, and proved Internet connectivity before production
-hardening. Physical bring-up now completes QMI and the full core lifecycle,
-including client-vdev creation, and firmware accepts a passive-scan command.
-Two same-kernel core cycles proved the normal cleanup path described below in
-about 120.3 seconds each. A subsequent scan-result collection attempt lost the
-candidate before producing a result and recovered through the armed fallback,
-so observed BSS results are not yet proved. Cleanup proof applies through the
-successful core/passive-scan terminal paths, not arbitrary later DMA states.
+hardening. Physical bring-up now completes QMI, the full core lifecycle,
+passive scanning, and scan-result collection. A bounded physical run delivered
+management frames and four BSS summaries across channels 1, 6, and 11. The
+same run proved normal scan-result cleanup with WPSS stopped before VFIO
+release and no SMMU or WPSS fault. Association is not yet proved: observed
+BSSes require RSN, while the ath11k SoftMAC adapter still blocks key
+installation until the device's REO packet-number replay and peer
+security-index effects are ported.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
