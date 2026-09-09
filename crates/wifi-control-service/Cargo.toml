@@ -9,13 +9,13 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
-fidl-fuchsia-wlan-sme = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.sme" }
-fidl-fuchsia-wlan-ieee80211 = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 futures = "=0.3.32"
 libc = "=0.2.189"
 wlan-control-wire = { path = "../wlan-control-wire" }
 wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
 
 [dev-dependencies]
-fidl-fuchsia-wlan-common = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.common" }
-fidl-fuchsia-wlan-internal = { path = "../netstack3-port-spike/upstream-cargo/sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
