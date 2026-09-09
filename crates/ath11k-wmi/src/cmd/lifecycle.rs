@@ -59,6 +59,17 @@ impl<T: Transport> Wmi<T> {
         self.events.wait_for_unified_ready(deadline_ns)
     }
 
+    pub fn discard_regulatory_update(&mut self) {
+        self.events.discard_regulatory_update();
+    }
+
+    pub fn wait_for_regulatory_update(
+        &mut self,
+        deadline_ns: u64,
+    ) -> Result<crate::event::RegulatoryChannelList, WmiError> {
+        self.events.wait_for_regulatory_update(deadline_ns)
+    }
+
     pub fn wait_for_vdev_start(
         &mut self,
         deadline_ns: u64,
@@ -213,6 +224,23 @@ mod tests {
         Event::from_tlvs(crate::tags::WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID, tlvs).unwrap()
     }
 
+    fn regulatory_update() -> Event {
+        let mut fixed = alloc::vec![0; 56];
+        fixed[48..52].copy_from_slice(&1u32.to_le_bytes());
+        let mut tlvs = Vec::new();
+        tlvs.extend_from_slice(
+            &((u32::from(crate::tags::WMI_TAG_REG_CHAN_LIST_CC_EVENT.0) << 16)
+                | fixed.len() as u32)
+                .to_le_bytes(),
+        );
+        tlvs.extend_from_slice(&fixed);
+        tlvs.extend_from_slice(
+            &((u32::from(crate::tags::WMI_TAG_ARRAY_STRUCT.0) << 16) | 16).to_le_bytes(),
+        );
+        tlvs.extend_from_slice(&[0; 16]);
+        Event::from_tlvs(crate::tags::WMI_REG_CHAN_LIST_CC_EVENTID, tlvs).unwrap()
+    }
+
     #[test]
     fn vdev_start_wait_correlates_id_and_retains_earlier_events() {
         let unrelated = Event::from_tlvs(crate::EventId(0x123), Vec::new()).unwrap();
@@ -254,5 +282,23 @@ mod tests {
         let response = wmi.wait_for_key_installed(10, 1, 1).unwrap();
         assert_eq!((response.key_index, response.status), (1, 7));
         assert_eq!(wmi.next_event(10), Ok(Some(other)));
+    }
+
+    #[test]
+    fn new_country_discards_the_pre_ready_regulatory_event() {
+        let stale = regulatory_update();
+        let fresh = regulatory_update();
+        let unrelated = Event::from_tlvs(crate::EventId(0x123), Vec::new()).unwrap();
+        let mut wmi = Wmi::attach(MockTransport {
+            commands: Vec::new(),
+            incoming: VecDeque::from([stale, unrelated.clone()]),
+        });
+        assert_eq!(wmi.wait_for_vdev_start(10, 1), Err(WmiError::Timeout));
+        wmi.discard_regulatory_update();
+        wmi.events.transport_mut().incoming.push_back(fresh);
+        let update = wmi.wait_for_regulatory_update(10).unwrap();
+        assert!(!update.extended);
+        assert_eq!(update.rules.len(), 1);
+        assert_eq!(wmi.next_event(10), Ok(Some(unrelated)));
     }
 }

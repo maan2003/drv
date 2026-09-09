@@ -28,9 +28,10 @@ use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
         Channel as WmiChannel, HtcWmiTransport, Init, KeySeqCounter, MgmtSend, PeerAssoc,
-        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, StaPowerSaveMode,
-        StaPowerSaveParameter, TxRxStreams, VdevCreate, VdevDelete, VdevDown, VdevInstallKey,
-        VdevSetParam, VdevStart, VdevStop, VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
+        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, ScanChannel,
+        ScanChannelList, SetCurrentCountry, StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams,
+        VdevCreate, VdevDelete, VdevDown, VdevInstallKey, VdevSetParam, VdevStart, VdevStop,
+        VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
     },
 };
 
@@ -265,6 +266,29 @@ pub fn wcn6750_scan_start(scan: crate::ScanConfig) -> ath11k_wmi::cmd::ScanStart
         extra_ie: Vec::new(),
         short_ssid_hints: Vec::new(),
         bssid_hints: Vec::new(),
+    }
+}
+
+fn wcn6750_scan_channel(channel: crate::RegulatoryChannel) -> ScanChannel {
+    let half_dbm = |value: i8| value.max(0).saturating_mul(2) as u8;
+    ScanChannel {
+        mhz: u32::from(channel.frequency_mhz),
+        center_freq1: u32::from(channel.frequency_mhz),
+        center_freq2: 0,
+        passive: channel.passive,
+        allow_ht: channel.allow_ht,
+        allow_vht: channel.allow_vht,
+        allow_he: channel.allow_he,
+        half_rate: false,
+        quarter_rate: false,
+        psc: false,
+        dfs: channel.radar,
+        phy_mode: if channel.frequency_mhz < 3_000 { 1 } else { 0 },
+        min_power: 0,
+        max_power: half_dbm(channel.max_power_dbm),
+        max_reg_power: half_dbm(channel.max_reg_power_dbm),
+        antenna_max: half_dbm(channel.max_antenna_gain_dbi),
+        reg_class_id: 0,
     }
 }
 
@@ -956,6 +980,26 @@ where
                     band_5ghz: TxRxStreams { tx: nss, rx: nss },
                 })
             }
+            Operation::WmiSetCurrentCountry { alpha2 } => {
+                Self::protocol(self.wmi.as_mut())?.discard_regulatory_update();
+                self.wmi_send(&SetCurrentCountry {
+                    pdev_id: 0,
+                    alpha2: [alpha2[0], alpha2[1], 0],
+                })
+            }
+            Operation::WmiScanChannelList { pdev, channels } => self.wmi_send(&ScanChannelList {
+                pdev_id: u32::from(pdev.0),
+                append: false,
+                channels: channels.into_iter().map(wcn6750_scan_channel).collect(),
+            }),
+            Operation::WaitRegulatoryUpdate { pdev } if pdev.0 == 0 => {
+                self.pump()?;
+                let deadline = (self.deadline)();
+                Self::protocol(self.wmi.as_mut())?
+                    .wait_for_regulatory_update(deadline)
+                    .map(|_| ())
+                    .map_err(|_| CoreError::Protocol)
+            }
             Operation::WmiVdevSetNss { vdev, nss } => self.wmi_send(&VdevSetParam {
                 vdev_id: u32::from(vdev.0),
                 param_id: 0x22,
@@ -1383,6 +1427,32 @@ mod tests {
         assert!(command.control_flags.channel_stat_event);
         assert!(command.control_flags.filter_probe_request);
         assert!(!command.control_flags.strict_passive);
+    }
+
+    #[test]
+    fn regulatory_channel_uses_linux_half_dbm_power_and_capability_bits() {
+        let command = wcn6750_scan_channel(crate::RegulatoryChannel {
+            frequency_mhz: 2412,
+            max_power_dbm: 23,
+            max_reg_power_dbm: 20,
+            max_antenna_gain_dbi: 6,
+            passive: true,
+            radar: false,
+            allow_ht: true,
+            allow_vht: false,
+            allow_he: true,
+        });
+        assert_eq!((command.mhz, command.center_freq1), (2412, 2412));
+        assert_eq!(command.phy_mode, 1);
+        assert!(command.passive && command.allow_ht && command.allow_he);
+        assert_eq!(
+            (
+                command.max_power,
+                command.max_reg_power,
+                command.antenna_max
+            ),
+            (46, 40, 12)
+        );
     }
 
     struct DummyQmi;

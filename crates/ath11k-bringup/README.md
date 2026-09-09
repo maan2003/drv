@@ -30,6 +30,21 @@ test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
 test ! -e /run/redwood-lab-watchdog/armed
 ```
 
+For an operator-attended manual-recovery run, do not use the canonical staged
+command line unchanged. The staged watchdog initrd enables
+`boot-watchdog.service`, whose 120-second initrd deadline kexecs the rescue
+kernel unless switch-root has completed, and it also enables the normally
+disarmed `redwood-lab-watchdog.service`. Create and manifest a distinct,
+single-line command-line input which appends both initrd-only masks:
+
+```sh
+rd.systemd.mask=boot-watchdog.service \
+rd.systemd.mask=redwood-lab-watchdog.service
+```
+
+Use that exact input for **both** hops. Merely observing no armed lab-watchdog
+marker does not disable the boot watchdog.
+
 The first line must identify flashed `7.2.0 #1`. Unlock only by streaming the
 protected key from np to the phone process's stdin. Resolve the phone's trusted
 `systemd-cryptsetup` path first, substitute it for `SYSTEMD_CRYPTSETUP`, and do
@@ -57,16 +72,31 @@ succeeds on flashed `#1`. Then load hop 1 through
 ```sh
 LAB=/var/lib/ath11k-redwood-lab
 kexec -u || true
-kexec -l "$LAB/stage3/Image" \
+kexec -s -l "$LAB/stage3/Image" \
   --initrd="$LAB/stage7/initrd-watchdog" \
-  --command-line="$(cat "$LAB/stage7/kexec-transaction/command-line")"
+  --command-line="$(cat "$LAB/stage12/kexec-command-line-manual-no-reboot")"
 sync
 systemd-inhibit --what=sleep --mode=block --why='Redwood orderly kexec hop 1' \
   systemctl kexec
 ```
 
-After USB and stdin-only unlock return, require `7.2.0+ #9`, a 16-byte Wi-Fi
-`reg`, and the hop-1 live-FDT digest from the validated last-tested manifest.
+Before unlocking, verify the masks in the initrd manager and keep the initrd
+reachable past the former 120-second deadline:
+
+```sh
+grep -qw 'rd.systemd.mask=boot-watchdog.service' /proc/cmdline
+grep -qw 'rd.systemd.mask=redwood-lab-watchdog.service' /proc/cmdline
+test "$(systemctl show -P LoadState boot-watchdog.service)" = masked
+test "$(systemctl show -P ActiveState boot-watchdog.service)" = inactive
+test "$(systemctl show -P LoadState redwood-lab-watchdog.service)" = masked
+test "$(systemctl show -P ActiveState redwood-lab-watchdog.service)" = inactive
+test ! -e /run/redwood-lab-watchdog/armed
+sleep 125
+test "$(systemctl show -P LoadState boot-watchdog.service)" = masked
+```
+
+After stdin-only unlock returns, require `7.2.0+ #9`, a 16-byte Wi-Fi `reg`,
+and the hop-1 live-FDT digest from the validated last-tested manifest.
 Then force the legacy loader for hop 2, this time passing the candidate DTB,
 and again use the orderly PID-1 path:
 
@@ -80,21 +110,25 @@ test -z "$(systemctl --failed --no-legend --plain --no-pager | \
   awk '$1 ~ /\.(service|path)$/ { print $1 }')"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
 test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
-  d97685d12ed5033abeeec478e9ed5a409e327a86f0384305de0d275062815f35
+  62c375d195061179d75f5d2a022c062d228d575c352858f0e8cc0bd36ca9d74a
 kexec -u || true
 kexec -c -l "$LAB/stage3/Image" \
   --initrd="$LAB/stage7/initrd-watchdog" \
   --dtb="$LAB/stage10/runB-region1.fdt" \
-  --command-line="$(cat "$LAB/stage7/kexec-transaction/command-line")"
+  --command-line="$(cat "$LAB/stage12/kexec-command-line-manual-no-reboot")"
 sync
 systemd-inhibit --what=sleep --mode=block --why='Redwood orderly kexec hop 2' \
   systemctl kexec
 ```
 
-Unlock once more, then require the last-tested candidate state explicitly:
+Repeat the initrd mask checks and 125-second dwell before unlocking once more,
+then require the last-tested candidate state explicitly:
 
 ```sh
 cat /proc/version                         # must identify 7.2.0+ #9
+grep -qw 'rd.systemd.mask=boot-watchdog.service' /proc/cmdline
+grep -qw 'rd.systemd.mask=redwood-lab-watchdog.service' /proc/cmdline
+test ! -e /run/redwood-lab-watchdog/armed
 systemctl reset-failed unl0kr-agent.path unl0kr-agent.service \
   unl0kr.service unl0kr-stop.service nftables.service 2>/dev/null || true
 test "$(systemctl is-system-running)" = running
@@ -102,9 +136,9 @@ test -z "$(systemctl --failed --no-legend --plain --no-pager | \
   awk '$1 ~ /\.(service|path)$/ { print $1 }')"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 od -An -tx1 -v /proc/device-tree/soc@0/wifi@17a10040/reg
-test "$(wc -c </sys/firmware/fdt)" = 146776
+test "$(wc -c </sys/firmware/fdt)" = 146860
 test "$(sha256sum /sys/firmware/fdt | cut -d' ' -f1)" = \
-  99b5b3161106ac79a06f252607598e1de995610b72095044ff914f9f99365cfb
+  23245887d50adaaa02586778567444ad24c111d6314ce0782324aa1949671b4f
 ```
 
 The `reg` dump must end `61 e0 00 00 ... 00 20 00 00`. These live-FDT hashes
@@ -130,6 +164,7 @@ sha256sum \
   "$LAB/stage7/initrd-watchdog" \
   "$LAB/stage10/runB-region1.fdt" \
   "$LAB/stage7/kexec-transaction/command-line" \
+  "$LAB/stage12/kexec-command-line-manual-no-reboot" \
   "$LAB/stage7/modules/vfio-platform-base.ko" \
   "$LAB/stage7/modules/vfio-platform.ko" \
   "$LAB/stage10/redwood-wifi-transaction" \

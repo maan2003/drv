@@ -4,11 +4,12 @@ use alloc::vec::Vec;
 
 use crate::tags::{
     WMI_PEER_ASSOC_CONF_EVENTID, WMI_PEER_CREATE_CONF_EVENTID, WMI_PEER_DELETE_RESP_EVENTID,
-    WMI_READY_EVENTID, WMI_SERVICE_AVAILABLE_EVENTID, WMI_SERVICE_READY_EVENTID,
-    WMI_SERVICE_READY_EXT_EVENTID, WMI_SERVICE_READY_EXT2_EVENTID, WMI_TAG_ARRAY_STRUCT,
-    WMI_TAG_ARRAY_UINT32, WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT,
-    WMI_TAG_HW_MODE_CAPABILITIES, WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT,
-    WMI_TAG_SERVICE_READY_EVENT, WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
+    WMI_READY_EVENTID, WMI_REG_CHAN_LIST_CC_EVENTID, WMI_REG_CHAN_LIST_CC_EXT_EVENTID,
+    WMI_SERVICE_AVAILABLE_EVENTID, WMI_SERVICE_READY_EVENTID, WMI_SERVICE_READY_EXT_EVENTID,
+    WMI_SERVICE_READY_EXT2_EVENTID, WMI_TAG_ARRAY_STRUCT, WMI_TAG_ARRAY_UINT32,
+    WMI_TAG_DMA_RING_CAPABILITIES, WMI_TAG_HAL_REG_CAPABILITIES_EXT, WMI_TAG_HW_MODE_CAPABILITIES,
+    WMI_TAG_MAC_PHY_CAPABILITIES, WMI_TAG_SERVICE_AVAILABLE_EVENT, WMI_TAG_SERVICE_READY_EVENT,
+    WMI_TAG_SERVICE_READY_EXT_EVENT, WMI_TAG_SOC_HAL_REG_CAPABILITIES,
     WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS, WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID,
     WMI_VDEV_START_RESP_EVENTID,
 };
@@ -17,7 +18,8 @@ use crate::{Event, Transport, WmiError};
 
 use super::{
     Decoder, EventDecoder, InstallKeyCompletion, PeerAssocConfirmation, PeerCreateConfirmation,
-    PeerDeleteResponse, Ready, ReadyDecoder, TlvIter, VdevStartResponse, WireEvent, word,
+    PeerDeleteResponse, Ready, ReadyDecoder, RegulatoryChannelList, RegulatoryChannelListExtended,
+    RegulatoryChannelListLegacy, TlvIter, VdevStartResponse, WireEvent, word,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -456,6 +458,43 @@ pub struct EventStream<T> {
 }
 
 impl<T: Transport> EventStream<T> {
+    pub fn discard_regulatory_update(&mut self) {
+        self.pending.retain(|event| {
+            event.id != WMI_REG_CHAN_LIST_CC_EVENTID && event.id != WMI_REG_CHAN_LIST_CC_EXT_EVENTID
+        });
+    }
+
+    pub fn wait_for_regulatory_update(
+        &mut self,
+        deadline_ns: u64,
+    ) -> Result<RegulatoryChannelList, WmiError> {
+        loop {
+            let event = if let Some(index) = self.pending.iter().position(|event| {
+                event.id == WMI_REG_CHAN_LIST_CC_EVENTID
+                    || event.id == WMI_REG_CHAN_LIST_CC_EXT_EVENTID
+            }) {
+                self.pending.remove(index)
+            } else {
+                self.transport
+                    .receive(deadline_ns)?
+                    .ok_or(WmiError::Timeout)?
+            };
+            match event.id {
+                WMI_REG_CHAN_LIST_CC_EVENTID => {
+                    return Decoder::<RegulatoryChannelListLegacy>::new(event.id)
+                        .decode(event)
+                        .map(|event| event.0);
+                }
+                WMI_REG_CHAN_LIST_CC_EXT_EVENTID => {
+                    return Decoder::<RegulatoryChannelListExtended>::new(event.id)
+                        .decode(event)
+                        .map(|event| event.0);
+                }
+                _ => self.pending.push(event),
+            }
+        }
+    }
+
     fn wait_for<TEvent, F>(
         &mut self,
         deadline_ns: u64,
