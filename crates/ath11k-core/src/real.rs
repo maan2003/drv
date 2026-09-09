@@ -762,12 +762,12 @@ where
 
     fn execute(&mut self, operation: Operation) -> Result<(), CoreError> {
         match operation {
-            Operation::QmiInitService => self.qmi.init_service().map_err(|_| CoreError::Protocol),
+            Operation::QmiInitService => self.qmi.init_service().map_err(CoreError::Qmi),
             Operation::QmiFirmwareStart => self
                 .qmi
                 .firmware_start(&Self::qmi_config(), 0, false)
-                .map_err(|_| CoreError::Protocol),
-            Operation::QmiFirmwareStop => self.qmi.firmware_stop().map_err(|_| CoreError::Protocol),
+                .map_err(CoreError::Qmi),
+            Operation::QmiFirmwareStop => self.qmi.firmware_stop().map_err(CoreError::Qmi),
             Operation::QmiDeinitService => {
                 self.qmi.deinit_service();
                 Ok(())

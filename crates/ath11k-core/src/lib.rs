@@ -44,6 +44,7 @@ pub struct PdevId(pub u8);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreError {
     WrongState,
+    Qmi(ath11k_qmi::QmiError),
     Protocol,
     DeviceFault,
     NoResources,

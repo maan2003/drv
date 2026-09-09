@@ -30,6 +30,7 @@ fn status(error: ath11k_core::CoreError) -> zx::Status {
         ath11k_core::CoreError::WrongState => zx::Status::BAD_STATE,
         ath11k_core::CoreError::NoResources => zx::Status::NO_RESOURCES,
         ath11k_core::CoreError::NotFound => zx::Status::NOT_FOUND,
+        ath11k_core::CoreError::Qmi(_) => zx::Status::IO,
         ath11k_core::CoreError::Protocol => zx::Status::IO_INVALID,
         ath11k_core::CoreError::DeviceFault => zx::Status::IO,
     }
