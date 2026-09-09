@@ -500,7 +500,9 @@ where
         match Self::protocol(self.wmi.as_mut())?.send(request) {
             Ok(()) => Ok(()),
             Err(WmiError::NoCredits) => {
-                self.pump()?;
+                if self.pump_bounded(1)? == 0 {
+                    return Err(CoreError::Protocol);
+                }
                 Self::protocol(self.wmi.as_mut())?
                     .send(request)
                     .map_err(|_| CoreError::Protocol)
@@ -893,31 +895,31 @@ where
                     bands: Vec::new(),
                 })
             }
-            Operation::WmiWaitUnifiedReady => {
-                self.pump()?;
-                Self::protocol(self.wmi.as_mut())?
-                    .wait_for_unified_ready((self.deadline)())
-                    .map(|_| ())
-                    .map_err(|_| CoreError::Protocol)
-            }
+            Operation::WmiWaitUnifiedReady => loop {
+                match Self::protocol(self.wmi.as_mut())?.wait_for_unified_ready((self.deadline)()) {
+                    Ok(_) => break Ok(()),
+                    Err(WmiError::Timeout) if self.pump_bounded(1)? != 0 => {}
+                    Err(_) => break Err(CoreError::Protocol),
+                }
+            },
             Operation::DpHttVersionRequest => {
                 Self::protocol(self.htt.as_mut())?
                     .send(version_request())
                     .map_err(Self::dp_error)?;
-                self.pump()?;
-                let deadline = (self.deadline)();
                 loop {
-                    let message = Self::protocol(self.htt.as_mut())?
-                        .receive(deadline)
-                        .map_err(Self::dp_error)?
-                        .ok_or(CoreError::Protocol)?;
-                    if let HttEvent::VersionConfirm { major, .. } = message
-                        .decode()
+                    if let Some(message) = Self::protocol(self.htt.as_mut())?
+                        .receive(0)
                         .map_err(Self::dp_error)?
                     {
-                        return (major == TARGET_VERSION_MAJOR)
-                            .then_some(())
-                            .ok_or(CoreError::Protocol);
+                        if let HttEvent::VersionConfirm { major, .. } =
+                            message.decode().map_err(Self::dp_error)?
+                        {
+                            return (major == TARGET_VERSION_MAJOR)
+                                .then_some(())
+                                .ok_or(CoreError::Protocol);
+                        }
+                    } else if self.pump_bounded(1)? == 0 {
+                        return Err(CoreError::Protocol);
                     }
                 }
             }

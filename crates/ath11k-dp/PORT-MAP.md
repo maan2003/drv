@@ -14,7 +14,7 @@ Pinned oracle: Linux `509ce3d952d550f93b544c8d94c99e798f09a9b4`.
 | `htt_t2h_peer_unmap_event` | `dp.h:1063-1074` | `htt::HttEvent` | ported | V1/V2 packed size checked. |
 | `htt_tx_wbm_completion` | `dp.h:304-322` | `htt::TxCompletion` | ported | WBM offset-8 overlay fixture and truncation test. |
 | `ath11k_dp_htt_connect` | `dp.c:942-967` | `ath11k_dp_htt_connect`, `transport::HttTransport` | ported | Binds the raw CE transport to `ServiceId::HTT_DATA_MSG`; wrong-service receive is rejected. |
-| Shared HTC router HTT adapter | — | `ath11k_dp_htt_connect_service`, `transport::HtcHttTransport` | local-seam | Adapts the endpoint-bound `HtcServiceTransport` used to share one HTC router with WMI; truncated HTT headers are rejected. |
+| Shared HTC router HTT adapter | — | `ath11k_dp_htt_connect_service`, `transport::HtcHttTransport` | local-seam | Adapts the endpoint-bound `HtcServiceTransport` used to share one HTC router with WMI; truncated HTT headers are rejected. Core pumps one routed frame at a time while awaiting the HTT version response, rather than waiting for a full quiet control deadline after the response is already queued. |
 | `ath11k_dp_tx_htt_h2t_ver_req_msg` | `dp_tx.c:995-1034` | `request_target_version` | ported | Sends request, waits to deadline, and rejects incompatible major. |
 | `ath11k_dp_tx_get_ring_id_type` | `dp_tx.c:810-875` | `htt::SrngRingType`, `htt::SrngRingId` | ported | Wire discriminants transcribed from `dp.h`. |
 | `ath11k_dp_tx_htt_srng_setup` | `dp_tx.c:877-993` | `send_srng_setup` | ported | Source-derived byte fixture. |
