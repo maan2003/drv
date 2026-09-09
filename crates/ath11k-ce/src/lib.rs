@@ -754,6 +754,7 @@ impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
         )
     }
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+        let mut deadline_expired = false;
         loop {
             for pipe in [1, 2, 5] {
                 if let Some(frame) = self.pipes.completed_recv_next(
@@ -768,9 +769,10 @@ impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
                     return Ok(Some(frame));
                 }
             }
-            if !self.waiter.wait_for_ce(deadline_ns)? {
+            if deadline_expired {
                 return Ok(None);
             }
+            deadline_expired = !self.waiter.wait_for_ce(deadline_ns)?;
         }
     }
 }
@@ -2711,7 +2713,9 @@ mod tests {
             wait_state.borrow_mut().dmas.get_mut(&4).unwrap()[..4].copy_from_slice(&[0, 0, 5, 0]);
             wait_state.borrow_mut().dmas.get_mut(&1).unwrap()[324..328]
                 .copy_from_slice(&4_u32.to_le_bytes());
-            Ok(true)
+            // Even when the wait expires, receive_htc must make one final
+            // completion pass before reporting a timeout.
+            Ok(false)
         };
         let mut packet_io = CePipesPacketIo::new_with_waiter(device, mmio, rdp, pipes, waiter);
         assert_eq!(

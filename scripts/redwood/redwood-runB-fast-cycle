@@ -26,13 +26,14 @@ test "$CYCLES" -ge 2
 # Keep USB control reachable after the clean final cycle leaves this candidate
 # idle. The active-run transaction's inhibitor ends with that transaction and
 # does not cover the retained same-kernel iteration window.
-if ! systemctl is-active --quiet ath11k-redwood-sleep-inhibit.service; then
-  systemctl reset-failed ath11k-redwood-sleep-inhibit.service 2>/dev/null || true
-  systemd-run --quiet --unit=ath11k-redwood-sleep-inhibit \
-    systemd-inhibit --what=sleep --who=ath11k-redwood-lab \
-      --why='retain USB control of inert candidate' --mode=block sleep infinity
+if ! systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service; then
+  systemctl reset-failed ath11k-redwood-sleep-inhibit-v2.service 2>/dev/null || true
+  systemd-run --quiet --unit=ath11k-redwood-sleep-inhibit-v2 \
+    /run/current-system/sw/bin/systemd-inhibit --what=sleep \
+      --who=ath11k-redwood-lab --why='retain USB control of inert candidate' \
+      --mode=block /run/current-system/sw/bin/sleep infinity
 fi
-systemctl is-active --quiet ath11k-redwood-sleep-inhibit.service
+systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
 
 "$LAB/watchdog-acceptance/redwood-lab-watchdog" arm "$RUN"
 systemd-run --quiet --unit=ath11k-fast-cycle-deadline --on-active=120s \
