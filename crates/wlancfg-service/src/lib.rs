@@ -70,7 +70,7 @@ enum Pending {
 
 struct ClientInner {
     commands: sync_mpsc::SyncSender<OwnerCommand>,
-    wake: OwnedFd,
+    wake: Arc<OwnedFd>,
     force_terminal: Arc<AtomicBool>,
     event_stream: Mutex<Option<mpsc::Receiver<anyhow::Result<()>>>>,
 }
@@ -121,23 +121,24 @@ impl HostControlClient {
 
     fn start(fd: OwnedFd, generation: [u8; 16]) -> anyhow::Result<Self> {
 
-        let (wake_read, wake_write) = wake_event()?;
+        let wake = wake_event()?;
         let (command_tx, command_rx) = sync_mpsc::sync_channel(QUEUE_PACKETS);
         // futures mpsc reserves one slot per sender in addition to this
         // buffer; there is exactly one owner-side sender.
         let (event_tx, event_rx) = mpsc::channel(QUEUE_PACKETS - 1);
         let force_terminal = Arc::new(AtomicBool::new(false));
         let owner_terminal = force_terminal.clone();
+        let owner_wake = wake.clone();
         thread::Builder::new()
             .name("wlancfg-control-io".into())
             .spawn(move || {
-                Owner::new(fd, wake_read, generation, command_rx, event_tx).run(owner_terminal)
+                Owner::new(fd, owner_wake, generation, command_rx, event_tx).run(owner_terminal)
             })
             .context("spawn WLAN control I/O owner")?;
 
         Ok(Self(Arc::new(ClientInner {
             commands: command_tx,
-            wake: wake_write,
+            wake,
             force_terminal,
             event_stream: Mutex::new(Some(event_rx)),
         })))
@@ -211,7 +212,7 @@ struct Outgoing {
 
 struct Owner {
     socket: OwnedFd,
-    wake: OwnedFd,
+    wake: Arc<OwnedFd>,
     generation: [u8; 16],
     validator: SessionValidator,
     next_sequence: u64,
@@ -226,7 +227,7 @@ struct Owner {
 impl Owner {
     fn new(
         socket: OwnedFd,
-        wake: OwnedFd,
+        wake: Arc<OwnedFd>,
         generation: [u8; 16],
         commands: sync_mpsc::Receiver<OwnerCommand>,
         liveness: mpsc::Sender<anyhow::Result<()>>,
@@ -516,20 +517,12 @@ fn set_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn wake_event() -> anyhow::Result<(OwnedFd, OwnedFd)> {
+fn wake_event() -> anyhow::Result<Arc<OwnedFd>> {
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
         return Err(io::Error::last_os_error()).context("create control wake event");
     }
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error).context("duplicate control wake event");
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fd), OwnedFd::from_raw_fd(duplicate)) })
+    Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 fn wake(fd: RawFd) {
