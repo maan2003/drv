@@ -8,6 +8,9 @@ version = "0.1.0"
 [workspace]
 resolver = "3"
 
+[features]
+filter-integration-test = ["linux-self-sandbox/filter-integration-test"]
+
 [dependencies]
 anyhow = "=1.0.102"
 async-trait = "=0.1.89"
@@ -30,3 +33,8 @@ wifi-control-service = { path = "../wifi-control-service" }
 name = "separate-process-e2e"
 path = "tests/separate_process_e2e.rs"
 harness = false
+
+[[test]]
+name = "filtered-control-owner"
+path = "tests/filtered_control_owner.rs"
+required-features = ["filter-integration-test"]

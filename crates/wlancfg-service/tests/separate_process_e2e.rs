@@ -281,7 +281,8 @@ fn wlancfg_child() -> anyhow::Result<()> {
         wlancfg_service::PreparedHostControlClient::from_inherited_socket(control, GENERATION)?;
     let parked = prepared.spawn_parked_after_setup()?;
     // TEST FIXTURE ONLY: kernel namespace enforcement is not claimed here.
-    wlancfg_service::policy::serve_one_generation(parked, state)
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+    wlancfg_service::policy::serve_one_generation(runtime, parked, state)
 }
 
 fn wifi_child() -> anyhow::Result<()> {

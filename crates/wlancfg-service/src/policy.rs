@@ -76,14 +76,11 @@ impl ScanRequestApi for ControlScan {
 /// Load persisted policy and serve one already-locked-down interface
 /// generation. The caller must not invoke this before `LockedDown::run`.
 pub fn serve_one_generation(
+    runtime: tokio::runtime::Runtime,
     parked: ParkedHostControlClient,
     state_directory: OwnedFd,
 ) -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .context("construct wlancfg policy executor")?
-        .block_on(async move {
+    runtime.block_on(async move {
             let (telemetry_tx, _telemetry_rx) = mpsc::channel::<TelemetryEvent>(100);
             let telemetry = TelemetrySender::new(telemetry_tx);
             // Construction performs all metadata validation, cleanup, file reads,

@@ -73,11 +73,16 @@ struct ClientInner {
     wake: Arc<OwnedFd>,
     force_terminal: Arc<AtomicBool>,
     event_stream: Mutex<Option<mpsc::Receiver<anyhow::Result<()>>>>,
+    owner: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
+        self.force_terminal.store(true, Ordering::Release);
         wake(self.wake.as_raw_fd());
+        if let Some(owner) = self.owner.lock().expect("owner lock poisoned").take() {
+            let _ = owner.join();
+        }
     }
 }
 
@@ -130,9 +135,7 @@ impl ParkedHostControlClient {
             .expect("parked owner start is single-use")
             .send(())
             .map_err(|_| anyhow!("WLAN control owner ended before lockdown opened"))?;
-        // Dropping a JoinHandle detaches the active owner. ClientInner's
-        // command/wake handles retain its normal shutdown ownership.
-        drop(self.owner.take());
+        *self.client.0.owner.lock().expect("owner lock poisoned") = self.owner.take();
         Ok(self.client.clone())
     }
 }
@@ -188,6 +191,7 @@ impl HostControlClient {
             wake,
             force_terminal,
             event_stream: Mutex::new(Some(event_rx)),
+            owner: Mutex::new(None),
         }));
         Ok(ParkedHostControlClient {
             client,
@@ -382,14 +386,7 @@ impl Owner {
 
     fn flush_outgoing(&mut self) -> Result<(), String> {
         while let Some(packet) = self.outgoing.front() {
-            let mut iov = libc::iovec {
-                iov_base: packet.bytes.as_ptr().cast_mut().cast(),
-                iov_len: packet.bytes.len(),
-            };
-            let mut header: libc::msghdr = unsafe { mem::zeroed() };
-            header.msg_iov = &mut iov;
-            header.msg_iovlen = 1;
-            let sent = unsafe { libc::sendmsg(self.socket.as_raw_fd(), &header, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+            let sent = unsafe { libc::sendto(self.socket.as_raw_fd(), packet.bytes.as_ptr().cast(), packet.bytes.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL, std::ptr::null(), 0) };
             if sent < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::WouldBlock { return Ok(()); }
@@ -405,9 +402,6 @@ impl Owner {
     fn handle_received(&mut self, received: Received) -> Result<(), String> {
         let packet = wire::decode(&received.bytes).map_err(|e| format!("invalid control packet: {e}"))?;
         self.validator.validate(&packet).map_err(|e| format!("invalid control sequence: {e}"))?;
-        // The policy channel never carries capabilities. The Ethernet
-        // data-plane capability belongs on the distinct lifecycle channel.
-        if !received.fds.is_empty() { return Err("ancillary fd on policy control channel".into()); }
         match packet.message {
             Message::Ready => try_send(&mut self.liveness, Ok(()), "liveness")?,
             Message::Event(event) => {
@@ -492,56 +486,23 @@ fn try_send<T>(sender: &mut mpsc::Sender<anyhow::Result<T>>, value: anyhow::Resu
     sender.try_send(value).map_err(|_| format!("{name} backpressure"))
 }
 
-struct Received { bytes: Vec<u8>, fds: Vec<OwnedFd> }
+struct Received { bytes: Vec<u8> }
 
 fn recv_packet(fd: RawFd) -> Result<Option<Received>, String> {
     let mut bytes = [0u8; wire::MAX_PACKET];
-    // Fixed aligned ancillary storage keeps malicious rights delivery bounded.
-    let mut control = [0usize; 8];
-    let mut iov = libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() };
-    let mut header: libc::msghdr = unsafe { mem::zeroed() };
-    header.msg_iov = &mut iov;
-    header.msg_iovlen = 1;
-    header.msg_control = control.as_mut_ptr().cast();
-    header.msg_controllen = mem::size_of_val(&control);
-    let received = unsafe { libc::recvmsg(fd, &mut header, libc::MSG_DONTWAIT | libc::MSG_TRUNC | libc::MSG_CMSG_CLOEXEC) };
+    // recvfrom has no ancillary-data interface: Linux discards SCM_RIGHTS
+    // without installing descriptors in this process. The policy channel is
+    // therefore capability-free at the syscall boundary, even if its peer is
+    // compromised.
+    let received = unsafe { libc::recvfrom(fd, bytes.as_mut_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT | libc::MSG_TRUNC, std::ptr::null_mut(), std::ptr::null_mut()) };
     if received < 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::WouldBlock { return Ok(None); }
-        return Err(format!("control recvmsg failed: {error}"));
+        return Err(format!("control recvfrom failed: {error}"));
     }
-    let mut fds = Vec::new();
-    let mut ancillary_error = None;
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&header);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-                ancillary_error.get_or_insert("unexpected ancillary data");
-                cmsg = libc::CMSG_NXTHDR(&header, cmsg);
-                continue;
-            }
-            let header_len = libc::CMSG_LEN(0) as usize;
-            if (*cmsg).cmsg_len < header_len {
-                ancillary_error.get_or_insert("malformed ancillary data");
-                break;
-            }
-            let data_len = (*cmsg).cmsg_len as usize - header_len;
-            if !data_len.is_multiple_of(mem::size_of::<RawFd>()) {
-                ancillary_error.get_or_insert("malformed descriptor ancillary data");
-                break;
-            }
-            let count = data_len / mem::size_of::<RawFd>();
-            let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-            for index in 0..count { fds.push(OwnedFd::from_raw_fd(*data.add(index))); }
-            cmsg = libc::CMSG_NXTHDR(&header, cmsg);
-        }
-    }
-    if let Some(error) = ancillary_error { return Err(error.into()); }
-    if header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 || received as usize > bytes.len() {
-        return Err("truncated control packet or ancillary data".into());
-    }
+    if received as usize > bytes.len() { return Err("truncated control packet".into()); }
     if received == 0 { return Err("control socket closed".into()); }
-    Ok(Some(Received { bytes: bytes[..received as usize].to_vec(), fds }))
+    Ok(Some(Received { bytes: bytes[..received as usize].to_vec() }))
 }
 
 fn validate_socket(fd: &OwnedFd) -> anyhow::Result<()> {
@@ -855,16 +816,23 @@ mod tests {
     }
 
     #[test]
-    fn any_fd_is_terminal() {
-        terminal_after(|fd| {
-            let (extra, _) = sockets();
-            send_packet(fd, 1, Message::Ready, &[extra.as_raw_fd()]);
-        });
-        terminal_after(|fd| {
-            let capabilities: Vec<_> = (0..8).map(|_| sockets().0).collect();
-            let raw: Vec<_> = capabilities.iter().map(AsRawFd::as_raw_fd).collect();
-            send_packet(fd, 1, Message::Ready, &raw);
-        });
+    fn ancillary_rights_are_discarded_without_installation() {
+        let (client_fd, server_fd) = sockets();
+        let parked = PreparedHostControlClient::from_inherited_socket(client_fd, GENERATION)
+            .unwrap()
+            .spawn_parked_after_setup()
+            .unwrap();
+        let capabilities: Vec<_> = (0..8).map(|_| sockets()).collect();
+        let raw: Vec<_> = capabilities.iter().map(|(passed, _)| passed.as_raw_fd()).collect();
+        send_packet(server_fd.as_raw_fd(), 1, Message::Ready, &raw);
+        let peers: Vec<_> = capabilities.into_iter().map(|(passed, peer)| { drop(passed); peer }).collect();
+        let client = parked.activate_after_persistence().unwrap();
+        let mut liveness = client.take_event_stream();
+        assert!(futures::executor::block_on(liveness.next()).unwrap().is_ok());
+        for peer in peers {
+            assert_eq!(unsafe { libc::send(peer.as_raw_fd(), b"x".as_ptr().cast(), 1, libc::MSG_NOSIGNAL) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
+        }
     }
 
     #[test]
@@ -892,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_credentials_and_rights_closes_received_fd_before_error() {
+    fn mixed_credentials_and_rights_are_discarded_without_installation() {
         let (client_fd, server_fd) = sockets();
         let enabled = 1i32;
         assert_eq!(unsafe {
@@ -909,7 +877,7 @@ mod tests {
         let (passed, peer) = sockets();
         send_packet(server_fd.as_raw_fd(), 1, Message::Ready, &[passed.as_raw_fd()]);
         drop(passed);
-        assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
+        assert!(futures::executor::block_on(liveness.next()).unwrap().is_ok());
         assert_eq!(unsafe { libc::send(peer.as_raw_fd(), b"x".as_ptr().cast(), 1, libc::MSG_NOSIGNAL) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
     }

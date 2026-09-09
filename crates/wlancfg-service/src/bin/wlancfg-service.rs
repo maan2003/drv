@@ -41,12 +41,19 @@ fn main() -> anyhow::Result<()> {
     let parked = prepared
         .spawn_parked_after_setup()
         .context("park WLAN control owner before lockdown")?;
+    // Construct the current-thread executor, including its epoll descriptor,
+    // during setup so runtime confinement needs no descriptor creator.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("construct wlancfg policy executor")?;
     let locked = setup
         .lockdown(Profile::Wlancfg {
+            control_fd: control_raw,
             persistence_dir_fd: state_raw,
         })
         .context("install wlancfg seccomp policy")?;
-    locked.run(|| serve_one_generation(parked, state_fd))
+    locked.run(|| serve_one_generation(runtime, parked, state_fd))
 }
 
 fn parse_fd(value: Option<String>, name: &str) -> anyhow::Result<RawFd> {

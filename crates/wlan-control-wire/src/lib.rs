@@ -199,7 +199,8 @@ const SCAN: u16 = 11;
 const SCAN_REPLY: u16 = 12;
 
 /// Number of file descriptors the policy transport must attach to this message.
-/// Policy transport bindings must reject all ancillary file descriptors.
+/// Policy transport bindings must use kernel operations without an ancillary
+/// data interface, so descriptors can be neither imported nor exported.
 pub const fn required_fd_count(_message: &Message) -> usize {
     0
 }

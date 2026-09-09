@@ -40,6 +40,9 @@ fn run() -> Result<(), Error> {
     } else {
         None
     };
+    let outside_marker = std::env::var("SANDBOX_OUTSIDE_MARKER")
+        .ok()
+        .map(|path| CString::new(path).unwrap());
     let setup = Sandbox::new().setup(&retained_fds, persistence)?;
     for &fd in &retained_fds {
         assert!(
@@ -93,6 +96,9 @@ fn run() -> Result<(), Error> {
                 assert_eq!(unsafe { libc::openat(retained, escape.as_ptr(), read_flags) }, -1);
                 assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
             }
+            let outside_marker = outside_marker.expect("wlancfg outside marker");
+            assert_eq!(unsafe { libc::openat(retained, outside_marker.as_ptr(), read_flags) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT));
             let file = unsafe { libc::openat(retained, installed.as_ptr(), read_flags) };
             assert!(file >= 0, "directory-relative reopen failed: {}", std::io::Error::last_os_error());
             let mut bytes = [0u8; 5];
@@ -100,7 +106,7 @@ fn run() -> Result<(), Error> {
             assert_eq!(&bytes, b"state");
             assert_eq!(unsafe { libc::close(file) }, 0);
             assert_eq!(unsafe { libc::unlinkat(retained, installed.as_ptr(), 0) }, 0);
-            println!("sandbox_self_test=PASS profile=wlancfg parent_escape_absent=true symlink_escape_absent=true directory_create=true atomic_replace=true");
+            println!("sandbox_self_test=PASS profile=wlancfg parent_escape_absent=true symlink_escape_absent=true absolute_outside_marker_absent=true directory_create=true atomic_replace=true");
         }),
         "mt7921-vfio" => {
             assert_eq!(retained_fds.len(), 4);

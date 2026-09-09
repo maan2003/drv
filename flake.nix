@@ -168,7 +168,12 @@
             runHook preCheck
             cd crates/wlancfg-service
             cargo test --locked --offline
-            cargo clippy --locked --offline --all-targets -- -D warnings
+            # This filtered lifecycle must match deployment. Rust's debug-only
+            # I/O-safety assertions use fcntl, which the runtime policy
+            # intentionally kills rather than admitting for test convenience.
+            cargo test --locked --offline --release \
+              --features filter-integration-test --test filtered-control-owner
+            cargo clippy --locked --offline --all-targets --all-features -- -D warnings
             runHook postCheck
           '';
           installPhase = ''
@@ -387,6 +392,16 @@
                 cp -R crates/wlan-control-wire/src "$out/share/wlan-control-wire/"
               '';
             };
+          wlancfg-service = pkgs.rustPlatform.buildRustPackage {
+            pname = "wlancfg-service";
+            version = "0.1.0";
+            src = mt7921FuchsiaSource;
+            cargoRoot = "crates/wlancfg-service";
+            buildAndTestSubdir = "crates/wlancfg-service";
+            cargoLock.lockFile = ./crates/wlancfg-service/Cargo.lock;
+            nativeBuildInputs = [ pkgs.cmake pkgs.perl ];
+            doCheck = false;
+          };
 
           audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
 

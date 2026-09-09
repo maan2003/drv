@@ -19,7 +19,7 @@ fn setup_preserves_only_capabilities_without_consuming_them_and_lockdown_denies_
         unsafe { libc::send(pair[0], b"X".as_ptr().cast(), 1, 0) },
         1
     );
-    let output = helper("simulated", &[pair[1]], Some(unwanted[0]));
+    let output = helper("simulated", &[pair[1]], Some(unwanted[0]), None);
     unsafe {
         libc::close(pair[0]);
         libc::close(pair[1]);
@@ -55,7 +55,12 @@ fn wlancfg_allows_only_directory_relative_atomic_persistence() {
         0
     );
     clear_cloexec(control[1]);
-    let output = helper("wlancfg", &[control[1], fd], None);
+    let output = helper(
+        "wlancfg",
+        &[control[1], fd],
+        None,
+        Some(&sibling.join("secret")),
+    );
     unsafe {
         libc::close(control[0]);
         libc::close(control[1]);
@@ -134,7 +139,12 @@ fn mt7921_vfio_subprocess_has_only_its_runtime_authority() {
     );
 }
 
-fn helper(mode: &str, retained: &[RawFd], unwanted: Option<RawFd>) -> Output {
+fn helper(
+    mode: &str,
+    retained: &[RawFd],
+    unwanted: Option<RawFd>,
+    outside_marker: Option<&std::path::Path>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_self-test-helper"));
     command.env("SANDBOX_HELPER_MODE", mode);
     if retained.len() == 1 {
@@ -151,6 +161,9 @@ fn helper(mode: &str, retained: &[RawFd], unwanted: Option<RawFd>) -> Output {
     }
     if let Some(fd) = unwanted {
         command.env("SANDBOX_UNWANTED_FD", fd.to_string());
+    }
+    if let Some(path) = outside_marker {
+        command.env("SANDBOX_OUTSIDE_MARKER", path);
     }
     command.output().unwrap()
 }

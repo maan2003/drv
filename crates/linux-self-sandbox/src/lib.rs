@@ -620,6 +620,22 @@ fn install_filter(profile: Profile) -> Result<(), Error> {
     }
 }
 
+/// Installs only the runtime filter for cross-crate integration tests.
+///
+/// Production services must use [`Sandbox`] so namespace, filesystem,
+/// identity, capability, and descriptor setup cannot be bypassed. This hook is
+/// feature-gated solely to exercise a real consumer under the fatal filter on
+/// build hosts that prohibit namespace creation.
+#[cfg(feature = "filter-integration-test")]
+#[doc(hidden)]
+pub fn install_runtime_filter_for_integration_test(profile: Profile) -> Result<(), Error> {
+    syscall_ok(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        "set integration-test no_new_privs",
+    )?;
+    install_filter(profile)
+}
+
 fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
     let dispatch = f.len();
     f.push(jump(libc::SYS_ioctl as u32, 0, 0));

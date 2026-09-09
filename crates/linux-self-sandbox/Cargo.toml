@@ -8,6 +8,9 @@ version = "0.1.0"
 [workspace]
 resolver = "3"
 
+[features]
+filter-integration-test = []
+
 [dependencies]
 libc = "0.2"
 userspace-vfio = { path = "../userspace-vfio" }
