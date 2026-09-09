@@ -10,9 +10,9 @@
 //! A scan reply is one atomic packet containing the complete result vector;
 //! [`encode`] returns [`Error::PacketTooLarge`] rather than truncating results.
 //! SME [`sme::ScanErrorCode`] values are policy outcomes in that reply, while
-//! runtime-terminal failures use [`Message::GenerationEnd`]. Transports attach
-//! no file descriptors except the single capability required by
-//! [`Message::EthernetReady`], as reported by [`required_fd_count`].
+//! runtime-terminal failures use [`Message::GenerationEnd`]. This policy seam
+//! never carries file descriptors; the Ethernet data-plane capability belongs
+//! to the distinct Wi-Fi-to-supervisor lifecycle seam.
 //!
 //! Header `request_id` is the sending endpoint's packet sequence, not an echo:
 //! each direction has an independent strictly increasing sequence. Reply bodies
@@ -71,10 +71,6 @@ pub struct Reply<T> {
 #[derive(Clone, Eq, PartialEq)]
 pub enum Message {
     Ready,
-    EthernetReady {
-        ethernet_generation: u64,
-        mac: [u8; 6],
-    },
     Scan(sme::ScanRequest),
     ScanReply(Reply<Result<Vec<sme::ScanResult>, sme::ScanErrorCode>>),
     Connect(sme::ConnectRequest),
@@ -92,14 +88,6 @@ impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready => f.write_str("Ready"),
-            Self::EthernetReady {
-                ethernet_generation,
-                mac,
-            } => f
-                .debug_struct("EthernetReady")
-                .field("ethernet_generation", ethernet_generation)
-                .field("mac", mac)
-                .finish(),
             Self::Scan(request) => f.debug_tuple("Scan").field(request).finish(),
             Self::ScanReply(reply) => f.debug_tuple("ScanReply").field(reply).finish(),
             Self::Connect(request) => f
@@ -153,7 +141,6 @@ pub enum Error {
     ZeroRequestId,
     WrongGeneration,
     NonIncreasingRequestId,
-    NonIncreasingEthernetGeneration,
     UnknownDiscriminant(&'static str, u64),
     BoundExceeded(&'static str),
     InvalidValue(&'static str),
@@ -172,14 +159,12 @@ impl std::error::Error for Error {}
 pub struct SessionValidator {
     generation: [u8; 16],
     last_request_id: u64,
-    last_ethernet_generation: u64,
 }
 impl SessionValidator {
     pub const fn new(generation: [u8; 16]) -> Self {
         Self {
             generation,
             last_request_id: 0,
-            last_ethernet_generation: 0,
         }
     }
     pub const fn generation(&self) -> [u8; 16] {
@@ -198,16 +183,6 @@ impl SessionValidator {
         if packet.request_id <= self.last_request_id {
             return Err(Error::NonIncreasingRequestId);
         }
-        if let Message::EthernetReady {
-            ethernet_generation,
-            ..
-        } = packet.message
-        {
-            if ethernet_generation == 0 || ethernet_generation <= self.last_ethernet_generation {
-                return Err(Error::NonIncreasingEthernetGeneration);
-            }
-            self.last_ethernet_generation = ethernet_generation;
-        }
         self.last_request_id = packet.request_id;
         Ok(())
     }
@@ -222,18 +197,13 @@ const ROAM: u16 = 6;
 const ROAM_REPLY: u16 = 7;
 const EVENT: u16 = 8;
 const GENERATION_END: u16 = 9;
-const ETHERNET_READY: u16 = 10;
 const SCAN: u16 = 11;
 const SCAN_REPLY: u16 = 12;
 
-/// Number of file descriptors the transport must attach to this message.
-/// Transport bindings must reject missing, extra, or truncated ancillary data.
-pub const fn required_fd_count(message: &Message) -> usize {
-    if matches!(message, Message::EthernetReady { .. }) {
-        1
-    } else {
-        0
-    }
+/// Number of file descriptors the policy transport must attach to this message.
+/// Policy transport bindings must reject all ancillary file descriptors.
+pub const fn required_fd_count(_message: &Message) -> usize {
+    0
 }
 
 pub fn encode(packet: &Packet) -> Result<Vec<u8>, Error> {
@@ -300,17 +270,6 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
     let mut w = Vec::new();
     let kind = match message {
         Message::Ready => READY,
-        Message::EthernetReady {
-            ethernet_generation,
-            mac,
-        } => {
-            if *ethernet_generation == 0 {
-                return Err(Error::InvalidValue("zero Ethernet generation"));
-            }
-            put_u64(&mut w, *ethernet_generation);
-            w.extend_from_slice(mac);
-            ETHERNET_READY
-        }
         Message::Scan(v) => {
             enc_scan(&mut w, v)?;
             SCAN
@@ -367,16 +326,6 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
 fn decode_message(kind: u16, r: &mut Reader<'_>) -> Result<Message, Error> {
     Ok(match kind {
         READY => Message::Ready,
-        ETHERNET_READY => {
-            let ethernet_generation = r.u64()?;
-            if ethernet_generation == 0 {
-                return Err(Error::InvalidValue("zero Ethernet generation"));
-            }
-            Message::EthernetReady {
-                ethernet_generation,
-                mac: r.array()?,
-            }
-        }
         SCAN => Message::Scan(dec_scan(r)?),
         SCAN_REPLY => Message::ScanReply(dec_reply(r, dec_scan_reply)?),
         CONNECT => Message::Connect(dec_connect(r)?),
@@ -1160,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrips_every_top_level_kind_and_fd_contract() {
+    fn roundtrips_every_top_level_kind_and_policy_messages_are_fd_free() {
         let scan_result = sme::ScanResult {
             compatibility: sme::Compatibility::Compatible(sme::Compatible {
                 mutual_security_protocols: vec![
@@ -1173,10 +1122,6 @@ mod tests {
         };
         let messages = vec![
             Message::Ready,
-            Message::EthernetReady {
-                ethernet_generation: 1,
-                mac: [6, 5, 4, 3, 2, 1],
-            },
             Message::Scan(sme::ScanRequest::Active(sme::ActiveScanRequest {
                 ssids: vec![b"one".to_vec(), b"two".to_vec()],
                 channels: vec![1, 36],
@@ -1209,11 +1154,7 @@ mod tests {
             Message::GenerationEnd(GenerationEndReason::ProtocolViolation),
         ];
         for message in messages {
-            let fd_count = required_fd_count(&message);
-            assert_eq!(
-                fd_count,
-                usize::from(matches!(message, Message::EthernetReady { .. }))
-            );
+            assert_eq!(required_fd_count(&message), 0);
             roundtrip(message);
         }
     }
@@ -1348,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn session_enforces_generation_request_order_and_ethernet_order() {
+    fn session_enforces_generation_and_request_order() {
         let mut session = SessionValidator::new([9; 16]);
         session.validate(&packet(Message::Ready, 1)).unwrap();
         assert_eq!(
@@ -1363,35 +1304,7 @@ mod tests {
             }),
             Err(Error::WrongGeneration)
         );
-        session
-            .validate(&packet(
-                Message::EthernetReady {
-                    ethernet_generation: 4,
-                    mac: [0; 6],
-                },
-                2,
-            ))
-            .unwrap();
-        assert_eq!(
-            session.validate(&packet(
-                Message::EthernetReady {
-                    ethernet_generation: 4,
-                    mac: [0; 6]
-                },
-                3
-            )),
-            Err(Error::NonIncreasingEthernetGeneration)
-        );
-        assert_eq!(
-            encode(&packet(
-                Message::EthernetReady {
-                    ethernet_generation: 0,
-                    mac: [0; 6]
-                },
-                4
-            )),
-            Err(Error::InvalidValue("zero Ethernet generation"))
-        );
+        session.validate(&packet(Message::Ready, 2)).unwrap();
     }
 
     #[test]
