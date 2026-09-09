@@ -15,9 +15,10 @@ use netstack3_port_spike::{
 };
 use rand::{SeedableRng as _, rngs::StdRng};
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::os::fd::AsRawFd as _;
 use std::time::Duration;
 
 mod child;
@@ -54,6 +55,18 @@ struct BoundedNetstackProof {
 
 const MAX_SOCKS5_CLIENTS: usize = 24;
 const MAX_SOCKS5_PENDING_BYTES: usize = 256 * 1024;
+
+fn set_nonblocking(stream: &TcpStream) -> std::io::Result<()> {
+    let fd = stream.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 struct Socks5Client {
     stream: TcpStream,
@@ -248,7 +261,7 @@ impl BoundedNetstackProof {
             for _ in 0..32 {
                 match listener.accept() {
                     Ok((stream, peer)) if clients.len() < MAX_SOCKS5_CLIENTS => {
-                        if stream.set_nonblocking(true).is_err() {
+                        if set_nonblocking(&stream).is_err() {
                             println!(
                                 "internet_proxy_client_error=SOCKS5 client nonblocking setup failed peer={peer}"
                             );
@@ -477,11 +490,18 @@ impl BoundedNetstackProof {
                 let socket = client.socket.ok_or("SOCKS5 relay socket missing")?;
                 let mut buffer = [0; 16 * 1024];
                 if client.host_to_remote.len() < MAX_SOCKS5_PENDING_BYTES {
-                    match client.stream.read(&mut buffer) {
-                        Ok(0) => return Ok(true),
-                        Ok(read) => client.host_to_remote.extend(&buffer[..read]),
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                        Err(_) => return Err("SOCKS5 host read failed"),
+                    let read = unsafe {
+                        libc::read(
+                            client.stream.as_raw_fd(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                        )
+                    };
+                    match read {
+                        0 => return Ok(true),
+                        read if read > 0 => client.host_to_remote.extend(&buffer[..read as usize]),
+                        _ if std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock => {}
+                        _ => return Err("SOCKS5 host read failed"),
                     }
                 }
                 let mut provider = self.runner.stack().socket_provider();
@@ -557,15 +577,22 @@ impl BoundedNetstackProof {
         bytes: &mut Vec<u8>,
     ) -> Result<bool, &'static str> {
         let mut buffer = [0; 16 * 1024];
-        match client.stream.read(&mut buffer) {
-            Ok(0) => Ok(true),
-            Ok(read) => {
-                bytes.extend_from_slice(&buffer[..read]);
+        let read = unsafe {
+            libc::read(
+                client.stream.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        match read {
+            0 => Ok(true),
+            read if read > 0 => {
+                bytes.extend_from_slice(&buffer[..read as usize]);
                 client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 Ok(false)
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
-            Err(_) => Err("SOCKS5 host read failed"),
+            _ if std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock => Ok(false),
+            _ => Err("SOCKS5 host read failed"),
         }
     }
 
@@ -578,15 +605,23 @@ impl BoundedNetstackProof {
         if pending.is_empty() {
             return Ok(());
         }
-        match client.stream.write(pending.make_contiguous()) {
-            Ok(0) => Err("SOCKS5 host closed during write"),
-            Ok(written) => {
-                pending.drain(..written);
+        let bytes = pending.make_contiguous();
+        let written = unsafe {
+            libc::write(
+                client.stream.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        match written {
+            0 => Err("SOCKS5 host closed during write"),
+            written if written > 0 => {
+                pending.drain(..written as usize);
                 client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 Ok(())
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
-            Err(_) => Err("SOCKS5 host write failed"),
+            _ if std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock => Ok(()),
+            _ => Err("SOCKS5 host write failed"),
         }
     }
 

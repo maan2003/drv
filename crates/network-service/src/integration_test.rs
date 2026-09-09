@@ -23,6 +23,7 @@ use packet_formats::{
 use rand::rngs::StdRng;
 use std::{
     collections::VecDeque,
+    io::{Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::Duration,
@@ -365,9 +366,9 @@ fn drive(
 #[test]
 fn socks_connect_relays_application_bytes_over_ethernet() {
     let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
-    let device = unsafe {
-        ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
-    };
+    let frame = device_capability.into_frame_fd();
+    let frame_fd = frame.as_raw_fd();
+    let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = BoundedNetstackProof::new(
         device,
         NetstackProofConfig {
@@ -466,6 +467,9 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
         ])
         .unwrap();
     client.set_nonblocking(true).unwrap();
+    if std::env::var_os("DRV_NETWORK_RELAY_FILTER_FIXTURE").is_some() {
+        crate::child::install_test_filter(frame_fd, listener.as_raw_fd()).unwrap();
+    }
     let mut response = Vec::new();
     service
         .serve_socks5_listener(
@@ -475,11 +479,19 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
             || {
                 let mut bytes = [0; 64];
                 loop {
-                    match client.read(&mut bytes) {
-                        Ok(0) => break,
-                        Ok(read) => response.extend_from_slice(&bytes[..read]),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => panic!("SOCKS client read failed: {error}"),
+                    let read = unsafe {
+                        libc::read(client.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
+                    };
+                    if read > 0 {
+                        response.extend_from_slice(&bytes[..read as usize]);
+                    } else if read == 0 {
+                        break;
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            break;
+                        }
+                        panic!("SOCKS client read failed: {error}");
                     }
                 }
                 if response.len() >= 31 {
@@ -498,6 +510,9 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
     assert_eq!(&response[12..], b"HTTP/1.0 200 OK\r\n\r\n");
     assert_eq!(request_rx.recv().unwrap(), b"GET /\r\n");
     ap_thread.join().unwrap();
+    if std::env::var_os("DRV_NETWORK_RELAY_FILTER_FIXTURE").is_some() {
+        unsafe { libc::_exit(0) }
+    }
 }
 
 #[test]

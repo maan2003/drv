@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::c_void;
 use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroU16;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 const FRAME_FD: i32 = 3;
@@ -32,7 +32,6 @@ const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
@@ -49,11 +48,7 @@ const SYS_SOCKET: i64 = 41;
 #[cfg(target_arch = "x86_64")]
 const SYS_OPENAT: i64 = 257;
 #[cfg(target_arch = "x86_64")]
-const ALLOWED_SYSCALLS: &[u32] = &[
-    0, 1, 3, 7, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25, 28, 35, 39, 44, 45, 47, 60, 72, 96, 131,
-    202, 219, 228, 230, 231, 288, 318,
-];
-
+const SYS_READINESS: i64 = libc::SYS_poll;
 #[cfg(target_arch = "aarch64")]
 const SYS_READ: i64 = 63;
 #[cfg(target_arch = "aarch64")]
@@ -65,11 +60,7 @@ const SYS_SOCKET: i64 = 198;
 #[cfg(target_arch = "aarch64")]
 const SYS_OPENAT: i64 = 56;
 #[cfg(target_arch = "aarch64")]
-const ALLOWED_SYSCALLS: &[u32] = &[
-    25, 57, 63, 64, 72, 73, 93, 94, 98, 101, 113, 115, 124, 128, 132, 134, 135, 139, 169, 172, 198,
-    206, 207, 212, 214, 215, 216, 222, 226, 233, 242, 278,
-];
-
+const SYS_READINESS: i64 = libc::SYS_ppoll;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("wlan netstack seccomp is supported only on x86_64 and aarch64");
 
@@ -85,6 +76,121 @@ struct SockFilter {
 struct SockFprog {
     len: u16,
     filter: *const SockFilter,
+}
+
+fn stmt(code: u16, k: u32) -> SockFilter {
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+fn jump(k: u32, jt: u8, jf: u8) -> SockFilter {
+    SockFilter {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt,
+        jf,
+        k,
+    }
+}
+
+fn arg(index: usize) -> SockFilter {
+    stmt(BPF_LD | BPF_W | BPF_ABS, 16 + (index * 8) as u32)
+}
+
+fn arg_high(index: usize) -> SockFilter {
+    stmt(BPF_LD | BPF_W | BPF_ABS, 20 + (index * 8) as u32)
+}
+
+fn append_kill(filter: &mut Vec<SockFilter>, syscall: i64) {
+    filter.push(jump(syscall as u32, 0, 1));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+}
+
+fn append_fd_and_flags(filter: &mut Vec<SockFilter>, syscall: i64, fd: RawFd, flags: i32) {
+    filter.push(jump(syscall as u32, 0, 20));
+    filter.push(arg(0));
+    filter.push(jump(fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(3));
+    filter.push(jump(flags as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    // Connected frame send/recv never supplies an alternate address buffer.
+    filter.push(arg(4));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(4));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(5));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(5));
+    filter.push(jump(0, 0, 1));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_accept4(filter: &mut Vec<SockFilter>, listener_fd: RawFd) {
+    filter.push(jump(libc::SYS_accept4 as u32, 0, 9));
+    filter.push(arg(0));
+    filter.push(jump(listener_fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(3));
+    filter.push(jump(libc::SOCK_CLOEXEC as u32, 2, 0));
+    filter.push(jump(
+        (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32,
+        1,
+        0,
+    ));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_io_except_capabilities(
+    filter: &mut Vec<SockFilter>,
+    syscall: i64,
+    frame_fd: RawFd,
+    listener_fd: RawFd,
+) {
+    filter.push(jump(syscall as u32, 0, 6));
+    filter.push(arg(0));
+    filter.push(jump(frame_fd as u32, 2, 0));
+    filter.push(jump(listener_fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_fcntl_commands(filter: &mut Vec<SockFilter>) {
+    filter.push(jump(libc::SYS_fcntl as u32, 0, 7));
+    filter.push(arg(1));
+    filter.push(jump(libc::F_GETFL as u32, 3, 0));
+    filter.push(jump(libc::F_SETFL as u32, 2, 0));
+    // Rust's owned-socket teardown checks that the descriptor is still open.
+    filter.push(jump(libc::F_GETFD as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_no_exec_memory(filter: &mut Vec<SockFilter>, syscall: i64) {
+    const BPF_JSET_K: u16 = BPF_JMP | 0x40 | BPF_K;
+    filter.push(jump(syscall as u32, 0, 5));
+    filter.push(arg(2));
+    filter.push(SockFilter {
+        code: BPF_JSET_K,
+        jt: 0,
+        jf: 1,
+        k: libc::PROT_EXEC as u32,
+    });
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
 unsafe extern "C" {
@@ -188,68 +294,91 @@ fn setup(expected_parent: i32) -> Result<(), String> {
     Ok(())
 }
 
+fn network_filter(frame_fd: RawFd, listener_fd: RawFd) -> Vec<SockFilter> {
+    let mut filter = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, 4),
+        jump(AUDIT_ARCH, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, 0),
+    ];
+
+    // Forbidden ambient authority is fatal rather than an errno fallback.
+    for denied in [SYS_IOCTL, SYS_SOCKET, SYS_OPENAT] {
+        append_kill(&mut filter, denied);
+    }
+    // Netstack3's only kernel packet transport is inherited frame fd 3.
+    append_fd_and_flags(
+        &mut filter,
+        libc::SYS_sendto,
+        frame_fd,
+        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+    );
+    append_fd_and_flags(
+        &mut filter,
+        libc::SYS_recvfrom,
+        frame_fd,
+        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+    );
+    // Owned applications enter only through the inherited loopback listener.
+    append_accept4(&mut filter, listener_fd);
+    // Bootstrap, logs, and dynamic accepted clients use byte-stream I/O. The
+    // frame and listener capabilities cannot bypass their role-specific calls.
+    append_io_except_capabilities(&mut filter, libc::SYS_read, frame_fd, listener_fd);
+    append_io_except_capabilities(&mut filter, libc::SYS_write, frame_fd, listener_fd);
+    // Accepted streams are made nonblocking; no descriptor duplication,
+    // ownership, or advisory-lock fcntl commands are needed at runtime.
+    append_fcntl_commands(&mut filter);
+    // Heap growth/reclamation is allowed, but executable memory is not.
+    append_no_exec_memory(&mut filter, libc::SYS_mmap);
+    append_no_exec_memory(&mut filter, libc::SYS_mprotect);
+
+    // Runtime and teardown operations, grouped by the role that requires them.
+    // read/write/close cover bootstrap fd 5, logs, and dynamic accepted clients;
+    // poll drives the frame readiness loop.
+    let allowed = [
+        libc::SYS_close,
+        SYS_READINESS,
+        // Rust allocation and deallocation after executable mappings are denied.
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        // Rust signal runtime state is installed before confinement but may be
+        // queried/restored during failures and process teardown.
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        // Single-process synchronization and interrupted sleep restart.
+        libc::SYS_futex,
+        libc::SYS_restart_syscall,
+        // Service deadlines, idle timeouts, and bounded loop sleeps.
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_nanosleep,
+        // RandomState initialization; protocol entropy is otherwise injected.
+        libc::SYS_getrandom,
+        // Readiness diagnostics and normal/error termination.
+        libc::SYS_getpid,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+    ];
+    for number in allowed {
+        filter.push(jump(number as u32, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+    // Unknown syscalls are fatal: adding a runtime operation requires naming
+    // and justifying it above instead of silently expanding ambient authority.
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter
+}
+
 fn lockdown() -> Result<(), String> {
-    // Target-specific Linux syscall numbers. There are deliberately no open, socket,
-    // connect, ioctl, exec, fork, mount, namespace, or privilege syscalls.
-    let mut filter = Vec::with_capacity(12 + ALLOWED_SYSCALLS.len() * 2);
-    filter.push(SockFilter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: 4,
-    });
-    filter.push(SockFilter {
-        code: BPF_JMP | BPF_JEQ | BPF_K,
-        jt: 1,
-        jf: 0,
-        k: AUDIT_ARCH,
-    });
-    filter.push(SockFilter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_KILL_PROCESS,
-    });
-    filter.push(SockFilter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: 0,
-    });
-    for denied in [SYS_IOCTL as u32, SYS_SOCKET as u32, SYS_OPENAT as u32] {
-        filter.push(SockFilter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 0,
-            jf: 1,
-            k: denied,
-        });
-        filter.push(SockFilter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | 1,
-        });
-    }
-    for number in ALLOWED_SYSCALLS {
-        filter.push(SockFilter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 0,
-            jf: 1,
-            k: *number,
-        });
-        filter.push(SockFilter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        });
-    }
-    filter.push(SockFilter {
-        code: BPF_RET | BPF_K,
-        jt: 0,
-        jf: 0,
-        k: SECCOMP_RET_KILL_PROCESS,
-    });
+    install_filter(FRAME_FD, LISTENER_FD)
+}
+
+fn install_filter(frame_fd: RawFd, listener_fd: RawFd) -> Result<(), String> {
+    let filter = network_filter(frame_fd, listener_fd);
     let program = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
@@ -268,11 +397,13 @@ fn lockdown() -> Result<(), String> {
     )
 }
 
-fn denied_probe(number: i64, arg: *const i8) -> bool {
-    unsafe {
-        syscall(number, -100i32, arg, 0i32) == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(1)
-    }
+#[cfg(test)]
+pub(crate) fn install_test_filter(frame_fd: RawFd, listener_fd: RawFd) -> Result<(), String> {
+    syscall_ok(
+        unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1usize, 0usize, 0usize, 0usize) },
+        "test no-new-privileges",
+    )?;
+    install_filter(frame_fd, listener_fd)
 }
 
 fn write_all_fd(fd: i32, mut bytes: &[u8], operation: &'static str) -> Result<(), String> {
@@ -350,20 +481,10 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
     let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
     setup(expected_parent)?;
     lockdown()?;
-    let fs_denied = denied_probe(SYS_OPENAT, c"/etc/passwd".as_ptr());
-    let vfio_denied = denied_probe(SYS_OPENAT, c"/dev/vfio/vfio".as_ptr());
-    let iommu_denied = denied_probe(SYS_OPENAT, c"/dev/iommu".as_ptr());
-    let socket_denied = unsafe { syscall(SYS_SOCKET, 2i32, 1i32, 0i32) } == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(1);
-    let ioctl_denied = unsafe { syscall(SYS_IOCTL, FRAME_FD, 0x3b67u64, 0usize) } == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(1);
     println!(
-        "netstack_sandbox_ready=true pid={} uid=65534 gid=65534 no_new_privs=true seccomp=true empty_root=true own_netns=true fs_open_denied={fs_denied} vfio_open_denied={vfio_denied} iommu_open_denied={iommu_denied} socket_denied={socket_denied} vfio_ioctl_denied={ioctl_denied}",
+        "netstack_sandbox_ready=true pid={} uid=65534 gid=65534 no_new_privs=true seccomp_default=kill empty_root=true own_netns=true inherited_frame_only=true inherited_listener_only=true",
         unsafe { getpid() }
     );
-    if !(fs_denied && vfio_denied && iommu_denied && socket_denied && ioctl_denied) {
-        return Err("sandbox denial self-proof failed".into());
-    }
     write_all_fd(5, b"READY", "bootstrap READY failed")?;
     let mut go = [0u8; 2];
     read_exact_fd(5, &mut go, "bootstrap GO failed")?;
@@ -424,4 +545,458 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
             || false,
         )
         .map_err(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    use wlan_softmac_host::ethernet::{EthernetIngressError, ethernet_port};
+
+    fn duplicate(fd: RawFd) -> OwnedFd {
+        let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+        assert!(fd >= 0);
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    fn child_exit(code: i32) -> ! {
+        unsafe { libc::_exit(code) }
+    }
+
+    fn child_require(condition: bool, code: i32) {
+        if !condition {
+            child_exit(code);
+        }
+    }
+
+    #[test]
+    fn network_filter_fixture() {
+        if std::env::var_os("DRV_NETWORK_FILTER_FIXTURE").is_none() {
+            return;
+        }
+        child_require(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
+            10,
+        );
+        child_require(lockdown().is_ok(), 11);
+
+        let mut pollfd = libc::pollfd {
+            fd: FRAME_FD,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        child_require(unsafe { libc::poll(&mut pollfd, 1, 0) } == 1, 20);
+        let mut frame = [0u8; 14];
+        child_require(
+            unsafe {
+                libc::recvfrom(
+                    FRAME_FD,
+                    frame.as_mut_ptr().cast(),
+                    frame.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == frame.len() as isize,
+            21,
+        );
+        child_require(
+            unsafe {
+                libc::sendto(
+                    FRAME_FD,
+                    frame.as_ptr().cast(),
+                    frame.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    std::ptr::null(),
+                    0,
+                )
+            } == frame.len() as isize,
+            22,
+        );
+
+        let accepted = unsafe {
+            libc::accept4(
+                LISTENER_FD,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        };
+        child_require(accepted >= 0, 23);
+        let flags = unsafe { libc::fcntl(accepted, libc::F_GETFL) };
+        child_require(flags >= 0, 24);
+        child_require(
+            unsafe { libc::fcntl(accepted, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+            25,
+        );
+        let mut request = [0u8; 4];
+        child_require(
+            unsafe { libc::read(accepted, request.as_mut_ptr().cast(), request.len()) }
+                == request.len() as isize
+                && request == *b"PING",
+            26,
+        );
+        child_require(
+            unsafe { libc::write(accepted, b"PONG".as_ptr().cast(), 4) } == 4,
+            27,
+        );
+
+        let mut go = [0u8; 2];
+        child_require(
+            unsafe { libc::read(5, go.as_mut_ptr().cast(), go.len()) } == 2 && go == *b"GO",
+            28,
+        );
+        child_require(unsafe { libc::write(5, b"OK".as_ptr().cast(), 2) } == 2, 29);
+
+        let memory = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        child_require(memory != libc::MAP_FAILED, 30);
+        child_require(
+            unsafe { libc::mprotect(memory, 4096, libc::PROT_READ) } == 0,
+            31,
+        );
+        child_require(
+            unsafe { libc::madvise(memory, 4096, libc::MADV_DONTNEED) } == 0,
+            32,
+        );
+        child_require(unsafe { libc::munmap(memory, 4096) } == 0, 33);
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        child_require(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0,
+            34,
+        );
+        let delay = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+        child_require(
+            unsafe { libc::nanosleep(&delay, std::ptr::null_mut()) } == 0,
+            35,
+        );
+        let mut random = [0u8; 8];
+        child_require(
+            unsafe { libc::syscall(libc::SYS_getrandom, random.as_mut_ptr(), random.len(), 0) }
+                == random.len() as i64,
+            36,
+        );
+        child_require(unsafe { libc::close(accepted) } == 0, 37);
+        child_require(unsafe { libc::close(FRAME_FD) } == 0, 38);
+        child_require(unsafe { libc::close(LISTENER_FD) } == 0, 39);
+        child_require(unsafe { libc::close(5) } == 0, 40);
+        child_exit(0);
+    }
+
+    #[test]
+    fn network_service_filter_fixture() {
+        if std::env::var_os("DRV_NETWORK_SERVICE_FILTER_FIXTURE").is_none() {
+            return;
+        }
+        child_require(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
+            45,
+        );
+        child_require(lockdown().is_ok(), 46);
+        let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
+        let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
+        let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };
+        let mut service = match BoundedNetstackProof::new(
+            device,
+            NetstackProofConfig {
+                dns_name: "unused.invalid.".into(),
+                server_port: NonZeroU16::new(80).unwrap(),
+            },
+        ) {
+            Ok(service) => service,
+            Err(_) => child_exit(47),
+        };
+        child_require(
+            service
+                .serve_socks5_listener(
+                    listener,
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some(Instant::now() + Duration::from_millis(100)),
+                    || false,
+                )
+                .is_ok(),
+            48,
+        );
+        drop(service);
+        child_exit(0);
+    }
+
+    #[test]
+    fn network_filter_denial_fixture() {
+        let Some(operation) = std::env::var_os("DRV_NETWORK_FILTER_DENIAL") else {
+            return;
+        };
+        child_require(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
+            50,
+        );
+        child_require(lockdown().is_ok(), 51);
+        unsafe {
+            match operation.to_str().unwrap() {
+                "socket" => {
+                    libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
+                }
+                "openat" => {
+                    libc::syscall(
+                        libc::SYS_openat,
+                        libc::AT_FDCWD,
+                        c"/etc/passwd".as_ptr(),
+                        libc::O_RDONLY,
+                    );
+                }
+                "ioctl" => {
+                    libc::syscall(libc::SYS_ioctl, FRAME_FD, 0x5413, 0);
+                }
+                "wrong-send-fd" => {
+                    libc::syscall(libc::SYS_sendto, LISTENER_FD, b"x".as_ptr(), 1, 0, 0, 0);
+                }
+                "send-flags" => {
+                    libc::syscall(libc::SYS_sendto, FRAME_FD, b"x".as_ptr(), 1, 0, 0, 0);
+                }
+                "recv-flags" => {
+                    libc::syscall(libc::SYS_recvfrom, FRAME_FD, 0, 0, 0, 0, 0);
+                }
+                "frame-address" => {
+                    libc::syscall(
+                        libc::SYS_sendto,
+                        FRAME_FD,
+                        b"x".as_ptr(),
+                        1,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        1,
+                        1,
+                    );
+                }
+                "read-frame" => {
+                    libc::syscall(libc::SYS_read, FRAME_FD, 0, 0);
+                }
+                "write-listener" => {
+                    libc::syscall(libc::SYS_write, LISTENER_FD, 0, 0);
+                }
+                "wrong-accept-fd" => {
+                    libc::syscall(
+                        libc::SYS_accept4,
+                        FRAME_FD,
+                        0,
+                        0,
+                        libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    );
+                }
+                "accept-flags" => {
+                    libc::syscall(libc::SYS_accept4, LISTENER_FD, 0, 0, 0);
+                }
+                "fcntl-dup" => {
+                    libc::syscall(libc::SYS_fcntl, FRAME_FD, libc::F_DUPFD_CLOEXEC, 10);
+                }
+                "executable-memory" => {
+                    libc::syscall(
+                        libc::SYS_mmap,
+                        0,
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    );
+                }
+                "executable-mprotect" => {
+                    libc::syscall(libc::SYS_mprotect, 0, 4096, libc::PROT_EXEC);
+                }
+                "unknown" => {
+                    libc::syscall(libc::SYS_getuid);
+                }
+                _ => child_exit(52),
+            }
+        }
+        child_exit(53);
+    }
+
+    #[test]
+    fn network_filter_forbidden_operations_are_fatal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        for operation in [
+            "socket",
+            "openat",
+            "ioctl",
+            "wrong-send-fd",
+            "send-flags",
+            "recv-flags",
+            "frame-address",
+            "read-frame",
+            "write-listener",
+            "wrong-accept-fd",
+            "accept-flags",
+            "fcntl-dup",
+            "executable-memory",
+            "executable-mprotect",
+            "unknown",
+        ] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "child::tests::network_filter_denial_fixture",
+                    "--nocapture",
+                ])
+                .env("DRV_NETWORK_FILTER_DENIAL", operation)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGSYS),
+                "forbidden network operation survived: {operation}; status={status}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_service_core_runs_under_network_filter() {
+        let (host, driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        let frame = duplicate(host.into_frame_fd().as_raw_fd());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&[5, 1, 0]).unwrap();
+        let listener = duplicate(listener.as_raw_fd());
+        let raw = [frame.as_raw_fd(), listener.as_raw_fd()];
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "child::tests::network_service_filter_fixture",
+                "--nocapture",
+            ])
+            .env("DRV_NETWORK_SERVICE_FILTER_FIXTURE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in raw.into_iter().zip([3, 4]) {
+                    if libc::dup2(source, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((frame, listener));
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 0]);
+        let status = child.wait().unwrap();
+        drop(driver);
+        assert!(
+            status.success(),
+            "filtered production core failed: {status}"
+        );
+    }
+
+    #[test]
+    fn production_socks_relay_runs_under_network_filter() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "integration_test::socks_connect_relays_application_bytes_over_ethernet",
+                "--nocapture",
+            ])
+            .env("DRV_NETWORK_RELAY_FILTER_FIXTURE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success(), "filtered SOCKS relay failed: {status}");
+    }
+
+    #[test]
+    fn network_filter_allows_runtime_and_teardown() {
+        let (host, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        driver.set_link(true);
+        driver.deliver(&[0xa5; 14]).unwrap();
+        let frame = duplicate(host.into_frame_fd().as_raw_fd());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"PING").unwrap();
+        let listener = duplicate(listener.as_raw_fd());
+        let (mut bootstrap_parent, bootstrap_child) = UnixStream::pair().unwrap();
+        bootstrap_parent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        bootstrap_parent.write_all(b"GO").unwrap();
+        let bootstrap = duplicate(bootstrap_child.as_raw_fd());
+        let raw = [
+            frame.as_raw_fd(),
+            listener.as_raw_fd(),
+            bootstrap.as_raw_fd(),
+        ];
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "child::tests::network_filter_fixture",
+                "--nocapture",
+            ])
+            .env("DRV_NETWORK_FILTER_FIXTURE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in raw.into_iter().zip([3, 4, 5]) {
+                    if libc::dup2(source, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((frame, listener, bootstrap, bootstrap_child));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let echoed = loop {
+            match driver.take_transmit() {
+                Ok(Some(frame)) => break frame,
+                Ok(None) | Err(EthernetIngressError::Backpressure) => {}
+                Err(error) => panic!("network filter frame path failed: {error:?}"),
+            }
+            assert!(Instant::now() < deadline, "network filter frame timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(echoed.as_bytes(), [0xa5; 14]);
+        let mut response = [0u8; 4];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"PONG");
+        let mut ready = [0u8; 2];
+        bootstrap_parent.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"OK");
+        assert!(child.wait().unwrap().success());
+    }
 }
