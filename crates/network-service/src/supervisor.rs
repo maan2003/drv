@@ -537,6 +537,38 @@ mod tests {
     }
 
     #[test]
+    fn accepted_clients_inherit_accounted_listener_socket_buffers() {
+        fn buffer(fd: RawFd, option: i32) -> i32 {
+            let mut value = 0i32;
+            let mut length = size_of::<i32>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&mut value as *mut i32).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            value
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        crate::bound_listener_socket_memory(&listener).unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            assert_eq!(
+                buffer(accepted.as_raw_fd(), option),
+                buffer(listener.as_raw_fd(), option)
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_rejects_non_protocol_bytes() {
         let (mut parent, mut child) = UnixStream::pair().unwrap();
         child.write_all(b"NOPE!").unwrap();

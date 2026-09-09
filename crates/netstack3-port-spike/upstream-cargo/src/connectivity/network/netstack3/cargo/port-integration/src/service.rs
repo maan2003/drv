@@ -27,7 +27,7 @@ use std::{
     future::poll_fn,
     io,
     net::{IpAddr, Ipv4Addr as StdIpv4Addr, SocketAddr},
-    num::{NonZeroU16, NonZeroU64},
+    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     rc::Rc,
     task::{Poll, Waker},
     time::Duration,
@@ -242,6 +242,20 @@ pub struct DhcpService {
 }
 impl DhcpService {
     pub fn new<R: Rng + 'static>(runtime: Runtime, rng: R, mac: [u8; 6]) -> Self {
+        Self::new_with_dns_capacity(
+            runtime,
+            rng,
+            mac,
+            NonZeroUsize::new(64).expect("nonzero default DNS capacity"),
+        )
+    }
+
+    pub fn new_with_dns_capacity<R: Rng + 'static>(
+        runtime: Runtime,
+        rng: R,
+        mac: [u8; 6],
+        dns_capacity: NonZeroUsize,
+    ) -> Self {
         let rt = Rc::new(RefCell::new(runtime));
         let now = Rc::new(Cell::new(NativeInstant::ZERO));
         let wakes = Rc::new(RefCell::new(Wakes::default()));
@@ -321,7 +335,7 @@ impl DhcpService {
         let sockets = NativeSocketProvider::new(rt.clone());
         Self {
             sockets,
-            dns: NativeDnsBridge::new(),
+            dns: NativeDnsBridge::with_capacity(dns_capacity),
             rt,
             pool,
             now,

@@ -55,19 +55,38 @@ struct BoundedNetstackProof {
     resolved: Option<[u8; 4]>,
     socket: Option<netstack3_port_spike::RemoteSocketHandle>,
     proxy_client: SocketClientId,
+    admission_capacity: usize,
     frame_events: u32,
 }
 
 // Admission and staging are separate budgets: idle clients consume descriptors
-// but cannot reserve the aggregate relay-buffer budget. This supports ordinary
-// fan-out without allowing an unbounded accepted-fd or heap attack. Sixty-four
-// active clients is an explicit service resource policy, not a measured
-// hardware maximum; larger deployments require revisiting descriptor, kernel
-// socket-state, Netstack socket-state, and scheduler costs together.
-const MAX_SOCKS5_CLIENTS: usize = 64;
+// and protocol metadata but cannot reserve the aggregate relay-buffer budget.
+// Each admission is conservatively charged 512 KiB against a 64 MiB
+// connection-state accounting pool; this is admission policy, not a claim of
+// an exact process-RSS or kernel-memory bound:
+// 128 KiB for Netstack's 64 KiB send/receive buffers, 256 KiB for Linux's
+// doubled 64 KiB send/receive socket-buffer requests, and 128 KiB for client,
+// scheduler, map, allocator, kernel, and transport metadata. Buffers allocate lazily,
+// but charging their reachable maximum prevents idle admission from granting
+// an unbounded future commitment. Actual relay staging has separate limits.
+pub(crate) const HOST_SOCKET_BUFFER_REQUEST: i32 = 64 * 1024;
+const SOCKS5_CLIENT_STATE_CHARGE: usize = 512 * 1024;
+const SOCKS5_CONNECTION_STATE_BUDGET: usize = 64 * 1024 * 1024;
+// Netstack's independent TX/event/readiness/UDP queues share a separate 4 MiB
+// accounting budget. Each position is charged 72 KiB: one maximum 64 KiB UDP
+// datagram plus Ethernet TX/device frames and event/readiness/map overhead in
+// the other independently bounded queue families. This deliberately does not
+// scale with admitted connections or with the scheduler work quantum.
+const NETSTACK_QUEUE_MEMORY_BUDGET: usize = 4 * 1024 * 1024;
+const NETSTACK_QUEUE_SLOT_CHARGE: usize = 72 * 1024;
+// Production enters confinement with descriptors 0..=6 assigned to stdio,
+// Ethernet, listener, bootstrap, and epoll. Charge all seven even if stdio is
+// closed and retain one additional slot for operational/error-path headroom.
+const SOCKS5_OPERATIONAL_FD_RESERVE: usize = 8;
 const MAX_SOCKS5_PENDING_BYTES: usize = 256 * 1024;
 const MAX_SOCKS5_TOTAL_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SOCKS5_HANDSHAKE_BYTES: usize = 512;
+const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const EVENT_BATCH: usize = 64;
 const CLIENT_WORK_BUDGET: usize = 64;
 const STACK_WORK_BUDGET: usize = 64;
@@ -76,6 +95,70 @@ const LISTENER_TOKEN: u64 = 2;
 const FIRST_CLIENT_TOKEN: u64 = 3;
 const BASE_EVENTS: u32 = (libc::EPOLLERR | libc::EPOLLHUP) as u32;
 const CLIENT_BASE_EVENTS: u32 = BASE_EVENTS | libc::EPOLLRDHUP as u32;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Socks5ResourceBudget {
+    admission_capacity: usize,
+}
+
+impl Socks5ResourceBudget {
+    pub(crate) fn from_process_limit() -> Result<Self, &'static str> {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return Err("SOCKS5 descriptor limit query failed");
+        }
+        Self::from_soft_limit(unsafe { limit.assume_init() }.rlim_cur)
+    }
+
+    fn from_soft_limit(soft_limit: libc::rlim_t) -> Result<Self, &'static str> {
+        let descriptor_capacity = usize::try_from(soft_limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(SOCKS5_OPERATIONAL_FD_RESERVE);
+        let state_capacity = SOCKS5_CONNECTION_STATE_BUDGET / SOCKS5_CLIENT_STATE_CHARGE;
+        let admission_capacity = descriptor_capacity.min(state_capacity);
+        if admission_capacity == 0 {
+            return Err("SOCKS5 process resource allowance is too small");
+        }
+        Ok(Self { admission_capacity })
+    }
+}
+
+pub(crate) fn bound_listener_socket_memory(listener: &TcpListener) -> Result<(), String> {
+    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let value = HOST_SOCKET_BUFFER_REQUEST;
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&value as *const i32).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "bound network-service listener socket memory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut actual = 0i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&mut actual as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || actual > HOST_SOCKET_BUFFER_REQUEST * 2
+        {
+            return Err("network-service listener socket memory exceeds accounting charge".into());
+        }
+    }
+    Ok(())
+}
 
 pub(crate) struct NetworkPoller {
     fd: OwnedFd,
@@ -163,7 +246,13 @@ impl NetworkPoller {
     }
 }
 
-fn accept_nonblocking(listener_fd: RawFd) -> Result<Option<(TcpStream, SocketAddr)>, &'static str> {
+enum AcceptResult {
+    Accepted(TcpStream, SocketAddr),
+    Drained,
+    ResourcePressure,
+}
+
+fn accept_nonblocking(listener_fd: RawFd) -> Result<AcceptResult, &'static str> {
     let mut address = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
     let mut length = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let fd = unsafe {
@@ -175,10 +264,17 @@ fn accept_nonblocking(listener_fd: RawFd) -> Result<Option<(TcpStream, SocketAdd
         )
     };
     if fd < 0 {
-        return match std::io::Error::last_os_error().kind() {
-            ErrorKind::WouldBlock => Ok(None),
-            _ => Err("SOCKS5 accept failed"),
-        };
+        let error = std::io::Error::last_os_error();
+        if error.kind() == ErrorKind::WouldBlock {
+            return Ok(AcceptResult::Drained);
+        }
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE)
+        ) {
+            return Ok(AcceptResult::ResourcePressure);
+        }
+        return Err("SOCKS5 accept failed");
     }
     let address = unsafe { address.assume_init() };
     let peer = match i32::from(address.ss_family) {
@@ -204,7 +300,10 @@ fn accept_nonblocking(listener_fd: RawFd) -> Result<Option<(TcpStream, SocketAdd
             return Err("SOCKS5 accepted unsupported peer family");
         }
     };
-    Ok(Some((unsafe { TcpStream::from_raw_fd(fd) }, peer)))
+    Ok(AcceptResult::Accepted(
+        unsafe { TcpStream::from_raw_fd(fd) },
+        peer,
+    ))
 }
 
 fn schedule_client(
@@ -316,18 +415,30 @@ impl BoundedNetstackProof {
         device: ServiceEthernetDevice,
         config: NetstackProofConfig,
     ) -> Result<Self, &'static str> {
-        Self::new_with_poller(device, config, NetworkPoller::new()?)
+        Self::new_with_poller(
+            device,
+            config,
+            NetworkPoller::new()?,
+            Socks5ResourceBudget::from_process_limit()?,
+        )
     }
 
     fn new_with_poller(
         device: ServiceEthernetDevice,
         config: NetstackProofConfig,
         poller: NetworkPoller,
+        resources: Socks5ResourceBudget,
     ) -> Result<Self, &'static str> {
         let mac = device.mac_address();
         let frame_fd = device.raw_fd();
-        let runtime = Runtime::new(
-            MAX_SOCKS5_CLIENTS * 2 + 1,
+        let runtime_capacity = resources
+            .admission_capacity
+            .checked_mul(2)
+            .and_then(|capacity| capacity.checked_add(1))
+            .ok_or("Netstack runtime capacity overflow")?;
+        let runtime = Runtime::new_with_capacities(
+            runtime_capacity,
+            NETSTACK_QUEUE_MEMORY_BUDGET / NETSTACK_QUEUE_SLOT_CHARGE,
             (0u8..=255).cycle().take(8192),
             NonZeroU64::new(1).unwrap(),
             mac,
@@ -335,12 +446,17 @@ impl BoundedNetstackProof {
         )
         .map_err(|_| "Netstack runtime initialization failed")?;
         let runner = EthernetRunner::new(
-            DhcpService::new(runtime, StdRng::seed_from_u64(7), mac),
+            DhcpService::new_with_dns_capacity(
+                runtime,
+                StdRng::seed_from_u64(7),
+                mac,
+                NonZeroUsize::new(resources.admission_capacity).unwrap(),
+            ),
             device,
         );
         let proxy_client = RemoteSocketProvider::open_client(
             &mut runner.stack().socket_provider(),
-            NonZeroUsize::new(MAX_SOCKS5_CLIENTS).unwrap(),
+            NonZeroUsize::new(resources.admission_capacity).unwrap(),
         )
         .map_err(|_| "SOCKS5 provider client initialization failed")?;
         let proof = Self {
@@ -352,6 +468,7 @@ impl BoundedNetstackProof {
             resolved: None,
             socket: None,
             proxy_client,
+            admission_capacity: resources.admission_capacity,
             frame_events: BASE_EVENTS | libc::EPOLLIN as u32,
         };
         proof
@@ -550,9 +667,16 @@ impl BoundedNetstackProof {
         )?;
         let mut listener_readable = false;
         let mut listener_events = BASE_EVENTS | libc::EPOLLIN as u32;
+        let mut admission_retry = None;
         let mut stack_pending = true;
         println!("internet_proxy_ready=true listen={listen}");
         while !stop_requested() && deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            if admission_retry.is_some_and(|retry| Instant::now() >= retry) {
+                admission_retry = None;
+                // Retry explicitly rather than depending on a readiness edge
+                // while EPOLLIN was disabled under descriptor pressure.
+                listener_readable = true;
+            }
             if stack_pending {
                 match self.drive_once(deadline) {
                     Ok((exhausted, worked)) => {
@@ -582,11 +706,11 @@ impl BoundedNetstackProof {
             }
 
             for _ in 0..32 {
-                if !listener_readable || clients.len() >= MAX_SOCKS5_CLIENTS {
+                if !listener_readable || clients.len() >= self.admission_capacity {
                     break;
                 }
                 match accept_nonblocking(listener_fd) {
-                    Ok(Some((stream, peer))) => {
+                    Ok(AcceptResult::Accepted(stream, peer)) => {
                         let token = next_token;
                         next_token = next_token
                             .checked_add(1)
@@ -606,8 +730,13 @@ impl BoundedNetstackProof {
                             4,
                         );
                     }
-                    Ok(None) => {
+                    Ok(AcceptResult::Drained) => {
                         listener_readable = false;
+                        break;
+                    }
+                    Ok(AcceptResult::ResourcePressure) => {
+                        listener_readable = false;
+                        admission_retry = Some(Instant::now() + ADMISSION_RETRY_INTERVAL);
                         break;
                     }
                     Err(error) => {
@@ -619,6 +748,7 @@ impl BoundedNetstackProof {
                 }
             }
 
+            let mut released_client = false;
             let expired: Vec<_> = clients
                 .iter()
                 .filter_map(|(token, client)| {
@@ -627,6 +757,7 @@ impl BoundedNetstackProof {
                 .collect();
             for token in expired {
                 if let Some(mut client) = clients.remove(&token) {
+                    released_client = true;
                     pending_clients.remove(&token);
                     self.poller.delete(client.stream.as_raw_fd())?;
                     self.close_socks5_client(&mut client);
@@ -647,6 +778,7 @@ impl BoundedNetstackProof {
                 };
                 if event_mask & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
                     if let Some(mut client) = clients.remove(&token) {
+                        released_client = true;
                         self.poller.delete(client.stream.as_raw_fd())?;
                         self.close_socks5_client(&mut client);
                         client_mutated_stack = true;
@@ -683,6 +815,7 @@ impl BoundedNetstackProof {
                     }
                     Ok(true) => {
                         let mut client = clients.remove(&token).expect("client exists");
+                        released_client = true;
                         pending_clients.remove(&token);
                         self.poller.delete(client.stream.as_raw_fd())?;
                         self.close_socks5_client(&mut client);
@@ -691,6 +824,7 @@ impl BoundedNetstackProof {
                     }
                     Err(error) => {
                         let mut client = clients.remove(&token).expect("client exists");
+                        released_client = true;
                         pending_clients.remove(&token);
                         self.poller.delete(client.stream.as_raw_fd())?;
                         self.close_socks5_client(&mut client);
@@ -700,6 +834,10 @@ impl BoundedNetstackProof {
                 }
             }
             stack_pending |= client_mutated_stack;
+            if released_client {
+                admission_retry = None;
+                listener_readable = true;
+            }
 
             let total_pending: usize = clients.values().map(Socks5Client::pending_bytes).sum();
             for client in clients.values_mut() {
@@ -711,7 +849,7 @@ impl BoundedNetstackProof {
                 }
             }
             let desired_listener_events = BASE_EVENTS
-                | if clients.len() < MAX_SOCKS5_CLIENTS {
+                | if clients.len() < self.admission_capacity && admission_retry.is_none() {
                     libc::EPOLLIN as u32
                 } else {
                     0
@@ -728,7 +866,8 @@ impl BoundedNetstackProof {
             let timeout = self.next_wait_timeout(
                 deadline
                     .into_iter()
-                    .chain(clients.values().map(|client| client.idle_deadline)),
+                    .chain(clients.values().map(|client| client.idle_deadline))
+                    .chain(admission_retry),
             );
             let mut events = [libc::epoll_event { events: 0, u64: 0 }; EVENT_BATCH];
             let ready = self.poller.wait(&mut events, timeout)?;
@@ -985,6 +1124,7 @@ impl BoundedNetstackProof {
                     })
                     .map_err(|_| "SOCKS5 remote write failed")?;
                     client.host_to_remote.drain(..written);
+                    client.host_to_remote.shrink_to_fit();
                     if written != 0 {
                         client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                     }
@@ -1082,6 +1222,7 @@ impl BoundedNetstackProof {
             0 => Err("SOCKS5 host closed during write"),
             written if written > 0 => {
                 pending.drain(..written as usize);
+                pending.shrink_to_fit();
                 client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 Ok(())
             }
@@ -1122,6 +1263,27 @@ impl BoundedNetstackProof {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn admission_is_derived_from_descriptor_and_connection_state_budgets() {
+        assert_eq!(
+            Socks5ResourceBudget::from_soft_limit(80)
+                .unwrap()
+                .admission_capacity,
+            72
+        );
+        assert_eq!(
+            Socks5ResourceBudget::from_soft_limit(libc::rlim_t::MAX)
+                .unwrap()
+                .admission_capacity,
+            SOCKS5_CONNECTION_STATE_BUDGET / SOCKS5_CLIENT_STATE_CHARGE
+        );
+        assert!(Socks5ResourceBudget::from_soft_limit(8).is_err());
+        assert!(
+            size_of::<Socks5Client>() + MAX_SOCKS5_HANDSHAKE_BYTES
+                < SOCKS5_CLIENT_STATE_CHARGE - 128 * 1024 - 256 * 1024
+        );
+    }
 
     #[test]
     fn runnable_queue_coalesces_and_preserves_round_robin_order() {

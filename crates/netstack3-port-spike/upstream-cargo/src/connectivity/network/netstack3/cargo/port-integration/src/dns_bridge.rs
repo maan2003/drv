@@ -13,7 +13,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroUsize},
     pin::Pin,
     rc::Rc,
     sync::{
@@ -35,17 +35,24 @@ use trust_dns_resolver::{
     name_server::{GenericConnection, GenericConnectionProvider, RuntimeProvider, Spawn},
 };
 
-const LIMIT: usize = 64;
+const DEFAULT_LIMIT: usize = 64;
+const SOCKET_MESSAGE_LIMIT: usize = 8;
+// DNS responses larger than this service-owned bound are discarded. It covers
+// conventional UDP/EDNS responses and bounds each transport's retained queue;
+// TCP delivery is already read in 2 KiB chunks.
+const SOCKET_MESSAGE_BYTES_LIMIT: usize = 4096;
 type Task = Pin<Box<dyn Future<Output = Result<(), ProtoError>> + Send>>;
 struct End {
+    limit: usize,
     peer: Mutex<Option<SocketAddr>>,
     open: Mutex<Option<io::Result<()>>>,
     rx: Mutex<VecDeque<Vec<u8>>>,
     wake: Mutex<Option<Waker>>,
 }
 impl End {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
+            limit,
             peer: Mutex::new(None),
             open: Mutex::new(None),
             rx: Mutex::new(VecDeque::new()),
@@ -57,8 +64,11 @@ impl End {
         self.wake()
     }
     fn push(&self, b: Vec<u8>) {
+        if b.len() > SOCKET_MESSAGE_BYTES_LIMIT {
+            return;
+        }
         let mut q = self.rx.lock().unwrap();
-        if q.len() == LIMIT {
+        if q.len() == self.limit {
             q.pop_front();
         }
         q.push_back(b);
@@ -79,6 +89,7 @@ enum Cmd {
     CT(u64),
 }
 struct Bus {
+    limit: usize,
     now: AtomicU64,
     next: AtomicU64,
     cmd: Mutex<VecDeque<Cmd>>,
@@ -86,8 +97,9 @@ struct Bus {
     timers: Mutex<Vec<(u64, Waker)>>,
 }
 impl Bus {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
+            limit,
             now: AtomicU64::new(0),
             next: AtomicU64::new(1),
             cmd: Mutex::new(VecDeque::new()),
@@ -96,8 +108,15 @@ impl Bus {
         }
     }
     fn send(&self, c: Cmd) -> io::Result<()> {
+        if matches!(&c, Cmd::SU(_, _, bytes) | Cmd::WT(_, bytes) if bytes.len() > SOCKET_MESSAGE_BYTES_LIMIT)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS command payload exceeds bridge budget",
+            ));
+        }
         let mut q = self.cmd.lock().unwrap();
-        if q.len() == LIMIT {
+        if q.len() == self.limit {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "DNS command queue full",
@@ -203,7 +222,7 @@ impl NativeUdp {
     async fn open(remote: SocketAddr, bind: Option<SocketAddr>) -> io::Result<Self> {
         let b = bus()?;
         let id = b.next.fetch_add(1, Ordering::Relaxed);
-        let e = Arc::new(End::new());
+        let e = Arc::new(End::new(SOCKET_MESSAGE_LIMIT));
         b.send(Cmd::OU(id, remote, bind, e.clone()))?;
         Ok(Self { b, id, remote, e })
     }
@@ -263,7 +282,7 @@ impl Connect for NativeTcp {
     async fn connect_with_bind(a: SocketAddr, _: Option<SocketAddr>) -> io::Result<Self> {
         let b = bus()?;
         let id = b.next.fetch_add(1, Ordering::Relaxed);
-        let e = Arc::new(End::new());
+        let e = Arc::new(End::new(SOCKET_MESSAGE_LIMIT));
         b.send(Cmd::OT(id, a, e.clone()))?;
         wait(&e).await?;
         Ok(Self {
@@ -322,17 +341,22 @@ pub struct NativeDnsBridge {
     pool: LocalPool,
     resolver: Option<Resolver>,
     next_query: u64,
+    limit: usize,
     results: Rc<RefCell<HashMap<u64, DnsLookupSlot>>>,
     udp: HashMap<u64, (UdpSocketHandle, SocketAddr, NonZeroU16, Arc<End>)>,
     tcp: HashMap<u64, (TcpSocketHandle, Arc<End>)>,
 }
 impl NativeDnsBridge {
     pub fn new() -> Self {
+        Self::with_capacity(NonZeroUsize::new(DEFAULT_LIMIT).unwrap())
+    }
+    pub fn with_capacity(limit: NonZeroUsize) -> Self {
         Self {
-            b: Arc::new(Bus::new()),
+            b: Arc::new(Bus::new(limit.get())),
             pool: LocalPool::new(),
             resolver: None,
             next_query: 0,
+            limit: limit.get(),
             results: Rc::new(RefCell::new(HashMap::new())),
             udp: HashMap::new(),
             tcp: HashMap::new(),
@@ -370,7 +394,7 @@ impl NativeDnsBridge {
             .checked_add(1)
             .expect("DNS query id exhausted");
         let results = self.results.clone();
-        if results.borrow().len() == LIMIT {
+        if results.borrow().len() == self.limit {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "DNS lookup table full",
@@ -574,7 +598,7 @@ mod tests {
 
         let mut work = 0;
         for _ in 0..8 {
-            work += bridge.pump(&mut runtime, Duration::ZERO, LIMIT);
+            work += bridge.pump(&mut runtime, Duration::ZERO, DEFAULT_LIMIT);
         }
         assert!(work > 0);
         let frame = runtime
@@ -636,7 +660,7 @@ mod tests {
         assert!(bridge.take_result(query).is_none());
         assert!(bridge.take_result(query).is_none());
         for _ in 0..8 {
-            bridge.pump(&mut client, Duration::ZERO, LIMIT);
+            bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
             exchange(&mut client, &mut server);
         }
         let request = server
@@ -665,11 +689,34 @@ mod tests {
             .unwrap();
         for _ in 0..8 {
             exchange(&mut client, &mut server);
-            bridge.pump(&mut client, Duration::ZERO, LIMIT);
+            bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
         }
         assert_eq!(
             bridge.take_result(query).unwrap().unwrap(),
             [IpAddr::from([192, 0, 2, 99])]
         );
+    }
+
+    #[test]
+    fn configured_capacity_applies_beyond_legacy_dns_limit() {
+        let bridge = NativeDnsBridge::with_capacity(NonZeroUsize::new(65).unwrap());
+        for id in 0..65 {
+            bridge.b.send(Cmd::CT(id)).unwrap();
+        }
+        assert_eq!(
+            bridge.b.send(Cmd::CT(65)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            bridge
+                .b
+                .send(Cmd::WT(0, vec![0; SOCKET_MESSAGE_BYTES_LIMIT + 1]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let end = End::new(SOCKET_MESSAGE_LIMIT);
+        end.push(vec![0; SOCKET_MESSAGE_BYTES_LIMIT + 1]);
+        assert!(end.rx.lock().unwrap().is_empty());
     }
 }

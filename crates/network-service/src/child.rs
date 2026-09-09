@@ -542,6 +542,10 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
             poller.raw_fd()
         ));
     }
+    // RLIMIT_NOFILE is ambient process state, so turn it into a bounded
+    // admission capability before the default-kill filter is installed.
+    let resources = crate::Socks5ResourceBudget::from_process_limit().map_err(str::to_string)?;
+    crate::bound_listener_socket_memory(&listener)?;
     lockdown()?;
     println!(
         "netstack_sandbox_ready=true pid={} uid=65534 gid=65534 no_new_privs=true seccomp_default=kill empty_root=true own_netns=true inherited_frame_only=true inherited_listener_only=true",
@@ -568,6 +572,7 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
             server_port: NonZeroU16::new(80).unwrap(),
         },
         poller,
+        resources,
     )
     .map_err(str::to_string)?;
     if !lab_proof {
@@ -613,11 +618,14 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Socks5ResourceBudget;
     use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
+    use std::thread;
     use wlan_softmac_host::ethernet::{EthernetIngressError, ethernet_port};
 
     fn duplicate(fd: RawFd) -> OwnedFd {
@@ -789,6 +797,7 @@ mod tests {
             return;
         }
         let poller = NetworkPoller::new().unwrap();
+        let resources = Socks5ResourceBudget::from_process_limit().unwrap();
         child_require(
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
             45,
@@ -807,6 +816,7 @@ mod tests {
                 server_port: NonZeroU16::new(80).unwrap(),
             },
             poller,
+            resources,
         ) {
             Ok(service) => service,
             Err(_) => child_exit(47),
@@ -821,6 +831,86 @@ mod tests {
                 )
                 .is_ok(),
             48,
+        );
+        drop(service);
+        child_exit(0);
+    }
+
+    #[test]
+    fn resource_admission_filter_fixture() {
+        let Some(mode) = std::env::var_os("DRV_NETWORK_RESOURCE_ADMISSION_FIXTURE") else {
+            return;
+        };
+        let poller = NetworkPoller::new().unwrap();
+        let resources = Socks5ResourceBudget::from_process_limit().unwrap();
+        child_require(resources.admission_capacity == 72, 120);
+        let restore_limit = (mode == "emfile").then(|| {
+            let lowered = libc::rlimit {
+                rlim_cur: 72,
+                rlim_max: 80,
+            };
+            child_require(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } == 0,
+                121,
+            );
+            thread::spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                let restored = libc::rlimit {
+                    rlim_cur: 80,
+                    rlim_max: 80,
+                };
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restored) },
+                    0
+                );
+            })
+        });
+        let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
+        let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
+        crate::bound_listener_socket_memory(&listener).unwrap();
+        let listen = listener.local_addr().unwrap();
+        let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };
+        let mut service = BoundedNetstackProof::new_with_poller(
+            device,
+            NetstackProofConfig {
+                dns_name: "unused.invalid.".into(),
+                server_port: NonZeroU16::new(80).unwrap(),
+            },
+            poller,
+            resources,
+        )
+        .unwrap();
+        child_require(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
+            122,
+        );
+        child_require(
+            install_filter(FRAME_FD, LISTENER_FD, service.poller_fd()).is_ok(),
+            123,
+        );
+        let before = service.poller_wait_counts();
+        child_require(
+            service
+                .serve_socks5_listener(
+                    listener,
+                    listen,
+                    Some(Instant::now() + Duration::from_millis(800)),
+                    || false,
+                )
+                .is_ok(),
+            124,
+        );
+        let after = service.poller_wait_counts();
+        let waits = after.0 - before.0;
+        let blocking = after.1 - before.1;
+        child_require(blocking != 0 && blocking == waits && waits <= 32, 125);
+        if let Some(restore_limit) = restore_limit {
+            child_require(restore_limit.join().is_ok(), 126);
+        }
+        eprintln!(
+            "resource_admission mode={} capacity={} waits={waits} blocking_waits={blocking}",
+            mode.to_string_lossy(),
+            resources.admission_capacity,
         );
         drop(service);
         child_exit(0);
@@ -1077,11 +1167,109 @@ mod tests {
         assert!(status.success(), "filtered SOCKS relay failed: {status}");
     }
 
+    fn run_resource_admission_fixture(mode: &str, initially_admitted: usize, release_client: bool) {
+        let (host, driver) = ethernet_port([2, 0, 0, 0, 0, 1], 256).unwrap();
+        let frame = duplicate(host.into_frame_fd().as_raw_fd());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        crate::bound_listener_socket_memory(&listener).unwrap();
+        let listen = listener.local_addr().unwrap();
+        let listener = duplicate(listener.as_raw_fd());
+        let raw = [frame.as_raw_fd(), listener.as_raw_fd()];
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "child::tests::resource_admission_filter_fixture",
+                "--nocapture",
+            ])
+            .env("DRV_NETWORK_RESOURCE_ADMISSION_FIXTURE", mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in raw.into_iter().zip([FRAME_FD, LISTENER_FD]) {
+                    if libc::dup2(source, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: 80,
+                    rlim_max: 80,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((frame, listener));
+        let mut clients: Vec<_> = (0..=initially_admitted)
+            .map(|_| {
+                let mut client = TcpStream::connect(listen).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                client.write_all(&[5, 1, 0]).unwrap();
+                client
+            })
+            .collect();
+        let mut queued = clients.pop().unwrap();
+        for client in &mut clients {
+            let mut greeting = [0; 2];
+            client.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 0]);
+        }
+        queued
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut greeting = [0; 2];
+        let error = queued.read_exact(&mut greeting).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "queued client failed unexpectedly: {error}"
+        );
+        if release_client {
+            drop(clients.swap_remove(0));
+        }
+        queued
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        queued.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 0]);
+        drop((queued, clients));
+        let status = child.wait().unwrap();
+        drop(driver);
+        assert!(
+            status.success(),
+            "resource admission fixture failed: {status}"
+        );
+    }
+
+    #[test]
+    fn filtered_resource_derived_admission_exceeds_sixty_four_and_recovers_slot() {
+        // RLIMIT_NOFILE=80 minus seven retained descriptors and one spare.
+        run_resource_admission_fixture("boundary", 72, true);
+    }
+
+    #[test]
+    fn filtered_emfile_pause_recovers_on_external_resource_timer() {
+        // The child snapshots capacity at 80, then temporarily lowers its soft
+        // limit to 72. Six retained descriptors leave 66 successful accepts;
+        // restoring the limit exercises timer-driven recovery without closing
+        // a locally admitted client.
+        run_resource_admission_fixture("emfile", 66, false);
+    }
+
     #[test]
     fn epoll_scaling_idle_and_deadline_run_under_network_filter() {
         for test in [
             "integration_test::epoll_serves_more_than_twenty_four_clients_with_isolated_failures",
-            "integration_test::epoll_admission_resumes_queued_client_after_slot_frees",
             "integration_test::idle_epoll_waits_for_deadline_without_busy_polling",
         ] {
             let status = Command::new(std::env::current_exe().unwrap())

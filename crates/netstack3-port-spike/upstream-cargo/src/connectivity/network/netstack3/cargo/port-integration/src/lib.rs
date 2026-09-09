@@ -250,7 +250,8 @@ pub struct NativeBindingsCtx {
         ),
     >,
     entropy: InjectedEntropy,
-    capacity: usize,
+    socket_capacity: usize,
+    queue_capacity: usize,
     queues: Queues,
     udp_v4: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_v6: HashMap<String, VecDeque<NativeUdpDatagram>>,
@@ -264,13 +265,22 @@ impl Debug for NativeBindingsCtx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeBindingsCtx")
             .field("now", &self.now)
-            .field("capacity", &self.capacity)
+            .field("socket_capacity", &self.socket_capacity)
+            .field("queue_capacity", &self.queue_capacity)
             .finish_non_exhaustive()
     }
 }
 
 impl NativeBindingsCtx {
     pub fn new(queue_capacity: usize, entropy: impl IntoIterator<Item = u8>) -> Self {
+        Self::new_with_capacities(queue_capacity, queue_capacity, entropy)
+    }
+
+    fn new_with_capacities(
+        socket_capacity: usize,
+        queue_capacity: usize,
+        entropy: impl IntoIterator<Item = u8>,
+    ) -> Self {
         let mut rng = InjectedEntropy::default();
         rng.inject(entropy);
         let min = std::num::NonZeroUsize::new(4096).unwrap();
@@ -282,7 +292,8 @@ impl NativeBindingsCtx {
             next_timer: 0,
             timers: BTreeMap::new(),
             entropy: rng,
-            capacity: queue_capacity,
+            socket_capacity,
+            queue_capacity,
             queues: Queues::default(),
             udp_v4: HashMap::new(),
             udp_v6: HashMap::new(),
@@ -815,7 +826,7 @@ impl SocketOpsFilterBindingContext<DeviceId<Self>> for NativeBindingsCtx {
 impl<T: Debug> EventContext<T> for NativeBindingsCtx {
     fn on_event(&mut self, event: T) {
         let event = format!("{event:?}");
-        let _ = Self::push_bounded(self.capacity, &mut self.queues.events, event);
+        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, event);
     }
 }
 
@@ -827,7 +838,7 @@ impl<I: IpExt> UdpReceiveBindingsContext<I, DeviceId<Self>> for NativeBindingsCt
         meta: UdpPacketMeta<I>,
         body: &[u8],
     ) -> Result<(), ReceiveUdpError> {
-        if self.udp_pending >= self.capacity {
+        if self.udp_pending >= self.queue_capacity {
             return Err(ReceiveUdpError::QueueFull);
         }
         let map = if I::VERSION == IpVersion::V4 {
@@ -857,7 +868,7 @@ impl<I: IpExt> UdpReceiveBindingsContext<I, DeviceId<Self>> for NativeBindingsCt
         err: PendingDatagramSocketError,
     ) {
         let event = format!("UDP {id:?}: {err:?}");
-        let _ = Self::push_bounded(self.capacity, &mut self.queues.events, event);
+        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, event);
     }
 }
 impl<I: IpExt> IcmpEchoBindingsContext<I, DeviceId<Self>> for NativeBindingsCtx {
@@ -892,7 +903,7 @@ impl DeviceSocketBindingsContext<DeviceId<Self>> for NativeBindingsCtx {
         raw: &[u8],
     ) -> Result<(), ReceiveFrameError> {
         let mut q = socket.socket_state().lock().unwrap();
-        if q.len() >= self.capacity {
+        if q.len() >= self.queue_capacity {
             return Err(ReceiveFrameError::QueueFull);
         }
         q.push_back((device.downgrade(), raw.to_vec()));
@@ -902,7 +913,7 @@ impl DeviceSocketBindingsContext<DeviceId<Self>> for NativeBindingsCtx {
 impl ReceiveQueueBindingsContext<LoopbackDeviceId<Self>> for NativeBindingsCtx {
     fn wake_rx_task(&mut self, _device: &LoopbackDeviceId<Self>) {
         let _ = Self::push_bounded(
-            self.capacity,
+            self.queue_capacity,
             &mut self.queues.readiness,
             ReadinessEvent::RxReady,
         );
@@ -911,7 +922,7 @@ impl ReceiveQueueBindingsContext<LoopbackDeviceId<Self>> for NativeBindingsCtx {
 impl<D: Clone + Into<DeviceId<Self>>> TransmitQueueBindingsContext<D> for NativeBindingsCtx {
     fn wake_tx_task(&mut self, _device: &D) {
         let _ = Self::push_bounded(
-            self.capacity,
+            self.queue_capacity,
             &mut self.queues.readiness,
             ReadinessEvent::TxReady,
         );
@@ -927,7 +938,7 @@ impl DeviceLayerEventDispatcher for NativeBindingsCtx {
         _csum: Option<ChecksumOffloadResult>,
     ) -> Result<(), DeviceSendFrameError> {
         Self::push_bounded(
-            self.capacity,
+            self.queue_capacity,
             &mut self.queues.tx,
             TxFrame::Ethernet(device.downgrade(), frame.into_inner()),
         )
@@ -942,7 +953,7 @@ impl DeviceLayerEventDispatcher for NativeBindingsCtx {
         _csum: Option<ChecksumOffloadResult>,
     ) -> Result<(), DeviceSendFrameError> {
         Self::push_bounded(
-            self.capacity,
+            self.queue_capacity,
             &mut self.queues.tx,
             TxFrame::PureIp(version, packet.into_inner()),
         )
@@ -1144,8 +1155,27 @@ impl Runtime {
         mac: [u8; 6],
         mtu: u32,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_capacities(
+            queue_capacity,
+            queue_capacity,
+            entropy,
+            interface_id,
+            mac,
+            mtu,
+        )
+    }
+
+    /// Creates a runtime with independent socket admission and external queue limits.
+    pub fn new_with_capacities(
+        socket_capacity: usize,
+        queue_capacity: usize,
+        entropy: impl IntoIterator<Item = u8>,
+        interface_id: NonZeroU64,
+        mac: [u8; 6],
+        mtu: u32,
+    ) -> Result<Self, RuntimeError> {
         let mac = UnicastAddr::new(Mac::new(mac)).ok_or(RuntimeError::InvalidMac)?;
-        if queue_capacity == 0 {
+        if socket_capacity == 0 || queue_capacity == 0 {
             return Err(RuntimeError::InvalidCapacity);
         }
         if mtu > 1500 {
@@ -1153,7 +1183,8 @@ impl Runtime {
         }
         let max_frame_size =
             MaxEthernetFrameSize::from_mtu(Mtu::new(mtu)).ok_or(RuntimeError::InvalidMtu)?;
-        let mut bindings = NativeBindingsCtx::new(queue_capacity, entropy);
+        let mut bindings =
+            NativeBindingsCtx::new_with_capacities(socket_capacity, queue_capacity, entropy);
         let stack = bindings.build_stack();
         let device = stack
             .api(&mut bindings)
@@ -1502,10 +1533,10 @@ impl Runtime {
     }
 
     fn service_tx(&mut self, budget: usize) {
-        if budget == 0 || self.bindings.queues.tx.len() >= self.bindings.capacity {
+        if budget == 0 || self.bindings.queues.tx.len() >= self.bindings.queue_capacity {
             return;
         }
-        let available = (self.bindings.capacity - self.bindings.queues.tx.len()).min(budget);
+        let available = (self.bindings.queue_capacity - self.bindings.queues.tx.len()).min(budget);
         let _ = self
             .stack
             .api(&mut self.bindings)
@@ -1537,7 +1568,7 @@ impl Runtime {
     }
 
     pub fn udp_socket(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = self.stack.api(&mut self.bindings).udp::<Ipv4>().create();
@@ -1682,7 +1713,7 @@ impl Runtime {
     }
 
     pub fn udp_socket_ipv6(&mut self) -> Result<UdpSocketHandle, RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = self.stack.api(&mut self.bindings).udp::<Ipv6>().create();
@@ -1854,7 +1885,7 @@ impl Runtime {
     }
 
     pub fn tcp_socket(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
@@ -1911,7 +1942,7 @@ impl Runtime {
         handle: TcpSocketHandle,
         backlog: NonZeroUsize,
     ) -> Result<(), RuntimeError> {
-        if backlog.get() > self.bindings.capacity {
+        if backlog.get() > self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
@@ -1950,7 +1981,7 @@ impl Runtime {
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<(TcpSocketHandle, NativeSocketAddress, NativeSocketAddress), RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let listener = &self
@@ -2168,7 +2199,7 @@ impl Runtime {
     }
 
     pub fn tcp_socket_ipv6(&mut self) -> Result<TcpSocketHandle, RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
@@ -2231,7 +2262,7 @@ impl Runtime {
         handle: TcpSocketHandle,
         backlog: NonZeroUsize,
     ) -> Result<(), RuntimeError> {
-        if backlog.get() > self.bindings.capacity {
+        if backlog.get() > self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let id = &self
@@ -2278,7 +2309,7 @@ impl Runtime {
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<(TcpSocketHandle, NativeSocketAddress, NativeSocketAddress), RuntimeError> {
-        if self.socket_count() >= self.bindings.capacity {
+        if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
         let listener = &self
@@ -2491,14 +2522,57 @@ mod tests {
     fn externally_visible_queues_enforce_capacity() {
         let mut ctx = NativeBindingsCtx::new(1, []);
         assert!(
-            NativeBindingsCtx::push_bounded(ctx.capacity, &mut ctx.queues.events, "one".into())
-                .is_ok()
+            NativeBindingsCtx::push_bounded(
+                ctx.queue_capacity,
+                &mut ctx.queues.events,
+                "one".into()
+            )
+            .is_ok()
         );
         assert!(
-            NativeBindingsCtx::push_bounded(ctx.capacity, &mut ctx.queues.events, "two".into())
-                .is_err()
+            NativeBindingsCtx::push_bounded(
+                ctx.queue_capacity,
+                &mut ctx.queues.events,
+                "two".into()
+            )
+            .is_err()
         );
         assert_eq!(ctx.take_event().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn socket_capacity_is_independent_from_queue_capacity() {
+        let mut runtime = Runtime::new_with_capacities(
+            2,
+            1,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(99).unwrap(),
+            [2, 0, 0, 0, 0, 99],
+            1500,
+        )
+        .unwrap();
+
+        runtime.udp_socket().unwrap();
+        runtime.tcp_socket().unwrap();
+        assert_eq!(runtime.udp_socket_ipv6(), Err(RuntimeError::SocketLimit));
+
+        runtime.bindings.queues.events.clear();
+        assert!(
+            NativeBindingsCtx::push_bounded(
+                runtime.bindings.queue_capacity,
+                &mut runtime.bindings.queues.events,
+                "one".into()
+            )
+            .is_ok()
+        );
+        assert!(
+            NativeBindingsCtx::push_bounded(
+                runtime.bindings.queue_capacity,
+                &mut runtime.bindings.queues.events,
+                "two".into()
+            )
+            .is_err()
+        );
     }
 
     fn runtime(id: u64, mac: [u8; 6], address: [u8; 4]) -> Runtime {
