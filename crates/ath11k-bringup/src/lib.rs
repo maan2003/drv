@@ -95,6 +95,7 @@ pub struct Cli {
     pub wmi_log: Option<PathBuf>,
     pub ssid: Option<Vec<u8>>,
     pub containment_remoteproc: Option<String>,
+    pub stop_remoteproc_on_error: bool,
 }
 
 impl Default for Cli {
@@ -111,6 +112,7 @@ impl Default for Cli {
             wmi_log: Some("ath11k-wmi-run.jsonl".into()),
             ssid: None,
             containment_remoteproc: None,
+            stop_remoteproc_on_error: false,
         }
     }
 }
@@ -165,6 +167,7 @@ impl Cli {
                     }
                     cli.containment_remoteproc = Some(name.into());
                 }
+                "--stop-remoteproc-on-error" => cli.stop_remoteproc_on_error = true,
                 "-h" | "--help" => return Err(usage().into()),
                 _ => return Err(format!("unknown argument {argument:?}\n{}", usage())),
             }
@@ -181,6 +184,9 @@ impl Cli {
                 usage()
             ));
         }
+        if cli.stop_remoteproc_on_error && cli.containment_remoteproc.is_none() {
+            return Err("--stop-remoteproc-on-error requires --containment".into());
+        }
         Ok(cli)
     }
 }
@@ -195,7 +201,7 @@ fn valid_remoteproc_name(name: &str) -> bool {
 }
 
 pub const fn usage() -> &'static str {
-    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--broker]"
+    "usage: ath11k-bringup [preflight] [--dry-run] [--stop-after <resources|firmware|qmi|core|passive-scan|scan-results|dp-poll>] [--ssid <name>] [--vfio-device <path>] [--register-region <index>] [--board <path>] [--regdb <path>] [--wmi-log <path>] [--containment remoteproc:<sysfs-name>] [--stop-remoteproc-on-error] [--broker]"
 }
 
 #[derive(Debug)]
@@ -989,6 +995,7 @@ pub struct RealHost {
     vdev: Option<ath11k_core::VdevId>,
     summary: Option<ScanSummary>,
     dp_poll_log: Vec<String>,
+    stop_remoteproc_on_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1139,6 +1146,10 @@ impl Host for RealHost {
         self.qrtr = Some(qrtr);
         self.register_region = config.register_region;
         self.wmi_log = config.wmi_log.clone();
+        self.stop_remoteproc_on_error = config
+            .stop_remoteproc_on_error
+            .then(|| config.containment_remoteproc.clone())
+            .flatten();
         Ok(())
     }
 
@@ -1250,17 +1261,40 @@ impl Host for RealHost {
     fn core(&mut self) -> Result<(), Error> {
         use ath11k_core::{Lifecycle as _, RadioControl as _};
 
-        let device = self.device.as_mut().ok_or(Error::Unsupported(
-            "core requested before QMI initialization",
-        ))?;
-        device.attach_firmware().map_err(Error::Core)?;
-        device.start_radio().map_err(Error::Core)?;
-        self.vdev = Some(
-            device
-                .create_client_vdev([0x02, 0, 0, 0, 0, 1])
-                .map_err(Error::Core)?,
-        );
-        Ok(())
+        let result = (|| {
+            let device = self.device.as_mut().ok_or(Error::Unsupported(
+                "core requested before QMI initialization",
+            ))?;
+            device.attach_firmware().map_err(Error::Core)?;
+            device.start_radio().map_err(Error::Core)?;
+            self.vdev = Some(
+                device
+                    .create_client_vdev([0x02, 0, 0, 0, 0, 1])
+                    .map_err(Error::Core)?,
+            );
+            Ok(())
+        })();
+        if result.is_err()
+            && let Some(name) = &self.stop_remoteproc_on_error
+        {
+            let state = Path::new(REMOTEPROC_CLASS).join(name).join("state");
+            fs::write(&state, "stop\n").map_err(|source| Error::Io {
+                action: "stop containment remoteproc while VFIO DMA remains owned",
+                source,
+            })?;
+            let observed = fs::read_to_string(&state).map_err(|source| Error::Io {
+                action: "verify stopped containment remoteproc",
+                source,
+            })?;
+            if observed.trim() != "offline" {
+                return Err(Error::Hardware(format!(
+                    "containment remoteproc {name} stop returned state {:?}",
+                    observed.trim()
+                )));
+            }
+            eprintln!("remoteproc_quiesced_before_vfio_drop name={name:?} state=\"offline\"");
+        }
+        result
     }
 
     fn passive_scan(&mut self) -> Result<(), Error> {
@@ -1620,6 +1654,17 @@ mod tests {
         let cli = Cli::parse(["--dry-run", "--containment", "remoteproc:remoteproc3"]).unwrap();
         assert_eq!(cli.containment_remoteproc.as_deref(), Some("remoteproc3"));
         assert!(Cli::parse(["--dry-run", "--containment", "remoteproc:../state"]).is_err());
+        assert!(Cli::parse(["--dry-run", "--stop-remoteproc-on-error"]).is_err());
+        assert!(
+            Cli::parse([
+                "--dry-run",
+                "--containment",
+                "remoteproc:remoteproc3",
+                "--stop-remoteproc-on-error",
+            ])
+            .unwrap()
+            .stop_remoteproc_on_error
+        );
     }
 
     #[test]
