@@ -14,6 +14,7 @@ P=/sys/bus/platform/devices/$DEVICE
 RUNNER=$LAB/stage10/ath11k-bringup-runB
 TRANSACTION=$LAB/stage10/redwood-wifi-transaction
 CYCLES=${REDWOOD_FAST_CYCLES:-2}
+STOP_AFTER=${REDWOOD_STOP_AFTER:-core}
 
 mkdir -p "$RUN"
 exec >>"$RUN/fast-cycle.log" 2>&1
@@ -21,7 +22,11 @@ echo "FAST_BEGIN=$(date -u +%FT%TZ)"
 sha256sum -c "$LAB/stage12/SHA256SUMS"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 test "$(cat "$RPROC/state")" = offline
-test "$CYCLES" -ge 2
+test "$CYCLES" -ge 1
+case "$STOP_AFTER" in
+  core|passive-scan) ;;
+  *) echo "unsupported REDWOOD_STOP_AFTER=$STOP_AFTER"; exit 2 ;;
+esac
 
 # Keep USB control reachable after the clean final cycle leaves this candidate
 # idle. The active-run transaction's inhibitor ends with that transaction and
@@ -64,7 +69,7 @@ while test "$i" -le "$CYCLES"; do
 
   set +e
   "$RUNNER" --vfio-device "$cdev" --containment remoteproc:remoteproc2 \
-    --stop-remoteproc-on-exit --register-region 1 --stop-after core \
+    --stop-remoteproc-on-exit --register-region 1 --stop-after "$STOP_AFTER" \
     --wmi-log "$RUN/runB-$i.wmi.jsonl" >"$RUN/runB-$i.log" 2>&1
   rc=$?
   set -e
