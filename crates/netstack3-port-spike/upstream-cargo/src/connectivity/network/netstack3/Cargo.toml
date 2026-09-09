@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "../../../lib/directory-capability",
   "../../../lib/driver-runtime-host", "../../../lib/fuchsia-async-host",
   "cargo/net-types-macros", "cargo/net-declare-macros", "cargo/net-declare-portable", "cargo/port-integration",
   "../../wlan/lib/statemachine", "../../wlan/lib/statemachine/macro",

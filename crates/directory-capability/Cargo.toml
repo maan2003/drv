@@ -1,0 +1,9 @@
+[package]
+name = "directory-capability"
+description = "Minimal capability-scoped Linux directory file operations"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+libc = "0.2.189"

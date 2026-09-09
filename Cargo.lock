@@ -441,6 +441,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "directory-capability"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dma-pool"
 version = "0.1.0"
 dependencies = [

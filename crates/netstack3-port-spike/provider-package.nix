@@ -28,6 +28,7 @@ let
     chmod -R u+w "$out"
 
     cp -R ${./upstream-cargo}/src/. "$refroot/src/"
+    cp -R ${../directory-capability} "$refroot/src/lib/directory-capability"
     cp -R ${./upstream-cargo}/third_party/. "$refroot/third_party/"
     cp ${./upstream-cargo}/LICENSE.fuchsia "$refroot/LICENSE"
     cat >"$out/Cargo.toml" <<'CARGO'
@@ -44,6 +45,7 @@ let
     cp ${./Cargo.toml} "$out/crates/netstack3-port-spike/Cargo.toml"
     cp -R ${./src} "$out/crates/netstack3-port-spike/src"
     chmod -R u+w "$out"
+    sed -i '/\[package\]/a workspace = "../../connectivity/network/netstack3"' "$refroot/src/lib/directory-capability/Cargo.toml"
 
     patch -d "$refroot" -p1 < ${./upstream-cargo/patches/dhcp-client-core-host.patch}
     patch -d "$refroot" -p1 < ${./upstream-cargo/patches/trust-dns-workspace.patch}

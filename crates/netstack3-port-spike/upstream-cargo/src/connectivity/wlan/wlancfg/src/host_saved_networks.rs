@@ -7,7 +7,7 @@
 //! file: after a crash there is no name at which to install a fully synced
 //! replacement.  The explicit capability is therefore an owned `File` opened on
 //! a dedicated, sole-writer directory.  All names below are fixed, relative names
-//! used with `openat`/`renameat`; no ambient path lookup is performed.
+//! accepted by `directory-capability`; no ambient path lookup is performed.
 //!
 //! Version 1 is an exact-EOF, little-endian format: eight-byte magic, `u16`
 //! version, `u16` record count, then bounded records containing length-prefixed
@@ -16,13 +16,12 @@
 
 use crate::config_management::{Credential, NetworkConfig, SecurityType};
 use std::collections::HashMap;
-use std::ffi::c_char;
+use directory_capability::Directory;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-const DATA_NAME: &[u8] = b"saved-networks.v1\0";
-const TEMP_NAME: &[u8] = b".saved-networks.v1.tmp\0";
+const DATA_NAME: &str = "saved-networks.v1";
+const TEMP_NAME: &str = ".saved-networks.v1.tmp";
 const MAGIC: &[u8; 8] = b"DRVWIFI\0";
 const VERSION: u16 = 1;
 const MAX_NETWORKS: usize = 1000;
@@ -99,25 +98,17 @@ impl std::error::Error for PersistenceError {}
 
 /// Persistent storage owned by the pinned `SavedNetworksManager`.
 pub struct HostPolicyStorage {
-    directory: File,
+    directory: Directory,
 }
 
 impl HostPolicyStorage {
     pub(crate) fn new(directory: File) -> Result<Self, PersistenceError> {
-        let metadata = directory.metadata().map_err(|error| {
-            PersistenceError::io("cannot inspect saved-network directory", error)
-        })?;
-        if !metadata.is_dir() {
-            return Err(PersistenceError::invalid(
-                "saved-network capability is not a directory",
-            ));
-        }
-        directory.sync_all().map_err(|error| {
-            PersistenceError::io("saved-network directory cannot be durably synced", error)
+        let directory = Directory::new(directory).map_err(|error| {
+            PersistenceError::io("invalid saved-network directory capability", error)
         })?;
         let storage = Self { directory };
-        if remove_stale_temp(storage.directory.as_raw_fd())? {
-            storage.directory.sync_all().map_err(|error| {
+        if remove_stale_temp(&storage.directory)? {
+            storage.directory.sync().map_err(|error| {
                 PersistenceError::io("cannot sync saved-network directory", error)
             })?;
         }
@@ -125,12 +116,7 @@ impl HostPolicyStorage {
     }
 
     pub(crate) fn load(&mut self) -> Result<Vec<PersistedNetwork>, PersistenceError> {
-        let mut file = match openat_file(
-            self.directory.as_raw_fd(),
-            DATA_NAME,
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0,
-        ) {
+        let mut file = match self.directory.open_existing_regular(DATA_NAME) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
@@ -143,11 +129,6 @@ impl HostPolicyStorage {
         let metadata = file
             .metadata()
             .map_err(|error| PersistenceError::io("cannot inspect saved-network data", error))?;
-        if !metadata.is_file() {
-            return Err(PersistenceError::invalid(
-                "saved-network data is not a regular file",
-            ));
-        }
         let length = metadata.len();
         if length > MAX_FILE_BYTES {
             return Err(PersistenceError::invalid("saved-network data is oversized"));
@@ -159,18 +140,12 @@ impl HostPolicyStorage {
         &mut self,
         networks: &HashMap<crate::config_management::NetworkIdentifier, NetworkConfig>,
     ) -> Result<(), PersistenceError> {
-        let dirfd = self.directory.as_raw_fd();
-        if remove_stale_temp(dirfd)? {
-            self.directory.sync_all().map_err(|error| {
+        if remove_stale_temp(&self.directory)? {
+            self.directory.sync().map_err(|error| {
                 PersistenceError::io("cannot sync saved-network directory", error)
             })?;
         }
-        let mut temporary = openat_file(
-            dirfd,
-            TEMP_NAME,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
+        let mut temporary = self.directory.create_new_regular(TEMP_NAME, 0o600)
         .map_err(|error| PersistenceError::io("cannot create saved-network replacement", error))?;
 
         let result = (|| {
@@ -178,15 +153,15 @@ impl HostPolicyStorage {
             temporary.sync_all().map_err(|error| {
                 PersistenceError::io("cannot sync saved-network replacement", error)
             })?;
-            renameat(dirfd, TEMP_NAME, DATA_NAME).map_err(|error| {
+            self.directory.replace(TEMP_NAME, DATA_NAME).map_err(|error| {
                 PersistenceError::io("cannot install saved-network replacement", error)
             })?;
-            self.directory.sync_all().map_err(|error| {
+            self.directory.sync().map_err(|error| {
                 PersistenceError::after_install("cannot sync saved-network directory", error)
             })
         })();
         if result.is_err() {
-            let _ = unlinkat(dirfd, TEMP_NAME);
+            let _ = self.directory.unlink(TEMP_NAME);
         }
         result
     }
@@ -356,47 +331,8 @@ fn security_from_byte(value: u8) -> Result<SecurityType, PersistenceError> {
     }
 }
 
-fn openat_file(dirfd: RawFd, name: &[u8], flags: i32, mode: libc::mode_t) -> io::Result<File> {
-    // SAFETY: name is a static NUL-terminated byte string and the returned fd is
-    // transferred exactly once into File.
-    let fd = unsafe { libc::openat(dirfd, name.as_ptr().cast::<c_char>(), flags, mode) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // SAFETY: openat returned a new owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-fn renameat(dirfd: RawFd, old: &[u8], new: &[u8]) -> io::Result<()> {
-    // SAFETY: both names are static NUL-terminated relative names.
-    let result = unsafe {
-        libc::renameat(
-            dirfd,
-            old.as_ptr().cast::<c_char>(),
-            dirfd,
-            new.as_ptr().cast::<c_char>(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn unlinkat(dirfd: RawFd, name: &[u8]) -> io::Result<()> {
-    // SAFETY: name is a static NUL-terminated relative name.
-    let result = unsafe { libc::unlinkat(dirfd, name.as_ptr().cast::<c_char>(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn remove_stale_temp(dirfd: RawFd) -> Result<bool, PersistenceError> {
-    match unlinkat(dirfd, TEMP_NAME) {
+fn remove_stale_temp(directory: &Directory) -> Result<bool, PersistenceError> {
+    match directory.unlink(TEMP_NAME) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(PersistenceError::io(

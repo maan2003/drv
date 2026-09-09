@@ -103,10 +103,12 @@ runCommand "mt7921-source-fuchsia-${commit}-${builtins.substring 0 12 orderedPat
 
   chmod -R u+w "$refroot"
   cp -R ${../crates/netstack3-port-spike/upstream-cargo}/src/. "$refroot/src/"
+  cp -R ${../crates/directory-capability} "$refroot/src/lib/directory-capability"
   cp -R ${../crates/netstack3-port-spike/upstream-cargo}/sdk/. "$refroot/sdk/"
   cp -R ${../crates/netstack3-port-spike/upstream-cargo}/third_party/. "$refroot/third_party/"
   cp ${../crates/netstack3-port-spike/upstream-cargo}/LICENSE.fuchsia "$refroot/LICENSE"
   chmod -R u+w "$refroot"
+  sed -i '/\[package\]/a workspace = "../../connectivity/network/netstack3"' "$refroot/src/lib/directory-capability/Cargo.toml"
 
   cat > "$refroot/.drv-host-patches" <<'PATCHES'
 ${orderedPatchManifest}PATCHES

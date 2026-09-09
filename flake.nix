@@ -240,12 +240,14 @@
           cargoRoot = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
           buildAndTestSubdir = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
           cargoLock.lockFile = ./crates/netstack3-port-spike/upstream-cargo/src/connectivity/network/netstack3/Cargo.lock;
-          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config pkgs.perl ];
+          nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
             cd reference/fuchsia-${commit}/src/connectivity/network/netstack3
+            cargo test --locked --offline -p directory-capability
+            cargo clippy --locked --offline -p directory-capability --all-targets -- -D warnings
             cargo test --locked --offline -p wlancfg-selection --test host-saved-networks
             cargo test --locked --offline -p wlancfg-selection --test host-selection
             runHook postCheck

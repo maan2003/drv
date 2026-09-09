@@ -39,6 +39,9 @@ if [[ ! -f "$refroot/COMMIT" ]] || [[ $(cat "$refroot/COMMIT") != "$commit" ]] |
 fi
 
 cp -R "$here/upstream-cargo/src" "$refroot/"
+rm -rf "$refroot/src/lib/directory-capability"
+cp -R "$repo/crates/directory-capability" "$refroot/src/lib/directory-capability"
+sed -i '/\[package\]/a workspace = "../../connectivity/network/netstack3"' "$refroot/src/lib/directory-capability/Cargo.toml"
 cp -R "$here/upstream-cargo/sdk" "$refroot/"
 cp -R "$here/upstream-cargo/third_party" "$refroot/"
 cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"

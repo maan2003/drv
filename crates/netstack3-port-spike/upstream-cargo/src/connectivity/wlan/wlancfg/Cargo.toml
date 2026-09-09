@@ -24,6 +24,7 @@ name = "host-saved-networks"
 path = "host_tests/saved_networks.rs"
 
 [dependencies]
+directory-capability = { path = "../../../lib/directory-capability" }
 anyhow.workspace = true
 arbitrary.workspace = true
 async-trait.workspace = true
