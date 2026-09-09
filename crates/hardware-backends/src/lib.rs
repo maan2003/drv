@@ -14,8 +14,9 @@ mod linux_vfio;
 pub use linux_vfio::unconfined as unconfined_vfio;
 #[cfg(target_os = "linux")]
 pub use linux_vfio::{
-    LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LockedLinuxVfioPciCapabilities,
-    LockedVfioEduReport, OpenedPciCoherent, run_locked_vfio_edu_mechanics,
+    LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LinuxVfioPlatformCapabilities,
+    LinuxVfioPlatformFdIdentities, LockedLinuxVfioPciCapabilities, LockedVfioEduReport,
+    OpenedPciCoherent, run_locked_vfio_edu_mechanics,
 };
 #[cfg(target_os = "linux")]
 pub fn monotonic_time_ns() -> Result<u64> {
