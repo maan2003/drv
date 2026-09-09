@@ -10,8 +10,8 @@ use ath11k_ce::{
     HtcPacketIo, HtcRouter, HtcTransport, ServiceId, WCN6750_SERVICE_TO_PIPE,
 };
 use ath11k_dp::{
-    HalDpRings,
-    htt::request_target_version,
+    HalDpRings, HttControl,
+    htt::{HttEvent, TARGET_VERSION_MAJOR, version_request},
     transport::{HtcHttTransport, ath11k_dp_htt_connect_service},
     tx::{ClientDataPath, ClientTxConfig},
 };
@@ -894,11 +894,25 @@ where
                     .map_err(|_| CoreError::Protocol)
             }
             Operation::DpHttVersionRequest => {
+                Self::protocol(self.htt.as_mut())?
+                    .send(version_request())
+                    .map_err(Self::dp_error)?;
                 self.pump()?;
                 let deadline = (self.deadline)();
-                request_target_version(Self::protocol(self.htt.as_mut())?, deadline)
-                    .map(|_| ())
-                    .map_err(|_| CoreError::Protocol)
+                loop {
+                    let message = Self::protocol(self.htt.as_mut())?
+                        .receive(deadline)
+                        .map_err(Self::dp_error)?
+                        .ok_or(CoreError::Protocol)?;
+                    if let HttEvent::VersionConfirm { major, .. } = message
+                        .decode()
+                        .map_err(Self::dp_error)?
+                    {
+                        return (major == TARGET_VERSION_MAJOR)
+                            .then_some(())
+                            .ok_or(CoreError::Protocol);
+                    }
+                }
             }
             Operation::WmiVdevCreate { vdev, mac } => {
                 let nss = u32::from(self.client_nss()?);
