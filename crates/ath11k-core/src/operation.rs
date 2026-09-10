@@ -156,6 +156,32 @@ pub struct RegulatoryDomain {
     pub channels: Vec<RegulatoryChannel>,
 }
 
+/// Conservative subset of Linux's world regulatory domain used for Redwood.
+///
+/// The pinned Linux 7.1.6 world rule permits channels 1 through 11 at 20 dBm
+/// without `NO_IR`.  Redwood currently exposes only the three channels used by
+/// its bring-up seam; its 2.4 GHz WCN6750 channel flags support HT and HE, but
+/// not VHT.
+pub fn redwood_conservative_world_domain() -> RegulatoryDomain {
+    RegulatoryDomain {
+        alpha2: *b"00",
+        channels: [2412, 2437, 2462]
+            .into_iter()
+            .map(|frequency_mhz| RegulatoryChannel {
+                frequency_mhz,
+                max_power_dbm: 20,
+                max_reg_power_dbm: 20,
+                max_antenna_gain_dbi: 0,
+                passive: false,
+                radar: false,
+                allow_ht: true,
+                allow_vht: false,
+                allow_he: true,
+            })
+            .collect(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagementFrame {
     pub vdev: VdevId,

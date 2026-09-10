@@ -403,6 +403,30 @@ fn completed_key_retry_is_idempotent_and_uncertain_dp_failure_is_quarantined() {
 }
 
 #[test]
+fn redwood_conservative_world_domain_matches_linux_world_rule() {
+    assert_eq!(
+        redwood_conservative_world_domain(),
+        RegulatoryDomain {
+            alpha2: *b"00",
+            channels: [2412, 2437, 2462]
+                .into_iter()
+                .map(|frequency_mhz| RegulatoryChannel {
+                    frequency_mhz,
+                    max_power_dbm: 20,
+                    max_reg_power_dbm: 20,
+                    max_antenna_gain_dbi: 0,
+                    passive: false,
+                    radar: false,
+                    allow_ht: true,
+                    allow_vht: false,
+                    allow_he: true,
+                })
+                .collect(),
+        }
+    );
+}
+
+#[test]
 fn regulatory_channels_follow_the_fresh_country_event() {
     let mut device = ready_device();
     device.backend_mut().log.clear();

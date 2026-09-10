@@ -711,28 +711,6 @@ fn dry_scan_config(vdev: ath11k_core::VdevId) -> ath11k_core::ScanConfig {
     }
 }
 
-fn conservative_world_domain() -> ath11k_core::RegulatoryDomain {
-    ath11k_core::RegulatoryDomain {
-        alpha2: *b"00",
-        channels: [2412, 2437, 2462]
-            .into_iter()
-            .map(|frequency_mhz| ath11k_core::RegulatoryChannel {
-                frequency_mhz,
-                max_power_dbm: 23,
-                max_reg_power_dbm: 23,
-                max_antenna_gain_dbi: 0,
-                // The temporary Fuchsia world-domain boundary authorizes
-                // these channels only for passive discovery.
-                passive: true,
-                radar: false,
-                allow_ht: true,
-                allow_vht: false,
-                allow_he: true,
-            })
-            .collect(),
-    }
-}
-
 pub struct DryRunHost {
     device: Option<ath11k_core::Device<ath11k_core::ModelSubsystems>>,
     vdev: Option<ath11k_core::VdevId>,
@@ -778,7 +756,7 @@ impl Host for DryRunHost {
         device.attach_firmware().map_err(Error::Core)?;
         device.start_radio().map_err(Error::Core)?;
         device
-            .set_regulatory_domain(conservative_world_domain())
+            .set_regulatory_domain(ath11k_core::redwood_conservative_world_domain())
             .map_err(Error::Core)?;
         self.vdev = Some(
             device
@@ -1349,7 +1327,7 @@ impl Host for RealHost {
             device.attach_firmware().map_err(Error::Core)?;
             device.start_radio().map_err(Error::Core)?;
             device
-                .set_regulatory_domain(conservative_world_domain())
+                .set_regulatory_domain(ath11k_core::redwood_conservative_world_domain())
                 .map_err(Error::Core)?;
             self.vdev = Some(
                 device
