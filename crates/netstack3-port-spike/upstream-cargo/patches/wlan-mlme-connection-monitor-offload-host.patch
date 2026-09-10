@@ -20,7 +20,7 @@
      ) -> impl Future<Output = Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status>>;
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
-@@ -475,8 +475,15 @@
+@@ -474,8 +474,15 @@
              DEFAULT_AUTO_DEAUTH_TIMEOUT_BEACON_COUNT,
          );
  
@@ -38,7 +38,7 @@
  
          Ok(Some(Association {
              aid,
-@@ -623,6 +630,18 @@
+@@ -622,6 +629,18 @@
      }
  }
  
@@ -57,7 +57,7 @@
  #[derive(Debug, PartialEq)]
  pub enum Qos {
      Enabled,
-@@ -1758,6 +1777,31 @@
+@@ -1748,6 +1767,31 @@
      static BSSID: LazyLock<Bssid> = LazyLock::new(|| [6u8; 6].into());
      static IFACE_MAC: LazyLock<MacAddr> = LazyLock::new(|| [3u8; 6].into());
  

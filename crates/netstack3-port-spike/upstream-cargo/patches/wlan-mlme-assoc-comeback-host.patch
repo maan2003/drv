@@ -379,7 +379,7 @@
  fn peer_eapol(payload: &[u8]) -> Vec<u8> {
      let mut bytes = vec![0x08, 0x02, 0, 0];
      bytes.extend_from_slice(&CLIENT);
-@@ -398,6 +430,60 @@
+@@ -398,6 +430,174 @@
  }
  
  #[test]
@@ -437,10 +437,124 @@
 +}
 +
 +#[test]
++fn production_six_status30_comebacks_can_still_associate() {
++    futures::executor::block_on(async {
++        let (device, effects) = FakeDeviceOps::new();
++        let (timer, mut timers) = wlan_mlme::common::timer::create_timer();
++        let mut mlme = ClientMlme::new(Default::default(), device, timer).await.unwrap();
++        let mut bss = wpa3_bss();
++        bss.capability_info = 1;
++        bss.ies.truncate(16);
++        mlme.handle_mlme_request(MlmeRequest::Connect(fidl_mlme::ConnectRequest {
++            selected_bss: bss,
++            connect_failure_timeout: 20,
++            auth_type: fidl_mlme::AuthenticationTypes::OpenSystem,
++            sae_password: vec![],
++            wep_key: None,
++            security_ie: vec![],
++            owe_public_key: None,
++        }))
++        .await
++        .unwrap();
++        mlme.handle_mac_frame_rx(&peer_open_auth_success(), rx_info(), 20.into()).await;
++
++        for attempt in 1..=6 {
++            mlme.handle_mac_frame_rx(&peer_assoc_comeback(196), rx_info(), attempt.into()).await;
++            let mut comeback = None;
++            while let Ok(timer) = timers.try_recv() {
++                if matches!(
++                    timer.1.event,
++                    wlan_mlme::client::TimedEvent::AssociationComeback { .. }
++                ) {
++                    comeback = Some(timer.1.event);
++                }
++            }
++            mlme.handle_timeout(comeback.expect("association comeback timer")).await;
++            assert_eq!(effects.lock().unwrap().frames.len(), 2 + attempt as usize);
++            assert!(effects.lock().unwrap().events.is_empty());
++        }
++
++        mlme.handle_mac_frame_rx(&peer_assoc_success(), rx_info(), 4.into()).await;
++        let effects = effects.lock().unwrap();
++        assert_eq!(effects.associations[0].aid, Some(42));
++        assert!(matches!(
++            effects.events[0],
++            fidl_mlme::MlmeEvent::ConnectConf { ref resp }
++                if resp.result_code == fidl_ieee80211::StatusCode::Success
++        ));
++    });
++}
++
++#[test]
++fn production_status30_retries_remain_bounded_by_original_connect_timeout() {
++    tokio::runtime::Builder::new_current_thread()
++        .enable_time()
++        .build()
++        .unwrap()
++        .block_on(async {
++        let (device, effects) = FakeDeviceOps::new();
++        let (timer, mut timers) = wlan_mlme::common::timer::create_timer();
++        let mut mlme = ClientMlme::new(Default::default(), device, timer).await.unwrap();
++        let mut bss = wpa3_bss();
++        bss.capability_info = 1;
++        bss.ies.truncate(16);
++        mlme.handle_mlme_request(MlmeRequest::Connect(fidl_mlme::ConnectRequest {
++            selected_bss: bss,
++            connect_failure_timeout: 20,
++            auth_type: fidl_mlme::AuthenticationTypes::OpenSystem,
++            sae_password: vec![],
++            wep_key: None,
++            security_ie: vec![],
++            owe_public_key: None,
++        }))
++        .await
++        .unwrap();
++        mlme.handle_mac_frame_rx(&peer_open_auth_success(), rx_info(), 20.into()).await;
++
++        let mut original_connect_timeout = None;
++        while let Ok(timer) = timers.try_recv() {
++            if matches!(timer.1.event, wlan_mlme::client::TimedEvent::Connecting) {
++                original_connect_timeout = Some(timer);
++            }
++        }
++        for attempt in 1..=4 {
++            mlme.handle_mac_frame_rx(&peer_assoc_comeback(196), rx_info(), attempt.into()).await;
++            let mut comeback = None;
++            while let Ok(timer) = timers.try_recv() {
++                if matches!(
++                    timer.1.event,
++                    wlan_mlme::client::TimedEvent::AssociationComeback { .. }
++                ) {
++                    comeback = Some(timer.1.event);
++                }
++            }
++            mlme.handle_timeout(comeback.expect("association comeback timer")).await;
++        }
++        let fired: Vec<_> = wlan_mlme::common::timer::make_async_timed_event_stream(
++            futures::stream::iter([
++                original_connect_timeout.expect("original connect timeout")
++            ]),
++        )
++        .collect()
++        .await;
++        assert_eq!(fired.len(), 1, "status 30 must retain the original connect timeout");
++        mlme.handle_timeout(fired.into_iter().next().unwrap().event).await;
++
++        assert_eq!(effects.lock().unwrap().frames.len(), 6);
++        let event = effects.lock().unwrap().events.remove(0);
++        assert!(matches!(
++            event,
++            fidl_mlme::MlmeEvent::ConnectConf { resp }
++                if resp.result_code == fidl_ieee80211::StatusCode::RefusedTemporarily
++        ));
++        });
++}
++
++#[test]
  fn observed_receive_uses_exact_constructed_scan_result_and_ordinary_sink_is_unchanged() {
      futures::executor::block_on(async {
          fn scan_request() -> fidl_mlme::ScanRequest {
-@@ -697,9 +783,59 @@
+@@ -697,9 +897,50 @@
              &[0xb2, 0x71, 0x90, 0x33, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
          );
  
@@ -453,27 +567,18 @@
 +            assert!(effects.events.is_empty(), "valid comeback must not fail the connect");
 +        }
 +
-+        let mut stale_connect = None;
 +        let mut comeback = None;
 +        while let Ok(timer) = mlme_timers.try_recv() {
 +            match timer.1.event {
-+                wlan_mlme::client::TimedEvent::Connecting => stale_connect = Some(timer),
 +                wlan_mlme::client::TimedEvent::AssociationComeback { .. } => {
 +                    comeback = Some(timer)
 +                }
 +                _ => {}
 +            }
 +        }
-+        let stale_connect = stale_connect.expect("pre-comeback connect timer");
 +        let comeback = comeback.expect("association comeback timer");
 +        let remaining = comeback.0 - zx::MonotonicInstant::get();
 +        assert!(remaining.into_nanos() > 15_000_000 && remaining.into_nanos() <= 20_480_000);
-+        let stale: Vec<_> = wlan_mlme::common::timer::make_async_timed_event_stream(
-+            futures::stream::iter([stale_connect]),
-+        )
-+        .collect()
-+        .await;
-+        assert!(stale.is_empty(), "comeback must cancel the old connect deadline");
 +        let generation = match comeback.1.event {
 +            wlan_mlme::client::TimedEvent::AssociationComeback { generation } => generation,
 +            _ => unreachable!(),
@@ -502,7 +607,7 @@
          Station::on_mlme_event(&mut sme, connect_conf);
  
          let msg1 = peer_updates.into_iter().find_map(|update| match update {
-@@ -707,7 +843,7 @@
+@@ -707,7 +948,7 @@
              _ => None,
          }).expect("authenticator EAPOL message 1");
          peer.on_eapol_conf(&mut vec![], fidl_mlme::EapolResultCode::Success).unwrap();

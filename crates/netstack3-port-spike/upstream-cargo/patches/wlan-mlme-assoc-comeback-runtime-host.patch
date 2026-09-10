@@ -1,10 +1,30 @@
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs
-@@ -347,12 +347,14 @@
-                 sta.sta.connect_timeout.take();
+@@ -282,6 +282,6 @@
+     /// This field is only populated when MLME is reconnecting after a disassociation.
+     reconnect_timeout: Option<EventHandle>,
+-    association_attempts: u8,
++    saw_valid_association_comeback: bool,
+     comeback_timeout: Option<EventHandle>,
+     comeback_generation: Option<u64>,
+ }
+@@ -290,7 +290,7 @@
+     fn default() -> Self {
+         Self {
+             reconnect_timeout: None,
+-            association_attempts: 1,
++            saw_valid_association_comeback: false,
+             comeback_timeout: None,
+             comeback_generation: None,
+         }
+@@ -345,15 +345,16 @@
+                 };
+                 sta.ctx.next_association_comeback_generation = next_generation;
+-                sta.sta.connect_timeout.take();
                  self.comeback_timeout.take();
                  self.comeback_generation = Some(generation);
 -                self.comeback_timeout.replace(sta.ctx.timer.schedule_after(
++                self.saw_valid_association_comeback = true;
 +                let timeout = sta.ctx.timer.schedule_after(
                      zx::MonotonicDuration::from_nanos(duration_nanos),
                      TimedEvent::AssociationComeback { generation },
@@ -14,11 +34,12 @@
 +                self.comeback_timeout.replace(timeout);
                  crate::sae_disposition(format_args!(
 -                    "association_comeback scheduled=true generation={generation} tu={tu} ms={ms} attempt={}",
-+                    "association_comeback scheduled=true timer_id={timer_id} generation={generation} deadline_after_ms={ms} tu={tu} attempt={}",
-                     self.association_attempts
+-                    self.association_attempts
++                    "association_comeback scheduled=true timer_id={timer_id} generation={generation} deadline_after_ms={ms} tu={tu}"
                  ));
                  return Ok(None);
-@@ -1351,6 +1353,9 @@
+             }
+@@ -1351,6 +1352,9 @@
                  States::Associating(mut state)
                      if state.comeback_generation == Some(generation) =>
                  {
@@ -28,16 +49,36 @@
                      state.comeback_timeout.take();
                      state.comeback_generation = None;
                      if state.association_attempts >= 3 {
-@@ -1375,7 +1380,7 @@
-                             sta.ctx.timer.schedule_after(duration, TimedEvent::Connecting);
-                         sta.sta.connect_timeout.replace(timeout);
+@@ -1356,11 +1360,3 @@
+-                    if state.association_attempts >= 3 {
+-                        crate::sae_disposition(format_args!(
+-                            "association_comeback retry=false generation={generation} reason=max_attempts"
+-                        ));
+-                        sta.send_connect_conf_failure(
+-                            fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
+-                        );
+-                        state.transition_to(Joined).into()
+-                    } else if let Err(e) = sta.send_assoc_req_frame() {
++                    if let Err(e) = sta.send_assoc_req_frame() {
+                         error!("error resending association request after comeback: {}", e);
+                         sta.send_connect_conf_failure(
+@@ -1369,14 +1365,7 @@
+                         state.transition_to(Joined).into()
+                     } else {
+-                        state.association_attempts += 1;
+-                        let duration = sta.sta.beacon_period()
+-                            * sta.sta.connect_req.connect_failure_timeout;
+-                        let timeout =
+-                            sta.ctx.timer.schedule_after(duration, TimedEvent::Connecting);
+-                        sta.sta.connect_timeout.replace(timeout);
                          crate::sae_disposition(format_args!(
 -                            "association_comeback retry=true generation={generation} attempt={}",
-+                            "association_comeback retry=true request_emitted=true generation={generation} attempt={}",
-                             state.association_attempts
+-                            state.association_attempts
++                            "association_comeback retry=true request_emitted=true generation={generation}"
                          ));
                          state.into()
-@@ -1383,7 +1388,7 @@
+                     }
+@@ -1383,7 +1372,7 @@
                  }
                  States::Associating(state) => {
                      crate::sae_disposition(format_args!(
@@ -46,3 +87,14 @@
                      ));
                      state.into()
                  }
+@@ -1393,3 +1382,9 @@
+                 sta.sta.connect_timeout.take();
+-                sta.send_connect_conf_failure(fidl_ieee80211::StatusCode::RejectedSequenceTimeout);
++                let status = match &self {
++                    States::Associating(state) if state.saw_valid_association_comeback => {
++                        fidl_ieee80211::StatusCode::RefusedTemporarily
++                    }
++                    _ => fidl_ieee80211::StatusCode::RejectedSequenceTimeout,
++                };
++                sta.send_connect_conf_failure(status);
+                 let _ = sta
