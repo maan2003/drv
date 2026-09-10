@@ -14,6 +14,7 @@ id_command=@id_command@
 native_client_mac=@native_client_mac@
 session_client_mac=@session_client_mac@
 identity_mode=@identity_mode@
+hardware_lock=@hardware_lock@
 umask 077
 
 plan=false
@@ -64,6 +65,28 @@ if $plan; then
   printf ' %q' "$validation_launcher"
   printf '\n'
   exit 0
+fi
+
+# Serialize the complete destructive handoff and recovery lifecycle with every
+# other physical-hardware workflow.  Keep fd 8 open until the supervisor exits.
+exec 8>"$hardware_lock"
+if ! @flock@ -n 8; then
+  echo "physical hardware is already owned by another workflow" >&2
+  exit 75
+fi
+if ! "$wifi_driver_lab" --idle; then
+  echo "wifi-driver-lab has unresolved state; refusing handoff" >&2
+  exit 75
+fi
+"$wifi_driver_lab" --quarantined
+quarantined_rc=$?
+if ((quarantined_rc != 1)); then
+  echo "wifi-driver-lab quarantine status is not clear; refusing handoff" >&2
+  exit 75
+fi
+if ! "$wifi_driver_lab" --native-ready "$bdf"; then
+  echo "native Wi-Fi readiness check failed; refusing handoff" >&2
+  exit 75
 fi
 
 normalize_iw_frequency() {

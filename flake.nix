@@ -1137,7 +1137,7 @@
 
           mt7921-fresh-laa-diagnostic-supervisor = pkgs.runCommand
             "mt7921-fresh-laa-diagnostic-supervisor"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p "$out/bin"
               substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
@@ -1152,7 +1152,9 @@
                 --subst-var-by id_command ${pkgs.coreutils}/bin/id \
                 --subst-var-by native_client_mac da:61:40:51:27:e8 \
                 --subst-var-by session_client_mac 02:7d:91:4c:b8:3e \
-                --subst-var-by identity_mode fixed-fresh-laa-diagnostic
+                --subst-var-by identity_mode fixed-fresh-laa-diagnostic \
+                --subst-var-by hardware_lock /run/lock/drv-hardware.lock \
+                --subst-var-by flock ${pkgs.util-linux}/bin/flock
               chmod 0755 "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
               ! grep -Eq '@[a-z_]+@' "$out/bin/mt7921-fresh-laa-diagnostic-supervisor"
@@ -1226,7 +1228,7 @@
 
           mt7921-full-firmware-validation-supervisor = pkgs.runCommand
             "mt7921-full-firmware-validation-supervisor"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p "$out/bin"
               substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
@@ -1244,7 +1246,9 @@
                 --subst-var-by id_command ${pkgs.coreutils}/bin/id \
                 --subst-var-by native_client_mac da:61:40:51:27:e8 \
                 --subst-var-by session_client_mac da:61:40:51:27:e8 \
-                --subst-var-by identity_mode native-handoff
+                --subst-var-by identity_mode native-handoff \
+                --subst-var-by hardware_lock /run/lock/drv-hardware.lock \
+                --subst-var-by flock ${pkgs.util-linux}/bin/flock
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-supervisor"
               ${pkgs.bash}/bin/bash -n "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -F 'connected Wi-Fi target does not match packaged ajay/native-identity policy' \
@@ -1252,9 +1256,111 @@
               grep -F 'connected_ssid=$ssid' "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -F 'bdf=%s timeout_seconds=420 watchdog_owner=' "$out/bin/mt7921-full-firmware-validation-supervisor"
               grep -Fx '"$wifi_driver_lab" "$bdf" 420 -- "$@" &' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -Fx 'exec 8>"$hardware_lock"' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -F '${pkgs.util-linux}/bin/flock -n 8' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -Fx 'if ! "$wifi_driver_lab" --idle; then' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -Fx '"$wifi_driver_lab" --quarantined' "$out/bin/mt7921-full-firmware-validation-supervisor"
+              grep -Fx 'if ! "$wifi_driver_lab" --native-ready "$bdf"; then' "$out/bin/mt7921-full-firmware-validation-supervisor"
               identity=${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json
               grep -F '"association_request_contract":"client-mlme+device-query+pinned-regdb"' "$identity"
               grep -F '"bss_wire_contract":"connac2-bss-wire-v1"' "$identity"
+            '';
+
+          mt7921-full-firmware-validation-supervisor-readiness-test = pkgs.runCommand
+            "mt7921-full-firmware-validation-supervisor-readiness-test"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
+            ''
+              mkdir -p work
+              printf '%s\n' '{"artifact_identity":"test"}' > work/identity
+              cat > work/launcher <<'EOF'
+              #!${pkgs.runtimeShell}
+              if [ "''${1-}" = --artifact-identity ]; then
+                printf '%s\n' '{"artifact_identity":"test"}'
+                exit 0
+              fi
+              exit 99
+              EOF
+              cat > work/id <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf '0\n'
+              EOF
+              cat > work/watchdog <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf '%s\n' "$*" >> "$PWD/watchdog.calls"
+              exit 99
+              EOF
+              cat > work/wifi-driver-lab <<'EOF'
+              #!${pkgs.runtimeShell}
+              printf '%s\n' "$*" >> "$PWD/wifi.calls"
+              case "''${1-}" in
+                --idle) [ "''${TEST_CASE-}" != unresolved ] ;;
+                --quarantined)
+                  case "''${TEST_CASE-}" in
+                    quarantine) exit 0 ;;
+                    quarantine-error) exit 2 ;;
+                    *) exit 1 ;;
+                  esac
+                  ;;
+                --native-ready) [ "''${TEST_CASE-}" != native ] ;;
+                *) printf '%s\n' "$*" >> "$PWD/worker.calls"; exit 99 ;;
+              esac
+              EOF
+              chmod 0755 work/{launcher,id,watchdog,wifi-driver-lab}
+              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} work/supervisor \
+                --subst-var-by runtime_path ${pkgs.bash}/bin:${pkgs.coreutils}/bin \
+                --subst-var-by wifi_driver_lab "$PWD/work/wifi-driver-lab" \
+                --subst-var-by wifi_lab_watchdog "$PWD/work/watchdog" \
+                --subst-var-by validation_launcher "$PWD/work/launcher" \
+                --subst-var-by artifact_identity "$PWD/work/identity" \
+                --subst-var-by recovery_samples 1 \
+                --subst-var-by sys_root "$PWD/work/sys" \
+                --subst-var-by run_root "$PWD/work/run" \
+                --subst-var-by var_root "$PWD/work/var" \
+                --subst-var-by id_command "$PWD/work/id" \
+                --subst-var-by native_client_mac da:61:40:51:27:e8 \
+                --subst-var-by session_client_mac da:61:40:51:27:e8 \
+                --subst-var-by identity_mode native-handoff \
+                --subst-var-by hardware_lock "$PWD/work/hardware.lock" \
+                --subst-var-by flock ${pkgs.util-linux}/bin/flock
+              chmod 0755 work/supervisor
+
+              run_failure() {
+                case_name=$1
+                expected_calls=$2
+                rm -f wifi.calls watchdog.calls worker.calls
+                set +e
+                TEST_CASE="$case_name" ${pkgs.bash}/bin/bash work/supervisor \
+                  0000:05:00.0 -- "$PWD/work/launcher" \
+                  >"$case_name.out" 2>"$case_name.error"
+                rc=$?
+                set -e
+                test "$rc" -eq 75
+                test ! -e watchdog.calls
+                test ! -e worker.calls
+                printf '%s' "$expected_calls" | cmp -s - wifi.calls
+              }
+
+              run_failure unresolved $'--idle\n'
+              run_failure quarantine $'--idle\n--quarantined\n'
+              run_failure quarantine-error $'--idle\n--quarantined\n'
+              run_failure native $'--idle\n--quarantined\n--native-ready 0000:05:00.0\n'
+
+              rm -f wifi.calls watchdog.calls worker.calls
+              exec 9>work/hardware.lock
+              ${pkgs.util-linux}/bin/flock -n 9
+              set +e
+              TEST_CASE=clear ${pkgs.bash}/bin/bash work/supervisor \
+                0000:05:00.0 -- "$PWD/work/launcher" \
+                >contention.out 2>contention.error
+              rc=$?
+              set -e
+              exec 9>&-
+              test "$rc" -eq 75
+              test ! -e wifi.calls
+              test ! -e watchdog.calls
+              test ! -e worker.calls
+              grep -F 'physical hardware is already owned by another workflow' contention.error
+              touch "$out"
             '';
 
           mt7921-full-firmware-validation-recovery-status = pkgs.stdenv.mkDerivation {

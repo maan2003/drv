@@ -2840,6 +2840,17 @@ It proves normal SAE dispatch is distinct from the patch-table gate, requires
 RAM firmware, verifies both embedded firmware images, and leaves the watchdog
 disarmed with the lab idle.
 
+Run the active full-firmware root entry only as the payload of an `np`-local
+transient systemd service, not as another timer and not as an SSH-owned
+process, so loss of the coordinator or phone connection cannot terminate the
+supervisor. The existing remote entry's direct active mode does not establish
+that lifetime and is not an authorized launcher for this candidate. The
+supervisor holds `/run/lock/drv-hardware.lock` on fd 8 from
+the native readiness gates through target capture, watchdog ownership, the
+fixed 420-second lab handoff, restoration sampling, and exact-token disarm.
+Lock contention, unresolved or quarantined lab state, or failed native
+readiness exits before either watchdog arm or worker launch.
+
 One future authorization permits exactly one attempt. Start only from native
 association plus an idle, non-quarantined lab; verify the exact package, ELF,
 closure, target SSID/BSSID/channel, credential file, and watchdog; then invoke
