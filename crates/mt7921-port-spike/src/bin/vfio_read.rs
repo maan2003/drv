@@ -9566,18 +9566,23 @@ fn observe_passive_command_provenance(
 
 #[cfg(feature = "fuchsia-passive")]
 impl PrivateRawFrameCarrier {
-    fn parse(self) -> Result<PrivateRawAdvertisementCarrier, (Self, String)> {
+    fn parse(self) -> Result<PrivateRawAdvertisementCarrier, (Self, PassiveRxError)> {
         let advertisement = match parse_passive_advertisement(&self.bytes) {
             Ok(advertisement) => advertisement,
-            Err(error) => {
-                return Err((self, format!("reject routed passive RX frame: {error:?}")));
-            }
+            Err(error) => return Err((self, error)),
         };
         Ok(PrivateRawAdvertisementCarrier {
             advertisement,
             frame_bytes: self.bytes,
             occurrence: self.occurrence,
         })
+    }
+
+    fn discharge(mut self, provenance: &mut DescriptorProvenance) {
+        if let Some(occurrence) = self.occurrence.as_ref() {
+            provenance.retire(occurrence);
+        }
+        self.bytes.fill(0);
     }
 }
 
@@ -15895,7 +15900,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
                 &mut self.data,
                 &mut self.loader.mcu.descriptor_provenance,
                 &mut self.tx_completions,
-                None,
+                Some(&mut self.loader.mcu.normal_rx_frames),
             )
             .map_err(PhysicalPassiveError)?,
         );
@@ -15906,14 +15911,20 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             let frame = routed_frames.pop_front().expect("queue is nonempty");
             match frame.parse() {
                 Ok(advertisement) => self.advertisements.push(advertisement),
-                Err((frame, error)) => {
+                Err((frame, PassiveRxError::UnsupportedFrame)) => {
+                    frame.discharge(&mut self.loader.mcu.descriptor_provenance);
+                    record_sae_stage("passive_rx_filtered reason=unsupported_frame");
+                }
+                Err((mut frame, error)) => {
                     revoke_before_local_frame_release(
                         &mut self.loader.mcu.descriptor_provenance,
                         &mut routed_frames,
                     )
                     .map_err(PhysicalPassiveError)?;
-                    drop(frame);
-                    return Err(PhysicalPassiveError(error));
+                    frame.bytes.fill(0);
+                    return Err(PhysicalPassiveError(format!(
+                        "reject routed passive RX frame: {error:?}"
+                    )));
                 }
             }
         }
@@ -23087,6 +23098,82 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn data_rx_unsupported_frame_rearms_and_is_privately_discharged() {
+        let ring_mapping = TestMapping::new(PAGE);
+        let buffer_mapping = TestMapping::new(MT7921_DATA_RX_RING_COUNT * 2048);
+        let page_mapping = TestMapping::new(PAGE);
+        let mut ring = ring_mapping.dma(0x0102_0000);
+        let mut buffers = buffer_mapping.dma(0x0103_0000);
+        let page = page_mapping.read_page();
+        let mut frame = passive_advertisement_frame();
+        frame[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
+        buffers.write_bytes_at(0, &frame).unwrap();
+        ring.write_descriptor_at(
+            0,
+            DmaDescriptor {
+                buf0: buffers.iova as u32,
+                ctrl: (1 << 31) | (1 << 30) | (frame.len() as u32) << 16,
+                buf1: 0,
+                info: 0,
+            },
+        );
+        let mut queue = ActiveMcuRx {
+            rx_ring: &mut ring,
+            rx_buffers: &buffers,
+            rx_tail: 0,
+            rx_head: MT7921_DATA_RX_RING_COUNT - 1,
+            rx_ring_index: 2,
+            rx_count: MT7921_DATA_RX_RING_COUNT,
+            completed_total: 0,
+            rx_error_total: 0,
+            client_frame_total: 0,
+            eapol_total: 0,
+            authenticator_m1_total: 0,
+            irq_bit: DATA_RX_IRQ_BIT,
+        };
+        let mut provenance = DescriptorProvenance::new();
+        let lease = Arc::clone(&provenance.lease);
+        let mut normal = VecDeque::new();
+
+        let advertisements = drain_data_rx_queue(
+            &page,
+            &mut queue,
+            &mut provenance,
+            &mut Vec::new(),
+            Some(&mut normal),
+        )
+        .unwrap();
+
+        assert!(advertisements.is_empty());
+        assert_eq!((queue.rx_tail, queue.rx_head), (1, 0));
+        assert_eq!(provenance.effects.len(), 2);
+        assert!(matches!(
+            provenance.effects[0],
+            DescriptorProvenanceEffect::Mint(_)
+        ));
+        match provenance.effects[1] {
+            DescriptorProvenanceEffect::Rearm {
+                route, ring, slot, ..
+            } => {
+                assert!(route == DescriptorOccurrenceRoute::DataRx);
+                assert_eq!(ring, 2);
+                assert_eq!(slot, MT7921_DATA_RX_RING_COUNT - 1);
+            }
+            _ => panic!("second effect was not descriptor rearm"),
+        }
+        let (frame, error) = match normal.pop_front().unwrap().parse() {
+            Ok(_) => panic!("non-advertisement unexpectedly parsed"),
+            Err(failure) => failure,
+        };
+        assert_eq!(error, PassiveRxError::UnsupportedFrame);
+        frame.discharge(&mut provenance);
+        assert!(normal.is_empty());
+        assert!(provenance.sealed.is_empty());
+        assert!(lease.current.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn status77_descriptor_rearm_reaches_pinned_runtime_group19_fallback() {
         futures::executor::block_on(async {
             let ring_mapping = TestMapping::new(PAGE);
@@ -23905,7 +23992,7 @@ mod tests {
                 .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 0, 1, vec![2])
                 .unwrap(),
         );
-        let (failed, _error) = match failed.parse() {
+        let (mut failed, _error) = match failed.parse() {
             Ok(_) => panic!("invalid routed frame unexpectedly parsed"),
             Err(failure) => failure,
         };
@@ -23914,8 +24001,33 @@ mod tests {
         // `VfioPassiveMechanics::next_event`.
         revoke_before_local_carrier_release(&mut provenance, &mut remaining_taken).unwrap();
         assert!(!lease.current.load(Ordering::Acquire));
+        failed.bytes.fill(0);
         drop(failed);
         assert!(provenance.sealed.is_empty());
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
+    fn unsupported_routed_frame_is_privately_discharged_without_revoking_run() {
+        let mut provenance = DescriptorProvenance::new();
+        let lease = Arc::clone(&provenance.lease);
+        let mut bytes = passive_advertisement_frame();
+        bytes[32..34].copy_from_slice(&0x0008u16.to_le_bytes());
+        let frame = carried(
+            provenance
+                .seal_frame(DescriptorOccurrenceRoute::McuNormalRx, 4, 5, bytes)
+                .unwrap(),
+        );
+        let (frame, error) = match frame.parse() {
+            Ok(_) => panic!("non-advertisement unexpectedly parsed"),
+            Err(failure) => failure,
+        };
+        assert_eq!(error, PassiveRxError::UnsupportedFrame);
+
+        frame.discharge(&mut provenance);
+
+        assert!(provenance.sealed.is_empty());
+        assert!(lease.current.load(Ordering::Acquire));
     }
 
     #[test]

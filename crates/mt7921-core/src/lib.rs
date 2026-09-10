@@ -4404,13 +4404,19 @@ pub fn parse_passive_advertisement(bytes: &[u8]) -> Result<PassiveAdvertisement,
         rssi_dbm,
         ..
     } = parse_connac2_rx_frame(bytes)?;
-    let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
-    let frame_control = u16::from_le_bytes([fixed[0], fixed[1]]);
+    let frame_control = u16::from_le_bytes(
+        frame
+            .get(..2)
+            .ok_or(PassiveRxError::Truncated)?
+            .try_into()
+            .expect("fixed field"),
+    );
     let probe_response = match frame_control & 0x00fc {
         0x0080 => false,
         0x0050 => true,
         _ => return Err(PassiveRxError::UnsupportedFrame),
     };
+    let fixed = frame.get(..36).ok_or(PassiveRxError::Truncated)?;
     Ok(PassiveAdvertisement {
         probe_response,
         bssid: fixed[16..22].try_into().expect("fixed field"),
@@ -15217,6 +15223,20 @@ mod tests {
         assert_eq!(
             parse_passive_advertisement(&rx),
             Err(PassiveRxError::UnsupportedFrame)
+        );
+
+        let mut short_control = rx[..34].to_vec();
+        let short_length = short_control.len() as u32;
+        short_control[0..4].copy_from_slice(&((2u32 << 27) | short_length).to_le_bytes());
+        short_control[32..34].copy_from_slice(&0x00d4u16.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&short_control),
+            Err(PassiveRxError::UnsupportedFrame)
+        );
+        short_control[32..34].copy_from_slice(&0x0080u16.to_le_bytes());
+        assert_eq!(
+            parse_passive_advertisement(&short_control),
+            Err(PassiveRxError::Truncated)
         );
     }
 
