@@ -22,6 +22,9 @@ const WFDMA_GLO_CFG: usize = 0x208;
 const WFDMA_RST_DTX_PTR: usize = 0x20c;
 const WFDMA_RST_DRX_PTR: usize = 0x100;
 const WFDMA_GLO_CFG_EXT0: usize = 0x2b0;
+// Pinned Linux mt792x_regs.h defines these as live engine-status bits rather
+// than writable configuration state.
+const WFDMA_GLO_CFG_BUSY: u32 = (1 << 1) | (1 << 3);
 const DMASHDL_SW_CONTROL: usize = 0x004;
 const DMASHDL_BYPASS: u32 = 1 << 28;
 const WFDMA_TX_DMASHDL_ENABLE: u32 = 1 << 6;
@@ -311,6 +314,16 @@ fn readback(
     if value == u32::MAX || value != expected {
         Err(format!(
             "{name} readback {value:#010x}, expected {expected:#010x}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_wfdma_global_readback(value: u32, expected: u32, name: &str) -> Result<(), String> {
+    if value == u32::MAX || value & !WFDMA_GLO_CFG_BUSY != expected & !WFDMA_GLO_CFG_BUSY {
+        Err(format!(
+            "{name} readback {value:#010x}, expected {expected:#010x} outside busy mask {WFDMA_GLO_CFG_BUSY:#010x}"
         ))
     } else {
         Ok(())
@@ -626,7 +639,10 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
         wfdma
             .write_u32(WFDMA_GLO_CFG, global)
             .map_err(|e| format!("enable WFDMA: {e:?}"))?;
-        readback(&wfdma, WFDMA_GLO_CFG, global, "WFDMA global")
+        let value = wfdma
+            .read_u32(WFDMA_GLO_CFG)
+            .map_err(|error| format!("read WFDMA global: {error:?}"))?;
+        verify_wfdma_global_readback(value, global, "WFDMA global")
             .inspect(|()| self.enabled_wfdma = Some(global))
     }
     fn enable_host_interrupt(&mut self) -> Result<(), Self::Error> {
@@ -694,11 +710,7 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
             .read_u32(WFDMA_GLO_CFG)
             .map_err(|e| format!("final WFDMA read: {e:?}"))?;
         let expected = self.enabled_wfdma.ok_or("enabled WFDMA value absent")?;
-        if global != expected {
-            return Err(format!(
-                "final WFDMA global {global:#010x}, expected {expected:#010x}"
-            ));
-        }
+        verify_wfdma_global_readback(global, expected, "final WFDMA global")?;
         readback(
             &wfdma,
             HOST_INT_ENABLE,
@@ -821,6 +833,28 @@ mod tests {
             reset_generation: None,
             post_reset_registers: None,
             post_reset_pci: None,
+        }
+    }
+
+    #[test]
+    fn wfdma_global_readback_allows_live_busy_bits_to_change() {
+        let expected = 0x5030_b875;
+        for value in [
+            expected,
+            expected ^ (1 << 1),
+            expected ^ (1 << 3),
+            expected ^ WFDMA_GLO_CFG_BUSY,
+        ] {
+            verify_wfdma_global_readback(value, expected, "WFDMA global").unwrap();
+        }
+        verify_wfdma_global_readback(0x5030_b87d, expected, "WFDMA global").unwrap();
+    }
+
+    #[test]
+    fn wfdma_global_readback_rejects_enable_and_config_mismatches() {
+        let expected = 0x5030_b875;
+        for value in [expected ^ (1 << 0), expected ^ (1 << 6), u32::MAX] {
+            assert!(verify_wfdma_global_readback(value, expected, "WFDMA global").is_err());
         }
     }
 
