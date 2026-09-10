@@ -27,6 +27,9 @@ const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
 const DP_WORK_BUDGET: usize = 64;
 const DP_RECEIVE_BUDGET: usize = 1;
 const MGMT_TX_PENDING_MAX: u32 = 512;
+const ACTIVE_SCAN_CHANNEL_MAX: usize = 256;
+const ACTIVE_SCAN_SSID_MAX: usize = 16;
+const SSID_BYTE_MAX: usize = 32;
 const TWO_GHZ_RATES: &[u8] = &[2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 const FIVE_GHZ_RATES: &[u8] = &[12, 18, 24, 36, 48, 72, 96, 108];
 
@@ -944,9 +947,67 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn start_active_scan(
         &mut self,
-        _request: WlanSoftmacStartActiveScanRequest,
+        request: WlanSoftmacStartActiveScanRequest,
     ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        if self.active_scan.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let channels = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
+        let ssids = request.ssids.ok_or(zx::Status::INVALID_ARGS)?;
+        if channels.is_empty()
+            || channels.len() > ACTIVE_SCAN_CHANNEL_MAX
+            || ssids.is_empty()
+            || ssids.len() > ACTIVE_SCAN_SSID_MAX
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let installed_channels = &self
+            .regulatory_domain
+            .as_ref()
+            .ok_or(zx::Status::BAD_STATE)?
+            .channels;
+        let mut channels_mhz = Vec::with_capacity(channels.len());
+        for channel in channels {
+            let frequency = channel_frequency(channel)?;
+            let Some(installed) = installed_channels
+                .iter()
+                .find(|installed| installed.frequency_mhz == frequency)
+            else {
+                return Err(zx::Status::INVALID_ARGS);
+            };
+            if installed.passive || channels_mhz.contains(&frequency) {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            channels_mhz.push(frequency);
+        }
+        let ssids = ssids
+            .into_iter()
+            .map(|ssid| {
+                let len = usize::from(ssid.len);
+                if len == 0 || len > SSID_BYTE_MAX {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                Ok(ssid.data[..len].to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let scan_id = self.next_scan_id;
+        self.next_scan_id = self
+            .next_scan_id
+            .checked_add(1)
+            .ok_or(zx::Status::NO_RESOURCES)?;
+        self.device
+            .start_scan(ScanConfig {
+                vdev: self.ready_vdev()?,
+                id: ScanId(scan_id),
+                active: true,
+                channels_mhz,
+                ssids,
+            })
+            .map_err(status)?;
+        self.active_scan = Some(scan_id);
+        Ok(WlanSoftmacBaseStartActiveScanResponse {
+            scan_id: Some(u64::from(scan_id)),
+        })
     }
     fn cancel_scan(&mut self, request: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
         let scan_id = u32::try_from(request.scan_id.ok_or(zx::Status::INVALID_ARGS)?)
@@ -1046,6 +1107,7 @@ mod tests {
     struct RecordedUpcalls {
         received: Vec<Vec<u8>>,
         tx: Vec<([u8; 6], fidl_fuchsia_wlan_softmac::WlanTxResultCode)>,
+        scans: Vec<(zx::Status, u64)>,
     }
 
     struct Recorder(Arc<Mutex<RecordedUpcalls>>);
@@ -1060,7 +1122,9 @@ mod tests {
                 .tx
                 .push((result.peer_addr, result.result_code));
         }
-        fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
+        fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
+            self.0.lock().unwrap().scans.push((status, scan_id));
+        }
     }
 
     struct SimultaneousRxSubsystems {
@@ -1290,6 +1354,149 @@ mod tests {
             .unwrap();
         adapter.device.backend_mut().clear();
         adapter
+    }
+
+    fn active_scan_request(ssids: &[&[u8]]) -> WlanSoftmacStartActiveScanRequest {
+        WlanSoftmacStartActiveScanRequest {
+            channels: Some(vec![ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 6,
+            }]),
+            ssids: Some(
+                ssids
+                    .iter()
+                    .map(|bytes| {
+                        let mut data = [0; SSID_BYTE_MAX];
+                        data[..bytes.len()].copy_from_slice(bytes);
+                        fidl_fuchsia_wlan_ieee80211::CSsid {
+                            len: bytes.len() as u8,
+                            data,
+                        }
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn active_scan_maps_exact_channels_ssids_and_scan_id() {
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(NoopUpcalls)).unwrap();
+        adapter.device.backend_mut().clear();
+        let vdev = adapter.vdev.unwrap();
+
+        let response = adapter
+            .start_active_scan(active_scan_request(&[b"redwood", b"lab"]))
+            .unwrap();
+
+        assert_eq!(response.scan_id, Some(1));
+        assert_eq!(adapter.active_scan, Some(1));
+        assert_eq!(
+            adapter.device.backend().operations(),
+            &[Operation::WmiScanStart(ScanConfig {
+                vdev,
+                id: ScanId(1),
+                active: true,
+                channels_mhz: vec![2437],
+                ssids: vec![b"redwood".to_vec(), b"lab".to_vec()],
+            })]
+        );
+    }
+
+    #[test]
+    fn active_scan_rejects_invalid_out_of_domain_and_busy_requests() {
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(NoopUpcalls)).unwrap();
+        adapter.device.backend_mut().clear();
+
+        let mut missing_channels = active_scan_request(&[b"lab"]);
+        missing_channels.channels = None;
+        assert_eq!(
+            adapter.start_active_scan(missing_channels),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        assert_eq!(
+            adapter.start_active_scan(active_scan_request(&[])),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        let mut empty_ssid = active_scan_request(&[b"lab"]);
+        empty_ssid.ssids.as_mut().unwrap()[0].len = 0;
+        assert_eq!(
+            adapter.start_active_scan(empty_ssid),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        let too_many_ssids = vec![b"lab".as_slice(); ACTIVE_SCAN_SSID_MAX + 1];
+        assert_eq!(
+            adapter.start_active_scan(active_scan_request(&too_many_ssids)),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        let mut oversized_ssid = active_scan_request(&[b"lab"]);
+        oversized_ssid.ssids.as_mut().unwrap()[0].len = (SSID_BYTE_MAX + 1) as u8;
+        assert_eq!(
+            adapter.start_active_scan(oversized_ssid),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        let mut out_of_domain = active_scan_request(&[b"lab"]);
+        out_of_domain.channels.as_mut().unwrap()[0].number = 11;
+        assert_eq!(
+            adapter.start_active_scan(out_of_domain),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = true;
+        assert_eq!(
+            adapter.start_active_scan(active_scan_request(&[b"lab"])),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = false;
+        assert!(adapter.device.backend().operations().is_empty());
+
+        adapter
+            .start_active_scan(active_scan_request(&[b"lab"]))
+            .unwrap();
+        assert_eq!(
+            adapter.start_active_scan(active_scan_request(&[b"other"])),
+            Err(zx::Status::BAD_STATE)
+        );
+        assert_eq!(adapter.device.backend().operations().len(), 1);
+    }
+
+    #[test]
+    fn active_scan_completion_and_cancel_close_the_transaction() {
+        let records = Arc::new(Mutex::new(RecordedUpcalls::default()));
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(Recorder(records.clone()))).unwrap();
+        adapter.device.backend_mut().clear();
+
+        let first = adapter
+            .start_active_scan(active_scan_request(&[b"lab"]))
+            .unwrap()
+            .scan_id
+            .unwrap();
+        assert!(adapter.drive().unwrap());
+        assert_eq!(records.lock().unwrap().scans, vec![(zx::Status::OK, first)]);
+        assert_eq!(adapter.active_scan, None);
+
+        let second = adapter
+            .start_active_scan(active_scan_request(&[b"lab"]))
+            .unwrap()
+            .scan_id
+            .unwrap();
+        adapter
+            .cancel_scan(WlanSoftmacBaseCancelScanRequest {
+                scan_id: Some(second),
+            })
+            .unwrap();
+        assert_eq!(second, first + 1);
+        assert_eq!(adapter.active_scan, None);
+        assert!(matches!(
+            adapter.device.backend().operations().last(),
+            Some(Operation::WmiScanStop {
+                scan: ScanId(2),
+                ..
+            })
+        ));
+        assert_eq!(records.lock().unwrap().scans.len(), 1);
     }
 
     fn open_association() -> WlanAssociationConfig {
