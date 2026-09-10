@@ -27,7 +27,7 @@ pub use operation::{
     AssociationBandwidth, Channel, Cipher, KeyConfig, KeyKind, KeyProtection, ManagementFrame,
     ModelSubsystems, Operation, OperationTarget, PeerAssociation, RegulatoryChannel,
     RegulatoryDomain, ScanConfig, ScanId, Subsystems, VdevStartFailure, WmmAccessCategory,
-    WmmConfig, redwood_conservative_world_domain,
+    WmmConfig, redwood_india_domain,
 };
 pub use qmi::{
     HardwareMemoryProvider, Wcn6750FirmwareAssetError, Wcn6750FirmwareAssets, Wcn6750QmiSession,

@@ -41,6 +41,101 @@ struct PendingAssociationSecurity {
     pmf: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Igtk {
+    key_id: u16,
+    key: [u8; 16],
+    receive_ipn: u64,
+    transmit_ipn: u64,
+}
+
+fn aes_cmac_128(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    // SAFETY: all pointers refer to live slices of the exact lengths supplied.
+    let ok = unsafe {
+        bssl_sys::AES_CMAC(
+            result.as_mut_ptr(),
+            key.as_ptr(),
+            key.len(),
+            message.as_ptr(),
+            message.len(),
+        )
+    };
+    assert_eq!(ok, 1, "AES-CMAC rejected fixed-size BIP inputs");
+    result
+}
+
+fn robust_management(frame: &[u8]) -> bool {
+    let subtype = u16::from_le_bytes([frame[0], frame[1]]) & 0x00f0;
+    matches!(subtype, 0xa0 | 0xc0)
+        || (subtype == 0xd0 && !matches!(frame.get(24), Some(4) | Some(7) | Some(15)))
+}
+
+fn bip_mic(key: &[u8; 16], frame: &[u8]) -> Result<[u8; 8], zx::Status> {
+    if frame.len() < 24 {
+        return Err(zx::Status::INVALID_ARGS);
+    }
+    let mut authenticated = Vec::with_capacity(frame.len() - 4);
+    let mut fc = u16::from_le_bytes([frame[0], frame[1]]);
+    fc &= !0x3800;
+    authenticated.extend_from_slice(&fc.to_le_bytes());
+    authenticated.extend_from_slice(&frame[4..22]);
+    authenticated.extend_from_slice(&frame[24..]);
+    Ok(aes_cmac_128(key, &authenticated)[..8].try_into().unwrap())
+}
+
+fn protect_group_management(frame: &[u8], igtk: &mut Igtk) -> Result<Vec<u8>, zx::Status> {
+    igtk.transmit_ipn = igtk
+        .transmit_ipn
+        .checked_add(1)
+        .ok_or(zx::Status::BAD_STATE)?;
+    if igtk.transmit_ipn > 0x0000_ffff_ffff_ffff {
+        return Err(zx::Status::BAD_STATE);
+    }
+    let mut protected = frame.to_vec();
+    protected[1] |= 0x40;
+    protected.extend_from_slice(&[76, 16]);
+    protected.extend_from_slice(&igtk.key_id.to_le_bytes());
+    protected.extend_from_slice(&igtk.transmit_ipn.to_le_bytes()[..6]);
+    protected.extend_from_slice(&[0; 8]);
+    let mic = bip_mic(&igtk.key, &protected)?;
+    let offset = protected.len() - 8;
+    protected[offset..].copy_from_slice(&mic);
+    Ok(protected)
+}
+
+fn verify_group_management(frame: &[u8], igtk: &mut Igtk) -> bool {
+    if frame.len() < 42 || frame[frame.len() - 18..frame.len() - 16] != [76, 16] {
+        return false;
+    }
+    let mmie = frame.len() - 16;
+    if u16::from_le_bytes(frame[mmie..mmie + 2].try_into().unwrap()) != igtk.key_id {
+        return false;
+    }
+    let mut ipn_bytes = [0u8; 8];
+    ipn_bytes[..6].copy_from_slice(&frame[mmie + 2..mmie + 8]);
+    let ipn = u64::from_le_bytes(ipn_bytes);
+    if ipn <= igtk.receive_ipn {
+        return false;
+    }
+    let mut checked = frame.to_vec();
+    let received = checked[checked.len() - 8..].to_vec();
+    let offset = checked.len() - 8;
+    checked[offset..].fill(0);
+    let Ok(expected) = bip_mic(&igtk.key, &checked) else {
+        return false;
+    };
+    let equal = received
+        .iter()
+        .zip(expected)
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0;
+    if equal {
+        igtk.receive_ipn = ipn;
+    }
+    equal
+}
+
 fn association_security(bytes: &[u8]) -> Result<PendingAssociationSecurity, zx::Status> {
     if bytes.len() < 28 {
         return Err(zx::Status::INVALID_ARGS);
@@ -77,27 +172,44 @@ fn association_security(bytes: &[u8]) -> Result<PendingAssociationSecurity, zx::
                     .get(akm_count_offset + 2..akm_count_offset + 2 + akm_count * 4)
                     .ok_or(zx::Status::INVALID_ARGS)?;
                 let capabilities_offset = akm_count_offset + 2 + akm_count * 4;
-                if !matches!(body.len().saturating_sub(capabilities_offset), 0 | 2) {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
                 let capabilities = body
                     .get(capabilities_offset..capabilities_offset + 2)
                     .map(|caps| u16::from_le_bytes(caps.try_into().unwrap()))
                     .unwrap_or(0);
+                let mut optional =
+                    capabilities_offset + usize::from(body.len() >= capabilities_offset + 2) * 2;
+                if body.len() >= optional + 2 {
+                    let pmkid_count = usize::from(u16::from_le_bytes(
+                        body[optional..optional + 2].try_into().unwrap(),
+                    ));
+                    optional = optional
+                        .checked_add(
+                            2 + pmkid_count
+                                .checked_mul(16)
+                                .ok_or(zx::Status::INVALID_ARGS)?,
+                        )
+                        .ok_or(zx::Status::INVALID_ARGS)?;
+                }
+                if !matches!(body.len().checked_sub(optional), Some(0) | Some(4)) {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                if body.len() == optional + 4
+                    && body[optional..optional + 4] != [0x00, 0x0f, 0xac, 6]
+                {
+                    return Err(zx::Status::NOT_SUPPORTED);
+                }
                 let sae = akms
                     .chunks_exact(4)
                     .any(|suite| suite[..3] == [0x00, 0x0f, 0xac] && suite[3] == 8);
                 let pmf = capabilities & ((1 << 6) | (1 << 7)) != 0;
-                // PMF and SAE require the unported BIP/IGTK semantics. Do not
-                // advertise WPA3 by accepting only half of that contract.
-                if sae || pmf {
-                    return Err(zx::Status::NOT_SUPPORTED);
+                if sae && capabilities & (1 << 7) == 0 {
+                    return Err(zx::Status::INVALID_ARGS);
                 }
                 rsne = Some(PendingAssociationSecurity {
                     peer,
                     need_ptk_4_way: true,
                     need_gtk_2_way: false,
-                    pmf: false,
+                    pmf,
                 });
             }
             221 if body.starts_with(&[0x00, 0x50, 0xf2, 1]) => {
@@ -221,6 +333,7 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     deterministic_scan_completion: bool,
     regulatory_domain: Option<ath11k_core::RegulatoryDomain>,
     pending_association_security: Option<PendingAssociationSecurity>,
+    igtk: Option<Igtk>,
 }
 
 impl<B: Subsystems> Ath11kClientDevice<B> {
@@ -241,6 +354,7 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             deterministic_scan_completion: false,
             regulatory_domain: None,
             pending_association_security: None,
+            igtk: None,
         }
     }
 
@@ -262,6 +376,18 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
     }
 
     fn deliver_management_rx(&mut self, received: DeferredManagementRx) {
+        if self.associated
+            && received.frame.len() >= 25
+            && received.frame[4] & 1 != 0
+            && robust_management(&received.frame)
+        {
+            let Some(igtk) = self.igtk.as_mut() else {
+                return;
+            };
+            if !verify_group_management(&received.frame, igtk) {
+                return;
+            }
+        }
         let primary = frequency_channel(received.channel_mhz as u16);
         self.upcalls.as_mut().unwrap().recv(
             received.frame,
@@ -350,6 +476,7 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
         self.associated = false;
         self.link_up = false;
         self.pending_association_security = None;
+        self.igtk = None;
         self.vdev = None;
         self.device.stop().map_err(status)
     }
@@ -604,7 +731,17 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         Ok(Default::default())
     }
     fn query_security_support(&mut self) -> Result<SecuritySupport, zx::Status> {
-        Ok(Default::default())
+        Ok(SecuritySupport {
+            sae: Some(fidl_fuchsia_wlan_common::SaeFeature {
+                driver_handler_supported: Some(false),
+                sme_handler_supported: Some(true),
+                hash_to_element_supported: Some(false),
+            }),
+            mfp: Some(fidl_fuchsia_wlan_common::MfpFeature {
+                supported: Some(true),
+            }),
+            owe: None,
+        })
     }
     fn query_spectrum_management_support(
         &mut self,
@@ -634,6 +771,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn join_bss(&mut self, request: JoinBssRequest) -> Result<(), zx::Status> {
         self.pending_association_security = None;
+        self.igtk = None;
         let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
         if request.beacon_period.is_none() {
             return Err(zx::Status::INVALID_ARGS);
@@ -696,9 +834,29 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
                 (KeyKind::Group, associated_peer)
             }
             fidl_fuchsia_wlan_ieee80211::KeyType::Igtk => {
-                // BIP/IGTK is software-owned in pinned ath11k; this adapter
-                // has no complete PMF software path yet.
-                return Err(zx::Status::NOT_SUPPORTED);
+                if configuration.peer_addr != Some([0xff; 6])
+                    || configuration.cipher_type != Some(6)
+                    || !matches!(configuration.key_idx, Some(4) | Some(5))
+                    || protection != KeyProtection::RxTx
+                {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                let key: [u8; 16] = configuration
+                    .key
+                    .ok_or(zx::Status::INVALID_ARGS)?
+                    .try_into()
+                    .map_err(|_| zx::Status::INVALID_ARGS)?;
+                let receive_ipn = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
+                if receive_ipn > 0x0000_ffff_ffff_ffff {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                self.igtk = Some(Igtk {
+                    key_id: u16::from(configuration.key_idx.unwrap()),
+                    key,
+                    receive_ipn,
+                    transmit_ipn: 0,
+                });
+                return Ok(());
             }
             _ => return Err(zx::Status::NOT_SUPPORTED),
         };
@@ -878,6 +1036,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         request: WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
         self.pending_association_security = None;
+        self.igtk = None;
         let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
         if request.peer_addr != Some(peer) {
             return Err(zx::Status::INVALID_ARGS);
@@ -1038,11 +1197,16 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         if frame_control & 0x000c != 0 {
             return Err(zx::Status::NOT_SUPPORTED);
         }
-        // Protected robust-management frames need the pinned C cipher/MIC
-        // expansion path; do not silently send them as plaintext.
-        if flags.contains(WlanTxInfoFlags::PROTECTED) || frame_control & 0x4000 != 0 {
+        let protected_requested =
+            flags.contains(WlanTxInfoFlags::PROTECTED) || frame_control & 0x4000 != 0;
+        if protected_requested && !robust_management(bytes) {
             return Err(zx::Status::NOT_SUPPORTED);
         }
+        let frame = if protected_requested && bytes[4] & 1 != 0 && robust_management(bytes) {
+            protect_group_management(bytes, self.igtk.as_mut().ok_or(zx::Status::BAD_STATE)?)?
+        } else {
+            bytes.to_vec()
+        };
         let association_security = if frame_control & 0x00fc == 0 {
             let security = association_security(bytes)?;
             if self.peer != Some(security.peer) {
@@ -1075,7 +1239,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             .transmit_management(ManagementFrame {
                 vdev: self.ready_vdev()?,
                 buffer_id,
-                bytes: bytes.to_vec(),
+                bytes: frame,
             })
             .map_err(status)?;
         self.pending_mgmt_tx.push((buffer_id, peer_addr));
@@ -1257,10 +1421,9 @@ mod tests {
         assert_eq!(info.bands[0].vht_cap, None);
         assert_eq!(info.bands[1].ht_cap, None);
         assert_eq!(info.bands[1].vht_cap, None);
-        assert_eq!(
-            adapter.query_security_support().unwrap(),
-            Default::default()
-        );
+        let security = adapter.query_security_support().unwrap();
+        assert_eq!(security.sae.unwrap().sme_handler_supported, Some(true));
+        assert_eq!(security.mfp.unwrap().supported, Some(true));
         assert_eq!(
             adapter.query_spectrum_management_support().unwrap(),
             Default::default()
@@ -2005,5 +2168,73 @@ mod tests {
             Operation::RegFree,
             Operation::QmiDeinitService,
         ]));
+    }
+
+    #[test]
+    fn bip_uses_rfc4493_cmac_and_rejects_replay() {
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let message = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
+        assert_eq!(
+            aes_cmac_128(&key, &message),
+            [
+                0x07, 0x0a, 0x16, 0xb4, 0x6b, 0x4d, 0x41, 0x44, 0xf7, 0x9b, 0xdd, 0x9d, 0xd0, 0x4a,
+                0x28, 0x7c
+            ]
+        );
+
+        let mut tx = Igtk {
+            key_id: 4,
+            key,
+            receive_ipn: 0,
+            transmit_ipn: 0,
+        };
+        let mut frame = vec![0u8; 26];
+        frame[0] = 0xc0;
+        frame[4..10].fill(0xff);
+        let protected = protect_group_management(&frame, &mut tx).unwrap();
+        let mut rx = Igtk {
+            key_id: 4,
+            key,
+            receive_ipn: 0,
+            transmit_ipn: 0,
+        };
+        assert!(verify_group_management(&protected, &mut rx));
+        assert!(!verify_group_management(&protected, &mut rx));
+        let mut forged = protected;
+        forged[24] ^= 1;
+        rx.receive_ipn = 0;
+        assert!(!verify_group_management(&forged, &mut rx));
+    }
+
+    #[test]
+    fn association_security_accepts_sae_with_pmf_and_bip_cmac_128() {
+        let peer = [2, 0, 0, 0, 0, 2];
+        let mut request = vec![0u8; 28];
+        request[4..10].copy_from_slice(&peer);
+        let rsne = [
+            1, 0, 0, 0x0f, 0xac, 4, // version and group CCMP
+            1, 0, 0, 0x0f, 0xac, 4, // one pairwise CCMP
+            1, 0, 0, 0x0f, 0xac, 8, // one SAE AKM
+            0xc0, 0, // MFPC and MFPR
+            0, 0, // no PMKIDs
+            0, 0x0f, 0xac, 6, // BIP-CMAC-128
+        ];
+        request.extend_from_slice(&[48, rsne.len() as u8]);
+        request.extend_from_slice(&rsne);
+        assert_eq!(
+            association_security(&request).unwrap(),
+            PendingAssociationSecurity {
+                peer,
+                need_ptk_4_way: true,
+                need_gtk_2_way: false,
+                pmf: true,
+            }
+        );
     }
 }

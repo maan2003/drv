@@ -943,6 +943,52 @@ pub struct RegulatoryChannelList {
     pub extended: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegulatoryRule {
+    pub start_mhz: u16,
+    pub end_mhz: u16,
+    pub max_bandwidth_mhz: u16,
+    pub max_power_dbm: u8,
+    pub max_antenna_gain_dbi: u8,
+    pub flags: u16,
+}
+
+impl RegulatoryChannelList {
+    pub fn status(&self) -> Result<u32, WmiError> {
+        word(&self.fixed, 0)
+    }
+
+    pub fn alpha2(&self) -> Result<[u8; 2], WmiError> {
+        let value = word(&self.fixed, 8)?.to_le_bytes();
+        Ok([value[0], value[1]])
+    }
+
+    pub fn band_rule_counts(&self) -> Result<(usize, usize), WmiError> {
+        Ok((
+            word(&self.fixed, 48)? as usize,
+            word(&self.fixed, 52)? as usize,
+        ))
+    }
+
+    pub fn decoded_rules(&self) -> Result<Vec<RegulatoryRule>, WmiError> {
+        self.rules
+            .iter()
+            .map(|rule| {
+                let freq = word(rule, 4)?;
+                let bandwidth_power = word(rule, 8)?;
+                Ok(RegulatoryRule {
+                    start_mhz: (freq & 0xffff) as u16,
+                    end_mhz: (freq >> 16) as u16,
+                    max_bandwidth_mhz: (bandwidth_power & 0xffff) as u16,
+                    max_power_dbm: ((bandwidth_power >> 16) & 0xff) as u8,
+                    max_antenna_gain_dbi: (bandwidth_power >> 24) as u8,
+                    flags: (word(rule, 12)? & 0xffff) as u16,
+                })
+            })
+            .collect()
+    }
+}
+
 fn regulatory_rules(
     fixed: &[u8],
     all: &[u8],
@@ -973,11 +1019,14 @@ fn regulatory_rules(
     }
     let array = find_tlv(all, tags::WMI_TAG_ARRAY_STRUCT.0)?.ok_or(WmiError::Malformed)?;
     let size = if extended { 20 } else { 16 };
-    let rules = array
+    let rules: Vec<_> = array
         .chunks_exact(size)
         .take(count)
         .map(<[u8]>::to_vec)
         .collect();
+    if rules.len() != count {
+        return Err(WmiError::Malformed);
+    }
     Ok(RegulatoryChannelList {
         fixed: fixed.to_vec(),
         rules,

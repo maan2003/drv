@@ -10,6 +10,7 @@ resolver = "3"
 
 [dependencies]
 ath11k-core = { path = "../ath11k-core" }
+bssl-sys = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys" }
 ath11k-dp = { path = "../ath11k-dp" }
 fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }

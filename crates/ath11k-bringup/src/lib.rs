@@ -756,7 +756,7 @@ impl Host for DryRunHost {
         device.attach_firmware().map_err(Error::Core)?;
         device.start_radio().map_err(Error::Core)?;
         device
-            .set_regulatory_domain(ath11k_core::redwood_conservative_world_domain())
+            .set_regulatory_domain(ath11k_core::redwood_india_domain())
             .map_err(Error::Core)?;
         self.vdev = Some(
             device
@@ -1327,7 +1327,7 @@ impl Host for RealHost {
             device.attach_firmware().map_err(Error::Core)?;
             device.start_radio().map_err(Error::Core)?;
             device
-                .set_regulatory_domain(ath11k_core::redwood_conservative_world_domain())
+                .set_regulatory_domain(ath11k_core::redwood_india_domain())
                 .map_err(Error::Core)?;
             self.vdev = Some(
                 device

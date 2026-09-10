@@ -36,6 +36,55 @@ use ath11k_wmi::{
 };
 
 const MGMT_RX_STATUS_ERROR_MASK: u32 = 0x01 | 0x08 | 0x10 | 0x20;
+const REGULATORY_DISABLED: u16 = 1 << 0;
+const REGULATORY_NO_IR: u16 = 1 << 1;
+const REGULATORY_RADAR: u16 = 1 << 3;
+const REGULATORY_NO_OFDM: u16 = 1 << 6;
+const REGULATORY_NO_20MHZ: u16 = 1 << 11;
+
+fn regulatory_event_authorizes(
+    event: &ath11k_wmi::event::RegulatoryChannelList,
+    alpha2: [u8; 2],
+    channels: &[crate::RegulatoryChannel],
+) -> Result<(), CoreError> {
+    if event.status().map_err(|_| CoreError::Protocol)? != 0
+        || event.alpha2().map_err(|_| CoreError::Protocol)? != alpha2
+    {
+        return Err(CoreError::Protocol);
+    }
+    let (two_ghz_count, five_ghz_count) =
+        event.band_rule_counts().map_err(|_| CoreError::Protocol)?;
+    let rules = event.decoded_rules().map_err(|_| CoreError::Protocol)?;
+    if rules.len() < two_ghz_count + five_ghz_count {
+        return Err(CoreError::Protocol);
+    }
+    for channel in channels {
+        let band_rules = if channel.frequency_mhz < 3_000 {
+            &rules[..two_ghz_count]
+        } else {
+            &rules[two_ghz_count..two_ghz_count + five_ghz_count]
+        };
+        let forbidden = REGULATORY_DISABLED | REGULATORY_NO_20MHZ | REGULATORY_NO_OFDM;
+        let authorized = channel.max_power_dbm >= 0
+            && channel.max_reg_power_dbm >= 0
+            && channel.max_antenna_gain_dbi >= 0
+            && band_rules.iter().any(|rule| {
+                u32::from(channel.frequency_mhz).saturating_sub(10) >= u32::from(rule.start_mhz)
+                    && u32::from(channel.frequency_mhz) + 10 <= u32::from(rule.end_mhz)
+                    && rule.max_bandwidth_mhz >= 20
+                    && rule.flags & forbidden == 0
+                    && (channel.passive || rule.flags & REGULATORY_NO_IR == 0)
+                    && channel.radar == (rule.flags & REGULATORY_RADAR != 0)
+                    && channel.max_power_dbm as u8 <= rule.max_power_dbm
+                    && channel.max_reg_power_dbm as u8 <= rule.max_power_dbm
+                    && channel.max_antenna_gain_dbi as u8 <= rule.max_antenna_gain_dbi
+            });
+        if !authorized {
+            return Err(CoreError::Protocol);
+        }
+    }
+    Ok(())
+}
 
 fn wcn6750_install_key(key: KeyConfig) -> Result<VdevInstallKey, CoreError> {
     let (key_cipher, mic_len) = match key.cipher {
@@ -425,6 +474,8 @@ where
     post_ready_quiet_drain: bool,
     service_ready: Option<ath11k_wmi::event::ServiceReadyState>,
     pending_mgmt_tx: Vec<(u32, StreamingDma<B, ToDevice>)>,
+    pending_regulatory_country: Option<[u8; 2]>,
+    pending_regulatory_event: Option<ath11k_wmi::event::RegulatoryChannelList>,
 }
 
 impl<B, Q, A, W, D, S> Wcn6750Subsystems<B, Q, A, W, D, S>
@@ -465,6 +516,8 @@ where
             post_ready_quiet_drain: false,
             service_ready: None,
             pending_mgmt_tx: Vec::new(),
+            pending_regulatory_country: None,
+            pending_regulatory_event: None,
         }
     }
 
@@ -1062,23 +1115,37 @@ where
             }
             Operation::WmiSetCurrentCountry { alpha2 } => {
                 Self::protocol(self.wmi.as_mut())?.discard_regulatory_update();
+                self.pending_regulatory_country = None;
+                self.pending_regulatory_event = None;
                 self.wmi_send(&SetCurrentCountry {
                     pdev_id: 0,
                     alpha2: [alpha2[0], alpha2[1], 0],
+                })?;
+                self.pending_regulatory_country = Some(alpha2);
+                Ok(())
+            }
+            Operation::WmiScanChannelList { pdev, channels } => {
+                let alpha2 = self.pending_regulatory_country.ok_or(CoreError::Protocol)?;
+                let event = self
+                    .pending_regulatory_event
+                    .take()
+                    .ok_or(CoreError::Protocol)?;
+                regulatory_event_authorizes(&event, alpha2, &channels)?;
+                self.pending_regulatory_country = None;
+                self.wmi_send(&ScanChannelList {
+                    pdev_id: u32::from(pdev.0),
+                    append: false,
+                    channels: channels.into_iter().map(wcn6750_scan_channel).collect(),
                 })
             }
-            Operation::WmiScanChannelList { pdev, channels } => self.wmi_send(&ScanChannelList {
-                pdev_id: u32::from(pdev.0),
-                append: false,
-                channels: channels.into_iter().map(wcn6750_scan_channel).collect(),
-            }),
             Operation::WaitRegulatoryUpdate { pdev } if pdev.0 == 0 => {
                 self.pump()?;
                 let deadline = (self.deadline)();
-                Self::protocol(self.wmi.as_mut())?
+                let event = Self::protocol(self.wmi.as_mut())?
                     .wait_for_regulatory_update(deadline)
-                    .map(|_| ())
-                    .map_err(|_| CoreError::Protocol)
+                    .map_err(|_| CoreError::Protocol)?;
+                self.pending_regulatory_event = Some(event);
+                Ok(())
             }
             Operation::WmiVdevSetNss { vdev, nss } => self.wmi_send(&VdevSetParam {
                 vdev_id: u32::from(vdev.0),
@@ -1576,6 +1643,39 @@ mod tests {
                 command.antenna_max
             ),
             (46, 40, 12)
+        );
+    }
+
+    #[test]
+    fn fresh_india_event_must_authorize_channel_149_before_install() {
+        let mut fixed = alloc::vec![0u8; 56];
+        fixed[8..12].copy_from_slice(&u32::from_le_bytes(*b"IN\0\0").to_le_bytes());
+        fixed[52..56].copy_from_slice(&1u32.to_le_bytes());
+        let freq = 5725u32 | (5875u32 << 16);
+        let bandwidth_power = 80u32 | (30u32 << 16);
+        let mut rule = alloc::vec![0u8; 16];
+        rule[4..8].copy_from_slice(&freq.to_le_bytes());
+        rule[8..12].copy_from_slice(&bandwidth_power.to_le_bytes());
+        let event = ath11k_wmi::event::RegulatoryChannelList {
+            fixed,
+            rules: alloc::vec![rule],
+            extended: false,
+        };
+        let channel = crate::redwood_india_domain().channels[3];
+        assert_eq!(
+            regulatory_event_authorizes(&event, *b"IN", &[channel]),
+            Ok(())
+        );
+
+        let mut no_ir = event.clone();
+        no_ir.rules[0][12..16].copy_from_slice(&u32::from(REGULATORY_NO_IR).to_le_bytes());
+        assert_eq!(
+            regulatory_event_authorizes(&no_ir, *b"IN", &[channel]),
+            Err(CoreError::Protocol)
+        );
+        assert_eq!(
+            regulatory_event_authorizes(&event, *b"00", &[channel]),
+            Err(CoreError::Protocol)
         );
     }
 

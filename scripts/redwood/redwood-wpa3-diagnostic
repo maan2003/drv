@@ -1,0 +1,85 @@
+#!/bin/sh
+# Operator-attended Redwood WPA3 association. The service itself owns the
+# ordering from active DMA through verified WPSS-offline teardown.
+set -eu
+
+[ "$#" -eq 0 ] || {
+    echo "usage: $0" >&2
+    exit 2
+}
+
+PATH=/run/current-system/sw/bin:/bin:/sbin
+export PATH
+
+LAB=/var/lib/ath11k-redwood-lab
+BIN=$LAB/stage13
+RUN=$LAB/runs/wpa3-ajay-channel149
+CREDENTIAL=/var/lib/iwd/ajay.psk
+RPROC=/sys/class/remoteproc/remoteproc2
+DEVICE=17a10040.wifi
+P=/sys/bus/platform/devices/$DEVICE
+MODULES=$LAB/stage7/modules
+FIRMWARE=/run/current-system/firmware/ath11k/WCN6750/hw1.0
+
+mkdir -p "$RUN"
+exec >>"$RUN/diagnostic.log" 2>&1
+echo "REDWOOD_WPA3_BEGIN=$(date -u +%FT%TZ)"
+
+# This run has explicitly accepted manual recovery. Automatic reboot
+# mechanisms remain absent, while the retained-candidate sleep inhibitor keeps
+# the attended control path from being lost to idle suspend.
+grep -qw 'rd.systemd.mask=boot-watchdog.service' /proc/cmdline
+grep -qw 'rd.systemd.mask=redwood-lab-watchdog.service' /proc/cmdline
+test ! -e /run/redwood-lab-watchdog/armed
+test ! -e /dev/watchdog0
+for unit in redwood-lab-watchdog.service boot-watchdog.service +    ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service; do
+    ! systemctl is-active --quiet "$unit"
+done
+systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
+
+test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
+test "$(stat -c %U:%G:%a "$CREDENTIAL")" = root:root:600
+test -x "$BIN/ath11k-wifi-service"
+test -x "$BIN/redwood-wifi-diagnostic"
+test -f "$FIRMWARE/board.bin"
+test -f "$FIRMWARE/regdb.bin"
+test -s "$LAB/stage13/client-mac"
+test "$(cat "$RPROC/name")" = wpss
+test "$(cat "$RPROC/state")" = offline
+test ! -e "$P/driver"
+
+printf 1 >/sys/module/iommufd/parameters/allow_unsafe_interrupts
+test -d /sys/module/vfio_platform ||
+    insmod "$MODULES/vfio-platform-base.ko"
+test -d /sys/module/vfio_platform ||
+    insmod "$MODULES/vfio-platform.ko" reset_required=0
+printf start >"$RPROC/state"
+test "$(cat "$RPROC/state")" = running
+printf %s vfio-platform >"$P/driver_override"
+printf %s "$DEVICE" >/sys/bus/platform/drivers/vfio-platform/bind
+CDEV_NAME=$(find "$P/vfio-dev" -maxdepth 1 -mindepth 1 -printf '%f\n' | head -n1)
+test -n "$CDEV_NAME"
+CDEV=/dev/vfio/devices/$CDEV_NAME
+test -c "$CDEV"
+
+set +e
+LC_ALL=C awk 'BEGIN { count=0 } /^Passphrase=/ { count++; value=substr($0,12) } END { if (count != 1 || length(value) < 8 || length(value) > 63) exit 1; printf "%s", value }' \
+    "$CREDENTIAL" | "$BIN/redwood-wifi-diagnostic" \
+    "$BIN/ath11k-wifi-service" "$CDEV" "$FIRMWARE/board.bin" \
+    "$FIRMWARE/regdb.bin" 1 "$(cat "$LAB/stage13/client-mac")" "$RPROC"
+RC=$?
+set -e
+echo "REDWOOD_WPA3_SERVICE_RC=$RC"
+
+# Never release the platform device until the service has synchronously
+# stopped WPSS and every process has released the VFIO cdev.
+test "$(cat "$RPROC/state")" = offline
+if find /proc/[0-9]*/fd -lname "$CDEV" -print -quit 2>/dev/null | grep -q .; then
+    echo "REDWOOD_WPA3_LIVE_CDEV_FD=1"
+    exit 1
+fi
+printf %s "$DEVICE" >/sys/bus/platform/drivers/vfio-platform/unbind
+test ! -e "$P/driver"
+echo "REDWOOD_WPA3_INERT=$(date -u +%FT%TZ)"
+sync -f "$RUN/diagnostic.log"
+exit "$RC"

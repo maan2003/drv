@@ -13,9 +13,25 @@ SoftMAC adapter now carries association security provenance into the ported
 key, peer-security-index, and REO replay effects, and a separate production
 service composes it behind a fatal WCN6750-specific sandbox, but that path
 still needs renewed physical association and Internet acceptance. An explicitly
-labelled operator diagnostic mode bypasses only that confinement gate while
-retaining the same wlancfg, MLME/SME, key/data-path, and orderly WPSS-stop path;
-the production default remains fail-closed and sandboxed.
+labelled operator diagnostic mode bypasses only that confinement gate and sends
+one exact scan and connect request directly to the existing ClientRuntime/SME
+control seam; it does not make production wlancfg persistence or namespace
+setup a bring-up prerequisite and does not duplicate SAE/RSN policy. The
+production default remains fail-closed and sandboxed. The target network is
+the India-domain (`IN`) WPA3-Personal network `ajay` on 5 GHz channel 149. The
+service installs only a conservative channel subset after a fresh successful
+firmware regulatory event confirms the country, band rule, active-initiation
+flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
+only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
+
+The 2026-09-10 physical attempt validated the two-hop `#9`/32-byte-DT candidate
+and started WPSS and VFIO, but the service did not publish its initial control
+`Ready` before the phone abruptly returned to flashed `#1`. The retained
+journal ends without an orderly shutdown or a kernel diagnostic, and pstore
+contains no `#9` crash record, so this is neither association evidence nor an
+orderly-cleanup proof. The phone was recovered to native ath11k with carrier,
+default route, and external reachability before releasing the shared hardware
+lock.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
@@ -70,8 +86,10 @@ coverage, production abstractions, and deferred interrupt/broker designs are
 not prerequisites for each polling experiment. Keep stage and native transcript
 evidence honest; source-derived fixtures are not physical captures.
 
-Before a stateful experiment, verify a working control path and coordinate
-exclusive hardware access through no-plastic (`np`). USB SSH through `usb0` at
+Before a stateful experiment, verify a working control path and hold an atomic
+nonblocking exclusive flock on `np:/run/lock/drv-hardware.lock` from before
+mutation through certified recovery. After acquisition, fail closed if durable
+Wi-Fi lab state reports quarantine or an unresolved transaction. USB SSH through `usb0` at
 172.16.42.1/24 is useful but does not gate a run when the existing Tailscale
 control path works. Wi-Fi loss is expected. Preserve reports locally; restoring
 `wlan0` is not a prerequisite for recovery or evidence collection.
@@ -108,7 +126,7 @@ image is known not to work from a real boot and must not be assumed as recovery.
 
 Kernel builds run on **np over SSH, using plain `make` outside Nix**. Do not
 substitute a Nix kernel build or `nix copy` workflow. Coordinate np usage with
-the MT7921/substrate owner. The NixOS configuration repository is `~/src/nixos`
+the shared filesystem lock rather than an owner-message handshake. The NixOS configuration repository is `~/src/nixos`
 (`/home/maan2003/src/nixos` in the coordinator's environment); it owns NixOS
 system configuration, not the plain-make experimental kernel build. Keep exact
 build/deployment commands with the runner rather than duplicating them here.

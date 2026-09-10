@@ -14,7 +14,11 @@ ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }
 ath11k-softmac-adapter = { path = "../ath11k-softmac-adapter" }
 drv-hardware = { path = "../hardware-api" }
 drv-hardware-backends = { path = "../hardware-backends" }
+fidl-fuchsia-wlan-common = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-internal = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
 fidl-fuchsia-wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
 fuchsia-inspect = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
 futures = "=0.3.32"
 libc = "=0.2.189"
@@ -22,5 +26,8 @@ linux-self-sandbox = { path = "../linux-self-sandbox" }
 qrtr-socket = { path = "../qrtr-socket" }
 userspace-vfio = { path = "../userspace-vfio" }
 wifi-control-service = { path = "../wifi-control-service" }
+wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
+wlan-control-wire = { path = "../wlan-control-wire" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
+wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme" }
 wlan-softmac-host = { path = "../wlan-softmac-host" }

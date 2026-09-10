@@ -403,12 +403,12 @@ fn completed_key_retry_is_idempotent_and_uncertain_dp_failure_is_quarantined() {
 }
 
 #[test]
-fn redwood_conservative_world_domain_matches_linux_world_rule() {
+fn redwood_india_domain_includes_confirmed_active_channel_149() {
     assert_eq!(
-        redwood_conservative_world_domain(),
+        redwood_india_domain(),
         RegulatoryDomain {
-            alpha2: *b"00",
-            channels: [2412, 2437, 2462]
+            alpha2: *b"IN",
+            channels: [2412, 2437, 2462, 5745]
                 .into_iter()
                 .map(|frequency_mhz| RegulatoryChannel {
                     frequency_mhz,
@@ -418,7 +418,7 @@ fn redwood_conservative_world_domain_matches_linux_world_rule() {
                     passive: false,
                     radar: false,
                     allow_ht: true,
-                    allow_vht: false,
+                    allow_vht: frequency_mhz >= 3_000,
                     allow_he: true,
                 })
                 .collect(),

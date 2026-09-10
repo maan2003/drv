@@ -26,6 +26,9 @@ QMI, firmware, the ath11k adapter, and pinned Fuchsia MLME/SME; Ethernet
 generations flow to the existing network supervisor lifecycle seam. This
 composition and its exact ARM64 artifact are build-tested but have not yet
 received physical association or Internet acceptance on Redwood. Its
+Redwood client configuration enables SME-managed SAE, and the ath11k adapter
+owns the software BIP/IGTK boundary that pinned Linux likewise keeps above the
+firmware key installer. Its
 same-process WPSS-first cleanup covers ordinary returned errors, not
 uncatchable parent death or fatal-filter termination; production still needs a
 surviving external containment owner for that case, and diagnostic association

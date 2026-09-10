@@ -169,7 +169,7 @@ fn activate_and_run(
             NoWmiTrace,
         );
         let device = WCN6750.device(subsystems);
-        let regulatory = conservative_world_domain();
+        let regulatory = ath11k_core::redwood_india_domain();
         let mut adapter =
             Ath11kClientDevice::new(device, config.mac).with_regulatory_domain(regulatory);
         let query = adapter
@@ -183,9 +183,11 @@ fn activate_and_run(
         let spectrum = adapter
             .query_spectrum_management_support()
             .map_err(|status| format!("query spectrum support: {status}"))?;
+        let mut sme_config = wlan_sme::client::ClientConfig::default();
+        sme_config.wpa3_supported = true;
         let runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
             adapter,
-            Default::default(),
+            sme_config,
             device_info,
             security,
             spectrum,
@@ -263,26 +265,6 @@ fn stop_and_verify_remoteproc(state: &mut File) -> Result<(), String> {
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-fn conservative_world_domain() -> ath11k_core::RegulatoryDomain {
-    ath11k_core::RegulatoryDomain {
-        alpha2: *b"00",
-        channels: [2412, 2437, 2462]
-            .into_iter()
-            .map(|frequency_mhz| ath11k_core::RegulatoryChannel {
-                frequency_mhz,
-                max_power_dbm: 23,
-                max_reg_power_dbm: 23,
-                max_antenna_gain_dbi: 0,
-                passive: true,
-                radar: false,
-                allow_ht: true,
-                allow_vht: false,
-                allow_he: true,
-            })
-            .collect(),
     }
 }
 

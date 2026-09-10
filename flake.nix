@@ -509,15 +509,21 @@
               cargoRoot = "crates/ath11k-wifi-service";
               buildAndTestSubdir = "crates/ath11k-wifi-service";
               cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
-              cargoBuildFlags = [ "--bin" "ath11k-wifi-service" ];
+              cargoBuildFlags = [ "--bins" ];
+              cargoInstallFlags = [ "--bins" ];
               nativeBuildInputs = [ pkgs.cmake pkgs.perl pkgs.gnugrep ];
               doCheck = false;
               postInstall = ''
                 test -x "$out/bin/ath11k-wifi-service"
+                test -x "$out/bin/redwood-wifi-diagnostic"
                 ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -h \
                   "$out/bin/ath11k-wifi-service" | grep -F 'Machine:' | grep -F 'AArch64'
+                ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -h \
+                  "$out/bin/redwood-wifi-diagnostic" | grep -F 'Machine:' | grep -F 'AArch64'
                 ! ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -l \
                   "$out/bin/ath11k-wifi-service" | grep -F 'Requesting program interpreter'
+                ! ${cross.stdenv.cc.bintools.bintools}/bin/${cross.stdenv.cc.targetPrefix}readelf -l \
+                  "$out/bin/redwood-wifi-diagnostic" | grep -F 'Requesting program interpreter'
               '';
               meta.mainProgram = "ath11k-wifi-service";
             };
