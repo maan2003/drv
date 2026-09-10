@@ -327,6 +327,7 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     upcalls: Option<Box<dyn WlanSoftmacUpcalls>>,
     next_scan_id: u32,
     active_scan: Option<u32>,
+    drive_calls: u32,
     next_mgmt_buffer_id: u32,
     pending_mgmt_tx: Vec<(u32, [u8; 6])>,
     deferred_mgmt_rx: Option<DeferredManagementRx>,
@@ -348,6 +349,7 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             upcalls: None,
             next_scan_id: 1,
             active_scan: None,
+            drive_calls: 0,
             next_mgmt_buffer_id: 0,
             pending_mgmt_tx: Vec::new(),
             deferred_mgmt_rx: None,
@@ -516,6 +518,12 @@ impl ath11k_dp::tx::DpHost for DpDeliveries {
 
 impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
     fn drive(&mut self) -> Result<bool, zx::Status> {
+        let drive_call = self.drive_calls;
+        self.drive_calls = self.drive_calls.saturating_add(1);
+        let trace = drive_call < 4;
+        if trace {
+            eprintln!("ath11k_softmac_drive stage=enter call={drive_call}");
+        }
         self.ready_vdev()?;
         if self.deterministic_scan_completion
             && let Some(scan_id) = self.active_scan.take()
@@ -534,6 +542,9 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         }
 
         let mut deliveries = DpDeliveries::default();
+        if trace {
+            eprintln!("ath11k_softmac_drive stage=dp_enter call={drive_call}");
+        }
         let serviced = self
             .device
             .service_dp_host(
@@ -546,6 +557,12 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 &mut deliveries,
             )
             .map_err(status)?;
+        if trace {
+            eprintln!(
+                "ath11k_softmac_drive stage=dp_complete call={drive_call} tx_delivered={} tx_malformed={} rx_delivered={}",
+                serviced.tx_delivered, serviced.tx_malformed, serviced.rx_delivered
+            );
+        }
         let mut progressed = rx_slot_consumed
             || serviced.tx_delivered != 0
             || serviced.tx_malformed != 0
@@ -595,10 +612,19 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 });
         }
 
+        if trace {
+            eprintln!("ath11k_softmac_drive stage=control_enter call={drive_call}");
+        }
         let (event, control_progressed) = self
             .device
             .poll_wlan_event(DP_WORK_BUDGET)
             .map_err(status)?;
+        if trace {
+            eprintln!(
+                "ath11k_softmac_drive stage=control_complete call={drive_call} event={} progressed={control_progressed}",
+                event.is_some()
+            );
+        }
         progressed |= control_progressed;
         if let Some(event) = event {
             match event {
@@ -1084,6 +1110,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         &mut self,
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
+        eprintln!("ath11k_softmac_scan=PASSIVE_ENTRY");
         if self.active_scan.is_some() {
             return Err(zx::Status::BAD_STATE);
         }
@@ -1095,6 +1122,10 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             .into_iter()
             .map(channel_frequency)
             .collect::<Result<Vec<_>, _>>()?;
+        eprintln!(
+            "ath11k_softmac_scan=PASSIVE_CHANNELS_READY count={}",
+            channels_mhz.len()
+        );
         let scan_id = self.next_scan_id;
         self.next_scan_id = self
             .next_scan_id

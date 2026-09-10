@@ -282,11 +282,21 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        self.device
+        eprintln!(
+            "client_softmac_scan stage=bridge_enter kind=passive channel_count={}",
+            request.channels.as_ref().map_or(0, Vec::len)
+        );
+        let response = self
+            .device
             .lock()
             .unwrap()
             .device
-            .start_passive_scan(request.clone())
+            .start_passive_scan(request.clone());
+        eprintln!(
+            "client_softmac_scan stage=bridge_complete kind=passive status={}",
+            if response.is_ok() { "ok" } else { "error" }
+        );
+        response
     }
     async fn start_active_scan(
         &mut self,
@@ -800,6 +810,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
             match self.events.try_recv() {
                 Ok(event) => {
+                    if let fidl_mlme::MlmeEvent::OnScanEnd { end } = &event {
+                        println!(
+                            "client_mlme_scan_end txn_id={} code={:?}",
+                            end.txn_id, end.code
+                        );
+                    }
                     if let fidl_mlme::MlmeEvent::OnSaeFrameRx { frame } = &event {
                         println!(
                             "client_sae_stage=mlme_sae_frame_rx algorithm=3 transaction={} status={} group={:?}",

@@ -33,12 +33,20 @@ orderly-cleanup proof. The phone was recovered to native ath11k with carrier,
 default route, and external reachability before releasing the shared hardware
 lock. A later instrumented attempt proved the 32-byte-DT service through QMI,
 firmware attach, regulatory setup, client-vdev creation, control `Ready`, and
-the SME's first passive-scan request. The phone then returned abruptly to the
-flashed kernel before a scan result or connect request; the retained journal
-ends after WPSS startup and VFIO bind without a kernel fault, and pstore is
-empty. This narrows the unresolved boundary to MLME/SoftMAC scan start or its
-first drive cycle, not pre-`Ready` activation. The phone was again recovered to
-native ath11k and external reachability. Association remains unproved.
+completion of the SME's first passive-scan request handling. The phone then
+returned abruptly to the flashed kernel before the adapter's existing passive
+scan marker, a scan result, or a connect request. That adapter marker followed
+request validation and channel conversion, so its absence does not prove that
+the callback was never entered or that MLME caused the reset. The retained
+journal ends after WPSS startup and VFIO bind without a kernel fault. Ramoops
+contains the candidate kernel's ordinary console errors through root switch,
+but no panic or reset diagnostic. The immediately following boot repeatedly
+reported bootloader values `bootinfo.pureason=0x80100` and
+`bootinfo.pdreason=0x2`; their vendor encoding remains unverified. This bounds
+the next diagnostic seam to scan request handling, the SoftMAC callback's early
+validation/conversion, and concurrent device drive, not pre-`Ready` activation.
+The phone was again recovered to native ath11k and external reachability.
+Association remains unproved.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
