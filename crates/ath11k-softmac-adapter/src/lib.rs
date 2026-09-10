@@ -438,24 +438,33 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
         if self.upcalls.is_some() || self.device.state() != DeviceState::Allocated {
             return Err(zx::Status::BAD_STATE);
         }
+        eprintln!("ath11k_softmac_startup=PROBE_ENTER");
         if let Err(error) = self.device.probe() {
             self.device.abort_startup();
             return Err(status(error));
         }
+        eprintln!("ath11k_softmac_startup=PROBE_READY");
+        eprintln!("ath11k_softmac_startup=FIRMWARE_ATTACH_ENTER");
         if let Err(error) = self.device.attach_firmware() {
             self.device.abort_startup();
             return Err(status(error));
         }
+        eprintln!("ath11k_softmac_startup=FIRMWARE_ATTACHED");
+        eprintln!("ath11k_softmac_startup=RADIO_START_ENTER");
         if let Err(error) = self.device.start_radio() {
             self.device.abort_startup();
             return Err(status(error));
         }
-        if let Some(domain) = self.regulatory_domain.clone()
-            && let Err(error) = self.device.set_regulatory_domain(domain)
-        {
-            self.device.abort_startup();
-            return Err(status(error));
+        eprintln!("ath11k_softmac_startup=RADIO_READY");
+        if let Some(domain) = self.regulatory_domain.clone() {
+            eprintln!("ath11k_softmac_startup=REGULATORY_ENTER");
+            if let Err(error) = self.device.set_regulatory_domain(domain) {
+                self.device.abort_startup();
+                return Err(status(error));
+            }
+            eprintln!("ath11k_softmac_startup=REGULATORY_READY");
         }
+        eprintln!("ath11k_softmac_startup=CLIENT_VDEV_ENTER");
         match self.device.create_client_vdev(self.mac) {
             Ok(vdev) => self.vdev = Some(vdev),
             Err(error) => {
@@ -463,6 +472,7 @@ impl<B: Subsystems> WlanSoftmacLifecycle for Ath11kClientDevice<B> {
                 return Err(status(error));
             }
         }
+        eprintln!("ath11k_softmac_startup=CLIENT_VDEV_READY");
         self.upcalls = Some(upcalls);
         Ok(())
     }

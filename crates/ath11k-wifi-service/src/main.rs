@@ -35,6 +35,7 @@ fn main() {
 
 fn start() -> Result<(), String> {
     let config = Config::parse()?;
+    eprintln!("ath11k_wifi_startup=ENTER");
     // Adopt fixed launcher capabilities before any open can reuse a missing
     // inherited descriptor number.
     let endpoints = PreparedServerEndpoints::new(
@@ -43,6 +44,7 @@ fn start() -> Result<(), String> {
         config.generation,
     )
     .map_err(|error| format!("validate inherited IPC: {error}"))?;
+    eprintln!("ath11k_wifi_startup=IPC_READY");
     let [control_fd, supervisor_fd] = endpoints.fd_identities();
     if WCN6750_INTERRUPT_ROUTES.len() != WCN6750_IRQ_EVENTFD_COUNT {
         return Err("sandbox and WCN6750 interrupt inventories differ".into());
@@ -52,12 +54,14 @@ fn start() -> Result<(), String> {
         fs::read(&config.regdb).map_err(|error| format!("read regdb.bin: {error}"))?,
     )
     .map_err(|error| format!("validate Redwood firmware assets: {error:?}"))?;
+    eprintln!("ath11k_wifi_startup=FIRMWARE_READY");
     let platform = if config.broker {
         LinuxVfioPlatformCapabilities::open_broker(&config.vfio, WCN6750_INTERRUPT_ROUTES.len())
     } else {
         LinuxVfioPlatformCapabilities::open_coherent(&config.vfio, WCN6750_INTERRUPT_ROUTES.len())
     }
     .map_err(|error| error.to_string())?;
+    eprintln!("ath11k_wifi_startup=VFIO_PREPARED");
     let platform_fds = platform.fd_identities();
     let irq_eventfds: [i32; WCN6750_IRQ_EVENTFD_COUNT] = platform_fds
         .irq_eventfds
@@ -65,9 +69,11 @@ fn start() -> Result<(), String> {
         .try_into()
         .map_err(|_| "prepared WCN6750 IRQ inventory is not exactly 16")?;
     let qrtr = QrtrSocket::open().map_err(|error| format!("open AF_QIPCRTR: {error}"))?;
+    eprintln!("ath11k_wifi_startup=QRTR_READY");
     let qrtr_fd = qrtr.raw_fd();
     let runtime_resources = PreparedRuntimeResources::new(config.mac)
         .map_err(|error| format!("prepare host runtime: {error}"))?;
+    eprintln!("ath11k_wifi_startup=RUNTIME_RESOURCES_READY");
     let ethernet_fds = runtime_resources.fd_identities();
     let runtime_fds = runtime_resources.runtime_fd_identities().to_vec();
     let mut remoteproc_state = OpenOptions::new()
@@ -76,6 +82,7 @@ fn start() -> Result<(), String> {
         .open(config.remoteproc.join("state"))
         .map_err(|error| format!("open remoteproc state: {error}"))?;
     verify_remoteproc_running(&mut remoteproc_state)?;
+    eprintln!("ath11k_wifi_startup=REMOTEPROC_RUNNING");
     let remoteproc_firmware = fs::read_to_string(config.remoteproc.join("firmware"))
         .map_err(|error| format!("read remoteproc firmware identity: {error}"))?;
     if remoteproc_firmware.trim().is_empty() {
@@ -139,7 +146,9 @@ fn activate_and_run(
     firmware: Wcn6750FirmwareAssets,
     mut remoteproc_state: File,
 ) -> Result<(), String> {
+    eprintln!("ath11k_wifi_startup=VFIO_ACTIVATE_ENTER");
     let vfio = LinuxVfio::activate_platform(platform).map_err(|error| error.to_string())?;
+    eprintln!("ath11k_wifi_startup=VFIO_ACTIVE");
     // Keep one VFIO owner outside every fallible post-activation operation.
     // The inner owners may unwind, but mappings cannot be released until WPSS
     // has synchronously reached offline below.
@@ -153,10 +162,12 @@ fn activate_and_run(
         )
         .map_err(|error| format!("configure interrupts: {error:?}"))?
         .split();
+        eprintln!("ath11k_wifi_startup=INTERRUPTS_READY");
         let memory = HardwareMemoryProvider::new(hardware.clone(), config.register_region);
         let mut qmi = Wcn6750QmiSession::new(QrtrTransport::from_socket(qrtr), firmware, memory);
         qmi.discover_device_bar()
             .map_err(|error| format!("QMI device BAR discovery: {error:?}"))?;
+        eprintln!("ath11k_wifi_startup=QMI_BAR_READY");
         if qmi.memory().device_bar().is_none() {
             return Err("selected VFIO region did not map the QMI device BAR".into());
         }
@@ -175,6 +186,7 @@ fn activate_and_run(
         let query = adapter
             .query()
             .map_err(|status| format!("query SoftMAC: {status}"))?;
+        eprintln!("ath11k_wifi_startup=SOFTMAC_QUERY_READY");
         let device_info = wlan_mlme::mlme_device_info_from_softmac(query)
             .map_err(|error| format!("convert SoftMAC query: {error}"))?;
         let security = adapter
@@ -185,6 +197,7 @@ fn activate_and_run(
             .map_err(|status| format!("query spectrum support: {status}"))?;
         let mut sme_config = wlan_sme::client::ClientConfig::default();
         sme_config.wpa3_supported = true;
+        eprintln!("ath11k_wifi_startup=SOFTMAC_START_ENTER");
         let runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
             adapter,
             sme_config,
@@ -195,10 +208,12 @@ fn activate_and_run(
             runtime_resources,
         ))
         .map_err(|error| format!("activate pinned client runtime: {error}"))?;
+        eprintln!("ath11k_wifi_startup=CLIENT_RUNTIME_READY");
         let mut server = endpoints
             .bind_runtime(runtime)
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
+        eprintln!("ath11k_wifi_startup=CONTROL_READY");
         let result = server.run_to_terminal();
         let mut runtime = server.into_runtime();
         let stop = runtime.stop();
