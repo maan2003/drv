@@ -1100,6 +1100,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             .next_scan_id
             .checked_add(1)
             .ok_or(zx::Status::NO_RESOURCES)?;
+        eprintln!("ath11k_softmac_scan=PASSIVE_START_ENTER");
         self.device
             .start_scan(ScanConfig {
                 vdev: self.ready_vdev()?,
@@ -1109,6 +1110,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
                 ssids: Vec::new(),
             })
             .map_err(status)?;
+        eprintln!("ath11k_softmac_scan=PASSIVE_START_READY");
         self.active_scan = Some(scan_id);
         Ok(WlanSoftmacBaseStartPassiveScanResponse {
             scan_id: Some(u64::from(scan_id)),

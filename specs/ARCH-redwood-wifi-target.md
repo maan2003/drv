@@ -31,12 +31,14 @@ journal ends without an orderly shutdown or a kernel diagnostic, and pstore
 contains no `#9` crash record, so this is neither association evidence nor an
 orderly-cleanup proof. The phone was recovered to native ath11k with carrier,
 default route, and external reachability before releasing the shared hardware
-lock. A later instrumented attempt completed both initrd dwells and reached the
-32-byte-DT second hop, but lost USB and Tailscale during switch-root before the
-Wi-Fi diagnostic or any WPSS/VFIO mutation began. The phone is currently
-unreachable after a physical power-cycle re-enumerated a fresh initrd USB
-gadget but did not restore phone-side IP control; its full-system/native state
-remains unverified and diagnostic work is halted pending recovery.
+lock. A later instrumented attempt proved the 32-byte-DT service through QMI,
+firmware attach, regulatory setup, client-vdev creation, control `Ready`, and
+the SME's first passive-scan request. The phone then returned abruptly to the
+flashed kernel before a scan result or connect request; the retained journal
+ends after WPSS startup and VFIO bind without a kernel fault, and pstore is
+empty. This narrows the unresolved boundary to MLME/SoftMAC scan start or its
+first drive cycle, not pre-`Ready` activation. The phone was again recovered to
+native ath11k and external reachability. Association remains unproved.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

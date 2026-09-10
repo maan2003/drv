@@ -780,6 +780,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                                 detail: error.to_string(),
                             })
                         })?;
+                    println!("client_mlme_request_complete name={name}");
                     if sae_frame_tx {
                         println!(
                             "client_sae_stage=mlme_request_complete state={}",
