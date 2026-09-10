@@ -8,6 +8,7 @@ bdf=0000:05:00.0
 run_dir=@run_root@/wifi-driver-lab
 report_dir=@var_root@/lib/wifi-driver-lab/reports
 wifi_lab_watchdog=@wifi_lab_watchdog@
+hardware_lock=@hardware_lock@
 
 require_private_directory() {
   directory=$1
@@ -36,6 +37,28 @@ fi
 if [ "$(@id@ -u)" -ne 0 ]; then
   echo "MT7921 manual firmware-bootstrap harness must run as root" >&2
   exit 77
+fi
+
+exec 8>"$hardware_lock"
+if ! @flock@ -n 8; then
+  echo "MT7921 manual firmware-bootstrap hardware lock is held: $hardware_lock" >&2
+  exit 75
+fi
+if ! "$wifi_driver_lab" --idle; then
+  echo "MT7921 manual firmware-bootstrap requires idle lab state" >&2
+  exit 75
+fi
+set +e
+"$wifi_driver_lab" --quarantined
+quarantined_rc=$?
+set -e
+if [ "$quarantined_rc" -ne 1 ]; then
+  echo "MT7921 manual firmware-bootstrap requires no quarantined lab state" >&2
+  exit 75
+fi
+if ! "$wifi_driver_lab" --native-ready "$bdf"; then
+  echo "MT7921 manual firmware-bootstrap requires native connectivity" >&2
+  exit 75
 fi
 
 require_private_directory "$run_dir"

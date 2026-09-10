@@ -1641,7 +1641,15 @@ The fixed `mt7921-firmware-bootstrap-manual-run` harness is the only prepared
 launcher for this candidate. It directly invokes the existing ownership
 boundary as `wifi-driver-lab --run STATE 0000:05:00.0 -- EXACT_DRIVER
 --run-one-shot-fwdl --watchdog-armed`, with no worker timeout, signal
-escalation, or unconditional post-stop restore. Before detach it requires the
+escalation, or unconditional post-stop restore. Run it in an `np`-local
+transient systemd service, not behind a second timer, so the harness survives
+coordinator SSH loss. The harness opens `/run/lock/drv-hardware.lock` once on
+fd 8, atomically takes a nonblocking exclusive `flock`, and holds that same
+descriptor from preflight through watchdog arm, worker execution, restoration,
+native-ready verification, and watchdog disarm. Immediately after locking it
+requires the existing lab to be idle and non-quarantined and requires native
+connectivity; contention or any failed baseline exits before watchdog arm or
+detach. Before detach it requires the
 installed `np` Wi-Fi watchdog to be disarmed, captures the exact token from
 arming its fixed 120-second lease, and verifies that the lease is unexpired,
 active, and waiting. This does not change the Redwood or phone watchdog

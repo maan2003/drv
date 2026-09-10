@@ -738,7 +738,7 @@
 
           mt7921-firmware-bootstrap-manual-run = pkgs.runCommand
             "mt7921-firmware-bootstrap-manual-run"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p "$out/bin"
               substitute ${./nix/mt7921-firmware-bootstrap-manual-run.sh} \
@@ -748,6 +748,8 @@
                 --subst-var-by driver ${mt7921-full-firmware-validation}/libexec/mt7921-full-firmware-validation \
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
+                --subst-var-by hardware_lock /run/lock/drv-hardware.lock \
+                --subst-var-by flock ${pkgs.util-linux}/bin/flock \
                 --subst-var-by id ${pkgs.coreutils}/bin/id \
                 --subst-var-by install ${pkgs.coreutils}/bin/install \
                 --subst-var-by date ${pkgs.coreutils}/bin/date \
@@ -769,7 +771,7 @@
 
           mt7921-firmware-bootstrap-manual-run-test = pkgs.runCommand
             "mt7921-firmware-bootstrap-manual-run-test"
-            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; }
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p work/bin work/run work/var
               cat > work/bin/id <<'EOF'
@@ -810,10 +812,18 @@
               cat > work/bin/wifi-driver-lab <<'EOF'
               #!${pkgs.runtimeShell}
               set -eu
-              state=$2
               marker='{"production_firmware_bootstrap":"passed","recovery":"np-watchdog","watchdog":"armed","single_run":true,"reset_generation":1}'
               case $1 in
+                --idle)
+                  printf 'idle\n' >> "$PWD/baseline.calls"
+                  test "''${MODE-}" != unresolved-state
+                  ;;
+                --quarantined)
+                  printf 'quarantined\n' >> "$PWD/baseline.calls"
+                  if [ "''${MODE-}" = quarantine ]; then exit 0; else exit 1; fi
+                  ;;
                 --run)
+                  state=$2
                   printf 'run\n' >> "$PWD/worker.calls"
                   test "$3" = 0000:05:00.0
                   test "$4" = --
@@ -842,6 +852,7 @@
                   esac
                   ;;
                 --restore)
+                  state=$2
                   test -f "$state"
                   printf '%s\n' "$state" >> "$PWD/restore.calls"
                   if [ "''${MODE-}" = restore-fail ]; then exit 42; fi
@@ -850,8 +861,11 @@
                   fi
                   ;;
                 --native-ready)
+                  printf 'native-ready\n' >> "$PWD/baseline.calls"
                   test "$2" = 0000:05:00.0
-                  test "''${MODE-}" != native-fail
+                  calls=$(${pkgs.gnugrep}/bin/grep -Fc native-ready "$PWD/baseline.calls")
+                  test "''${MODE-}" != native-not-ready
+                  if [ "''${MODE-}" = native-fail ] && [ "$calls" -gt 1 ]; then exit 1; fi
                   ;;
                 *) exit 97 ;;
               esac
@@ -875,6 +889,7 @@
                   ;;
                 arm)
                   test ! -e "$PWD/watchdog.armed"
+                  printf 'arm\n' >> "$PWD/watchdog.arm.calls"
                   : > "$PWD/watchdog.armed"
                   printf '0123456789abcdef0123456789abcdef\n'
                   ;;
@@ -895,6 +910,8 @@
                 --subst-var-by driver "$PWD/work/bin/driver" \
                 --subst-var-by run_root "$PWD/work/run" \
                 --subst-var-by var_root "$PWD/work/var" \
+                --subst-var-by hardware_lock "$PWD/work/drv-hardware.lock" \
+                --subst-var-by flock ${pkgs.util-linux}/bin/flock \
                 --subst-var-by id "$PWD/work/bin/id" \
                 --subst-var-by install ${pkgs.coreutils}/bin/install \
                 --subst-var-by date "$PWD/work/bin/date" \
@@ -909,7 +926,7 @@
 
               run_case() {
                 mode=$1 expected_rc=$2
-                rm -f date.calls restore.calls worker.calls watchdog.* \
+                rm -f baseline.calls date.calls restore.calls worker.calls watchdog.* \
                   work/run/wifi-driver-lab/*.state work/run/wifi-driver-lab/*.safety
                 set +e
                 output=$(MODE=$mode ./work/harness)
@@ -977,7 +994,31 @@
               run_case restore-fail 42
               run_case native-fail 75
 
-              rm -f date.calls restore.calls worker.calls watchdog.*
+              run_preflight_case() {
+                mode=$1
+                rm -f baseline.calls date.calls restore.calls worker.calls watchdog.* \
+                  work/run/wifi-driver-lab/*.state work/run/wifi-driver-lab/*.safety
+                set +e
+                MODE=$mode ./work/harness >/dev/null 2>&1
+                rc=$?
+                set -e
+                test "$rc" -eq 75
+                test ! -e watchdog.armed
+                test ! -e watchdog.arm.calls
+                test ! -e worker.calls
+                test ! -e restore.calls
+                test "$(find work/run/wifi-driver-lab -name '*.state' | wc -l)" -eq 0
+              }
+              run_preflight_case unresolved-state
+              run_preflight_case quarantine
+              run_preflight_case native-not-ready
+
+              exec 7>work/drv-hardware.lock
+              ${pkgs.util-linux}/bin/flock -n 7
+              run_preflight_case contention
+              exec 7>&-
+
+              rm -f baseline.calls date.calls restore.calls worker.calls watchdog.*
               rm -rf work/run/wifi-driver-lab work/var/lib/wifi-driver-lab
               mkdir -p work/run/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
               chmod 0700 work/run/wifi-driver-lab work/var/lib/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
