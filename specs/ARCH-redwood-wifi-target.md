@@ -31,7 +31,12 @@ journal ends without an orderly shutdown or a kernel diagnostic, and pstore
 contains no `#9` crash record, so this is neither association evidence nor an
 orderly-cleanup proof. The phone was recovered to native ath11k with carrier,
 default route, and external reachability before releasing the shared hardware
-lock.
+lock. A later instrumented attempt completed both initrd dwells and reached the
+32-byte-DT second hop, but lost USB and Tailscale during switch-root before the
+Wi-Fi diagnostic or any WPSS/VFIO mutation began. The phone is currently
+unreachable after a physical power-cycle re-enumerated a fresh initrd USB
+gadget but did not restore phone-side IP control; its full-system/native state
+remains unverified and diagnostic work is halted pending recovery.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
@@ -86,10 +91,14 @@ coverage, production abstractions, and deferred interrupt/broker designs are
 not prerequisites for each polling experiment. Keep stage and native transcript
 evidence honest; source-derived fixtures are not physical captures.
 
-Before a stateful experiment, verify a working control path and hold an atomic
-nonblocking exclusive flock on `np:/run/lock/drv-hardware.lock` from before
-mutation through certified recovery. After acquisition, fail closed if durable
-Wi-Fi lab state reports quarantine or an unresolved transaction. USB SSH through `usb0` at
+Before a shared-resource-conflicting mutation, verify a working control path
+and hold an atomic nonblocking exclusive flock on
+`np:/run/lock/drv-hardware.lock` for the critical mutation and cleanup. Release
+it during local builds, nonconflicting staging, idle boot dwell, connectivity
+waits, and manual recovery when no active DMA ownership remains; reacquire and
+revalidate state before the next conflicting mutation. After acquisition, fail
+closed if durable Wi-Fi lab state reports quarantine or an unresolved
+transaction. USB SSH through `usb0` at
 172.16.42.1/24 is useful but does not gate a run when the existing Tailscale
 control path works. Wi-Fi loss is expected. Preserve reports locally; restoring
 `wlan0` is not a prerequisite for recovery or evidence collection.
