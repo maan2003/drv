@@ -1,12 +1,8 @@
 #!/bin/sh
-# Operator-attended Redwood WPA3 association. The service itself owns the
-# ordering from active DMA through verified WPSS-offline teardown.
+# Operator-attended Redwood WPA3 association. SSH only submits the work: a
+# phone-local transient unit owns the service through verified WPSS-offline
+# teardown, independently of the submitting transport and log observers.
 set -eu
-
-[ "$#" -eq 0 ] || {
-    echo "usage: $0" >&2
-    exit 2
-}
 
 PATH=/run/current-system/sw/bin:/bin:/sbin
 export PATH
@@ -14,12 +10,56 @@ export PATH
 LAB=/var/lib/ath11k-redwood-lab
 BIN=$LAB/stage13
 RUN=$LAB/runs/wpa3-ajay-channel149
+SYSTEMD_RUN=${REDWOOD_SYSTEMD_RUN:-systemd-run}
+SYSTEMCTL=${REDWOOD_SYSTEMCTL:-systemctl}
+UNIT=ath11k-redwood-wpa3-diagnostic
 CREDENTIAL=/var/lib/iwd/ajay.psk
 RPROC=/sys/class/remoteproc/remoteproc2
 DEVICE=17a10040.wifi
 P=/sys/bus/platform/devices/$DEVICE
 MODULES=$LAB/stage7/modules
 FIRMWARE=/run/current-system/firmware/ath11k/WCN6750/hw1.0
+
+case ${1-} in
+--start)
+    [ "$#" -eq 1 ] || { echo "usage: $0 --start" >&2; exit 2; }
+    ! "$SYSTEMCTL" is-active --quiet "$UNIT.service"
+    "$SYSTEMD_RUN" --quiet --collect --no-block --unit="$UNIT" \
+        --property=Type=exec "$(readlink -f "$0")" --run
+    echo "REDWOOD_WPA3_SUBMITTED unit=$UNIT.service log=$RUN/diagnostic.log"
+    exit
+    ;;
+--self-test)
+    [ "$#" -eq 1 ] || exit 2
+    t=$(mktemp -d)
+    trap 'rm -rf "$t"' EXIT
+    cat >"$t/systemctl" <<'EOF'
+#!/bin/sh
+exit 3
+EOF
+    cat >"$t/systemd-run" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$REDWOOD_TEST_ACTIONS"
+EOF
+    chmod +x "$t/systemctl" "$t/systemd-run"
+    REDWOOD_SYSTEMCTL="$t/systemctl" REDWOOD_SYSTEMD_RUN="$t/systemd-run" \
+        REDWOOD_TEST_ACTIONS="$t/actions" "$0" --start >"$t/output"
+    grep -q -- '--collect --no-block' "$t/actions"
+    grep -q -- '--property=Type=exec' "$t/actions"
+    grep -q -- '--run' "$t/actions"
+    ! grep -Eq -- 'timeout|RuntimeMaxSec|KillSignal' "$t/actions"
+    grep -q 'REDWOOD_WPA3_SUBMITTED' "$t/output"
+    echo REDWOOD_WPA3_SELF_TEST_OK
+    exit
+    ;;
+--run)
+    [ "$#" -eq 1 ] || { echo "usage: $0 --run" >&2; exit 2; }
+    ;;
+*)
+    echo "usage: $0 --start|--self-test" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$RUN"
 exec >>"$RUN/diagnostic.log" 2>&1
@@ -32,7 +72,8 @@ grep -qw 'rd.systemd.mask=boot-watchdog.service' /proc/cmdline
 grep -qw 'rd.systemd.mask=redwood-lab-watchdog.service' /proc/cmdline
 test ! -e /run/redwood-lab-watchdog/armed
 test ! -e /dev/watchdog0
-for unit in redwood-lab-watchdog.service boot-watchdog.service +    ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service; do
+for unit in redwood-lab-watchdog.service boot-watchdog.service \
+    ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service; do
     ! systemctl is-active --quiet "$unit"
 done
 systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service

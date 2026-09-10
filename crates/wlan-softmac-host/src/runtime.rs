@@ -1084,11 +1084,21 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             .try_recv()
         {
             Ok(Some(result)) => {
+                match &result {
+                    Ok(results) => println!(
+                        "client_scan_attempt stage=reply_ready success=true result_count={}",
+                        results.len()
+                    ),
+                    Err(error) => println!(
+                        "client_scan_attempt stage=reply_ready success=false error={error:?}"
+                    ),
+                }
                 self.scan_attempt = None;
                 Ok(Some(wlan_sme::client::convert_scan_result(result)))
             }
             Ok(None) => Ok(None),
             Err(_) => {
+                println!("client_scan_attempt stage=reply_closed");
                 Err(self.contain_error(ConnectError::Driver(DriverError::ScanTransactionClosed)))
             }
         }
@@ -1394,6 +1404,7 @@ mod tests {
         stale_callback_during_cleanup: bool,
         link_failure: bool,
         scan_id: u64,
+        scan_offload: bool,
     }
 
     #[derive(Clone)]
@@ -1403,6 +1414,7 @@ mod tests {
         fn new(stop_failures: usize) -> (Self, Arc<Mutex<Effects>>) {
             let effects = Arc::new(Mutex::new(Effects {
                 stop_failures,
+                scan_offload: true,
                 ..Default::default()
             }));
             (Self(effects.clone()), effects)
@@ -1515,7 +1527,7 @@ mod tests {
                 "discovery",
                 fidl_softmac::DiscoverySupport {
                     scan_offload: Some(fidl_softmac::ScanOffloadExtension {
-                        supported: Some(true),
+                        supported: Some(self.0.lock().unwrap().scan_offload),
                         scan_cancel_supported: Some(true),
                     }),
                     ..Default::default()
@@ -2331,6 +2343,23 @@ mod tests {
         assert_eq!(
             futures::executor::block_on(runtime.drive_scan_once()),
             Err(ConnectError::Driver(DriverError::NoScanInProgress))
+        );
+    }
+
+    #[test]
+    fn rejected_discovery_scan_is_retained_as_a_policy_result() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().scan_offload = false;
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        runtime
+            .begin_scan(
+                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
+            Some(Err(fidl_sme::ScanErrorCode::NotSupported))
         );
     }
 

@@ -321,6 +321,36 @@ fn stale_failed_attempt_event_terminates_without_a_failure_reply() {
 }
 
 #[test]
+fn rejected_scan_reply_is_flushed_before_policy_eof_stops_the_service() {
+    let (client_fd, child_fd) = pair();
+    let (supervisor_fd, child_supervisor_fd) = pair();
+    let mut child = spawn_peer(&child_fd, &child_supervisor_fd);
+    drop(child_fd);
+    drop(child_supervisor_fd);
+    let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(client_fd).unwrap();
+    assert!(matches!(receive(&endpoint).packet.message, Message::Ready));
+    send(
+        &endpoint,
+        1,
+        Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
+            channels: vec![149],
+        })),
+    );
+    assert!(matches!(
+        receive(&endpoint).packet.message,
+        Message::ScanReply(ref reply)
+            if reply.in_reply_to == 1
+                && reply.result == Err(sme::ScanErrorCode::NotSupported)
+    ));
+
+    // The launcher closes policy after consuming the rejection. EOF is the
+    // cooperative cancellation signal; the service must terminate normally.
+    drop(endpoint);
+    drop(supervisor_fd);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn runtime_faults_are_sole_terminal_generation_messages() {
     for (ssid, reason) in [
         (b"timeout".as_slice(), GenerationEndReason::Timeout),

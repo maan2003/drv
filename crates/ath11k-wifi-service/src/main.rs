@@ -215,11 +215,17 @@ fn activate_and_run(
             .map_err(|error| format!("open control generation: {error}"))?;
         eprintln!("ath11k_wifi_startup=CONTROL_READY");
         let result = server.run_to_terminal();
+        eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
         let mut runtime = server.into_runtime();
         let stop = runtime.stop();
+        eprintln!(
+            "ath11k_wifi_cleanup=RUNTIME_STOP_RETURNED success={}",
+            stop.is_ok()
+        );
         result.map_err(|error| format!("control service: {error}"))?;
         stop.map_err(|error| format!("stop physical runtime: {error}"))
     })();
+    eprintln!("ath11k_wifi_cleanup=REMOTEPROC_STOP_ENTER");
     let containment = stop_and_verify_remoteproc(&mut remoteproc_state);
     if let Err(error) = containment {
         eprintln!(
@@ -232,7 +238,9 @@ fn activate_and_run(
             std::hint::spin_loop();
         }
     }
+    eprintln!("ath11k_wifi_cleanup=REMOTEPROC_OFFLINE");
     drop(hardware_guard);
+    eprintln!("ath11k_wifi_cleanup=VFIO_GUARD_RELEASED");
     operation
 }
 

@@ -108,6 +108,15 @@ fn run() -> Result<(), String> {
     let scan = loop {
         match cleanup_try!(wait_policy(&policy, &mut validator, &mut wifi, deadline)) {
             Message::ScanReply(reply) if reply.in_reply_to == 1 => {
+                match &reply.result {
+                    Ok(results) => eprintln!(
+                        "redwood_wifi_diagnostic=SCAN_REPLY request_id=1 success=true result_count={}",
+                        results.len()
+                    ),
+                    Err(error) => eprintln!(
+                        "redwood_wifi_diagnostic=SCAN_REPLY request_id=1 success=false error={error:?}"
+                    ),
+                }
                 break cleanup_try!(
                     reply
                         .result
@@ -263,8 +272,17 @@ fn run() -> Result<(), String> {
     )
 }
 
-fn finish_wifi(mut wifi: Child, outcome: String, succeeded: bool) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+fn finish_wifi(wifi: Child, outcome: String, succeeded: bool) -> Result<(), String> {
+    finish_wifi_with_warning(wifi, outcome, succeeded, Duration::from_secs(15))
+}
+
+fn finish_wifi_with_warning(
+    mut wifi: Child,
+    outcome: String,
+    succeeded: bool,
+    warning_after: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + warning_after;
     let mut warned = false;
     loop {
         if let Some(status) = wifi
@@ -498,4 +516,60 @@ fn receive_lifecycle(fd: RawFd) -> Result<Option<(LifecycleMessage, Option<Owned
         return Err("lifecycle descriptor cardinality mismatch".into());
     }
     Ok(Some((message, descriptors.pop())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_eof_allows_child_cleanup_without_forced_termination() {
+        let (launcher_policy, child_policy) = socket_pair().unwrap();
+        let (launcher_supervisor, child_supervisor) = socket_pair().unwrap();
+        let marker =
+            std::env::temp_dir().join(format!("redwood-wifi-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "while IFS= read -r line <&3; do :; done; printf cleaned >{}",
+            marker.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let fd3 = child_policy.as_raw_fd();
+        let fd4 = child_supervisor.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd3, 3) < 0 || libc::dup2(fd4, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let flags = libc::fcntl(3, libc::F_GETFL);
+                if flags < 0 || libc::fcntl(3, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(child_policy);
+        drop(child_supervisor);
+        drop(launcher_policy);
+        drop(launcher_supervisor);
+
+        assert_eq!(
+            finish_wifi_with_warning(
+                child,
+                "expected scan rejection".into(),
+                false,
+                Duration::from_millis(50),
+            ),
+            Err("expected scan rejection".into())
+        );
+        let mut contents = String::new();
+        File::open(&marker)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "cleaned");
+        std::fs::remove_file(marker).unwrap();
+    }
 }

@@ -24,29 +24,23 @@ firmware regulatory event confirms the country, band rule, active-initiation
 flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
-The 2026-09-10 physical attempt validated the two-hop `#9`/32-byte-DT candidate
-and started WPSS and VFIO, but the service did not publish its initial control
-`Ready` before the phone abruptly returned to flashed `#1`. The retained
-journal ends without an orderly shutdown or a kernel diagnostic, and pstore
-contains no `#9` crash record, so this is neither association evidence nor an
-orderly-cleanup proof. The phone was recovered to native ath11k with carrier,
-default route, and external reachability before releasing the shared hardware
-lock. A later instrumented attempt proved the 32-byte-DT service through QMI,
-firmware attach, regulatory setup, client-vdev creation, control `Ready`, and
-completion of the SME's first passive-scan request handling. The phone then
-returned abruptly to the flashed kernel before the adapter's existing passive
-scan marker, a scan result, or a connect request. That adapter marker followed
-request validation and channel conversion, so its absence does not prove that
-the callback was never entered or that MLME caused the reset. The retained
-journal ends after WPSS startup and VFIO bind without a kernel fault. Ramoops
-contains the candidate kernel's ordinary console errors through root switch,
-but no panic or reset diagnostic. The immediately following boot repeatedly
-reported bootloader values `bootinfo.pureason=0x80100` and
-`bootinfo.pdreason=0x2`; their vendor encoding remains unverified. This bounds
-the next diagnostic seam to scan request handling, the SoftMAC callback's early
-validation/conversion, and concurrent device drive, not pre-`Ready` activation.
-The phone was again recovered to native ath11k and external reachability.
-Association remains unproved.
+The latest instrumented 32-byte-DT run reached control `Ready`. Its first four
+adapter drive calls each completed data-path polling and control driving with
+no delivered packets or malformed records. SME then rejected the channel-149
+request as `NotSupported` because the adapter advertised no scan offload; MLME
+never called the adapter's hardware scan operation. This disproves those first
+four completed drive calls as the immediate reset trigger, but says nothing
+about later calls. The launcher was still running when an outer SSH timeout
+ended the submitting transport, after which the phone returned to flashed
+`#1`; that teardown contaminated the run and is not evidence that scan, data
+path, or SSH teardown caused the reset. No kernel fault was captured, and the
+following boot again reported `bootinfo.pureason=0x80100` and
+`bootinfo.pdreason=0x2`, whose vendor encoding remains unverified. The
+diagnostic is now submitted to a phone-local transient unit with no external
+timeout or forced termination, so transport and log observers do not own its
+lifetime; policy EOF still drives same-process runtime shutdown and verified
+WPSS-offline cleanup before VFIO release. This lifecycle has host regression
+coverage but awaits a renewed physical run. Association remains unproved.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

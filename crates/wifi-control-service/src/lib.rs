@@ -546,6 +546,7 @@ impl<R: WifiRuntime> ControlServer<R> {
                 }
                 Ok(None) => {}
                 Err(EndpointError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    eprintln!("wifi_control_lifecycle stage=policy_eof terminal=true");
                     self.terminal = true;
                 }
                 Err(_) => self.end_generation(GenerationEndReason::ProtocolViolation)?,
@@ -711,6 +712,7 @@ impl<R: WifiRuntime> ControlServer<R> {
                         self.end_generation(reason)?;
                         return Ok(true);
                     }
+                    eprintln!("wifi_control_scan stage=reply_queued request_id={id}");
                     progressed = true;
                 }
                 Ok(None) => {}
@@ -903,6 +905,7 @@ pub struct SimulatedWifiRuntime {
     mac: [u8; 6],
     connect: bool,
     scan: bool,
+    scan_result: Result<Vec<sme::ScanResult>, sme::ScanErrorCode>,
     events: VecDeque<sme::ConnectTransactionEvent>,
     ethernet: Option<OwnedFd>,
     ethernet_after_connect: Option<OwnedFd>,
@@ -927,6 +930,7 @@ impl SimulatedWifiRuntime {
             mac,
             connect: false,
             scan: false,
+            scan_result: Ok(Vec::new()),
             events: VecDeque::new(),
             ethernet: None,
             ethernet_after_connect: None,
@@ -1029,15 +1033,24 @@ impl WifiRuntime for SimulatedWifiRuntime {
     fn roam(&mut self, _: sme::RoamRequest) -> Result<(), RuntimeError> {
         Ok(())
     }
-    fn begin_scan(&mut self, _: sme::ScanRequest, _: Instant) -> Result<(), RuntimeError> {
+    fn begin_scan(&mut self, request: sme::ScanRequest, _: Instant) -> Result<(), RuntimeError> {
         self.scan = true;
+        self.scan_result = match request {
+            sme::ScanRequest::Passive(request) if request.channels == [149] => {
+                Err(sme::ScanErrorCode::NotSupported)
+            }
+            _ => Ok(Vec::new()),
+        };
         Ok(())
     }
     async fn drive_scan_once(
         &mut self,
     ) -> Result<Option<Result<Vec<sme::ScanResult>, sme::ScanErrorCode>>, RuntimeError> {
         if std::mem::take(&mut self.scan) {
-            Ok(Some(Ok(Vec::new())))
+            Ok(Some(std::mem::replace(
+                &mut self.scan_result,
+                Ok(Vec::new()),
+            )))
         } else {
             Ok(None)
         }
