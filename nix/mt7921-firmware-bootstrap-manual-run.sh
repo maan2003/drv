@@ -89,7 +89,8 @@ fi
 watchdog_deadline=$(printf '%s\n' "$watchdog_status" | @grep@ -E '^armed deadline=[0-9]+$')
 watchdog_deadline=${watchdog_deadline#armed deadline=}
 if [ "$watchdog_deadline" -lt "$((watchdog_before + 120))" ] \
-  || [ "$watchdog_deadline" -gt "$((watchdog_after + 120))" ]; then
+  || [ "$watchdog_deadline" -gt "$((watchdog_after + 120))" ] \
+  || [ "$watchdog_deadline" -le "$watchdog_after" ]; then
   echo "installed np-only firmware-bootstrap watchdog did not provide its fixed 120-second lease" >>"$report"
   exit 75
 fi

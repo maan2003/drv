@@ -780,6 +780,23 @@
               #!${pkgs.runtimeShell}
               exit 99
               EOF
+              cat > work/bin/date <<'EOF'
+              #!${pkgs.runtimeShell}
+              set -eu
+              if [ "''${MODE-}" = expired-lease ] && [ "''${1-}" = +%s ]; then
+                count=0
+                if [ -f "$PWD/date.calls" ]; then count=$(cat "$PWD/date.calls"); fi
+                count=$((count + 1))
+                printf '%s\n' "$count" > "$PWD/date.calls"
+                case $count in
+                  1) echo 900 ;;
+                  2) echo 1000 ;;
+                  *) echo 1120 ;;
+                esac
+              else
+                exec ${pkgs.coreutils}/bin/date "$@"
+              fi
+              EOF
               cat > work/bin/stat <<'EOF'
               #!${pkgs.runtimeShell}
               path=''${!#}
@@ -848,6 +865,7 @@
                     now=$(${pkgs.coreutils}/bin/date +%s)
                     case ''${MODE-} in
                       wrong-lease) deadline=$((now + 3600)) ;;
+                      expired-lease) deadline=1120 ;;
                       *) deadline=$((now + 120)) ;;
                     esac
                     printf 'armed deadline=%s\nNextElapseUSecMonotonic=exact-test-value\nSubState=waiting\nActiveState=active\n' "$deadline"
@@ -879,7 +897,7 @@
                 --subst-var-by var_root "$PWD/work/var" \
                 --subst-var-by id "$PWD/work/bin/id" \
                 --subst-var-by install ${pkgs.coreutils}/bin/install \
-                --subst-var-by date ${pkgs.coreutils}/bin/date \
+                --subst-var-by date "$PWD/work/bin/date" \
                 --subst-var-by mktemp ${pkgs.coreutils}/bin/mktemp \
                 --subst-var-by stat "$PWD/work/bin/stat" \
                 --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
@@ -891,7 +909,7 @@
 
               run_case() {
                 mode=$1 expected_rc=$2
-                rm -f restore.calls worker.calls watchdog.* \
+                rm -f date.calls restore.calls worker.calls watchdog.* \
                   work/run/wifi-driver-lab/*.state work/run/wifi-driver-lab/*.safety
                 set +e
                 output=$(MODE=$mode ./work/harness)
@@ -908,7 +926,7 @@
                   test ! -e watchdog.armed
                   ! find work/run/wifi-driver-lab -name '*.state' -print -quit | grep -q .
                   grep -Fx 'MANUAL_BOOTSTRAP restore=passed state_removed=true native_ready=true watchdog=disarmed' "$report"
-                elif [ "$mode" = wrong-lease ]; then
+                elif [ "$mode" = wrong-lease ] || [ "$mode" = expired-lease ]; then
                   test ! -e worker.calls
                   test -f watchdog.armed
                   test ! -e watchdog.disarm.calls
@@ -942,6 +960,7 @@
               }
               run_case success 0
               run_case wrong-lease 75
+              run_case expired-lease 75
               run_case abnormal 23
               run_case signal 143
               run_case sigsys 159
@@ -958,7 +977,7 @@
               run_case restore-fail 42
               run_case native-fail 75
 
-              rm -f restore.calls worker.calls watchdog.*
+              rm -f date.calls restore.calls worker.calls watchdog.*
               rm -rf work/run/wifi-driver-lab work/var/lib/wifi-driver-lab
               mkdir -p work/run/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
               chmod 0700 work/run/wifi-driver-lab work/var/lib/wifi-driver-lab work/var/lib/wifi-driver-lab/reports
