@@ -76,6 +76,8 @@ succeeds on flashed `#1`. Then load hop 1 through
 LAB=/var/lib/ath11k-redwood-lab
 test "$(sha256sum "$LAB/stage3/Image" | cut -d' ' -f1)" = \
   97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885
+test "$(grep -ao -m1 -E '#[0-9]+ SMP PREEMPT [^[:cntrl:]]+2026' \
+  "$LAB/stage3/Image")" = '#9 SMP PREEMPT Tue Sep  8 15:07:10 IST 2026'
 test "$(sha256sum "$LAB/stage7/initrd-watchdog" | cut -d' ' -f1)" = \
   654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f
 test "$(sha256sum "$LAB/stage12/kexec-command-line-manual-no-reboot" | cut -d' ' -f1)" = \
@@ -125,6 +127,8 @@ test -z "$(systemctl --failed --no-legend --plain --no-pager | \
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
 test "$(sha256sum "$LAB/stage3/Image" | cut -d' ' -f1)" = \
   97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885
+test "$(grep -ao -m1 -E '#[0-9]+ SMP PREEMPT [^[:cntrl:]]+2026' \
+  "$LAB/stage3/Image")" = '#9 SMP PREEMPT Tue Sep  8 15:07:10 IST 2026'
 test "$(sha256sum "$LAB/stage7/initrd-watchdog" | cut -d' ' -f1)" = \
   654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f
 test "$(sha256sum "$LAB/stage10/runB-region1.fdt" | cut -d' ' -f1)" = \
