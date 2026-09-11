@@ -12,6 +12,7 @@ BIN=$LAB/stage13
 RUN=$LAB/runs/wpa3-ajay-channel149
 SYSTEMD_RUN=${REDWOOD_SYSTEMD_RUN:-systemd-run}
 SYSTEMCTL=${REDWOOD_SYSTEMCTL:-systemctl}
+NC=${REDWOOD_NC:-nc}
 UNIT=ath11k-redwood-wpa3-diagnostic
 CREDENTIAL=/var/lib/iwd/ajay.psk
 RPROC=/sys/class/remoteproc/remoteproc2
@@ -23,8 +24,25 @@ FIRMWARE=/run/current-system/firmware/ath11k/WCN6750/hw1.0
 case ${1-} in
 --start)
     [ "$#" -eq 1 ] || { echo "usage: $0 --start" >&2; exit 2; }
+    : "${REDWOOD_EVIDENCE_ENDPOINT:?set the acknowledged np evidence endpoint}"
+    : "${REDWOOD_EVIDENCE_RUN_ID:?set the evidence run identity}"
+    case $REDWOOD_EVIDENCE_RUN_ID in
+        *[!A-Za-z0-9_-]*|'') echo "invalid evidence run identity" >&2; exit 2 ;;
+    esac
+    EVIDENCE_HOST=${REDWOOD_EVIDENCE_ENDPOINT%:*}
+    EVIDENCE_PORT=${REDWOOD_EVIDENCE_ENDPOINT##*:}
+    [ -n "$EVIDENCE_HOST" ] && [ -n "$EVIDENCE_PORT" ]
+    BOOT_ID=${REDWOOD_EVIDENCE_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}
+    SERVICE_SHA=${REDWOOD_EVIDENCE_SERVICE_SHA:-$(sha256sum "$BIN/ath11k-wifi-service" | cut -d' ' -f1)}
+    DIAGNOSTIC_SHA=${REDWOOD_EVIDENCE_DIAGNOSTIC_SHA:-$(sha256sum "$BIN/redwood-wifi-diagnostic" | cut -d' ' -f1)}
+    ACK=$(printf 'run=%s stage=unit_submit boot_id=%s service_sha256=%s diagnostic_sha256=%s\n' \
+        "$REDWOOD_EVIDENCE_RUN_ID" "$BOOT_ID" "$SERVICE_SHA" "$DIAGNOSTIC_SHA" | \
+        "$NC" -w 2 "$EVIDENCE_HOST" "$EVIDENCE_PORT")
+    [ "$ACK" = ACK ] || { echo "np evidence collector did not acknowledge unit submission" >&2; exit 1; }
     ! "$SYSTEMCTL" is-active --quiet "$UNIT.service"
     "$SYSTEMD_RUN" --quiet --collect --no-block --unit="$UNIT" \
+        --setenv="REDWOOD_EVIDENCE_ENDPOINT=$REDWOOD_EVIDENCE_ENDPOINT" \
+        --setenv="REDWOOD_EVIDENCE_RUN_ID=$REDWOOD_EVIDENCE_RUN_ID" \
         --property=Type=exec "$(readlink -f "$0")" --run
     echo "REDWOOD_WPA3_SUBMITTED unit=$UNIT.service log=$RUN/diagnostic.log"
     exit
@@ -41,11 +59,22 @@ EOF
 #!/bin/sh
 printf '%s\n' "$*" >"$REDWOOD_TEST_ACTIONS"
 EOF
-    chmod +x "$t/systemctl" "$t/systemd-run"
+    cat >"$t/nc" <<'EOF'
+#!/bin/sh
+cat >/dev/null
+echo ACK
+EOF
+    chmod +x "$t/systemctl" "$t/systemd-run" "$t/nc"
     REDWOOD_SYSTEMCTL="$t/systemctl" REDWOOD_SYSTEMD_RUN="$t/systemd-run" \
-        REDWOOD_TEST_ACTIONS="$t/actions" "$0" --start >"$t/output"
+        REDWOOD_NC="$t/nc" \
+        REDWOOD_TEST_ACTIONS="$t/actions" REDWOOD_EVIDENCE_ENDPOINT=127.0.0.1:9 \
+        REDWOOD_EVIDENCE_RUN_ID=selftest REDWOOD_EVIDENCE_BOOT_ID=selftest \
+        REDWOOD_EVIDENCE_SERVICE_SHA=selftest REDWOOD_EVIDENCE_DIAGNOSTIC_SHA=selftest \
+        PATH="$t:$PATH" "$0" --start >"$t/output"
     grep -q -- '--collect --no-block' "$t/actions"
     grep -q -- '--property=Type=exec' "$t/actions"
+    grep -q -- '--setenv=REDWOOD_EVIDENCE_ENDPOINT=127.0.0.1:9' "$t/actions"
+    grep -q -- '--setenv=REDWOOD_EVIDENCE_RUN_ID=selftest' "$t/actions"
     grep -q -- '--run' "$t/actions"
     ! grep -Eq -- 'timeout|RuntimeMaxSec|KillSignal' "$t/actions"
     grep -q 'REDWOOD_WPA3_SUBMITTED' "$t/output"
@@ -64,6 +93,7 @@ esac
 mkdir -p "$RUN"
 exec >>"$RUN/diagnostic.log" 2>&1
 echo "REDWOOD_WPA3_BEGIN=$(date -u +%FT%TZ)"
+sync -f "$RUN/diagnostic.log"
 
 # This run has explicitly accepted manual recovery. Automatic reboot
 # mechanisms remain absent, while the retained-candidate sleep inhibitor keeps

@@ -190,6 +190,51 @@ its executable name, then generate and verify a per-stage SHA-256 manifest with
 absolute staged paths. The payload verifies this exact file and copies it into
 the durable run directory before device mutation:
 
+Before the phone-local WPA3 diagnostic, start the checked-in collector on np
+bound only to np's phone-USB address with a run-specific output, and wait for its
+`collector_ready` line. The collector blocks in `recvfrom`; it is not a polling
+observer. Every received record is appended and fsynced before its `ACK`; the
+run-specific collector exits after the 260 possible identity/startup/CE
+records:
+
+Stage the exact collector into the run artifact directory, record its SHA-256,
+and launch it as an np-local system unit so it survives the operator's SSH
+session and all phone lifetime or transport loss:
+
+The collector port is closed by default. With explicit authorization for the
+shared np firewall mutation, add only the run's TCP port to NixOS's existing
+temporary-port set and remove it as soon as evidence collection ends:
+
+```sh
+PYTHON=$(command -v python3)
+test -x "$PYTHON"
+install -m 0755 scripts/redwood/redwood-evidence-collector \
+  "$OUT/redwood-evidence-collector"
+sha256sum "$OUT/redwood-evidence-collector" >>"$OUT/SHA256SUMS"
+sudo nft add element inet nixos-fw temp-ports '{ tcp . 41491 }'
+sudo systemd-run --unit="redwood-evidence-$RUN_ID" "$PYTHON" \
+  "$OUT/redwood-evidence-collector" --bind 172.16.42.2:41491 \
+  --output "$OUT/acknowledged-evidence.log" --max-records 260
+sudo journalctl -u "redwood-evidence-$RUN_ID.service" -n 1 --no-pager
+# After the collector has stopped and its output is archived:
+sudo nft delete element inet nixos-fw temp-ports '{ tcp . 41491 }'
+```
+
+The collector and output stay alive on np after phone or control loss. Set
+`REDWOOD_EVIDENCE_ENDPOINT=172.16.42.2:41491` and a unique
+`REDWOOD_EVIDENCE_RUN_ID` when invoking `redwood-wpa3-diagnostic --start`.
+The launcher refuses to create its phone-local unit until np acknowledges a
+record containing the candidate boot ID and exact service and diagnostic
+SHA-256 values. The service then synchronously checkpoints service entry,
+control readiness, control-loop entry, and at most 256 existing CE trace
+markers. The prelaunch ACK confirms that np fsynced the identity record before
+the phone creates its unit. A missing prelaunch ACK prevents mutation; a later
+evidence failure does not replace the device operation's result or bypass
+WPSS-owning cleanup.
+Per-marker network acknowledgements deliberately perturb timing, so even a
+successful diagnostic is evidence for this bounded experiment, not production
+timing behavior. Run the collector's `--self-test` before staging it.
+
 ```sh
 # From the repository checkout on np:
 scp scripts/redwood/redwood-runB-core-once PHONE:/tmp/redwood-runB-core-once

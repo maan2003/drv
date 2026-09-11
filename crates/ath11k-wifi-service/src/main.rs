@@ -13,11 +13,15 @@ use drv_hardware::Device as HardwareDevice;
 use drv_hardware_backends::{LinuxVfio, LinuxVfioPlatformCapabilities};
 use linux_self_sandbox::{Profile, Sandbox, WCN6750_IRQ_EVENTFD_COUNT, Wcn6750Dma};
 use qrtr_socket::QrtrSocket;
+use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use wifi_control_service::PreparedServerEndpoints;
 use wlan_softmac_host::WlanSoftmac as _;
 use wlan_softmac_host::runtime::{ClientRuntime, PreparedRuntimeResources};
@@ -36,6 +40,10 @@ fn main() {
 
 fn start() -> Result<(), String> {
     let config = Config::parse()?;
+    if config.diagnostic_unsandboxed {
+        init_evidence()?;
+        evidence(format_args!("stage=service_enter"))?;
+    }
     eprintln!("ath11k_wifi_startup=ENTER");
     // Adopt fixed launcher capabilities before any open can reuse a missing
     // inherited descriptor number.
@@ -216,8 +224,10 @@ fn activate_and_run(
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
         eprintln!("ath11k_wifi_startup=CONTROL_READY");
+        evidence(format_args!("stage=control_ready"))?;
         TRACE_CE_SEQUENCE.store(0, Ordering::Release);
         TRACE_CE_RUNTIME.store(true, Ordering::Release);
+        evidence(format_args!("stage=control_run_enter"))?;
         let result = server.run_to_terminal();
         TRACE_CE_RUNTIME.store(false, Ordering::Release);
         eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
@@ -251,12 +261,96 @@ fn activate_and_run(
 
 static TRACE_CE_RUNTIME: AtomicBool = AtomicBool::new(false);
 static TRACE_CE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static EVIDENCE: OnceLock<Mutex<EvidenceSink>> = OnceLock::new();
+
+struct EvidenceSink {
+    stream: TcpStream,
+    run_id: String,
+}
+
+struct StackMessage {
+    bytes: [u8; 256],
+    len: usize,
+}
+
+impl StackMessage {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 256],
+            len: 0,
+        }
+    }
+}
+
+impl fmt::Write for StackMessage {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn init_evidence() -> Result<(), String> {
+    let endpoint = std::env::var("REDWOOD_EVIDENCE_ENDPOINT")
+        .map_err(|_| "diagnostic requires REDWOOD_EVIDENCE_ENDPOINT".to_string())?;
+    let run_id = std::env::var("REDWOOD_EVIDENCE_RUN_ID")
+        .map_err(|_| "diagnostic requires REDWOOD_EVIDENCE_RUN_ID".to_string())?;
+    if run_id.is_empty()
+        || run_id.len() > 64
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid REDWOOD_EVIDENCE_RUN_ID".into());
+    }
+    let stream = TcpStream::connect(&endpoint)
+        .map_err(|error| format!("connect evidence collector: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set evidence acknowledgement deadline: {error}"))?;
+    EVIDENCE
+        .set(Mutex::new(EvidenceSink { stream, run_id }))
+        .map_err(|_| "evidence sink was already initialized".to_string())
+}
+
+fn evidence(message: fmt::Arguments<'_>) -> Result<(), String> {
+    let Some(sink) = EVIDENCE.get() else {
+        return Ok(());
+    };
+    let mut sink = sink
+        .lock()
+        .map_err(|_| "evidence sink lock poisoned".to_string())?;
+    let mut record = StackMessage::new();
+    write!(&mut record, "run={} {message}", sink.run_id)
+        .map_err(|_| "evidence record exceeds 256 bytes".to_string())?;
+    writeln!(&mut record).map_err(|_| "evidence record exceeds 256 bytes".to_string())?;
+    sink.stream
+        .write_all(&record.bytes[..record.len])
+        .map_err(|error| format!("send evidence record: {error}"))?;
+    let mut acknowledgement = [0; 4];
+    sink.stream
+        .read_exact(&mut acknowledgement)
+        .map_err(|error| format!("receive evidence acknowledgement: {error}"))?;
+    if acknowledgement != *b"ACK\n" {
+        return Err("invalid evidence acknowledgement".into());
+    }
+    Ok(())
+}
 
 fn trace_ce_runtime(stage: &'static str, value: usize) {
     if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
         let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         if sequence < 256 {
             eprintln!("ath11k_ce_runtime sequence={sequence} stage={stage} value={value}");
+            if let Err(error) = evidence(format_args!(
+                "stage=ce sequence={sequence} ce_stage={stage} value={value}"
+            )) {
+                // Evidence transport must never replace the device operation's
+                // result or bypass its WPSS-owning cleanup path.
+                eprintln!("ath11k_ce_evidence=FAILED detail={error}");
+            }
         }
     }
 }

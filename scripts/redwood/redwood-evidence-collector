@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Fsync acknowledged Redwood evidence received through an SSH reverse tunnel."""
+
+import argparse
+import os
+import socket
+import tempfile
+import threading
+
+
+def write_all(fd: int, value: bytes) -> None:
+    written = 0
+    while written < len(value):
+        written += os.write(fd, value[written:])
+
+
+def collect(bind: tuple[str, int], output: str, limit: int | None = None) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(bind)
+    sock.listen(4)
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        ready = f"collector_ready bind={sock.getsockname()[0]}:{sock.getsockname()[1]}\n".encode()
+        write_all(fd, ready)
+        os.fsync(fd)
+        print(ready.decode().rstrip(), flush=True)
+        received = 0
+        while limit is None or received < limit:
+            connection, _ = sock.accept()
+            with connection, connection.makefile("rb") as reader:
+                while limit is None or received < limit:
+                    record = reader.readline(1025)
+                    if not record:
+                        break
+                    if len(record) > 1024 or not record.endswith(b"\n"):
+                        break
+                    write_all(fd, record)
+                    os.fsync(fd)
+                    connection.sendall(b"ACK\n")
+                    received += 1
+    finally:
+        os.close(fd)
+        sock.close()
+
+
+def self_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        output = os.path.join(directory, "evidence.log")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        worker = threading.Thread(
+            target=collect, args=(("127.0.0.1", port), output, 1), daemon=True
+        )
+        worker.start()
+        sender = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sender.settimeout(2)
+        for _ in range(20):
+            try:
+                sender.connect(("127.0.0.1", port))
+                sender.sendall(b"run=selftest stage=probe\n")
+                if sender.recv(4) == b"ACK\n":
+                    break
+            except (ConnectionRefusedError, TimeoutError):
+                continue
+        else:
+            raise RuntimeError("collector did not acknowledge the probe")
+        worker.join(2)
+        with open(output, "rb") as evidence:
+            content = evidence.read()
+        assert b"collector_ready" in content
+        assert content.endswith(b"run=selftest stage=probe\n")
+    print("REDWOOD_EVIDENCE_COLLECTOR_SELF_TEST_OK")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bind")
+    parser.add_argument("--output")
+    parser.add_argument("--max-records", type=int, default=260)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if not args.bind or not args.output:
+        parser.error("--bind and --output are required")
+    if args.max_records < 1 or args.max_records > 260:
+        parser.error("--max-records must be within 1..=260")
+    host, port = args.bind.rsplit(":", 1)
+    collect((host, int(port)), args.output, args.max_records)
+
+
+if __name__ == "__main__":
+    main()
