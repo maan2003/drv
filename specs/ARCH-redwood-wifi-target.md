@@ -24,7 +24,7 @@ firmware regulatory event confirms the country, band rule, active-initiation
 flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
-The latest exact `#9`/32-byte-DT run reached control `Ready`, completed its
+An exact `#9`/32-byte-DT run reached control `Ready`, completed its
 first data-path poll with no delivered or malformed packets, then reset during
 the first control poll. Its bounded CE trace received and refilled one ready
 CE2 frame, then repeatedly found the receive rings empty and completed 10 ms
@@ -33,26 +33,30 @@ found that this runtime poll incorrectly reused the full synchronous control
 deadline after draining ready work. Runtime event polling now uses a zero CE
 deadline so it drains already-completed frames and returns immediately when
 quiet; bring-up and synchronous command paths retain their full deadlines.
-The trace ended before the reset, so this software bug does not yet explain the
-whole-SoC reset. The first physical run containing the fix also reset, but its
-second phone-local unit start and initial diagnostic line were not durably
-retained, so it does not establish whether execution reached the corrected
-runtime poll. The diagnostic ran in a
-phone-local transient unit with no external timeout or transport-owned
-lifetime; the submitting SSH session had already exited normally. The np-local
-hardware lock remained held across the reset, and the fresh flashed-`#1` boot
-found WPSS offline and the platform device unbound. This unconfounded run
-bounds the reset inside the first `poll_wlan_event` call, after data-path
-service and before SME requested a scan. It therefore excludes submitting
-transport loss, scan-policy rejection, and that call's data-path service as
-the immediate trigger. A previous run completed four such control polls, so
-the failure is not deterministic. No kernel fault or pstore record was
-captured; the fresh boot reported `bootinfo.pureason=0x80110` and
-`bootinfo.pdreason=0x2`, whose vendor encoding remains unverified. Bounded CE
-runtime markers surround each receive-ring access, refill, and interrupt
-wait so the validation run can distinguish the corrected quiet return without
-turning log collection into an unbounded observer. Association remains
-unproved.
+
+A subsequent exact run containing that fix durably reached the corrected
+runtime poll. An np-local collector acknowledged the exact candidate identity,
+service entry, control readiness, and control-loop entry before recording 70 CE
+markers. The first receive consumed and refilled one ready CE2 frame. Four
+following receives each reported an expired zero deadline and returned empty,
+physically establishing that the changed CE path drains ready work and returns
+when quiet. The separated empty-receive groups also establish that multiple
+corrected control polls returned: without another routed frame, each empty
+group ends its current `poll_wlan_event`, and later groups require a subsequent
+poll. The phone reset after the last acknowledged empty return. The durable
+stream did not distinguish that final poll's return, policy-request dispatch,
+or a following WMI send, so it does not identify the remaining reset boundary
+or cause. Per-marker TCP acknowledgements deliberately perturbed timing, so
+this is evidence for the bounded diagnostic experiment, not production timing
+behavior.
+
+The diagnostic ran in a phone-local transient unit with no external timeout or
+transport-owned lifetime; the submitting SSH session had already exited
+normally. The np-local hardware lock remained held across the reset, and the
+fresh recovery boot found WPSS offline and the platform device unbound. The
+recovery pstore record contained no panic or reset signature. A previous run
+completed four control polls, so the failure is not deterministic. Bounded CE
+runtime markers remain capped at 256 records. Association remains unproved.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

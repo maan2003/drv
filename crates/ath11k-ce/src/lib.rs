@@ -756,15 +756,22 @@ impl<B: Backend, W: CeCompletionWait> CePipesPacketIo<B, W> {
 
 impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
     fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError> {
+        self.waiter.trace("send_enter", usize::from(pipe));
         let mut buffer = CeTxBuffer::allocate(&self.device, frame.len())?;
+        self.waiter.trace("send_buffer_ready", usize::from(pipe));
         buffer.write(&frame)?;
-        self.pipes.send(
+        self.waiter.trace("send_buffer_written", usize::from(pipe));
+        let result = self.pipes.send(
             &self.mmio,
             &mut self.remote_read_pointers,
             pipe as usize,
             buffer,
             transfer_id,
-        )
+        );
+        if result.is_ok() {
+            self.waiter.trace("send_complete", usize::from(pipe));
+        }
+        result
     }
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
         let mut deadline_expired = false;
@@ -2527,6 +2534,59 @@ mod tests {
         let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
         let pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
         CePipesPacketIo::new(device, mmio, rdp, pipes)
+    }
+
+    struct TraceWaiter(Rc<RefCell<Vec<(&'static str, usize)>>>);
+
+    impl CeCompletionWait for TraceWaiter {
+        fn wait_for_ce(&mut self, _: u64) -> Result<bool, CeError> {
+            Ok(false)
+        }
+
+        fn trace(&mut self, stage: &'static str, value: usize) {
+            self.0.borrow_mut().push((stage, value));
+        }
+    }
+
+    #[test]
+    fn packet_send_traces_last_checkpoint_before_device_visibility() {
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let device = Device::from_backend(LargeModel {
+            state: state.clone(),
+        });
+        let mmio = device.open_region(0).unwrap();
+        let rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
+        let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
+        let pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut packet_io =
+            CePipesPacketIo::new_with_waiter(device, mmio, rdp, pipes, TraceWaiter(trace.clone()));
+
+        packet_io.send_htc(0, 1, vec![0x5a; 16]).unwrap();
+        assert_eq!(
+            *trace.borrow(),
+            [
+                ("send_enter", 0),
+                ("send_buffer_ready", 0),
+                ("send_buffer_written", 0),
+                ("send_complete", 0),
+            ]
+        );
+
+        trace.borrow_mut().clear();
+        state.borrow_mut().send_failure = Some(InjectedSendFailure::Publication);
+        assert_eq!(
+            packet_io.send_htc(0, 2, vec![0xa5; 16]),
+            Err(CeError::DeviceFault)
+        );
+        assert_eq!(
+            *trace.borrow(),
+            [
+                ("send_enter", 0),
+                ("send_buffer_ready", 0),
+                ("send_buffer_written", 0),
+            ]
+        );
     }
 
     fn assert_failed_send_is_retryable(failure: InjectedSendFailure) {
