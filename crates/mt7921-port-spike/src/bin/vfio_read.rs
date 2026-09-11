@@ -684,6 +684,45 @@ fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
+fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
+    if descriptors.len() != 7
+        || descriptors
+            .iter()
+            .enumerate()
+            .any(|(fd, (name, _))| name != &fd.to_string())
+    {
+        return Err(format!(
+            "netstack has unexpected bootstrap descriptors: {descriptors:?}"
+        ));
+    }
+    for fd in [3usize, 4, 5] {
+        let target = &descriptors[fd].1;
+        if !(target.starts_with("socket:[") && target.ends_with(']')) {
+            return Err(format!(
+                "netstack bootstrap capability has unexpected type: fd={fd} target={target:?}"
+            ));
+        }
+    }
+    if descriptors[6].1 != "anon_inode:[eventpoll]" {
+        return Err(format!(
+            "netstack poller has unexpected descriptor: fd=6 target={:?}",
+            descriptors[6].1
+        ));
+    }
+    if descriptors.iter().any(|(_, target)| {
+        target.contains("/dev/vfio")
+            || target.contains("/dev/iommu")
+            || target.contains("/sys/bus/pci")
+            || target.contains("anon_inode:[eventfd]")
+    }) {
+        return Err(format!(
+            "netstack inherited forbidden capability: {descriptors:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuchsia-passive")]
 fn spawn_netstack_child(
     device: mt7921_softmac_adapter::ethernet::Mt7921EthernetDevice,
     listener: TcpListener,
@@ -765,26 +804,7 @@ fn spawn_netstack_child(
         descriptors.push((name, target));
     }
     descriptors.sort();
-    if descriptors
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        != ["0", "1", "2", "3", "4", "5"]
-    {
-        return Err(format!(
-            "netstack inherited unexpected descriptors: {descriptors:?}"
-        ));
-    }
-    if descriptors.iter().any(|(_, target)| {
-        target.contains("/dev/vfio")
-            || target.contains("/dev/iommu")
-            || target.contains("/sys/bus/pci")
-            || target.contains("anon_inode:[eventfd]")
-    }) {
-        return Err(format!(
-            "netstack inherited forbidden capability: {descriptors:?}"
-        ));
-    }
+    validate_netstack_bootstrap_descriptors(&descriptors)?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|error| error.to_string())?;
     let maps =
@@ -867,6 +887,7 @@ fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
 #[cfg(feature = "fuchsia-passive")]
 fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
     let mut base = [false; 5];
+    let mut poller = false;
     let mut seen = Vec::new();
     for (name, target) in descriptors {
         let fd = name
@@ -878,6 +899,18 @@ fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Re
         seen.push(fd);
         if fd < base.len() {
             base[fd] = true;
+            if matches!(fd, 3 | 4) && !(target.starts_with("socket:[") && target.ends_with(']')) {
+                return Err(format!(
+                    "running netstack base capability has unexpected type: fd={fd} target={target:?}"
+                ));
+            }
+        } else if fd == 6 {
+            if target != "anon_inode:[eventpoll]" {
+                return Err(format!(
+                    "running netstack poller has unexpected descriptor: fd=6 target={target:?}"
+                ));
+            }
+            poller = true;
         } else if !(target.starts_with("socket:[") && target.ends_with(']')) {
             return Err(format!(
                 "running netstack has unexpected descriptor: fd={fd} target={target:?}"
@@ -887,6 +920,19 @@ fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Re
     if base != [true; 5] {
         return Err(format!(
             "running netstack is missing a base descriptor: present={base:?}"
+        ));
+    }
+    if !poller {
+        return Err("running netstack is missing its epoll descriptor: fd=6".into());
+    }
+    if descriptors.iter().any(|(_, target)| {
+        target.contains("/dev/vfio")
+            || target.contains("/dev/iommu")
+            || target.contains("/sys/bus/pci")
+            || target.contains("anon_inode:[eventfd]")
+    }) {
+        return Err(format!(
+            "running netstack inherited forbidden capability: {descriptors:?}"
         ));
     }
     Ok(())
@@ -20507,6 +20553,66 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_fd_audit_accepts_only_remapped_capabilities_and_child_poller() {
+        let descriptors = vec![
+            ("0".into(), "/dev/null".into()),
+            ("1".into(), "pipe:[1]".into()),
+            ("2".into(), "pipe:[1]".into()),
+            ("3".into(), "socket:[3]".into()),
+            ("4".into(), "socket:[4]".into()),
+            ("5".into(), "socket:[5]".into()),
+            ("6".into(), "anon_inode:[eventpoll]".into()),
+        ];
+        validate_netstack_bootstrap_descriptors(&descriptors).unwrap();
+
+        let mut unexpected = descriptors.clone();
+        unexpected.push(("7".into(), "socket:[7]".into()));
+        assert!(validate_netstack_bootstrap_descriptors(&unexpected).is_err());
+
+        let mut missing = descriptors.clone();
+        missing.remove(5);
+        assert!(validate_netstack_bootstrap_descriptors(&missing).is_err());
+
+        let mut wrong_poller = descriptors.clone();
+        wrong_poller[6].1 = "anon_inode:[eventfd]".into();
+        assert!(validate_netstack_bootstrap_descriptors(&wrong_poller).is_err());
+
+        let mut wrong_capability = descriptors;
+        wrong_capability[3].1 = "/dev/vfio/1".into();
+        assert!(validate_netstack_bootstrap_descriptors(&wrong_capability).is_err());
+    }
+
+    #[test]
+    fn runtime_fd_audit_requires_poller_and_allows_only_client_sockets() {
+        let descriptors = vec![
+            ("0".into(), "/dev/null".into()),
+            ("1".into(), "pipe:[1]".into()),
+            ("2".into(), "pipe:[1]".into()),
+            ("3".into(), "socket:[3]".into()),
+            ("4".into(), "socket:[4]".into()),
+            ("6".into(), "anon_inode:[eventpoll]".into()),
+        ];
+        validate_netstack_runtime_descriptors(&descriptors).unwrap();
+
+        let mut clients = descriptors.clone();
+        clients.push(("5".into(), "socket:[5]".into()));
+        clients.push(("7".into(), "socket:[7]".into()));
+        validate_netstack_runtime_descriptors(&clients).unwrap();
+
+        let mut missing_poller = descriptors.clone();
+        missing_poller.pop();
+        assert!(validate_netstack_runtime_descriptors(&missing_poller).is_err());
+
+        let mut wrong_poller = descriptors.clone();
+        wrong_poller[5].1 = "anon_inode:[eventfd]".into();
+        assert!(validate_netstack_runtime_descriptors(&wrong_poller).is_err());
+
+        let mut nonsocket_extra = descriptors;
+        nonsocket_extra.push(("7".into(), "/dev/vfio/1".into()));
+        assert!(validate_netstack_runtime_descriptors(&nonsocket_extra).is_err());
+    }
+
+    #[test]
     fn fragmented_network_ready_alone_activates_prebound_socks_socket() {
         const SIGNAL_FRAGMENT_POLL_LIMIT: usize = 4;
         let mut listener = Some(prebind_socks_listener("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -20561,12 +20667,17 @@ mod tests {
             .unwrap()
             .display()
             .to_string();
-        let mut descriptors = (0..5)
-            .map(|fd| (fd.to_string(), format!("base-{fd}")))
-            .collect::<Vec<_>>();
+        let mut descriptors = vec![
+            ("0".into(), "base-0".into()),
+            ("1".into(), "base-1".into()),
+            ("2".into(), "base-2".into()),
+            ("3".into(), "socket:[3]".into()),
+            ("4".into(), "socket:[4]".into()),
+        ];
         descriptors.push(("5".into(), accepted_target));
+        descriptors.push(("6".into(), "anon_inode:[eventpoll]".into()));
         validate_netstack_runtime_descriptors(&descriptors).unwrap();
-        descriptors.push(("6".into(), "/dev/vfio/1".into()));
+        descriptors.push(("7".into(), "/dev/vfio/1".into()));
         assert!(validate_netstack_runtime_descriptors(&descriptors).is_err());
 
         drop((accepted, client, child_listener));
