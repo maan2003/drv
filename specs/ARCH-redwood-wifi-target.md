@@ -151,8 +151,11 @@ path being relied on; a fake test that omits VFIO ownership/reset/remoteproc
 cannot establish live recovery correctness.
 
 IOMMU confinement, bounded DMA ownership, and device exclusivity remain required.
-New kernels and DTBs are **kexec-only**. Never flash boot/vendor_boot, modify
-partitions or slot metadata, or touch encryption keys. Every passed DTB retains
+Wi-Fi experiments use **kexec-only** kernels and DTBs; they do not flash
+boot/vendor_boot, modify partitions or slot metadata, or touch encryption keys.
+The owner-authorized NixOS reinstall is a separate maintenance operation: it may
+reformat userdata and install a validated slot-B kernel/configuration for
+untethered boot. Preserve the bootloader/firmware chain and fastboot recovery. Every passed DTB retains
 `qcom,board-id = <0x1000b 0>` and `xiaomi,board-id = <0xe 0>`. Keep the unchanged
 known-good boot configuration for lab recovery; this is not a native-driver
 runtime fallback in the production stack. Warm kexec into the embedded rescue
