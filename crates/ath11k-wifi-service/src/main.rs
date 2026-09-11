@@ -17,6 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wifi_control_service::PreparedServerEndpoints;
 use wlan_softmac_host::WlanSoftmac as _;
 use wlan_softmac_host::runtime::{ClientRuntime, PreparedRuntimeResources};
@@ -161,6 +162,7 @@ fn activate_and_run(
             CE_POLL_NS,
         )
         .map_err(|error| format!("configure interrupts: {error:?}"))?
+        .with_ce_trace(trace_ce_runtime)
         .split();
         eprintln!("ath11k_wifi_startup=INTERRUPTS_READY");
         let memory = HardwareMemoryProvider::new(hardware.clone(), config.register_region);
@@ -214,7 +216,10 @@ fn activate_and_run(
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
         eprintln!("ath11k_wifi_startup=CONTROL_READY");
+        TRACE_CE_SEQUENCE.store(0, Ordering::Release);
+        TRACE_CE_RUNTIME.store(true, Ordering::Release);
         let result = server.run_to_terminal();
+        TRACE_CE_RUNTIME.store(false, Ordering::Release);
         eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
         let mut runtime = server.into_runtime();
         let stop = runtime.stop();
@@ -242,6 +247,18 @@ fn activate_and_run(
     drop(hardware_guard);
     eprintln!("ath11k_wifi_cleanup=VFIO_GUARD_RELEASED");
     operation
+}
+
+static TRACE_CE_RUNTIME: AtomicBool = AtomicBool::new(false);
+static TRACE_CE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_ce_runtime(stage: &'static str, value: usize) {
+    if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
+        let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if sequence < 256 {
+            eprintln!("ath11k_ce_runtime sequence={sequence} stage={stage} value={value}");
+        }
+    }
 }
 
 fn verify_remoteproc_running(state: &mut File) -> Result<(), String> {

@@ -24,23 +24,24 @@ firmware regulatory event confirms the country, band rule, active-initiation
 flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
-The latest instrumented 32-byte-DT run reached control `Ready`. Its first four
-adapter drive calls each completed data-path polling and control driving with
-no delivered packets or malformed records. SME then rejected the channel-149
-request as `NotSupported` because the adapter advertised no scan offload; MLME
-never called the adapter's hardware scan operation. This disproves those first
-four completed drive calls as the immediate reset trigger, but says nothing
-about later calls. The launcher was still running when an outer SSH timeout
-ended the submitting transport, after which the phone returned to flashed
-`#1`; that teardown contaminated the run and is not evidence that scan, data
-path, or SSH teardown caused the reset. No kernel fault was captured, and the
-following boot again reported `bootinfo.pureason=0x80100` and
-`bootinfo.pdreason=0x2`, whose vendor encoding remains unverified. The
-diagnostic is now submitted to a phone-local transient unit with no external
-timeout or forced termination, so transport and log observers do not own its
-lifetime; policy EOF still drives same-process runtime shutdown and verified
-WPSS-offline cleanup before VFIO release. This lifecycle has host regression
-coverage but awaits a renewed physical run. Association remains unproved.
+The latest exact `#9`/32-byte-DT run reached control `Ready`, completed its
+first data-path poll with no delivered or malformed packets, then reset after
+the first control poll entered and before it returned. The diagnostic ran in a
+phone-local transient unit with no external timeout or transport-owned
+lifetime; the submitting SSH session had already exited normally. The np-local
+hardware lock remained held across the reset, and the fresh flashed-`#1` boot
+found WPSS offline and the platform device unbound. This unconfounded run
+bounds the reset inside the first `poll_wlan_event` call, after data-path
+service and before SME requested a scan. It therefore excludes submitting
+transport loss, scan-policy rejection, and that call's data-path service as
+the immediate trigger. A previous run completed four such control polls, so
+the failure is not deterministic. No kernel fault or pstore record was
+captured; the fresh boot reported `bootinfo.pureason=0x80110` and
+`bootinfo.pdreason=0x2`, whose vendor encoding remains unverified. Bounded CE
+runtime markers now surround each receive-ring access, refill, and interrupt
+wait so the next physical run can narrow that synchronous control call without
+turning log collection into an unbounded observer. Association remains
+unproved.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

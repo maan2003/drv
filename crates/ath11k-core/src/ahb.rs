@@ -160,6 +160,7 @@ impl<B: Backend> Wcn6750Interrupts<B> {
                 interrupts,
                 poll_clock,
                 poll_interval_ns,
+                trace: None,
             },
             dp: Wcn6750DpInterrupts {
                 device,
@@ -172,6 +173,12 @@ impl<B: Backend> Wcn6750Interrupts<B> {
     pub fn split(self) -> (Wcn6750CeWaiter<B>, Wcn6750DpInterrupts<B>) {
         (self.ce, self.dp)
     }
+
+    /// Install a no-allocation diagnostic callback for CE runtime stages.
+    pub fn with_ce_trace(mut self, trace: fn(&'static str, usize)) -> Self {
+        self.ce.trace = Some(trace);
+        self
+    }
 }
 
 pub struct Wcn6750CeWaiter<B: Backend> {
@@ -179,6 +186,7 @@ pub struct Wcn6750CeWaiter<B: Backend> {
     interrupts: Vec<Interrupt<B>>,
     poll_clock: Option<fn() -> u64>,
     poll_interval_ns: u64,
+    trace: Option<fn(&'static str, usize)>,
 }
 
 impl<B: Backend> Wcn6750CeWaiter<B> {
@@ -211,6 +219,12 @@ impl<B: Backend> ath11k_ce::CeCompletionWait for Wcn6750CeWaiter<B> {
             return Ok(true);
         }
         Ok(wait_deadline < deadline_ns)
+    }
+
+    fn trace(&mut self, stage: &'static str, value: usize) {
+        if let Some(trace) = self.trace {
+            trace(stage, value);
+        }
     }
 }
 

@@ -643,6 +643,9 @@ pub trait HtcPacketIo {
 /// implementation performs one `wait_any` over the HIF's CE interrupts.
 pub trait CeCompletionWait {
     fn wait_for_ce(&mut self, deadline_ns: u64) -> Result<bool, CeError>;
+
+    /// Bounded runtime diagnostics around CE ring access and interrupt waits.
+    fn trace(&mut self, _stage: &'static str, _value: usize) {}
 }
 
 pub struct NoCompletionWait;
@@ -765,24 +768,33 @@ impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
     }
     fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
         let mut deadline_expired = false;
+        self.waiter.trace("receive_enter", 0);
         loop {
             for pipe in [1, 2, 5] {
+                self.waiter.trace("ring_enter", pipe);
                 if let Some(frame) = self.pipes.completed_recv_next(
                     &self.mmio,
                     &mut self.remote_read_pointers,
                     pipe,
                 )? {
+                    self.waiter.trace("ring_frame", pipe);
                     // The completion consumes one destination slot. Refill it
                     // before exposing the frame so a sustained WMI/HTT stream
                     // cannot exhaust the finite CE receive ring.
                     self.rx_post_buf()?;
+                    self.waiter.trace("refill_complete", pipe);
                     return Ok(Some(frame));
                 }
+                self.waiter.trace("ring_empty", pipe);
             }
             if deadline_expired {
+                self.waiter.trace("receive_empty", 0);
                 return Ok(None);
             }
+            self.waiter.trace("wait_enter", 0);
             deadline_expired = !self.waiter.wait_for_ce(deadline_ns)?;
+            self.waiter
+                .trace("wait_complete", usize::from(deadline_expired));
         }
     }
 }
