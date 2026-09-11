@@ -21,8 +21,25 @@ no flashing, partition/slot changes, or encryption-key changes.
 
 The validated route to the 32-byte region-1 DT is two orderly kexec hops. Run
 the phone-side blocks directly in a root shell; do not wrap them in another
-remote `sh -c`. First identify the recovered flashed kernel before changing
-anything:
+remote `sh -c`. A reachable recovery initrd may be the original flashed image,
+whose 120-second boot deadline is still active. Before collecting evidence or
+unlocking, immediately stop and runtime-mask both watchdog units, then verify
+that neither can run:
+
+```sh
+systemctl stop boot-watchdog.service redwood-lab-watchdog.service
+systemctl mask --runtime boot-watchdog.service redwood-lab-watchdog.service
+test "$(systemctl show -P LoadState boot-watchdog.service)" = masked
+test "$(systemctl show -P ActiveState boot-watchdog.service)" = inactive
+test "$(systemctl show -P LoadState redwood-lab-watchdog.service)" = masked
+test "$(systemctl show -P ActiveState redwood-lab-watchdog.service)" = inactive
+test ! -e /run/redwood-lab-watchdog/armed
+```
+
+Do this on every reachable recovery-initrd boot, before any slower inspection;
+do not race the deadline by unlocking first. This recovery action does not
+replace the command-line mask gates below for either candidate hop. Then
+identify the recovered flashed kernel:
 
 ```sh
 cat /proc/version

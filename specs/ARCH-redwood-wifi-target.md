@@ -25,8 +25,16 @@ flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
 The latest exact `#9`/32-byte-DT run reached control `Ready`, completed its
-first data-path poll with no delivered or malformed packets, then reset after
-the first control poll entered and before it returned. The diagnostic ran in a
+first data-path poll with no delivered or malformed packets, then reset during
+the first control poll. Its bounded CE trace received and refilled one ready
+CE2 frame, then repeatedly found the receive rings empty and completed 10 ms
+waits normally until the 256-record trace cap was exhausted. Source inspection
+found that this runtime poll incorrectly reused the full synchronous control
+deadline after draining ready work. Runtime event polling now uses a zero CE
+deadline so it drains already-completed frames and returns immediately when
+quiet; bring-up and synchronous command paths retain their full deadlines.
+The trace ended before the reset, so this software bug does not yet explain the
+whole-SoC reset and the fix still requires physical validation. The diagnostic ran in a
 phone-local transient unit with no external timeout or transport-owned
 lifetime; the submitting SSH session had already exited normally. The np-local
 hardware lock remained held across the reset, and the fresh flashed-`#1` boot
@@ -38,8 +46,8 @@ the immediate trigger. A previous run completed four such control polls, so
 the failure is not deterministic. No kernel fault or pstore record was
 captured; the fresh boot reported `bootinfo.pureason=0x80110` and
 `bootinfo.pdreason=0x2`, whose vendor encoding remains unverified. Bounded CE
-runtime markers now surround each receive-ring access, refill, and interrupt
-wait so the next physical run can narrow that synchronous control call without
+runtime markers surround each receive-ring access, refill, and interrupt
+wait so the validation run can distinguish the corrected quiet return without
 turning log collection into an unbounded observer. Association remains
 unproved.
 

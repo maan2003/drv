@@ -2066,6 +2066,7 @@ mod tests {
     struct PacketIo {
         sent: Vec<(u8, u16, Vec<u8>)>,
         receive: VecDeque<Vec<u8>>,
+        receive_deadlines: Vec<u64>,
         fail_send: bool,
     }
 
@@ -2078,7 +2079,8 @@ mod tests {
             Ok(())
         }
 
-        fn receive_htc(&mut self, _: u64) -> Result<Option<Vec<u8>>, CeError> {
+        fn receive_htc(&mut self, deadline_ns: u64) -> Result<Option<Vec<u8>>, CeError> {
+            self.receive_deadlines.push(deadline_ns);
             Ok(self.receive.pop_front())
         }
     }
@@ -2149,6 +2151,21 @@ mod tests {
         drop(wmi);
         drop(htt);
         assert!(router.try_into_transport().is_ok());
+    }
+
+    #[test]
+    fn zero_deadline_receive_drains_ready_frames_and_returns_when_quiet() {
+        let io = PacketIo {
+            receive: VecDeque::from([htc_frame(1, &[9, 8])]),
+            ..PacketIo::default()
+        };
+        let router = HtcRouter::new(HtcTransport::new(connected_wmi_htc(), io));
+        let mut wmi = router.endpoint(ServiceId::WMI_CONTROL).unwrap();
+
+        assert_eq!(router.service_receive_bounded(0, 1), Ok(1));
+        assert_eq!(wmi.receive_payload(0), Ok(Some(vec![9, 8])));
+        assert_eq!(router.service_receive_bounded(0, 1), Ok(0));
+        assert_eq!(router.core.borrow().transport.io.receive_deadlines, [0, 0]);
     }
 
     #[test]

@@ -591,6 +591,12 @@ where
             .map_err(|_| CoreError::DeviceFault)
     }
 
+    fn pump_ready_bounded(&mut self, work_budget: usize) -> Result<usize, CoreError> {
+        Self::protocol(self.router.as_ref())?
+            .service_receive_bounded(0, work_budget)
+            .map_err(|_| CoreError::DeviceFault)
+    }
+
     fn pump(&mut self) -> Result<(), CoreError> {
         self.pump_bounded(usize::MAX).map(|_| ())
     }
@@ -880,7 +886,8 @@ where
                 .next_event(deadline)
                 .map_err(|_| CoreError::Protocol)?;
             if event.is_none() {
-                consumed = consumed.saturating_add(self.pump_bounded(work_budget - consumed)?);
+                consumed =
+                    consumed.saturating_add(self.pump_ready_bounded(work_budget - consumed)?);
                 if !control_budget_has_room(consumed, work_budget) {
                     return Ok((None, true));
                 }
