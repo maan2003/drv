@@ -54,12 +54,15 @@ path in the phone command line:
 ```sh
 ssh PHONE 'command -v systemd-cryptsetup'
 ssh PHONE \
-  'systemctl stop systemd-cryptsetup@redwood\\x2droot.service'
-ssh NP 'exec cat "$PROTECTED_KEY"' |
+  'systemctl stop systemd-cryptsetup@redwood\\x2droot.service; \
+   systemctl reset-failed systemd-cryptsetup@redwood\\x2droot.service || true; \
+   udevadm settle --timeout=10; sleep 2; \
+   test ! -e /dev/mapper/redwood-root'
+ssh NP 'exec sudo flock -n /run/lock/drv-hardware.lock \
+  cat "$PROTECTED_KEY"' |
   ssh PHONE 'exec SYSTEMD_CRYPTSETUP attach redwood-root /dev/sda33 /dev/stdin'
 ssh PHONE \
-  'systemctl reset-failed systemd-cryptsetup@redwood\\x2droot.service; \
-   systemctl start systemd-cryptsetup@redwood\\x2droot.service; \
+  'test -e /dev/mapper/redwood-root; touch /run/host-ack; \
    systemctl default'
 ```
 
@@ -71,6 +74,12 @@ succeeds on flashed `#1`. Then load hop 1 through
 
 ```sh
 LAB=/var/lib/ath11k-redwood-lab
+test "$(sha256sum "$LAB/stage3/Image" | cut -d' ' -f1)" = \
+  97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885
+test "$(sha256sum "$LAB/stage7/initrd-watchdog" | cut -d' ' -f1)" = \
+  654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f
+test "$(sha256sum "$LAB/stage12/kexec-command-line-manual-no-reboot" | cut -d' ' -f1)" = \
+  74ef9ba7e5abfc6131f595a3db921fdad63fac8e1ea73764b437e01af1115212
 kexec -u || true
 kexec -s -l "$LAB/stage3/Image" \
   --initrd="$LAB/stage7/initrd-watchdog" \
@@ -114,6 +123,14 @@ test "$(systemctl is-system-running)" = running
 test -z "$(systemctl --failed --no-legend --plain --no-pager | \
   awk '$1 ~ /\.(service|path)$/ { print $1 }')"
 test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 16
+test "$(sha256sum "$LAB/stage3/Image" | cut -d' ' -f1)" = \
+  97efd9fa53e252512dcf5f8572a06db150b31a79c1f9dddfb3934bb0d9c9b885
+test "$(sha256sum "$LAB/stage7/initrd-watchdog" | cut -d' ' -f1)" = \
+  654f1c6ffbf8baa85dad2bcf24a58db70f7133e32c8280a9d88c22edcb01652f
+test "$(sha256sum "$LAB/stage10/runB-region1.fdt" | cut -d' ' -f1)" = \
+  8a5d019f7c258b654dffa180215f5d17cb5d95d04561a59a470d27cf33707b67
+test "$(sha256sum "$LAB/stage12/kexec-command-line-manual-no-reboot" | cut -d' ' -f1)" = \
+  74ef9ba7e5abfc6131f595a3db921fdad63fac8e1ea73764b437e01af1115212
 kexec -u || true
 kexec -c -l "$LAB/stage3/Image" \
   --initrd="$LAB/stage7/initrd-watchdog" \
