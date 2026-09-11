@@ -333,6 +333,7 @@ pub struct Ath11kClientDevice<B: Subsystems> {
     deferred_mgmt_rx: Option<DeferredManagementRx>,
     deterministic_scan_completion: bool,
     regulatory_domain: Option<ath11k_core::RegulatoryDomain>,
+    runtime_trace: Option<fn(&'static str, usize)>,
     pending_association_security: Option<PendingAssociationSecurity>,
     igtk: Option<Igtk>,
 }
@@ -355,6 +356,7 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             deferred_mgmt_rx: None,
             deterministic_scan_completion: false,
             regulatory_domain: None,
+            runtime_trace: None,
             pending_association_security: None,
             igtk: None,
         }
@@ -364,6 +366,18 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
     pub fn with_regulatory_domain(mut self, domain: ath11k_core::RegulatoryDomain) -> Self {
         self.regulatory_domain = Some(domain);
         self
+    }
+
+    /// Install the bounded physical-runtime checkpoint sink.
+    pub fn with_runtime_trace(mut self, trace: fn(&'static str, usize)) -> Self {
+        self.runtime_trace = Some(trace);
+        self
+    }
+
+    fn trace_runtime(&self, stage: &'static str, value: usize) {
+        if let Some(trace) = self.runtime_trace {
+            trace(stage, value);
+        }
     }
 
     pub fn into_device(self) -> Device<B> {
@@ -520,6 +534,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
     fn drive(&mut self) -> Result<bool, zx::Status> {
         let drive_call = self.drive_calls;
         self.drive_calls = self.drive_calls.saturating_add(1);
+        self.trace_runtime("drive_enter", drive_call as usize);
         let trace = drive_call < 4;
         if trace {
             eprintln!("ath11k_softmac_drive stage=enter call={drive_call}");
@@ -532,6 +547,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 .as_mut()
                 .unwrap()
                 .notify_scan_complete(zx::Status::OK, u64::from(scan_id));
+            self.trace_runtime("drive_return", drive_call as usize);
             return Ok(true);
         }
 
@@ -545,6 +561,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         if trace {
             eprintln!("ath11k_softmac_drive stage=dp_enter call={drive_call}");
         }
+        self.trace_runtime("dp_enter", drive_call as usize);
         let serviced = self
             .device
             .service_dp_host(
@@ -557,6 +574,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 &mut deliveries,
             )
             .map_err(status)?;
+        self.trace_runtime("dp_complete", drive_call as usize);
         if trace {
             eprintln!(
                 "ath11k_softmac_drive stage=dp_complete call={drive_call} tx_delivered={} tx_malformed={} rx_delivered={}",
@@ -615,10 +633,12 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         if trace {
             eprintln!("ath11k_softmac_drive stage=control_enter call={drive_call}");
         }
+        self.trace_runtime("control_enter", drive_call as usize);
         let (event, control_progressed) = self
             .device
             .poll_wlan_event(DP_WORK_BUDGET)
             .map_err(status)?;
+        self.trace_runtime("control_complete", drive_call as usize);
         if trace {
             eprintln!(
                 "ath11k_softmac_drive stage=control_complete call={drive_call} event={} progressed={control_progressed}",
@@ -653,6 +673,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                         .iter()
                         .position(|(pending, _)| *pending == buffer_id)
                     else {
+                        self.trace_runtime("drive_return", drive_call as usize);
                         return Ok(true);
                     };
                     let (_, peer_addr) = self.pending_mgmt_tx.remove(index);
@@ -697,6 +718,7 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                 _ => {}
             }
         }
+        self.trace_runtime("drive_return", drive_call as usize);
         Ok(progressed)
     }
 
@@ -1111,6 +1133,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
         eprintln!("ath11k_softmac_scan=PASSIVE_ENTRY");
+        self.trace_runtime("passive_scan_enter", 0);
         if self.active_scan.is_some() {
             return Err(zx::Status::BAD_STATE);
         }
@@ -1132,6 +1155,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             .checked_add(1)
             .ok_or(zx::Status::NO_RESOURCES)?;
         eprintln!("ath11k_softmac_scan=PASSIVE_START_ENTER");
+        self.trace_runtime("passive_scan_send_enter", scan_id as usize);
         self.device
             .start_scan(ScanConfig {
                 vdev: self.ready_vdev()?,
@@ -1141,6 +1165,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
                 ssids: Vec::new(),
             })
             .map_err(status)?;
+        self.trace_runtime("passive_scan_send_complete", scan_id as usize);
         eprintln!("ath11k_softmac_scan=PASSIVE_START_READY");
         self.active_scan = Some(scan_id);
         Ok(WlanSoftmacBaseStartPassiveScanResponse {

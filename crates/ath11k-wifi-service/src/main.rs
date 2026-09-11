@@ -193,6 +193,9 @@ fn activate_and_run(
         let regulatory = ath11k_core::redwood_india_domain();
         let mut adapter =
             Ath11kClientDevice::new(device, config.mac).with_regulatory_domain(regulatory);
+        if config.diagnostic_unsandboxed {
+            adapter = adapter.with_runtime_trace(trace_softmac_runtime);
+        }
         let query = adapter
             .query()
             .map_err(|status| format!("query SoftMAC: {status}"))?;
@@ -350,6 +353,20 @@ fn trace_ce_runtime(stage: &'static str, value: usize) {
                 // Evidence transport must never replace the device operation's
                 // result or bypass its WPSS-owning cleanup path.
                 eprintln!("ath11k_ce_evidence=FAILED detail={error}");
+            }
+        }
+    }
+}
+
+fn trace_softmac_runtime(stage: &'static str, value: usize) {
+    if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
+        let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if sequence < 256 {
+            eprintln!("ath11k_softmac_runtime sequence={sequence} stage={stage} value={value}");
+            if let Err(error) = evidence(format_args!(
+                "stage=softmac sequence={sequence} softmac_stage={stage} value={value}"
+            )) {
+                eprintln!("ath11k_softmac_evidence=FAILED detail={error}");
             }
         }
     }

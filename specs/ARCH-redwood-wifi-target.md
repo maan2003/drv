@@ -50,6 +50,13 @@ or cause. Per-marker TCP acknowledgements deliberately perturbed timing, so
 this is evidence for the bounded diagnostic experiment, not production timing
 behavior.
 
+A follow-up run added checkpoints around runtime CE transmission and reproduced
+the same receive prefix through marker 69 without reaching any transmit-entry
+checkpoint. It excludes runtime CE ring publication in that run, but not later
+processing of commands issued during startup. The next bounded discriminator
+therefore checkpoints SoftMAC drive, data-path, control-return, and passive-scan
+dispatch boundaries before narrowing any device mutation further.
+
 The diagnostic ran in a phone-local transient unit with no external timeout or
 transport-owned lifetime; the submitting SSH session had already exited
 normally. The np-local hardware lock remained held across the reset, and the
