@@ -806,6 +806,9 @@ mod tests {
             install_filter(FRAME_FD, LISTENER_FD, poller.raw_fd()).is_ok(),
             46,
         );
+        let mut dns = netstack3_port_integration::dns_bridge::NativeDnsBridge::new();
+        child_require(dns.configure(&["192.0.2.53".parse().unwrap()]).is_ok(), 49);
+        drop(dns);
         let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
         let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
         let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };

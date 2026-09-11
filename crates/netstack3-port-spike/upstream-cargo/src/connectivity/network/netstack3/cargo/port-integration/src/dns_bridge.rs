@@ -41,6 +41,16 @@ const SOCKET_MESSAGE_LIMIT: usize = 8;
 // conventional UDP/EDNS responses and bounds each transport's retained queue;
 // TCP delivery is already read in 2 KiB chunks.
 const SOCKET_MESSAGE_BYTES_LIMIT: usize = 4096;
+
+fn native_resolver_options() -> ResolverOpts {
+    let mut options = ResolverOpts::default();
+    // This resolver runs after the network service has entered its empty-root
+    // sandbox. Host-file lookup would both be ineffective and violate the
+    // runtime no-open capability boundary.
+    options.use_hosts_file = false;
+    options
+}
+
 type Task = Pin<Box<dyn Future<Output = Result<(), ProtoError>> + Send>>;
 struct End {
     limit: usize,
@@ -373,7 +383,7 @@ impl NativeDnsBridge {
         );
         self.resolver = Some(AsyncResolver::new(
             c,
-            ResolverOpts::default(),
+            native_resolver_options(),
             NativeSpawn(self.b.clone()),
         )?);
         Ok(())
@@ -574,6 +584,13 @@ mod tests {
     use std::num::{NonZeroU16, NonZeroU64};
     use trust_dns_proto::op::Message;
     use trust_dns_proto::rr::{Name, RData, Record};
+
+    #[test]
+    fn native_resolver_never_reads_the_host_filesystem() {
+        let mut expected = ResolverOpts::default();
+        expected.use_hosts_file = false;
+        assert_eq!(native_resolver_options(), expected);
+    }
 
     #[test]
     fn pinned_resolver_reaches_native_udp_bridge() {
