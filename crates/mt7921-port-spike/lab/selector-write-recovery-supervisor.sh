@@ -6,7 +6,7 @@ wifi_driver_lab=@wifi_driver_lab@
 wifi_lab_watchdog=@wifi_lab_watchdog@
 validation_launcher=@validation_launcher@
 artifact_identity=@artifact_identity@
-recovery_samples=@recovery_samples@
+recovery_deadline_ms=@recovery_deadline_ms@
 sys_root=@sys_root@
 run_root=@run_root@
 var_root=@var_root@
@@ -93,6 +93,61 @@ normalize_iw_frequency() {
   local frequency=$1
   [[ $frequency =~ ^[0-9]+([.]0)?$ ]] || return 1
   printf '%s\n' "${frequency%.0}"
+}
+
+monotonic_ms() {
+  awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime
+}
+
+reconnect_due() {
+  local elapsed_ms=$1 eligible_since_ms=$2 attempts=$3 last_attempt_ms=$4
+  ((elapsed_ms <= 55000 && eligible_since_ms >= 0 && attempts < 2)) || return 1
+  ((elapsed_ms - eligible_since_ms >= 15000)) || return 1
+  ((last_attempt_ms < 0 || elapsed_ms - last_attempt_ms >= 30000))
+}
+
+native_reconnect_eligible() {
+  local interface=$1 station station_state file net candidate matches=0
+  [[ -n $interface \
+    && $(basename "$(readlink -f "$sys_root/bus/pci/devices/$bdf/driver")") == mt7921e \
+    && $(cat "$sys_root/bus/pci/devices/$bdf/power_state" 2>/dev/null) == D0 \
+    && $(systemctl is-active iwd.service 2>/dev/null) == active ]] || return 1
+  for net in "$sys_root"/class/net/wlan*; do
+    [[ -e $net && $(readlink -f "$net/device") == "$device_path" \
+      && $(cat "$net/address" 2>/dev/null) == "$native_client_mac" ]] || continue
+    candidate=$(basename "$net")
+    timeout 2 iwctl station "$candidate" show >/dev/null 2>&1 || continue
+    matches=$((matches + 1))
+    [[ $candidate == "$interface" ]] || return 1
+  done
+  ((matches == 1)) || return 1
+  station=$(timeout 2 iwctl station "$interface" show 2>/dev/null) || return 1
+  station_state=$(printf '%s\n' "$station" | sed 's/\x1b\[[0-9;]*m//g' \
+    | awk '$1 == "State" { print $2; exit }')
+  [[ $station_state == disconnected ]] || return 1
+  shopt -s nullglob
+  local states=("$run_root"/wifi-driver-lab/*.state)
+  local safety=("$run_root"/wifi-driver-lab/*.state.safety)
+  ((${#states[@]} == 0)) || return 1
+  for file in "${safety[@]}"; do
+    [[ $(<"$file") == SAFE ]] || return 1
+  done
+}
+
+scan_for_native_network() {
+  local interface=$1 started now networks
+  timeout 3 iwctl station "$interface" scan >/dev/null 2>&1 || return 1
+  started=$(monotonic_ms)
+  while true; do
+    networks=$(timeout 1 iwctl station "$interface" get-networks 2>/dev/null || true)
+    if printf '%s\n' "$networks" | sed 's/\x1b\[[0-9;]*m//g' \
+      | grep -qE '[[:space:]]ajay[[:space:]]'; then
+      return 0
+    fi
+    now=$(monotonic_ms)
+    ((now - started < 7000)) || return 1
+    sleep 1
+  done
 }
 
 stamp=$(date --utc +%Y%m%dT%H%M%SZ)
@@ -185,6 +240,7 @@ done
 wait "$experiment_pid"
 experiment_rc=$?
 restore_ns=$(date +%s%N)
+restore_mono_ms=$(monotonic_ms)
 printf 'RESTORE_RETURN realtime=%s rc=%s\n' "$(date --iso-8601=ns)" "$experiment_rc" >> "$timeline"
 sync -f "$timeline"
 
@@ -196,7 +252,13 @@ default_route=false
 connectivity=false
 association_failure=false
 connectivity_ms=-1
-for sample in $(seq 0 "$((recovery_samples - 1))"); do
+sample=0
+eligible_since_ms=-1
+reconnect_attempts=0
+last_reconnect_ms=-1
+while true; do
+  elapsed_ms=$(($(monotonic_ms) - restore_mono_ms))
+  ((elapsed_ms < recovery_deadline_ms)) || break
   now=$(date --iso-8601=ns)
   driver=none
   [[ -L $sys_root/bus/pci/devices/$bdf/driver ]] && \
@@ -223,6 +285,10 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
   associated_if=""
   ipv4_if=""
   native_identity_restored=false
+  native_if=""
+  native_station_state=""
+  native_interface_ambiguous=false
+  connectivity_now=false
   for net in "$sys_root"/class/net/wlan*; do
     [[ -e $net ]] || continue
     name=$(basename "$net")
@@ -231,9 +297,6 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
     carrier=$(cat "$net/carrier" 2>/dev/null || printf 0)
     printf 'WLAN name=%s operstate=%s carrier=%s address=%s\n' \
       "$name" "$operstate" "$carrier" "$address" >> "$timeline"
-    if [[ $(readlink -f "$net/device") == "$device_path" && $address == "$native_client_mac" ]]; then
-      native_identity_restored=true
-    fi
     station=$(timeout 2 iwctl station "$name" show 2>&1)
     station_rc=$?
     printf '%s' "$station" | head -c 2048 | sed 's/^/IWD_STATION /' >> "$timeline" || true
@@ -244,11 +307,30 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
       printf 'TRANSITION usable_interface_ready realtime=%s interface=%s\n' \
         "$now" "$name" >> "$timeline"
     fi
-    [[ $carrier == 1 ]] && associated_if=$name
-    if ip -4 -o address show dev "$name" scope global | grep -q .; then
+    if [[ $(readlink -f "$net/device") == "$device_path" && $address == "$native_client_mac" \
+      && $station_rc == 0 ]]; then
+      if [[ -n $native_if && $native_if != "$name" ]]; then
+        native_interface_ambiguous=true
+      else
+        native_if=$name
+        native_station_state=$(printf '%s\n' "$station" | sed 's/\x1b\[[0-9;]*m//g' \
+          | awk '$1 == "State" { print $2; exit }')
+      fi
+      link=$(timeout 2 iw dev "$name" link 2>/dev/null || true)
+      linked_ssid=$(awk '/^[[:space:]]*SSID:/ { sub(/^[[:space:]]*SSID:[[:space:]]*/, ""); print; exit }' <<< "$link")
+      [[ $carrier == 1 && $linked_ssid == ajay ]] && associated_if=$name
+    fi
+    if [[ $(readlink -f "$net/device") == "$device_path" && $address == "$native_client_mac" ]] \
+      && ip -4 -o address show dev "$name" scope global | grep -q .; then
       ipv4_if=$name
     fi
   done
+  if [[ -n $native_if ]] && ! $native_interface_ambiguous; then
+    native_identity_restored=true
+  else
+    native_if=""
+    associated_if=""
+  fi
   ip -brief address show | sed 's/^/ADDRESS /' >> "$timeline"
   ip route show | sed 's/^/ROUTE /' >> "$timeline"
 
@@ -260,18 +342,25 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
     dhcp=true
     printf 'TRANSITION ipv4 realtime=%s interface=%s\n' "$now" "$ipv4_if" >> "$timeline"
   fi
-  route_if=$(ip route show default | awk '/ dev wlan/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  route_if=""
+  if [[ -n $associated_if ]] && ip route show default dev "$associated_if" | grep -q .; then
+    route_if=$associated_if
+  fi
   if ! $default_route && [[ -n $route_if ]]; then
     default_route=true
     printf 'TRANSITION default_route realtime=%s interface=%s\n' "$now" "$route_if" >> "$timeline"
   fi
-  gateway=$(ip route show default | awk '/ dev wlan/ { print $3; exit }')
-  if ! $connectivity && [[ -n $associated_if && -n $ipv4_if && -n $route_if && -n $gateway ]] \
-    && ping -c 1 -W 1 "$gateway" >/dev/null 2>&1; then
-    connectivity=true
-    connectivity_ms=$((($(date +%s%N) - restore_ns) / 1000000))
-    printf 'TRANSITION connectivity realtime=%s interface=%s gateway=%s restore_elapsed_ms=%s\n' \
-      "$now" "$route_if" "$gateway" "$connectivity_ms" >> "$timeline"
+  gateway=""
+  [[ -z $route_if ]] || gateway=$(ip route show default dev "$route_if" | awk '{ print $3; exit }')
+  if [[ -n $associated_if && -n $ipv4_if && -n $route_if && -n $gateway ]] \
+    && ping -I "$native_if" -c 1 -W 1 "$gateway" >/dev/null 2>&1; then
+    connectivity_now=true
+    if ! $connectivity; then
+      connectivity=true
+      connectivity_ms=$((($(date +%s%N) - restore_ns) / 1000000))
+      printf 'TRANSITION connectivity realtime=%s interface=%s gateway=%s restore_elapsed_ms=%s\n' \
+        "$now" "$route_if" "$gateway" "$connectivity_ms" >> "$timeline"
+    fi
   fi
   sync -f "$timeline"
   sync -f "$messages" 2>/dev/null || true
@@ -289,9 +378,39 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
   for file in "${safety[@]}"; do
     [[ $(<"$file") == SAFE ]] || unsafe=true
   done
+
+  reconnect_eligible=false
+  if ((${#states[@]} == 0)) && ! $unsafe && [[ -n $native_if \
+    && $driver == mt7921e && $power == D0 && $iwd_active == active ]]; then
+    reconnect_eligible=true
+    ((eligible_since_ms >= 0)) || eligible_since_ms=$elapsed_ms
+  else
+    eligible_since_ms=-1
+  fi
+  elapsed_ms=$(($(monotonic_ms) - restore_mono_ms))
+  if $reconnect_eligible && [[ $native_station_state == disconnected ]] \
+    && reconnect_due "$elapsed_ms" "$eligible_since_ms" "$reconnect_attempts" "$last_reconnect_ms"; then
+    reconnect_attempts=$((reconnect_attempts + 1))
+    last_reconnect_ms=$elapsed_ms
+    printf 'RECOVERY_RECONNECT attempt=%s realtime=%s interface=%s phase=scan\n' \
+      "$reconnect_attempts" "$now" "$native_if" >> "$timeline"
+    if scan_for_native_network "$native_if" && native_reconnect_eligible "$native_if" \
+      && (($(monotonic_ms) - restore_mono_ms <= 55000)); then
+      timeout 15 iwctl station "$native_if" connect ajay </dev/null >> "$timeline" 2>&1
+      reconnect_rc=$?
+      printf 'RECOVERY_RECONNECT attempt=%s realtime=%s interface=%s phase=connect rc=%s\n' \
+        "$reconnect_attempts" "$(date --iso-8601=ns)" "$native_if" "$reconnect_rc" >> "$timeline"
+    else
+      printf 'RECOVERY_RECONNECT attempt=%s realtime=%s interface=%s phase=scan_or_revalidation_failed\n' \
+        "$reconnect_attempts" "$(date --iso-8601=ns)" "$native_if" >> "$timeline"
+    fi
+    sync -f "$timeline"
+  fi
   if ((${#states[@]} == 0)) && ! $unsafe \
     && [[ $driver == mt7921e && $power == D0 && $iwd_active == active ]] \
-    && $native_identity_restored && $association && $dhcp && $default_route && $connectivity; then
+    && $native_identity_restored && [[ $associated_if == "$native_if" \
+      && $ipv4_if == "$native_if" && $route_if == "$native_if" && -n $gateway ]] \
+    && $connectivity_now; then
     "$wifi_lab_watchdog" disarm "$token"
     outcome=passed
     reason=none
@@ -312,6 +431,7 @@ for sample in $(seq 0 "$((recovery_samples - 1))"); do
     [[ $outcome == passed ]]
     exit $?
   fi
+  sample=$((sample + 1))
   sleep 2
 done
 

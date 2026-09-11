@@ -20760,9 +20760,9 @@ mod tests {
     fn recovery_supervisor_disarms_after_proven_restore_even_when_experiment_failed() {
         let source = include_str!("../../lab/selector-write-recovery-supervisor.sh");
         let recovered = source
-            .split("if ((${#states[@]} == 0))")
-            .nth(1)
+            .rsplit_once("if ((${#states[@]} == 0))")
             .unwrap()
+            .1
             .split("sleep 2")
             .next()
             .unwrap();
@@ -20773,7 +20773,10 @@ mod tests {
             "power == D0",
             "iwd_active == active",
             "$native_identity_restored",
-            "$association && $dhcp && $default_route && $connectivity",
+            "associated_if == \"$native_if\"",
+            "ipv4_if == \"$native_if\"",
+            "route_if == \"$native_if\"",
+            "$connectivity_now",
         ] {
             assert!(recovered.contains(proof), "{proof}");
         }
@@ -20859,6 +20862,77 @@ mod tests {
         }
         for rejected in ["5180.5", "5180.", ".0", "five"] {
             assert!(!invoke(rejected).status.success(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn recovery_supervisor_reconnect_is_bounded_and_scan_gated() {
+        let supervisor = include_str!("../../lab/selector-write-recovery-supervisor.sh");
+        let decision = supervisor
+            .split("reconnect_due() {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        let invoke = |elapsed: u32, eligible: i32, attempts: u8, last: i32| {
+            Command::new("/run/current-system/sw/bin/bash")
+                .arg("-c")
+                .arg(format!(
+                    "reconnect_due() {{{decision}\n}}; reconnect_due {elapsed} {eligible} {attempts} {last}"
+                ))
+                .status()
+                .unwrap()
+                .success()
+        };
+        for allowed in [
+            (15_000, 0, 0, -1),
+            (45_000, 0, 1, 15_000),
+            (45_000, 30_000, 1, 15_000),
+        ] {
+            assert!(invoke(allowed.0, allowed.1, allowed.2, allowed.3));
+        }
+        for denied in [
+            (14_999, 0, 0, -1),
+            (15_000, -1, 0, -1),
+            (44_999, 0, 1, 15_000),
+            (45_000, 0, 2, 15_000),
+            (55_001, 0, 1, 15_000),
+        ] {
+            assert!(!invoke(denied.0, denied.1, denied.2, denied.3));
+        }
+
+        let recovery = supervisor.split("while true; do").nth(2).unwrap();
+        assert!(recovery.contains("elapsed_ms < recovery_deadline_ms"));
+        assert!(recovery.contains("scan_for_native_network \"$native_if\""));
+        assert!(recovery.contains("native_reconnect_eligible \"$native_if\""));
+        assert!(supervisor.contains("((matches == 1)) || return 1"));
+        assert!(supervisor.contains("[[ $candidate == \"$interface\" ]] || return 1"));
+        assert!(recovery.contains("native_station_state == disconnected"));
+        assert!(recovery.contains("$(monotonic_ms) - restore_mono_ms <= 55000"));
+        assert!(recovery.contains("ping -I \"$native_if\" -c 1 -W 1 \"$gateway\""));
+        assert!(
+            recovery.contains("timeout 15 iwctl station \"$native_if\" connect ajay </dev/null")
+        );
+        for forbidden in [
+            "iwctl station \"$native_if\" disconnect",
+            "password",
+            "/var/lib/iwd",
+        ] {
+            assert!(!recovery.contains(forbidden), "{forbidden}");
+        }
+        let connect = recovery.find("connect ajay").unwrap();
+        let disarm = recovery.find("\"$wifi_lab_watchdog\" disarm").unwrap();
+        assert!(connect < disarm);
+        let gate = &recovery[disarm.saturating_sub(700)..disarm];
+        for current in [
+            "associated_if == \"$native_if\"",
+            "ipv4_if == \"$native_if\"",
+            "route_if == \"$native_if\"",
+            "-n $gateway",
+            "$connectivity_now",
+        ] {
+            assert!(gate.contains(current), "{current}");
         }
     }
 

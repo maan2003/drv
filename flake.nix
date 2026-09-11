@@ -1147,7 +1147,8 @@
                 --subst-var-by wifi_lab_watchdog /run/current-system/sw/bin/wifi-lab-watchdog \
                 --subst-var-by validation_launcher ${mt7921-fresh-laa-diagnostic}/bin/mt7921-full-firmware-validation \
                 --subst-var-by artifact_identity ${mt7921-fresh-laa-diagnostic}/share/mt7921-full-firmware-validation/artifact-identity.json \
-                --subst-var-by recovery_samples 45 --subst-var-by sys_root /sys \
+                --subst-var-by recovery_deadline_ms 95000 \
+                --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run --subst-var-by var_root /var \
                 --subst-var-by id_command ${pkgs.coreutils}/bin/id \
                 --subst-var-by native_client_mac da:61:40:51:27:e8 \
@@ -1239,7 +1240,7 @@
                 --subst-var-by validation_launcher ${mt7921-full-firmware-validation}/bin/mt7921-full-firmware-validation \
                 --subst-var-by artifact_identity ${mt7921-full-firmware-validation}/share/mt7921-full-firmware-validation/artifact-identity.json \
                 --subst-var-by flavor full-firmware-production \
-                --subst-var-by recovery_samples 45 \
+                --subst-var-by recovery_deadline_ms 95000 \
                 --subst-var-by sys_root /sys \
                 --subst-var-by run_root /run \
                 --subst-var-by var_root /var \
@@ -1312,7 +1313,7 @@
                 --subst-var-by wifi_lab_watchdog "$PWD/work/watchdog" \
                 --subst-var-by validation_launcher "$PWD/work/launcher" \
                 --subst-var-by artifact_identity "$PWD/work/identity" \
-                --subst-var-by recovery_samples 1 \
+                --subst-var-by recovery_deadline_ms 1 \
                 --subst-var-by sys_root "$PWD/work/sys" \
                 --subst-var-by run_root "$PWD/work/run" \
                 --subst-var-by var_root "$PWD/work/var" \
