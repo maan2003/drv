@@ -27,7 +27,7 @@ unlocking, immediately stop and runtime-mask both watchdog units, then verify
 that neither can run:
 
 ```sh
-systemctl stop boot-watchdog.service redwood-lab-watchdog.service
+systemctl stop boot-watchdog.service redwood-lab-watchdog.service || true
 systemctl mask --runtime boot-watchdog.service redwood-lab-watchdog.service
 test "$(systemctl show -P LoadState boot-watchdog.service)" = masked
 test "$(systemctl show -P ActiveState boot-watchdog.service)" = inactive

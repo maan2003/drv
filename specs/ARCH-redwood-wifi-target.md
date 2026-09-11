@@ -34,7 +34,10 @@ deadline after draining ready work. Runtime event polling now uses a zero CE
 deadline so it drains already-completed frames and returns immediately when
 quiet; bring-up and synchronous command paths retain their full deadlines.
 The trace ended before the reset, so this software bug does not yet explain the
-whole-SoC reset and the fix still requires physical validation. The diagnostic ran in a
+whole-SoC reset. The first physical run containing the fix also reset, but its
+second phone-local unit start and initial diagnostic line were not durably
+retained, so it does not establish whether execution reached the corrected
+runtime poll. The diagnostic ran in a
 phone-local transient unit with no external timeout or transport-owned
 lifetime; the submitting SSH session had already exited normally. The np-local
 hardware lock remained held across the reset, and the fresh flashed-`#1` boot
