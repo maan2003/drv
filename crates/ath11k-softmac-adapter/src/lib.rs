@@ -1682,7 +1682,6 @@ mod tests {
         adapter
             .cancel_scan(WlanSoftmacBaseCancelScanRequest {
                 scan_id: scan.scan_id,
-                ..Default::default()
             })
             .unwrap();
         adapter.device.backend_mut().clear();
@@ -1780,10 +1779,7 @@ mod tests {
         assert_eq!(adapter.active_scan, None);
         assert!(matches!(
             adapter.device.backend().operations().last(),
-            Some(Operation::WmiScanStop {
-                scan: ScanId(2),
-                ..
-            })
+            Some(Operation::WmiScanStop { scan, .. }) if u64::from(scan.0) == second
         ));
         assert_eq!(records.lock().unwrap().scans.len(), 1);
     }
@@ -2085,7 +2081,7 @@ mod tests {
         };
         assert_eq!(
             run_client_conformance(Ath11kClientDevice::deterministic(CLIENT), channel).unwrap(),
-            expected_client_conformance(CLIENT, 1)
+            expected_client_conformance(CLIENT, u64::from(HOST_SCAN_ID_START))
         );
     }
 
