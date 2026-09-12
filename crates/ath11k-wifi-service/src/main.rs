@@ -347,13 +347,9 @@ fn trace_ce_runtime(stage: &'static str, value: usize) {
         let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         if sequence < 256 {
             eprintln!("ath11k_ce_runtime sequence={sequence} stage={stage} value={value}");
-            if let Err(error) = evidence(format_args!(
-                "stage=ce sequence={sequence} ce_stage={stage} value={value}"
-            )) {
-                // Evidence transport must never replace the device operation's
-                // result or bypass its WPSS-owning cleanup path.
-                eprintln!("ath11k_ce_evidence=FAILED detail={error}");
-            }
+            // The diagnostic launcher persists stderr with O_DSYNC. Do not
+            // serialize every CE operation behind a remote TCP acknowledgement;
+            // startup identities remain acknowledged separately.
         }
     }
 }
@@ -363,11 +359,6 @@ fn trace_softmac_runtime(stage: &'static str, value: usize) {
         let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         if sequence < 256 {
             eprintln!("ath11k_softmac_runtime sequence={sequence} stage={stage} value={value}");
-            if let Err(error) = evidence(format_args!(
-                "stage=softmac sequence={sequence} softmac_stage={stage} value={value}"
-            )) {
-                eprintln!("ath11k_softmac_evidence=FAILED detail={error}");
-            }
         }
     }
 }

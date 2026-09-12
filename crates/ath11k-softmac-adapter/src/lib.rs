@@ -535,7 +535,8 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         let drive_call = self.drive_calls;
         self.drive_calls = self.drive_calls.saturating_add(1);
         self.trace_runtime("drive_enter", drive_call as usize);
-        let trace = drive_call < 4;
+        let trace = drive_call < 4
+            || (self.runtime_trace.is_some() && drive_call.is_power_of_two());
         if trace {
             eprintln!("ath11k_softmac_drive stage=enter call={drive_call}");
         }
@@ -647,6 +648,21 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         }
         progressed |= control_progressed;
         if let Some(event) = event {
+            if self.runtime_trace.is_some()
+                && let WlanEvent::Scan {
+                    event_type,
+                    reason,
+                    request_id,
+                    scan_id,
+                    vdev_id,
+                    channel_mhz,
+                } = &event
+            {
+                eprintln!(
+                    "ath11k_softmac_scan event_type={event_type} reason={reason} request_id={request_id} scan_id={scan_id} vdev_id={vdev_id} channel_mhz={channel_mhz} active_scan={:?}",
+                    self.active_scan
+                );
+            }
             match event {
                 WlanEvent::ManagementReceived {
                     channel_mhz,
