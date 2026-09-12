@@ -7,7 +7,8 @@ use crate::{
 use alloc::vec::Vec;
 use ath11k_ce::{
     BoundService, CE_COUNT, CeAllocatedPipes, CeCompletionWait, CePipes, CePipesPacketIo, Htc,
-    HtcPacketIo, HtcRouter, HtcTransport, ServiceId, WCN6750_SERVICE_TO_PIPE,
+    HtcMessageId, HtcPacketIo, HtcRouter, HtcServiceTransport, HtcTransport, ServiceId,
+    WCN6750_SERVICE_TO_PIPE,
 };
 use ath11k_dp::{
     HalDpRings, HttControl,
@@ -28,7 +29,7 @@ use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
         Channel as WmiChannel, HtcWmiTransport, Init, KeySeqCounter, MgmtSend, PeerAssoc,
-        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, ScanChannel,
+        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, PdevSuspend, ScanChannel,
         ScanChannelList, SetCurrentCountry, StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams,
         VdevCreate, VdevDelete, VdevDown, VdevInstallKey, VdevSetParam, VdevStart, VdevStop,
         VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
@@ -1349,6 +1350,48 @@ where
                     Err(CoreError::WrongState)
                 } else {
                     Ok(())
+                }
+            }
+            Operation::PdevSuspend => {
+                // WCN6750 is single_pdev_only: native core suspends pdev 0
+                // before disabling interrupts and freeing the pdev RX rings.
+                let router = Self::protocol(self.router.as_ref())?.clone();
+                let mut control = router
+                    .endpoint(ServiceId::RESERVED_CONTROL)
+                    .map_err(|_| CoreError::Protocol)?;
+                // Match reinit_completion: old endpoint-zero notifications
+                // cannot acknowledge this new suspend request.
+                while control
+                    .receive_payload(0)
+                    .map_err(|_| CoreError::Protocol)?
+                    .is_some()
+                {}
+                self.wmi_send(&PdevSuspend {
+                    pdev_id: 0,
+                    suspend_option: 1, // WMI_PDEV_SUSPEND_AND_DISABLE_INTR
+                })?;
+                let deadline = (self.deadline)();
+                loop {
+                    while let Some(message) = control
+                        .receive_payload(0)
+                        .map_err(|_| CoreError::Protocol)?
+                    {
+                        let id = message.get(..4).ok_or(CoreError::Protocol)?;
+                        let id = u32::from_le_bytes(id.try_into().unwrap()) as u16;
+                        if id == HtcMessageId::SendSuspendComplete as u16 {
+                            return Ok(());
+                        }
+                        if id == HtcMessageId::NackSuspend as u16 {
+                            return Err(CoreError::Protocol);
+                        }
+                    }
+                    if router
+                        .service_receive_bounded(deadline, 1)
+                        .map_err(|_| CoreError::DeviceFault)?
+                        == 0
+                    {
+                        return Err(CoreError::Protocol);
+                    }
                 }
             }
             Operation::HifIrqDisable => {

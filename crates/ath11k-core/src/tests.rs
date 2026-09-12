@@ -610,6 +610,22 @@ fn core_start_error_unwinds_without_panicking() {
 }
 
 #[test]
+fn failed_suspend_does_not_free_firmware_visible_rings() {
+    let mut device = ready_device();
+    device.backend_mut().log.clear();
+    device.backend_mut().fail = Some(Operation::PdevSuspend);
+    assert_eq!(
+        device.stop(),
+        Err(CoreError::DeviceFaultAt(Operation::PdevSuspend))
+    );
+    assert_eq!(
+        device.backend().log,
+        vec![Operation::MacUnregister, Operation::PdevSuspend]
+    );
+    assert_eq!(device.state(), DeviceState::Ready);
+}
+
+#[test]
 fn crash_and_teardown_follow_distinct_paths() {
     let mut device = ready_device();
     device.backend_mut().log.clear();

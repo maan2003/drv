@@ -387,7 +387,8 @@ impl<B: Subsystems> Lifecycle for Device<B> {
             return Err(CoreError::WrongState);
         }
         let _ = self.op(Operation::MacUnregister);
-        let _ = self.op(Operation::PdevSuspend);
+        // Do not dismantle firmware-visible RX rings without a suspend ACK.
+        self.op(Operation::PdevSuspend)?;
         let _ = self.op(Operation::HifIrqDisable);
         let _ = self.op(Operation::DpPdevFree);
         self.core_stop(self.state == DeviceState::Recovering);

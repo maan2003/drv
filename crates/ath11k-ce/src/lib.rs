@@ -2121,6 +2121,21 @@ mod tests {
     }
 
     #[test]
+    fn suspend_ack_is_routed_to_control_not_wmi() {
+        let ack = (HtcMessageId::SendSuspendComplete as u32).to_le_bytes();
+        let io = PacketIo {
+            receive: VecDeque::from([htc_frame(0, &ack)]),
+            ..PacketIo::default()
+        };
+        let router = HtcRouter::new(HtcTransport::new(connected_wmi_htc(), io));
+        let mut control = router.endpoint(ServiceId::RESERVED_CONTROL).unwrap();
+        let mut wmi = router.endpoint(ServiceId::WMI_CONTROL).unwrap();
+        assert_eq!(router.service_receive_bounded(10, 1), Ok(1));
+        assert_eq!(control.receive_payload(0), Ok(Some(ack.to_vec())));
+        assert_eq!(wmi.receive_payload(0), Ok(None));
+    }
+
+    #[test]
     fn service_transport_frames_and_demultiplexes_wmi() {
         let mut htc = connected_wmi_htc();
         htc.connect_service(
