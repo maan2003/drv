@@ -254,8 +254,11 @@ impl HttTargetMessage {
             0x03 | 0x1e => {
                 let mac_low = word(&self.0, 1)?;
                 let info1 = word(&self.0, 2)?;
-                let wire_info2 = word(&self.0, 3)?;
-                let info2 = if message_type == 0x1e { wire_info2 } else { 0 };
+                let info2 = if message_type == 0x1e {
+                    word(&self.0, 3)?
+                } else {
+                    0
+                };
                 let low = mac_low.to_le_bytes();
                 let high = (info1 as u16).to_le_bytes();
                 Ok(HttEvent::PeerMap(PeerMap {
@@ -263,13 +266,17 @@ impl HttTargetMessage {
                     peer_id: PeerId((first >> 16) as u16),
                     address: [low[0], low[1], low[2], low[3], high[0], high[1]],
                     ast_hash: info2 as u16,
-                    hardware_peer_id: (info1 >> 16) as u16,
+                    hardware_peer_id: if message_type == 0x1e {
+                        (info1 >> 16) as u16
+                    } else {
+                        0
+                    },
                     v2: message_type == 0x1e,
                 }))
             }
             0x04 | 0x1f => {
-                word(&self.0, 1)?;
-                word(&self.0, 2)?;
+                // Native dispatch consumes only the peer ID in the first
+                // word, including the short legacy unmap event.
                 Ok(HttEvent::PeerUnmap {
                     peer_id: PeerId((first >> 16) as u16),
                     v2: message_type == 0x1f,
@@ -465,7 +472,7 @@ mod tests {
         );
 
         let words = [0x1234_5603, 0x4433_2211, 0x7788_6655, 0x0000_abcd];
-        let map = HttTargetMessage(words_to_bytes(&words));
+        let map = HttTargetMessage(words_to_bytes(&words[..3]));
         assert_eq!(
             map.decode(),
             Ok(HttEvent::PeerMap(PeerMap {
@@ -473,7 +480,7 @@ mod tests {
                 peer_id: PeerId(0x1234),
                 address: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
                 ast_hash: 0,
-                hardware_peer_id: 0x7788,
+                hardware_peer_id: 0,
                 v2: false,
             }))
         );
@@ -492,6 +499,19 @@ mod tests {
                 v2: true,
             }))
         );
+    }
+
+    #[test]
+    fn peer_unmap_needs_only_the_native_peer_id_word() {
+        for kind in [0x04, 0x1f] {
+            assert_eq!(
+                HttTargetMessage(words_to_bytes(&[0x1234_0000 | kind])).decode(),
+                Ok(HttEvent::PeerUnmap {
+                    peer_id: PeerId(0x1234),
+                    v2: kind == 0x1f,
+                })
+            );
+        }
     }
 
     #[test]

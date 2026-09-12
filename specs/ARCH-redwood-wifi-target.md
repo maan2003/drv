@@ -24,21 +24,22 @@ firmware regulatory event confirms the country, band rule, active-initiation
 flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
-Runtime polling now drains already-completed CE work with a zero deadline,
-rather than reusing the full synchronous control timeout. The diagnostic
-advertises scan offload and uses firmware-prefixed scan IDs; physical runs
-complete a channel-149 scan and dispatch Connect. The remaining failure
-reproduces after the following WMI send and two CE2 receive/refills.
+Runtime polling drains already-completed CE work with a zero deadline.
+The diagnostic now reaches SAE success and an AP-accepted association; a
+driver-side association completion has also been observed. The four-way
+handshake, usable data path, and Internet connectivity remain unproved.
+The earlier host SError during ring cleanup was isolated to a UMAC teardown
+write and fixed. The current blocker is a WPSS firmware receive-ring
+backpressure assertion. Kernel remoteproc can automatically recover WPSS
+without changing the Linux boot ID, so a retained phone boot is not proof of
+firmware continuity. Live diagnostics must account for remoteproc crashes
+and recovery, not merely process and phone-reset state.
 
-A kexec-only instrumented kernel with write-combined ramoops captured an
-asynchronous SError panic (`0xbfed17ff`) while running `ath11k-wifi-ser`.
-The exception PC does not identify the originating access; the root cause
-and association remain unproved. Earlier missing panic records were not
-evidence against a panic: the DT's cached ramoops mapping did not preserve
-the current crash. Use the [reset-debugging procedure](../scripts/redwood/debugging.md)
-for persistent capture, evidence attribution and incremental instrumentation.
-Fine-grained runtime logs are phone-local rather than per-marker TCP
-acknowledgements; the startup identity handshake remains np-acknowledged.
+Use the [reset-debugging procedure](../scripts/redwood/debugging.md) for
+persistent capture, evidence attribution, and build/run details. Reuse a
+verified kernel/DT for userspace iterations through synchronous WPSS
+stop/start and VFIO release/reacquisition. Kexec is needed for a kernel/DT
+change or recovery, not for every driver restart.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,

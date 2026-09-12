@@ -4,8 +4,8 @@
 //! before lockdown; VFIO/QMI/firmware/MLME activation starts only afterwards.
 
 use ath11k_core::{
-    HardwareMemoryProvider, NoWmiTrace, WCN6750, WCN6750_INTERRUPT_ROUTES, Wcn6750FirmwareAssets,
-    Wcn6750Interrupts, Wcn6750QmiSession, Wcn6750Subsystems,
+    HardwareMemoryProvider, WCN6750, WCN6750_INTERRUPT_ROUTES, Wcn6750FirmwareAssets,
+    Wcn6750Interrupts, Wcn6750QmiSession, Wcn6750Subsystems, WmiTraceSink,
 };
 use ath11k_qmi_qrtr::QrtrTransport;
 use ath11k_softmac_adapter::Ath11kClientDevice;
@@ -204,7 +204,7 @@ fn activate_and_run(
             waiter,
             dp_interrupts,
             control_deadline as fn() -> u64,
-            NoWmiTrace,
+            RuntimeWmiTrace,
         );
         let device = WCN6750.device(subsystems);
         let regulatory = ath11k_core::redwood_india_domain();
@@ -391,6 +391,31 @@ fn evidence(message: fmt::Arguments<'_>) -> Result<(), String> {
         return Err("invalid evidence acknowledgement".into());
     }
     Ok(())
+}
+
+struct RuntimeWmiTrace;
+
+impl WmiTraceSink for RuntimeWmiTrace {
+    fn record(
+        &mut self,
+        command: bool,
+        id: u32,
+        bytes: &[u8],
+    ) -> Result<(), ath11k_core::CoreError> {
+        if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
+            // Never dump command bodies: key-install commands contain secrets.
+            eprintln!(
+                "ath11k_wmi_runtime ns={} command={command} id={id:#x} len={}",
+                monotonic_now(),
+                bytes.len()
+            );
+            if !command && id == 0x6006 {
+                // WMI_PEER_ASSOC_CONF carries only vdev and peer identity.
+                eprintln!("ath11k_wmi_peer_assoc_confirmation bytes={bytes:?}");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn trace_ce_runtime(stage: &'static str, value: usize) {

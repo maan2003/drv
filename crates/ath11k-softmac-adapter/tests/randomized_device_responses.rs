@@ -250,6 +250,7 @@ impl Subsystems for ResponseModelSubsystems {
             delivered += 1;
         }
         Ok(HostServiceResult {
+            rx_descriptors: 0,
             tx_delivered: 0,
             tx_malformed: 0,
             rx_delivered: delivered,

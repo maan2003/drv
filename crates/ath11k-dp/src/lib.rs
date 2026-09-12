@@ -40,6 +40,7 @@ pub struct DataRings {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DpError {
+    Wmi(ath11k_wmi::WmiError),
     MalformedHtt,
     MalformedDescriptor,
     UnsupportedVersion,

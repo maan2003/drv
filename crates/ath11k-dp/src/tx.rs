@@ -188,6 +188,7 @@ pub struct HostRxDropCounters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostServiceResult {
+    pub rx_descriptors: usize,
     pub tx_delivered: usize,
     pub tx_malformed: usize,
     pub rx_delivered: usize,
@@ -632,6 +633,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
             }
         }
         Ok(HostServiceResult {
+            rx_descriptors: work_budget - remaining_work - tx_work,
             tx_delivered,
             tx_malformed,
             rx_delivered,

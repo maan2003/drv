@@ -187,3 +187,45 @@ and VFIO released. Evidence is in `candidate-6aa20f7d-quiet/`; service SHA-256
 `4f7eab63955a3b7cecf51e789086fb67bf8a7f2373a426ab5e2dadc7d0d16685`.
 This separates the remaining association failure from the fixed cleanup
 SError without the full-access tracing overhead.
+
+## Association progress exposes a separate firmware crash
+
+On retained boot `bd83e235-5700-43e5-b2ff-94d263c4a281`, userspace/WPSS
+restarts (without further kexec) isolated and fixed the non-HT channel-width
+mismatch, legacy 12-byte HTT peer-map decoding, missing live CE TX reaping,
+and WMI credit/completion handling. The AP accepted SAE and association
+(AID 4); driver-side association configuration completed in one run, but
+no EAPOL receive/usable connection or Internet acceptance was established.
+
+**A stable Linux boot concealed WPSS crashes.** The kernel log records
+`cmnos_thread.c:4645:Asserted in whal_recv_recovery.c:whalCheckRingBkPressure:935`
+and automatic remoteproc recovery. In the final instrumented run, the
+firmware assertion at uptime 3432.956218 preceded the WMI peer-association
+command at 3433.099562362. Subsequent missing completions therefore do not
+prove that command caused the crash. Capture the kernel log for every
+userspace cycle and correlate firmware lifetimes as well as Linux boot IDs.
+Do not keep retrying after a firmware crash as though the previous
+QMI/CE/DP generation were still valid. Investigate RX ring provisioning,
+consumption/backpressure, and remoteproc recovery containment before
+renewing live acceptance attempts.
+
+Final evidence on np is under the existing work directory:
+`evidence/reset-investigation/candidate-bd83e235-wmi-events/`.
+The final service SHA-256 was
+`f12f0e5df247441317d40c9eacc4640e3047e407da15b90688c7da6eee62977b`.
+Cleanup verified WPSS offline and VFIO unbound before releasing the
+hardware lock. This is a separate blocker from the fixed host cleanup SError.
+
+## Use direct incremental Cargo for userspace iterations
+
+Do not rebuild a Nix Rust package for every edit. On np, the retained
+`driver-takeover-20260912/cargo-cross/` workspace has a writable pinned
+reference tree, offline vendored dependencies, and `build-service`.
+That script invokes Cargo directly with the existing ARM64 musl toolchain,
+a persistent `target/`, `CARGO_INCREMENTAL=1`, and two jobs; it does not
+invoke a Nix build. Sync only changed project files into `crates/`; apply
+upstream port-patch changes to the writable `reference/` as well.
+The first cache population took 1m 50s, a no-change repeat took 0.23s,
+and subsequent source-edit builds typically took 2–6s. Keep exact build
+and test logs with the hardware evidence. Kernel work still uses plain
+incremental `make` on np, never Nix.

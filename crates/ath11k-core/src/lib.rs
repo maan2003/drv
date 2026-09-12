@@ -58,6 +58,18 @@ pub enum CoreError {
         ce2_destination_progress: Option<(u32, u32)>,
         ce2_status_progress: Option<(u32, u32)>,
     },
+    WmiSend(ath11k_wmi::WmiError),
+    WmiWait(ath11k_wmi::WmiError),
+    DpPeerSetup(ath11k_dp::DpError),
+    HttPeerMap {
+        cause: ath11k_dp::DpError,
+        message: Option<(usize, u8)>,
+    },
+    HttPeerMapTimeout {
+        last_event: Option<ath11k_dp::htt::HttEvent>,
+        ce1_destination_progress: Option<(u32, u32)>,
+        ce1_status_progress: Option<(u32, u32)>,
+    },
     HttVersionTimeout {
         ce4_source_progress: Option<(u32, u32)>,
         ce1_destination_progress: Option<(u32, u32)>,

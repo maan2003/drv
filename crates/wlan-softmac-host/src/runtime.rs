@@ -345,11 +345,15 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         &mut self,
         config: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
-        self.device
+        eprintln!("client_association stage=configure_enter config={config:?}");
+        let result = self
+            .device
             .lock()
             .unwrap()
             .device
-            .notify_association_complete(config)
+            .notify_association_complete(config);
+        eprintln!("client_association stage=configure_complete result={result:?}");
+        result
     }
     async fn clear_association(
         &mut self,
@@ -779,6 +783,15 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                     }
                     if eapol_tx {
                         println!("client_eapol_stage=sme_tx_request");
+                    }
+                    match &request {
+                        wlan_sme::MlmeRequest::SaeHandshakeResp(response) => {
+                            eprintln!("client_sae_handshake response={response:?}");
+                        }
+                        wlan_sme::MlmeRequest::Deauthenticate(request) => {
+                            eprintln!("client_deauthenticate request={request:?}");
+                        }
+                        _ => {}
                     }
                     let name = request.name();
                     // Diagnostic: surface every MLME request the SME issues so the

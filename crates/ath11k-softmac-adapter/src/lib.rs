@@ -262,9 +262,13 @@ fn status(error: ath11k_core::CoreError) -> zx::Status {
         | ath11k_core::CoreError::HtcControlReceive(_)
         | ath11k_core::CoreError::HtcControlTimeout { .. }
         | ath11k_core::CoreError::HttVersionTimeout { .. } => zx::Status::IO,
-        ath11k_core::CoreError::Protocol | ath11k_core::CoreError::ProtocolAt(_) => {
-            zx::Status::IO_INVALID
-        }
+        ath11k_core::CoreError::Protocol
+        | ath11k_core::CoreError::ProtocolAt(_)
+        | ath11k_core::CoreError::WmiSend(_)
+        | ath11k_core::CoreError::WmiWait(_)
+        | ath11k_core::CoreError::DpPeerSetup(_)
+        | ath11k_core::CoreError::HttPeerMap { .. }
+        | ath11k_core::CoreError::HttPeerMapTimeout { .. } => zx::Status::IO_INVALID,
         ath11k_core::CoreError::DeviceFault | ath11k_core::CoreError::DeviceFaultAt(_) => {
             zx::Status::IO
         }
@@ -538,8 +542,8 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
         let drive_call = self.drive_calls;
         self.drive_calls = self.drive_calls.saturating_add(1);
         self.trace_runtime("drive_enter", drive_call as usize);
-        let trace = drive_call < 4
-            || (self.runtime_trace.is_some() && drive_call.is_power_of_two());
+        let trace =
+            drive_call < 4 || (self.runtime_trace.is_some() && drive_call.is_power_of_two());
         if trace {
             eprintln!("ath11k_softmac_drive stage=enter call={drive_call}");
         }
@@ -579,10 +583,14 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
             )
             .map_err(status)?;
         self.trace_runtime("dp_complete", drive_call as usize);
-        if trace {
+        if trace || serviced.rx_descriptors != 0 || serviced.rx_dropped != Default::default() {
             eprintln!(
-                "ath11k_softmac_drive stage=dp_complete call={drive_call} tx_delivered={} tx_malformed={} rx_delivered={}",
-                serviced.tx_delivered, serviced.tx_malformed, serviced.rx_delivered
+                "ath11k_softmac_drive stage=dp_complete call={drive_call} tx_delivered={} tx_malformed={} rx_delivered={} rx_descriptors={} rx_dropped={:?}",
+                serviced.tx_delivered,
+                serviced.tx_malformed,
+                serviced.rx_delivered,
+                serviced.rx_descriptors,
+                serviced.rx_dropped
             );
         }
         let mut progressed = rx_slot_consumed
@@ -867,6 +875,9 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         }
         let vdev = self.ready_vdev()?;
         if let Err(error) = self.device.create_peer(vdev, peer) {
+            if self.runtime_trace.is_some() {
+                eprintln!("ath11k_softmac_peer_create error={error:?}");
+            }
             // A failed completion can leave peer creation ambiguous. Only a
             // terminal firmware stop is representable at the current seam.
             let _ = self.stop();
@@ -989,7 +1000,11 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             .capability_info
             .ok_or(zx::Status::INVALID_ARGS)?;
         let evidence = self.pending_association_security.take();
-        let security = if capability_info & 0x0010 != 0 {
+        // MLME's negotiated CapabilityInfo clears Privacy. The transmitted
+        // RSNE is authoritative security provenance, not that summary bit.
+        let security = if evidence.is_some_and(|security| security.need_ptk_4_way)
+            || capability_info & 0x0010 != 0
+        {
             evidence
                 .filter(|security| security.peer == peer && security.need_ptk_4_way)
                 .ok_or(zx::Status::BAD_STATE)?
@@ -1038,9 +1053,8 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         let wmm = configuration
             .wmm_params
             .map(|wmm| {
-                if wmm.apsd {
-                    return Err(zx::Status::NOT_SUPPORTED);
-                }
+                // This is the AP's U-APSD capability, not a requirement to
+                // enable it for our station. Our WMM setup keeps U-APSD off.
                 if !qos {
                     return Err(zx::Status::INVALID_ARGS);
                 }
@@ -1092,6 +1106,9 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             pmf: security.pmf,
         };
         if let Err(error) = self.device.associate_peer(association) {
+            if self.runtime_trace.is_some() {
+                eprintln!("ath11k_softmac_associate error={error:?}");
+            }
             self.peer = None;
             if self.device.delete_peer(vdev, peer).is_err() {
                 let _ = self.stop();
@@ -1358,7 +1375,11 @@ mod tests {
     #[test]
     fn advertises_implemented_scan_offload_and_cancel() {
         let mut device = Ath11kClientDevice::deterministic(CLIENT);
-        let scan = device.query_discovery_support().unwrap().scan_offload.unwrap();
+        let scan = device
+            .query_discovery_support()
+            .unwrap()
+            .scan_offload
+            .unwrap();
         assert_eq!(scan.supported, Some(true));
         assert_eq!(scan.scan_cancel_supported, Some(true));
     }
@@ -1432,6 +1453,7 @@ mod tests {
                 false
             };
             Ok(ath11k_dp::tx::HostServiceResult {
+                rx_descriptors: 0,
                 tx_delivered: 0,
                 tx_malformed: 0,
                 rx_delivered: usize::from(delivered),
@@ -2004,6 +2026,32 @@ mod tests {
     }
 
     #[test]
+    fn ap_uapsd_capability_does_not_require_station_uapsd() {
+        for apsd in [false, true] {
+            let mut adapter = ready_adapter();
+            adapter.join_bss(join_request()).unwrap();
+            let ac = || fidl_fuchsia_wlan_driver::WlanWmmAccessCategoryParameters {
+                ecw_min: 4,
+                ecw_max: 10,
+                aifsn: 3,
+                txop_limit: 0,
+                acm: false,
+            };
+            let mut association = open_association();
+            association.qos = Some(true);
+            association.wmm_params = Some(fidl_fuchsia_wlan_driver::WlanWmmParameters {
+                apsd,
+                ac_be_params: ac(),
+                ac_bk_params: ac(),
+                ac_vi_params: ac(),
+                ac_vo_params: ac(),
+            });
+            adapter.notify_association_complete(association).unwrap();
+            assert!(adapter.associated);
+        }
+    }
+
+    #[test]
     fn secure_association_requires_transmitted_rsn_evidence() {
         let mut adapter = ready_adapter();
         adapter.join_bss(join_request()).unwrap();
@@ -2038,7 +2086,7 @@ mod tests {
             .unwrap();
 
         let mut association = open_association();
-        association.capability_info = Some(0x0431);
+        association.capability_info = Some(0x0421);
         adapter.notify_association_complete(association).unwrap();
         assert!(adapter.associated);
         assert!(!adapter.link_up);

@@ -433,6 +433,40 @@ impl<T: WmiTransport, S: WmiTraceSink> WmiTransport for TracingWmi<T, S> {
     }
 }
 
+/// Poll the shared CE router for credit returns while a synchronous WMI
+/// transaction owns the caller. Retry only sends known not to be visible.
+struct CreditAwareWmi<'a, T, I> {
+    transport: &'a mut T,
+    router: &'a HtcRouter<I>,
+    deadline: u64,
+}
+
+impl<T: WmiTransport, I: HtcPacketIo> WmiTransport for CreditAwareWmi<'_, T, I> {
+    const SEND_ERROR_IS_NON_VISIBLE: bool = T::SEND_ERROR_IS_NON_VISIBLE;
+
+    fn send(&mut self, command: Command) -> Result<(), WmiError> {
+        loop {
+            match self.transport.send(command.clone()) {
+                Err(WmiError::NoCredits) => {
+                    if self
+                        .router
+                        .service_receive_bounded(self.deadline, 1)
+                        .map_err(|_| WmiError::Transport)?
+                        == 0
+                    {
+                        return Err(WmiError::NoCredits);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn receive(&mut self, deadline_ns: u64) -> Result<Option<Event>, WmiError> {
+        self.transport.receive(deadline_ns)
+    }
+}
+
 type PacketIo<B, W> = CePipesPacketIo<B, W>;
 type Router<B, W> = HtcRouter<PacketIo<B, W>>;
 type Endpoint<B, W> = BoundService<PacketIo<B, W>>;
@@ -602,35 +636,78 @@ where
         self.pump_bounded(usize::MAX).map(|_| ())
     }
 
+    fn wait_wmi<T>(
+        &mut self,
+        mut poll: impl FnMut(&mut RealWmi<B, W, S>) -> Result<T, WmiError>,
+    ) -> Result<T, CoreError> {
+        let deadline = (self.deadline)();
+        loop {
+            match poll(Self::protocol(self.wmi.as_mut())?) {
+                Ok(response) => return Ok(response),
+                Err(WmiError::Timeout) => {
+                    if Self::protocol(self.router.as_ref())?
+                        .service_receive_bounded(deadline, 1)
+                        .map_err(|_| CoreError::DeviceFault)?
+                        == 0
+                    {
+                        return Err(CoreError::WmiWait(WmiError::Timeout));
+                    }
+                }
+                Err(error) => return Err(CoreError::WmiWait(error)),
+            }
+        }
+    }
+
     fn wait_for_htt_peer_map(
         &mut self,
         vdev: crate::VdevId,
         address: [u8; 6],
     ) -> Result<(), CoreError> {
+        let mut last_event = None;
         loop {
-            while let Some(message) = Self::protocol(self.htt.as_mut())?
-                .receive(0)
-                .map_err(Self::dp_error)?
+            while let Some(message) =
+                Self::protocol(self.htt.as_mut())?
+                    .receive(0)
+                    .map_err(|cause| CoreError::HttPeerMap {
+                        cause,
+                        message: None,
+                    })?
             {
-                match message.decode().map_err(Self::dp_error)? {
+                let event = message.decode().map_err(|cause| CoreError::HttPeerMap {
+                    cause,
+                    message: message.0.first().map(|kind| (message.0.len(), *kind)),
+                })?;
+                last_event = Some(event);
+                match event {
                     HttEvent::PeerMap(map) => {
                         let matched =
                             u32::from(map.vdev_id) == u32::from(vdev.0) && map.address == address;
                         Self::protocol(self.dp.as_mut())?
                             .register_peer_map(map)
-                            .map_err(Self::dp_error)?;
+                            .map_err(|cause| CoreError::HttPeerMap {
+                                cause,
+                                message: None,
+                            })?;
                         if matched {
                             return Ok(());
                         }
                     }
                     HttEvent::PeerUnmap { peer_id, .. } => Self::protocol(self.dp.as_mut())?
                         .unregister_peer_map(peer_id)
-                        .map_err(Self::dp_error)?,
+                        .map_err(|cause| CoreError::HttPeerMap {
+                            cause,
+                            message: None,
+                        })?,
                     _ => {}
                 }
             }
             if self.pump_bounded(1)? == 0 {
-                return Err(CoreError::Protocol);
+                let router = Self::protocol(self.router.as_ref())?;
+                return Err(CoreError::HttPeerMapTimeout {
+                    last_event,
+                    ce1_destination_progress: router.destination_progress(1).ok(),
+                    ce1_status_progress: router.status_progress(1).ok(),
+                });
             }
         }
     }
@@ -674,18 +751,14 @@ where
         &mut self,
         request: &R,
     ) -> Result<(), CoreError> {
-        match Self::protocol(self.wmi.as_mut())?.send(request) {
-            Ok(()) => Ok(()),
-            Err(WmiError::NoCredits) => {
-                if self.pump_bounded(1)? == 0 {
-                    return Err(CoreError::Protocol);
-                }
-                Self::protocol(self.wmi.as_mut())?
-                    .send(request)
-                    .map_err(|_| CoreError::Protocol)
-            }
-            Err(_) => Err(CoreError::Protocol),
-        }
+        let mut transport = CreditAwareWmi {
+            transport: Self::protocol(self.wmi.as_mut())?,
+            router: Self::protocol(self.router.as_ref())?,
+            deadline: (self.deadline)(),
+        };
+        transport
+            .send(request.encode_command().map_err(CoreError::WmiSend)?)
+            .map_err(CoreError::WmiSend)
     }
 
     fn qmi_config() -> WlanConfigRequest {
@@ -823,11 +896,9 @@ where
             .discard_vdev_start(u32::from(vdev.0));
         self.wmi_send(&wcn6750_client_vdev_start(vdev, restart, channel, nss))
             .map_err(crate::VdevStartFailure::NotSent)?;
-        self.pump().map_err(crate::VdevStartFailure::Ambiguous)?;
-        let response = Self::protocol(self.wmi.as_mut())
-            .map_err(crate::VdevStartFailure::Ambiguous)?
-            .wait_for_vdev_start((self.deadline)(), u32::from(vdev.0))
-            .map_err(|_| crate::VdevStartFailure::Ambiguous(CoreError::Protocol))?;
+        let response = self
+            .wait_wmi(|wmi| wmi.wait_for_vdev_start(0, u32::from(vdev.0)))
+            .map_err(crate::VdevStartFailure::Ambiguous)?;
         if response.status == 0 {
             Ok(())
         } else {
@@ -1151,11 +1222,7 @@ where
                 })
             }
             Operation::WaitRegulatoryUpdate { pdev } if pdev.0 == 0 => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                let event = Self::protocol(self.wmi.as_mut())?
-                    .wait_for_regulatory_update(deadline)
-                    .map_err(|_| CoreError::Protocol)?;
+                let event = self.wait_wmi(|wmi| wmi.wait_for_regulatory_update(0))?;
                 self.pending_regulatory_event = Some(event);
                 Ok(())
             }
@@ -1246,45 +1313,28 @@ where
                 param_id: 1,
                 param_value: mode,
             }),
+            // Native ath11k completes peer creation from the HTT peer-map
+            // event, not WMI_PEER_CREATE_CONF. WCN6750 need not send that WMI
+            // event; waiting for it first hides an already delivered peer map.
             Operation::WaitPeerCreated { vdev, address } => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                let response = Self::protocol(self.wmi.as_mut())?
-                    .wait_for_peer_created(deadline, u32::from(vdev.0), address)
-                    .map_err(|_| CoreError::Protocol)?;
-                if response.status == 0 {
-                    self.wait_for_htt_peer_map(vdev, address)
-                } else {
-                    Err(CoreError::Protocol)
-                }
+                self.wait_for_htt_peer_map(vdev, address)
             }
             Operation::WaitPeerDeleted { vdev, address } => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                Self::protocol(self.wmi.as_mut())?
-                    .wait_for_peer_deleted(deadline, u32::from(vdev.0), address)
-                    .map_err(|_| CoreError::Protocol)?;
+                self.wait_wmi(|wmi| wmi.wait_for_peer_deleted(0, u32::from(vdev.0), address))?;
                 self.wait_for_htt_peer_unmap(vdev, address)
             }
-            Operation::WaitPeerAssociated { vdev, address } => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                Self::protocol(self.wmi.as_mut())?
-                    .wait_for_peer_associated(deadline, u32::from(vdev.0), address)
-                    .map(|_| ())
-                    .map_err(|_| CoreError::Protocol)
-            }
+            Operation::WaitPeerAssociated { vdev, address } => self
+                .wait_wmi(|wmi| wmi.wait_for_peer_associated(0, u32::from(vdev.0), address))
+                .map(|_| ()),
             Operation::WmiInstallKey(key) => {
                 Self::protocol(self.wmi.as_mut())?
                     .discard_key_installed(u32::from(key.vdev.0), u32::from(key.index));
                 self.wmi_send(&wcn6750_install_key(key)?)
             }
             Operation::WaitKeyInstalled { vdev, key_index } => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                let response = Self::protocol(self.wmi.as_mut())?
-                    .wait_for_key_installed(deadline, u32::from(vdev.0), u32::from(key_index))
-                    .map_err(|_| CoreError::Protocol)?;
+                let response = self.wait_wmi(|wmi| {
+                    wmi.wait_for_key_installed(0, u32::from(vdev.0), u32::from(key_index))
+                })?;
                 if response.status == 0 {
                     Ok(())
                 } else {
@@ -1301,11 +1351,8 @@ where
                 authorized,
             }),
             Operation::WaitVdevSetup { vdev } => {
-                self.pump()?;
-                let deadline = (self.deadline)();
-                let response = Self::protocol(self.wmi.as_mut())?
-                    .wait_for_vdev_start(deadline, u32::from(vdev.0))
-                    .map_err(|_| CoreError::Protocol)?;
+                let response =
+                    self.wait_wmi(|wmi| wmi.wait_for_vdev_start(0, u32::from(vdev.0)))?;
                 if response.status == 0 {
                     Ok(())
                 } else {
@@ -1460,10 +1507,14 @@ where
                     // WCN6750 mac_id 0 uses REO destination ring 1.
                     param_value: 1 | (1 << 1),
                 })?;
-                let (dp, wmi) = (self.dp.as_mut(), self.wmi.as_mut());
-                Self::protocol(dp)?
-                    .setup_peer(Self::protocol(wmi)?, u32::from(vdev.0), address)
-                    .map_err(Self::dp_error)
+                let mut wmi = CreditAwareWmi {
+                    transport: Self::protocol(self.wmi.as_mut())?,
+                    router: Self::protocol(self.router.as_ref())?,
+                    deadline: (self.deadline)(),
+                };
+                Self::protocol(self.dp.as_mut())?
+                    .setup_peer(&mut wmi, u32::from(vdev.0), address)
+                    .map_err(CoreError::DpPeerSetup)
             }
             Operation::DpPeerCleanup { vdev, address } => Self::protocol(self.dp.as_mut())?
                 .cleanup_peer(u32::from(vdev.0), address)
@@ -1503,6 +1554,109 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_wait_handles_unrelated_frames_and_never_retries_transport_errors() {
+        use alloc::{collections::VecDeque, rc::Rc, vec};
+        use ath11k_wmi::cmd::EncodeCommand;
+        use core::cell::RefCell;
+
+        struct Io {
+            frames: VecDeque<Vec<u8>>,
+            deadlines: Rc<RefCell<Vec<u64>>>,
+        }
+        impl HtcPacketIo for Io {
+            fn send_htc(&mut self, _: u8, _: u16, _: Vec<u8>) -> Result<(), ath11k_ce::CeError> {
+                Ok(())
+            }
+            fn receive_htc(
+                &mut self,
+                deadline: u64,
+            ) -> Result<Option<Vec<u8>>, ath11k_ce::CeError> {
+                self.deadlines.borrow_mut().push(deadline);
+                Ok(self.frames.pop_front())
+            }
+        }
+        struct Transport {
+            results: VecDeque<Result<(), WmiError>>,
+            sends: usize,
+        }
+        impl WmiTransport for Transport {
+            const SEND_ERROR_IS_NON_VISIBLE: bool = true;
+            fn send(&mut self, _: Command) -> Result<(), WmiError> {
+                self.sends += 1;
+                self.results.pop_front().unwrap()
+            }
+            fn receive(&mut self, _: u64) -> Result<Option<Event>, WmiError> {
+                Ok(None)
+            }
+        }
+
+        for (results, frames, expected, sends, receives) in [
+            (
+                vec![Err(WmiError::NoCredits), Err(WmiError::NoCredits), Ok(())],
+                2,
+                Ok(()),
+                3,
+                2,
+            ),
+            (
+                vec![Err(WmiError::NoCredits)],
+                0,
+                Err(WmiError::NoCredits),
+                1,
+                1,
+            ),
+            (
+                vec![Err(WmiError::Transport)],
+                2,
+                Err(WmiError::Transport),
+                1,
+                0,
+            ),
+        ] {
+            let mut htc = Htc::new(1, true, false);
+            htc.connect_service(ServiceId::RESERVED_CONTROL, &[])
+                .unwrap();
+            htc.wait_target(&[1, 0, 4, 0, 0, 1, 9, 0]).unwrap();
+            htc.connect_service(
+                ServiceId::WMI_CONTROL,
+                &[3, 0, 0, 1, 0, 1, 0, 8, 0, 0, 0, 0],
+            )
+            .unwrap();
+            let deadlines = Rc::new(RefCell::new(Vec::new()));
+            let router = HtcRouter::new(HtcTransport::new(
+                htc,
+                Io {
+                    frames: (0..frames)
+                        .map(|_| vec![1, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                        .collect(),
+                    deadlines: deadlines.clone(),
+                },
+            ));
+            let mut transport = Transport {
+                results: results.into(),
+                sends: 0,
+            };
+            let result = CreditAwareWmi {
+                transport: &mut transport,
+                router: &router,
+                deadline: 99,
+            }
+            .send(
+                PeerCreate {
+                    vdev_id: 0,
+                    peer_addr: [2; 6],
+                    peer_type: 0,
+                }
+                .encode_command()
+                .unwrap(),
+            );
+            assert_eq!(result, expected);
+            assert_eq!(transport.sends, sends);
+            assert_eq!(*deadlines.borrow(), vec![99; receives]);
+        }
+    }
 
     #[test]
     fn key_conversion_preserves_group_rsc_and_tkip_mic_lengths() {

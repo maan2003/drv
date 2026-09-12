@@ -22,8 +22,8 @@ impl<T: Transport> ReorderSetupControl for T {
     const SEND_ERROR_IS_NON_VISIBLE: bool = T::SEND_ERROR_IS_NON_VISIBLE;
 
     fn send_reorder_setup(&mut self, request: &PeerReorderQueueSetup) -> Result<(), DpError> {
-        self.send(request.encode_command().map_err(|_| DpError::DeviceFault)?)
-            .map_err(|_| DpError::DeviceFault)
+        self.send(request.encode_command().map_err(DpError::Wmi)?)
+            .map_err(DpError::Wmi)
     }
 }
 
@@ -1462,7 +1462,7 @@ mod tests {
                 0,
                 PacketNumberType::None,
             ),
-            Err(DpError::DeviceFault)
+            Err(DpError::Wmi(ath11k_wmi::WmiError::Transport))
         );
         assert!(!peer.is_active(4, [1, 2, 3, 4, 5, 6], 5));
         assert_eq!(peer.pool.free_segments(), 7);
@@ -1577,7 +1577,7 @@ mod tests {
                 0,
                 PacketNumberType::None,
             ),
-            Err(DpError::DeviceFault)
+            Err(DpError::Wmi(ath11k_wmi::WmiError::Transport))
         );
         assert!(!peer.is_active(1, [9; 6], 4));
         assert_eq!(peer.uncertain_setup.len(), 1);
@@ -2129,7 +2129,7 @@ mod tests {
         wmi.fail = true;
         assert_eq!(
             peers.ath11k_dp_rx_ampdu_stop(&mut reo, &mut rings, &mut wmi, 5, addr, 3),
-            Err(DpError::DeviceFault)
+            Err(DpError::Wmi(ath11k_wmi::WmiError::Transport))
         );
         assert_eq!(peers.tids[0].tid.ba_window_size, 1);
         assert_eq!(rings.published.len(), 1);

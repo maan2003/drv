@@ -808,6 +808,7 @@ impl Host for DryRunHost {
 
     fn dp_poll(&mut self) -> Result<(), Error> {
         self.dp_poll_log = vec![dp_poll_summary_line(ath11k_dp::tx::HostServiceResult {
+            rx_descriptors: 0,
             tx_delivered: 0,
             tx_malformed: 0,
             rx_delivered: 0,

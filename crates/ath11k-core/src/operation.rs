@@ -459,6 +459,7 @@ pub trait Subsystems {
         _host: &mut H,
     ) -> Result<ath11k_dp::tx::HostServiceResult, CoreError> {
         Ok(ath11k_dp::tx::HostServiceResult {
+            rx_descriptors: 0,
             tx_delivered: 0,
             tx_malformed: 0,
             rx_delivered: 0,

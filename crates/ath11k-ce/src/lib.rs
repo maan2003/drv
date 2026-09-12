@@ -778,6 +778,14 @@ impl<B: Backend, W: CeCompletionWait> CePipesPacketIo<B, W> {
 impl<B: Backend, W: CeCompletionWait> HtcPacketIo for CePipesPacketIo<B, W> {
     fn send_htc(&mut self, pipe: u8, transfer_id: u16, frame: Vec<u8>) -> Result<(), CeError> {
         self.waiter.trace("send_enter", usize::from(pipe));
+        // Reclaim only firmware-consumed source descriptors before reuse.
+        // Receive polling does not reap TX slots; without this, a live
+        // service eventually exhausts its finite CE source ring.
+        while self
+            .pipes
+            .completed_send_next(&mut self.remote_read_pointers, usize::from(pipe))?
+            .is_some()
+        {}
         let mut buffer = CeTxBuffer::allocate(&self.device, frame.len())?;
         self.waiter.trace("send_buffer_ready", usize::from(pipe));
         buffer.write(&frame)?;
@@ -3021,13 +3029,22 @@ mod tests {
         state.borrow_mut().dmas.get_mut(&1).unwrap()[128..132]
             .copy_from_slice(&4_u32.to_le_bytes());
         assert_eq!(packet_io.source_progress(0), Ok((4, 4)));
-        assert!(
-            packet_io
-                .pipes
-                .completed_send_next(&mut packet_io.remote_read_pointers, 0)
-                .unwrap()
-                .is_some()
-        );
+        // Send beyond CE0's ring capacity while firmware consumes each
+        // previous descriptor. The packet-I/O owner must reap on every send.
+        for _ in 0..64 {
+            packet_io.send_htc(0, 0x1234, vec![0x5a; 16]).unwrap();
+            assert_eq!(
+                packet_io.pipes.pipes[0]
+                    .source_slots
+                    .iter()
+                    .filter(|slot| slot.is_some())
+                    .count(),
+                1
+            );
+            let (head, _) = packet_io.source_progress(0).unwrap();
+            state.borrow_mut().dmas.get_mut(&1).unwrap()[128..132]
+                .copy_from_slice(&head.to_le_bytes());
+        }
 
         let rx = CeRxBuffer::allocate(&packet_io.device, 64).unwrap();
         let rx_id = state.borrow().next_id;
