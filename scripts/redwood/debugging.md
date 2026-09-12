@@ -209,18 +209,61 @@ QMI/CE/DP generation were still valid. Investigate RX ring provisioning,
 consumption/backpressure, and remoteproc recovery containment before
 renewing live acceptance attempts.
 
-Final evidence on np is under the existing work directory:
+That investigation’s evidence on np is under the existing work directory:
 `evidence/reset-investigation/candidate-bd83e235-wmi-events/`.
-The final service SHA-256 was
+Its service SHA-256 was
 `f12f0e5df247441317d40c9eacc4640e3047e407da15b90688c7da6eee62977b`.
 Cleanup verified WPSS offline and VFIO unbound before releasing the
-hardware lock. This is a separate blocker from the fixed host cleanup SError.
+hardware lock. The later Internet run below resolves that RX backpressure finding.
+
+## Internet acceptance after receive and key-boundary fixes
+
+On the same Linux boot `bd83e235-5700-43e5-b2ff-94d263c4a281`, populating
+the previously empty WBM idle-link ring eliminated the observed RX
+backpressure failure and delivered EAPOL through REO. Compiling the actual
+native `rx_desc.h` confirmed the QCN9074 descriptor is **384**, not 388,
+bytes; header status starts at 264 and MPDU-start at 132. The old handwritten
+C oracle duplicated the Rust offset error. It now derives offsets with
+`offsetof` from the pinned header.
+
+The adapter now decodes RX channel metadata, submits data/EAPOL through TCL,
+admits only EAPOL while the controlled port is closed, dispatches software
+IGTK before the data-cipher switch, and converts SME's wire-order GTK/IPN
+counters to the little-endian packet numbers used at the driver boundary.
+Native suspend uses the firmware MAC/PHY pdev ID, not the host radio index.
+
+`candidate-bd83e235-internet-netstack/` under the existing np evidence
+directory records WPA3 association, a sandboxed Netstack3 process in its own
+network namespace, and HTTPS to `https://example.com/` through its SOCKS5
+endpoint: HTTP 200, TLS verification 0, and 559 downloaded bytes containing
+“Example Domain”. The Wi-Fi diagnostic remains explicitly unsandboxed;
+this is Internet bring-up acceptance, not production confinement acceptance.
+The 180-second window completed, but PdevSuspend during cleanup triggered
+`wlan_dev.c:dispatch_wlan_pdev_cmds:7696`. Orderly teardown is not proved.
+Attended recovery verified WPSS offline and VFIO unbound before releasing the
+hardware lock; Linux retained the same boot ID.
+
+`redwood-wpa3-diagnostic` now defaults to the staged `drv-network-service`
+and retains the Ethernet generation for a bounded 180-second SOCKS5 window
+on phone loopback port 1080. Use `REDWOOD_NETWORK_SERVICE=` for the earlier
+association-only diagnostic. Proof clients must explicitly use
+`socks5h://127.0.0.1:1080` with no proxy bypass, so DNS and TCP traverse
+Netstack3 rather than the phone's Linux routing.
+
+With automatic remoteproc recovery disabled, a crashed WPSS can reject normal
+`stop`. In the attended recovery used here, the retained service was stopped
+with SIGSTOP while all mappings remained live; an explicit debugfs `recover`
+reset WPSS and copied its coredump, then normal `stop` verified `offline`.
+Only then was the stuck service killed and VFIO unbound. A coredump set to
+`enabled` is generated during recovery, not merely on entering `crashed`.
 
 ## Use direct incremental Cargo for userspace iterations
 
 Do not rebuild a Nix Rust package for every edit. On np, the retained
 `driver-takeover-20260912/cargo-cross/` workspace has a writable pinned
-reference tree, offline vendored dependencies, and `build-service`.
+reference tree, offline vendored dependencies, and `build-service`. The Internet diagnostic
+also links the existing network supervisor; its additional dependencies are
+available through the retained `vendor-union/` of existing vendor artifacts.
 That script invokes Cargo directly with the existing ARM64 musl toolchain,
 a persistent `target/`, `CARGO_INCREMENTAL=1`, and two jobs; it does not
 invoke a Nix build. Sync only changed project files into `crates/`; apply

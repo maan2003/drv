@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 use ath11k_hal::{HalError, RingId, RingMemory, RingType, Rings, Wcn6750Registers};
-use ath11k_platform_backend::{Backend, Bidirectional, Device};
+use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma, Device};
+
+use ath11k_hal::descriptors::WbmLinkDescriptor;
 
 use crate::{DataRings, DpError};
 
@@ -63,9 +65,9 @@ pub struct AllocatedDpRing {
 /// The three vectors preserve Linux's allocation order. Teardown walks the
 /// same source-defined order while retaining the first failed ring and the
 /// unvisited suffix for retry.
-#[derive(Default)]
-pub struct Wcn6750DpRings {
+pub struct Wcn6750DpRings<B: Backend> {
     common: Vec<AllocatedDpRing>,
+    link_desc_banks: Vec<CoherentDma<B, Bidirectional>>,
     reo_destination: Vec<AllocatedDpRing>,
     pdev_rx: Vec<AllocatedDpRing>,
 }
@@ -76,7 +78,7 @@ pub struct DpAllocationError<B: Backend, R: DpRingOps<B>> {
     cleanup_error: Option<DpError>,
     device: Device<B>,
     rings: R,
-    resources: Wcn6750DpRings,
+    resources: Wcn6750DpRings<B>,
 }
 
 impl<B: Backend, R: DpRingOps<B>> DpAllocationError<B, R> {
@@ -84,7 +86,7 @@ impl<B: Backend, R: DpRingOps<B>> DpAllocationError<B, R> {
         cause: DpError,
         device: Device<B>,
         mut rings: R,
-        mut resources: Wcn6750DpRings,
+        mut resources: Wcn6750DpRings<B>,
     ) -> Self {
         let cleanup_error = resources.free_common(&mut rings).err();
         Self {
@@ -118,7 +120,18 @@ impl<B: Backend, R: DpRingOps<B>> DpAllocationError<B, R> {
     }
 }
 
-impl Wcn6750DpRings {
+impl<B: Backend> Default for Wcn6750DpRings<B> {
+    fn default() -> Self {
+        Self {
+            common: Vec::new(),
+            link_desc_banks: Vec::new(),
+            reo_destination: Vec::new(),
+            pdev_rx: Vec::new(),
+        }
+    }
+}
+
+impl<B: Backend> Wcn6750DpRings<B> {
     pub fn common(&self) -> &[AllocatedDpRing] {
         &self.common
     }
@@ -131,7 +144,7 @@ impl Wcn6750DpRings {
         &self.pdev_rx
     }
 
-    pub(crate) fn allocate_common<B: Backend, R: DpRingOps<B>>(
+    pub(crate) fn allocate_common<R: DpRingOps<B>>(
         &mut self,
         device: &Device<B>,
         rings: &mut R,
@@ -139,10 +152,49 @@ impl Wcn6750DpRings {
         if !self.common.is_empty() {
             return Err(DpError::WrongState);
         }
-        allocate_group(device, rings, COMMON_RINGS, &mut self.common)
+        allocate_group(device, rings, &COMMON_RINGS[..1], &mut self.common)?;
+        self.setup_link_desc_banks(device, rings)?;
+        allocate_group(device, rings, &COMMON_RINGS[1..], &mut self.common)
     }
 
-    pub(crate) fn allocate_reo_destination<B: Backend, R: DpRingOps<B>>(
+    /// Native `ath11k_dp_link_desc_setup`: provide zeroed, 128-byte-aligned
+    /// link descriptors for WBM's hardware-internal RX/TX lists. The idle SRNG
+    /// is capped at 32767 entries and leaves one slot empty; no scatter list
+    /// is needed for its 256 KiB of address descriptors.
+    fn setup_link_desc_banks<R: DpRingOps<B>>(
+        &mut self,
+        device: &Device<B>,
+        rings: &mut R,
+    ) -> Result<(), DpError> {
+        const LINK_DESC_SIZE: usize = 128;
+        const BANK_ENTRIES: usize = 0x20_0000 / LINK_DESC_SIZE;
+        let idle = self.common[0];
+        let mut remaining = usize::from(idle.spec.entries) - 1;
+        while remaining != 0 {
+            let entries = remaining.min(BANK_ENTRIES);
+            let bank = device
+                .alloc_coherent::<Bidirectional>(entries * LINK_DESC_SIZE, LINK_DESC_SIZE)
+                .map_err(|_| DpError::NoResources)?;
+            let cookie = self.link_desc_banks.len() as u32;
+            // Retain the bank before the first potentially visible publication,
+            // including an ambiguous publish failure.
+            self.link_desc_banks.push(bank);
+            let bank = self.link_desc_banks.last().ok_or(DpError::WrongState)?;
+            for entry in 0..entries {
+                let address = bank
+                    .device_address(entry * LINK_DESC_SIZE)
+                    .map_err(|_| DpError::DeviceFault)?;
+                let descriptor = WbmLinkDescriptor::new_at(&address, cookie);
+                rings
+                    .publish(idle.id, descriptor.into_descriptor())
+                    .map_err(map_hal)?;
+            }
+            remaining -= entries;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocate_reo_destination<R: DpRingOps<B>>(
         &mut self,
         device: &Device<B>,
         rings: &mut R,
@@ -163,7 +215,7 @@ impl Wcn6750DpRings {
         })
     }
 
-    pub(crate) fn allocate_pdev_rx<B: Backend, R: DpRingOps<B>>(
+    pub(crate) fn allocate_pdev_rx<R: DpRingOps<B>>(
         &mut self,
         device: &Device<B>,
         rings: &mut R,
@@ -175,14 +227,11 @@ impl Wcn6750DpRings {
         find(&self.pdev_rx, RingType::RxdmaBuffer, 0)
     }
 
-    pub(crate) fn free_pdev_rx<B: Backend, R: DpRingOps<B>>(
-        &mut self,
-        rings: &mut R,
-    ) -> Result<(), DpError> {
+    pub(crate) fn free_pdev_rx<R: DpRingOps<B>>(&mut self, rings: &mut R) -> Result<(), DpError> {
         free_group(rings, &mut self.pdev_rx)
     }
 
-    pub(crate) fn free_reo_destination<B: Backend, R: DpRingOps<B>>(
+    pub(crate) fn free_reo_destination<R: DpRingOps<B>>(
         &mut self,
         rings: &mut R,
     ) -> Result<(), DpError> {
@@ -192,14 +241,13 @@ impl Wcn6750DpRings {
         free_group(rings, &mut self.reo_destination)
     }
 
-    pub(crate) fn free_common<B: Backend, R: DpRingOps<B>>(
-        &mut self,
-        rings: &mut R,
-    ) -> Result<(), DpError> {
+    pub(crate) fn free_common<R: DpRingOps<B>>(&mut self, rings: &mut R) -> Result<(), DpError> {
         if !self.pdev_rx.is_empty() || !self.reo_destination.is_empty() {
             return Err(DpError::WrongState);
         }
-        free_group(rings, &mut self.common)
+        free_group(rings, &mut self.common)?;
+        self.link_desc_banks.clear();
+        Ok(())
     }
 
     pub(crate) fn reo_controller_rings(&self) -> Result<(RingId, RingId), DpError> {

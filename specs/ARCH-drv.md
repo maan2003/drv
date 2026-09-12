@@ -5,7 +5,8 @@
 MT7921 has demonstrated userspace Wi-Fi association and Internet connectivity
 through Fuchsia WLAN components and a separately sandboxed Netstack3 service.
 Its hardware ownership migration and full Wi-Fi process sandbox remain
-incomplete. Redwood WCN6750 is in physical bring-up, not production hardening.
+incomplete. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
+mode; it remains a bring-up target, not production-ready.
 Legacy Wasm/WIT probes and Bluetooth scaffolding remain in the tree; they are
 not the production direction and are not extended by this architecture.
 

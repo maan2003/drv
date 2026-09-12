@@ -548,6 +548,12 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
             eprintln!("ath11k_softmac_drive stage=enter call={drive_call}");
         }
         self.ready_vdev()?;
+        if trace && self.runtime_trace.is_some() {
+            eprintln!(
+                "ath11k_dp_ring_progress call={drive_call} rings={:?}",
+                self.device.backend_mut().dp_ring_progress()
+            );
+        }
         if self.deterministic_scan_completion
             && let Some(scan_id) = self.active_scan.take()
         {
@@ -600,7 +606,26 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
             || serviced.rx_dropped != Default::default();
         rx_slot_consumed |= !deliveries.rx.is_empty();
         for frame in deliveries.rx {
-            let frequency = frame.info.phy_metadata as u16;
+            if self.runtime_trace.is_some() {
+                // MAC/LLC headers only, never EAPOL key material or payload.
+                eprintln!(
+                    "ath11k_dp_rx len={} info={:?} header={:02x?}",
+                    frame.bytes.len(),
+                    frame.info,
+                    &frame.bytes[..frame.bytes.len().min(32)]
+                );
+            }
+            // `ath11k_dp_rx_h_ppdu`: the low byte is a channel number,
+            // not MHz. This adapter currently advertises only 2/5 GHz.
+            let number = frame.info.phy_metadata as u8;
+            let primary = ChannelNumber {
+                band: if number <= 14 {
+                    WlanBand::TwoGhz
+                } else {
+                    WlanBand::FiveGhz
+                },
+                number,
+            };
             self.upcalls.as_mut().unwrap().recv(
                 frame.bytes,
                 WlanRxInfo {
@@ -608,10 +633,10 @@ impl<B: Subsystems> ClientRuntimeDriver for Ath11kClientDevice<B> {
                     valid_fields: fidl_fuchsia_wlan_softmac::WlanRxInfoValid::MCS,
                     phy: WlanPhyType::Ofdm,
                     data_rate: 0,
-                    primary: frequency_channel(frequency),
+                    primary,
                     bandwidth: ChannelBandwidth::Cbw20,
                     vht_secondary_80_channel: ChannelNumber {
-                        band: frequency_channel(frequency).band,
+                        band: primary.band,
                         number: 0,
                     },
                     mcs: frame.info.mcs,
@@ -887,6 +912,17 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         Ok(())
     }
     fn install_key(&mut self, configuration: WlanKeyConfiguration) -> Result<(), zx::Status> {
+        if self.runtime_trace.is_some() {
+            eprintln!(
+                "ath11k_key_request type={:?} cipher={:?} index={:?} peer={:?} protection={:?} rsc={:?}",
+                configuration.key_type,
+                configuration.cipher_type,
+                configuration.key_idx,
+                configuration.peer_addr,
+                configuration.protection,
+                configuration.rsc
+            );
+        }
         let vdev = self.ready_vdev()?;
         let associated_peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
         if !self.associated {
@@ -900,18 +936,9 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             fidl_fuchsia_wlan_softmac::WlanProtection::Rx => KeyProtection::Rx,
             fidl_fuchsia_wlan_softmac::WlanProtection::Tx => KeyProtection::Tx,
         };
-        let cipher = if configuration.cipher_oui != Some([0x00, 0x0f, 0xac]) {
+        if configuration.cipher_oui != Some([0x00, 0x0f, 0xac]) {
             return Err(zx::Status::NOT_SUPPORTED);
-        } else {
-            match configuration.cipher_type.ok_or(zx::Status::INVALID_ARGS)? {
-                2 => Cipher::Tkip,
-                4 => Cipher::Ccmp128,
-                8 => Cipher::Gcmp128,
-                9 => Cipher::Gcmp256,
-                10 => Cipher::Ccmp256,
-                _ => return Err(zx::Status::NOT_SUPPORTED),
-            }
-        };
+        }
         let (kind, peer) = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
             fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise => {
                 if configuration.peer_addr != Some(associated_peer) {
@@ -940,10 +967,19 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
                     .ok_or(zx::Status::INVALID_ARGS)?
                     .try_into()
                     .map_err(|_| zx::Status::INVALID_ARGS)?;
-                let receive_ipn = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
-                if receive_ipn > 0x0000_ffff_ffff_ffff {
+                // SME packs the six wire-order IPN octets into the low
+                // six bytes of a big-endian u64. BIP compares a little-endian
+                // 48-bit packet number.
+                let rsc = configuration
+                    .rsc
+                    .ok_or(zx::Status::INVALID_ARGS)?
+                    .to_be_bytes();
+                if rsc[..2] != [0, 0] {
                     return Err(zx::Status::INVALID_ARGS);
                 }
+                let mut ipn = [0; 8];
+                ipn[..6].copy_from_slice(&rsc[2..]);
+                let receive_ipn = u64::from_le_bytes(ipn);
                 self.igtk = Some(Igtk {
                     key_id: u16::from(configuration.key_idx.unwrap()),
                     key,
@@ -954,7 +990,23 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             }
             _ => return Err(zx::Status::NOT_SUPPORTED),
         };
-        let receive_sequence_counter = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
+        let cipher = match configuration.cipher_type.ok_or(zx::Status::INVALID_ARGS)? {
+            2 => Cipher::Tkip,
+            4 => Cipher::Ccmp128,
+            8 => Cipher::Gcmp128,
+            9 => Cipher::Gcmp256,
+            10 => Cipher::Ccmp256,
+            _ => return Err(zx::Status::NOT_SUPPORTED),
+        };
+        let rsc = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
+        // EAPOL's parser exposes the RSC octets as a big-endian u64;
+        // CCMP/GCMP's wire PN is little-endian. Preserve the packet number,
+        // rather than rejecting a valid nonzero GTK RSC as wider than 48 bits.
+        let receive_sequence_counter = if kind == KeyKind::Group {
+            u64::from_le_bytes(rsc.to_be_bytes())
+        } else {
+            rsc
+        };
         if receive_sequence_counter > 0x0000_ffff_ffff_ffff {
             return Err(zx::Status::INVALID_ARGS);
         }
@@ -969,6 +1021,19 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
             bytes: configuration.key.ok_or(zx::Status::INVALID_ARGS)?,
         };
         if let Err(error) = self.device.install_key(key) {
+            if self.runtime_trace.is_some() {
+                // Core errors can own the key-install operation: never Debug
+                // the whole error, since that would include key bytes.
+                let phase = match &error {
+                    ath11k_core::CoreError::ProtocolAt(operation)
+                    | ath11k_core::CoreError::DeviceFaultAt(operation) => Some(operation.target()),
+                    _ => None,
+                };
+                eprintln!(
+                    "ath11k_key_install_failed kind={kind:?} status={:?} phase={phase:?}",
+                    status(error.clone())
+                );
+            }
             // WMI completion may have succeeded before a DP publication
             // failed. Only terminal device teardown makes that state safe.
             let _ = self.stop();
@@ -1306,6 +1371,45 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         if frame_control & 0x0003 != 0 {
             return Err(zx::Status::INVALID_ARGS);
         }
+        if frame_control & 0x000c == 0x0008 {
+            let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+            if !self.associated || bytes[4..10] != peer || bytes[10..16] != self.mac {
+                return Err(zx::Status::BAD_STATE);
+            }
+            // STA infrastructure frames go to the AP. Do not admit WDS/TDLS
+            // or HT-control layouts that this client does not advertise.
+            if frame_control & 0x8300 != 0x0100 {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let qos = frame_control & 0x0080 != 0;
+            let header_len = if qos { 26 } else { 24 };
+            let eapol = bytes.get(header_len..header_len + 8)
+                == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+            if !self.link_up && !eapol {
+                return Err(zx::Status::BAD_STATE);
+            }
+            let result = self
+                .device
+                .transmit_data(
+                    self.ready_vdev()?,
+                    peer,
+                    bytes,
+                    ath11k_dp::tx::HostTxFlags {
+                        protected: flags.contains(WlanTxInfoFlags::PROTECTED)
+                            || frame_control & 0x4000 != 0,
+                        favor_reliability: flags.contains(WlanTxInfoFlags::FAVOR_RELIABILITY),
+                        qos,
+                    },
+                )
+                .map_err(status);
+            if self.runtime_trace.is_some() {
+                eprintln!(
+                    "ath11k_dp_tx len={} eapol={eapol} result={result:?}",
+                    bytes.len()
+                );
+            }
+            return result;
+        }
         if frame_control & 0x000c != 0 {
             return Err(zx::Status::NOT_SUPPORTED);
         }
@@ -1394,14 +1498,17 @@ mod tests {
     #[derive(Default)]
     struct RecordedUpcalls {
         received: Vec<Vec<u8>>,
+        received_channels: Vec<ChannelNumber>,
         tx: Vec<([u8; 6], fidl_fuchsia_wlan_softmac::WlanTxResultCode)>,
         scans: Vec<(zx::Status, u64)>,
     }
 
     struct Recorder(Arc<Mutex<RecordedUpcalls>>);
     impl WlanSoftmacUpcalls for Recorder {
-        fn recv(&mut self, bytes: Vec<u8>, _: WlanRxInfo) {
-            self.0.lock().unwrap().received.push(bytes);
+        fn recv(&mut self, bytes: Vec<u8>, info: WlanRxInfo) {
+            let mut records = self.0.lock().unwrap();
+            records.received.push(bytes);
+            records.received_channels.push(info.primary);
         }
         fn report_tx_result(&mut self, result: WlanTxResult) {
             self.0
@@ -2026,6 +2133,46 @@ mod tests {
     }
 
     #[test]
+    fn group_and_integrity_keys_decode_sme_wire_order_counters() {
+        let mut adapter = ready_adapter();
+        adapter.join_bss(join_request()).unwrap();
+        adapter
+            .notify_association_complete(open_association())
+            .unwrap();
+        let mut key = WlanKeyConfiguration {
+            protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
+            cipher_oui: Some([0, 0x0f, 0xac]),
+            cipher_type: Some(4),
+            key_type: Some(fidl_fuchsia_wlan_ieee80211::KeyType::Group),
+            peer_addr: Some([0xff; 6]),
+            key_idx: Some(1),
+            key: Some(vec![0x55; 16]),
+            rsc: Some(u64::from_be_bytes([2, 1, 0, 0, 0, 0, 0, 0])),
+            ..Default::default()
+        };
+        adapter.install_key(key.clone()).unwrap();
+        assert!(matches!(
+            adapter.device.backend().operations().last(),
+            Some(Operation::DpInstallPeerKey(KeyConfig {
+                kind: KeyKind::Group,
+                receive_sequence_counter: 0x102,
+                ..
+            }))
+        ));
+        key.rsc = Some(u64::from_be_bytes([0, 0, 0, 0, 0, 0, 1, 0]));
+        assert_eq!(
+            adapter.install_key(key.clone()),
+            Err(zx::Status::INVALID_ARGS)
+        );
+        key.key_type = Some(fidl_fuchsia_wlan_ieee80211::KeyType::Igtk);
+        key.cipher_type = Some(6);
+        key.key_idx = Some(4);
+        key.rsc = Some(u64::from_be_bytes([0, 0, 6, 5, 4, 3, 2, 1]));
+        adapter.install_key(key).unwrap();
+        assert_eq!(adapter.igtk.as_ref().unwrap().receive_ipn, 0x0102_0304_0506);
+    }
+
+    #[test]
     fn ap_uapsd_capability_does_not_require_station_uapsd() {
         for apsd in [false, true] {
             let mut adapter = ready_adapter();
@@ -2109,6 +2256,23 @@ mod tests {
                 })
         );
 
+        let mut data = vec![0; 24];
+        data[..2].copy_from_slice(&0x0108_u16.to_le_bytes());
+        data[4..10].copy_from_slice(&PEER);
+        data[10..16].copy_from_slice(&CLIENT);
+        data[16..22].copy_from_slice(&PEER);
+        data.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        assert_eq!(
+            adapter.queue_tx(&data, WlanTxInfoFlags::empty()),
+            Err(zx::Status::BAD_STATE)
+        );
+        data[30..32].copy_from_slice(&[0x88, 0x8e]);
+        adapter
+            .queue_tx(&data, WlanTxInfoFlags::FAVOR_RELIABILITY)
+            .unwrap();
+        assert!(matches!(adapter.device.backend().operations().last(),
+            Some(Operation::DpTransmitData { flags, .. }) if flags.favor_reliability));
+
         adapter.set_link_up(true).unwrap();
         assert!(adapter.link_up);
         assert!(matches!(
@@ -2119,6 +2283,13 @@ mod tests {
                 ..
             })
         ));
+        data[30..32].copy_from_slice(&[8, 0]);
+        adapter.queue_tx(&data, WlanTxInfoFlags::empty()).unwrap();
+        data[4] ^= 2;
+        assert_eq!(
+            adapter.queue_tx(&data, WlanTxInfoFlags::empty()),
+            Err(zx::Status::BAD_STATE)
+        );
     }
 
     #[test]
@@ -2241,7 +2412,7 @@ mod tests {
                     peer: None,
                     tid: 0,
                     decrypt_status: ath11k_dp::tx::RxDecryptStatus::NotDecrypted,
-                    phy_metadata: 2437,
+                    phy_metadata: (2437 << 16) | 6,
                     bandwidth: 0,
                     mcs: 0,
                     packet_type: 0,
@@ -2262,6 +2433,13 @@ mod tests {
         assert!(adapter.drive().unwrap());
         assert_eq!(records.lock().unwrap().received, [dp_frame, mgmt_frame]);
         assert_eq!(*receive_budgets.lock().unwrap(), [1, 0]);
+        assert_eq!(
+            records.lock().unwrap().received_channels,
+            [ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 6
+            }; 2]
+        );
     }
 
     #[test]

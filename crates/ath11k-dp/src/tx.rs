@@ -250,7 +250,7 @@ pub struct ClientDataPath<B: Backend, R: Rings<B>> {
     monitor_status_buffers: Vec<PendingRx<B>>,
     rx_chain: Vec<RxFragment>,
     next_monitor_cookie: u32,
-    ring_resources: Wcn6750DpRings,
+    ring_resources: Wcn6750DpRings<B>,
     reo: Option<ReoController>,
     peer_rx_tids: PeerRxTids<B>,
     htt_setup_index: usize,
@@ -445,7 +445,7 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         &mut self.rings
     }
 
-    pub fn ring_resources(&self) -> &Wcn6750DpRings {
+    pub fn ring_resources(&self) -> &Wcn6750DpRings<B> {
         &self.ring_resources
     }
 
@@ -734,9 +734,8 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
         peer: crate::PeerId,
         flags: HostTxFlags,
     ) -> Result<(), DpError> {
-        if flags.favor_reliability {
-            return Err(DpError::UnsupportedTxFlags);
-        }
+        // Rate selection is firmware-owned, as in native ath11k_dp_tx.
+        // FAVOR_RELIABILITY does not select a host rate-probing path.
         let fc = u16::from_le_bytes(
             bytes
                 .get(..2)
@@ -906,10 +905,10 @@ impl<B: Backend, R: DpRingOps<B>> ClientDataPath<B, R> {
     fn transmit_client(&mut self, mut packet: TxPacket) -> Result<(), DpError> {
         let data_rings = self.data_rings.ok_or(DpError::NoResources)?;
         let mut tx = self.tx;
-        if tx.encapsulation == EncapType::NativeWifi
-            && let Some(tid) = encap_native_wifi(&mut packet.bytes)?
-        {
-            tx.tid = tid;
+        if tx.encapsulation == EncapType::NativeWifi {
+            // Native ath11k_dp_tx_get_tid uses HAL_DESC_REO_NON_QOS_TID (16),
+            // not TID 0, for non-QoS frames such as initial EAPOL.
+            tx.tid = encap_native_wifi(&mut packet.bytes)?.unwrap_or(16);
         }
         let msdu_id = self.allocate_msdu_id()?;
         let buffer = TxBuffer::map(&self.device, &packet.bytes)?;
@@ -1881,6 +1880,43 @@ mod tests {
             Err(_) => panic!("aggregate allocation failed"),
         };
         assert_eq!(dp.ring_resources().common().len(), 15);
+        // WBM cannot form RX MSDU links from an empty idle descriptor list.
+        let idle_ring = memory
+            .borrow()
+            .iter()
+            .find(|(_, bytes)| bytes.len() == 32_767 * 8 + 7)
+            .map(|(&address, _)| address)
+            .unwrap();
+        {
+            let allocations = memory.borrow();
+            let idle = &allocations[&idle_ring];
+            for index in 0..32_766 {
+                let offset = index * 8;
+                let low = u32::from_le_bytes(idle[offset..offset + 4].try_into().unwrap());
+                let high = u32::from_le_bytes(idle[offset + 4..offset + 8].try_into().unwrap());
+                let address = u64::from(low) | (u64::from(high & 0xff) << 32);
+                assert_eq!(address % 128, 0);
+                assert_eq!((high >> 8) & 7, 1); // WBM idle descriptor manager
+                assert_eq!(high >> 11, (index / 16_384) as u32);
+                assert!(allocations.iter().any(|(&base, bytes)| {
+                    address >= base
+                        && address + 128 <= base + bytes.len() as u64
+                        && bytes[(address - base) as usize..(address - base) as usize + 128]
+                            .iter()
+                            .all(|byte| *byte == 0)
+                }));
+            }
+            assert_eq!(&idle[32_766 * 8..32_767 * 8], &[0; 8]);
+        }
+        assert_eq!(
+            dp.ring_progress()
+                .unwrap()
+                .iter()
+                .find(|ring| ring.0 == 104)
+                .unwrap()
+                .2,
+            32_766 * 2
+        );
         dp.ath11k_dp_pdev_pre_alloc().unwrap();
         dp.ath11k_dp_pdev_reo_setup().unwrap();
         assert_eq!(dp.ring_resources().reo_destination().len(), 4);
@@ -2413,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_reliability_hint_is_rejected_before_dma_mapping() {
+    fn reliable_non_qos_frame_uses_firmware_rate_control_and_non_qos_tid() {
         let device = DeterministicBackend::device();
         let mut dp =
             ClientDataPath::without_allocated_rings(device, ModelRings::default(), config());
@@ -2434,9 +2470,13 @@ mod tests {
                     ..HostTxFlags::default()
                 }
             ),
-            Err(DpError::UnsupportedTxFlags)
+            Ok(())
         );
-        assert!(dp.rings().published.is_empty());
+        assert_eq!(dp.rings().published.len(), 1);
+        let descriptor =
+            TclDataCommand::from_bytes(&dp.rings().published[0].1.bytes()[4..]).unwrap();
+        // HAL's four-bit TCL TID field masks native's non-QoS value 16.
+        assert_eq!(descriptor.tid(), 0);
     }
 
     #[test]
@@ -2579,7 +2619,7 @@ mod tests {
         bytes[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13)).to_le_bytes());
         bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         bytes[96..100].copy_from_slice(&5_u32.to_le_bytes());
-        bytes[388] = 7;
+        bytes[384] = 7;
 
         let valid = parse_received_buffer(&bytes).unwrap();
         assert_eq!(host_frame(valid).unwrap().bytes, [7]);
@@ -2607,12 +2647,12 @@ mod tests {
             bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
             let msdu_length = if encryption_type == 8 { 53_u32 } else { 45 };
             bytes[96..100].copy_from_slice(&msdu_length.to_le_bytes());
-            bytes[168..172].copy_from_slice(&(u32::from(encryption_type) << 2).to_le_bytes());
+            bytes[164..168].copy_from_slice(&(u32::from(encryption_type) << 2).to_le_bytes());
             if encryption_valid {
-                bytes[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+                bytes[180..184].copy_from_slice(&(1_u32 << 9).to_le_bytes());
             }
-            bytes[388..390].copy_from_slice(&0x4008_u16.to_le_bytes());
-            bytes[420] = 9;
+            bytes[384..386].copy_from_slice(&0x4008_u16.to_le_bytes());
+            bytes[416] = 9;
             parse_received_buffer(&bytes).unwrap()
         }
 
@@ -2651,12 +2691,12 @@ mod tests {
         bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         bytes[96..100].copy_from_slice(&25_u32.to_le_bytes());
         bytes[100..104].copy_from_slice(&(1_u32 << 8).to_le_bytes());
-        bytes[268..270].copy_from_slice(&0x0088_u16.to_le_bytes());
-        bytes[292] = 0x80; // A-MSDU present in original QoS control.
-        bytes[388..390].copy_from_slice(&0x0008_u16.to_le_bytes());
-        bytes[392..398].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
-        bytes[398..404].copy_from_slice(&[7, 8, 9, 10, 11, 12]);
-        bytes[412] = 0xaa;
+        bytes[264..266].copy_from_slice(&0x0088_u16.to_le_bytes());
+        bytes[288] = 0x80; // A-MSDU present in original QoS control.
+        bytes[384..386].copy_from_slice(&0x0008_u16.to_le_bytes());
+        bytes[388..394].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        bytes[394..400].copy_from_slice(&[7, 8, 9, 10, 11, 12]);
+        bytes[408] = 0xaa;
         let frame = host_frame(parse_received_buffer(&bytes).unwrap()).unwrap();
         assert_eq!(&frame.bytes[4..10], &[1, 2, 3, 4, 5, 6]);
         assert_eq!(&frame.bytes[10..16], &[7, 8, 9, 10, 11, 12]);
@@ -2693,8 +2733,8 @@ mod tests {
         // attention.info2: MSDU done and decrypt status OK.
         bytes[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         bytes[96..100].copy_from_slice(&4_u32.to_le_bytes());
-        bytes[182..184].copy_from_slice(&9_u16.to_le_bytes());
-        bytes[390..394].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[178..180].copy_from_slice(&9_u16.to_le_bytes());
+        bytes[386..390].copy_from_slice(&[1, 2, 3, 4]);
         let received = parse_received_buffer(&bytes).unwrap();
         assert_eq!(
             received.packet,
@@ -2715,12 +2755,12 @@ mod tests {
     fn multi_buffer_msdu_is_coalesced_at_descriptor_boundaries() {
         let mut first = vec![0; 2048];
         first[96..100].copy_from_slice(&1700_u32.to_le_bytes());
-        first[390..].fill(0xaa);
+        first[386..].fill(0xaa);
         let mut last = vec![0; 2048];
         last[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
         last[80..84].copy_from_slice(&((1_u32 << 29) | (1 << 2)).to_le_bytes());
         last[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
-        last[388..430].fill(0xbb);
+        last[384..426].fill(0xbb);
         let fragments = [
             RxFragment {
                 bytes: first,
@@ -2740,12 +2780,12 @@ mod tests {
         let received = parse_received_chain(&fragments).unwrap();
         assert_eq!(received.packet.bytes.len(), 1700);
         assert!(
-            received.packet.bytes[..1658]
+            received.packet.bytes[..1662]
                 .iter()
                 .all(|byte| *byte == 0xaa)
         );
         assert!(
-            received.packet.bytes[1658..]
+            received.packet.bytes[1662..]
                 .iter()
                 .all(|byte| *byte == 0xbb)
         );
@@ -2796,8 +2836,8 @@ mod tests {
         image[46..48].copy_from_slice(&((1_u16 << 12) | (1 << 13) | (2 << 10)).to_le_bytes());
         image[84..88].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         image[96..100].copy_from_slice(&8_u32.to_le_bytes());
-        image[182..184].copy_from_slice(&9_u16.to_le_bytes());
-        image[390..394].copy_from_slice(&[1, 2, 3, 4]);
+        image[178..180].copy_from_slice(&9_u16.to_le_bytes());
+        image[386..390].copy_from_slice(&[1, 2, 3, 4]);
         let source = TxBuffer::map(&device, &image).unwrap();
 
         let mut dp =
@@ -2896,5 +2936,11 @@ mod tests {
         let result = dp.service_host(1, 1, &mut host).unwrap();
         assert_eq!(result.tx_delivered, 1);
         assert_eq!(host.tx_completed, 1);
+    }
+}
+
+impl<B: Backend> ClientDataPath<B, crate::HalDpRings<B>> {
+    pub fn ring_progress(&mut self) -> Result<Vec<(u16, bool, u32, u32)>, DpError> {
+        self.rings.progress()
     }
 }

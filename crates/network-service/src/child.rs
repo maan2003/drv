@@ -2,7 +2,7 @@
 
 use crate::{BoundedNetstackProof, NetstackProofConfig, NetworkPoller, ServiceEthernetDevice};
 use std::env;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroU16;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -248,14 +248,14 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn unshare(flags: i32) -> i32;
     fn mount(
-        source: *const i8,
-        target: *const i8,
-        filesystem: *const i8,
+        source: *const c_char,
+        target: *const c_char,
+        filesystem: *const c_char,
         flags: usize,
         data: *const c_void,
     ) -> i32;
-    fn chdir(path: *const i8) -> i32;
-    fn chroot(path: *const i8) -> i32;
+    fn chdir(path: *const c_char) -> i32;
+    fn chroot(path: *const c_char) -> i32;
     fn setgroups(size: usize, groups: *const u32) -> i32;
     fn setresgid(real: u32, effective: u32, saved: u32) -> i32;
     fn setresuid(real: u32, effective: u32, saved: u32) -> i32;

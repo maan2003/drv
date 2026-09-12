@@ -239,7 +239,7 @@ impl Subsystems for ResponseModelSubsystems {
                     peer: None,
                     tid: 0,
                     decrypt_status: RxDecryptStatus::NotDecrypted,
-                    phy_metadata: 2437,
+                    phy_metadata: (2437 << 16) | 6,
                     bandwidth: 0,
                     mcs: 0,
                     packet_type: 0,

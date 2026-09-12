@@ -9,6 +9,7 @@ export PATH
 
 LAB=/var/lib/ath11k-redwood-lab
 BIN=$LAB/stage13
+NETWORK_SERVICE=${REDWOOD_NETWORK_SERVICE-$LAB/candidate/drv-network-service}
 RUN=$LAB/runs/wpa3-ajay-channel149
 SYSTEMD_RUN=${REDWOOD_SYSTEMD_RUN:-systemd-run}
 SYSTEMCTL=${REDWOOD_SYSTEMCTL:-systemctl}
@@ -46,6 +47,7 @@ case ${1-} in
     "$SYSTEMD_RUN" --quiet --collect --no-block --unit="$UNIT" \
         --setenv="REDWOOD_EVIDENCE_ENDPOINT=$REDWOOD_EVIDENCE_ENDPOINT" \
         --setenv="REDWOOD_EVIDENCE_RUN_ID=$REDWOOD_EVIDENCE_RUN_ID" \
+        --setenv="REDWOOD_NETWORK_SERVICE=$NETWORK_SERVICE" \
         --setenv="REDWOOD_DIAGNOSTIC_PAUSE=${REDWOOD_DIAGNOSTIC_PAUSE:-}" \
         --setenv="REDWOOD_DIAGNOSTIC_VFIO_TRACE=${REDWOOD_DIAGNOSTIC_VFIO_TRACE:-}" \
         --property=Type=exec "$(readlink -f "$0")" --run
@@ -138,12 +140,21 @@ test "$(wc -c </proc/device-tree/soc@0/wifi@17a10040/reg)" = 32
 test "$(stat -c %U:%G:%a "$CREDENTIAL")" = root:root:600
 test -x "$BIN/ath11k-wifi-service"
 test -x "$BIN/redwood-wifi-diagnostic"
+if [ -n "$NETWORK_SERVICE" ]; then test -x "$NETWORK_SERVICE"; fi
 test -f "$FIRMWARE/board.bin"
 test -f "$FIRMWARE/regdb.bin"
 test -s "$LAB/stage13/client-mac"
 test "$(cat "$RPROC/name")" = wpss
 test "$(cat "$RPROC/state")" = offline
 test ! -e "$P/driver"
+
+# A firmware restart must not silently reuse the old userspace DMA/session
+# generation. Keep the first crash visible until cooperative containment.
+RPROC_DEBUG=/sys/kernel/debug/remoteproc/remoteproc2
+printf disabled >"$RPROC_DEBUG/recovery"
+printf enabled >"$RPROC_DEBUG/coredump"
+test "$(cat "$RPROC_DEBUG/recovery")" = disabled
+test "$(cat "$RPROC_DEBUG/coredump")" = enabled
 
 printf 1 >/sys/module/iommufd/parameters/allow_unsafe_interrupts
 test -d /sys/module/vfio_platform ||

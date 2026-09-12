@@ -409,6 +409,10 @@ impl WmiTraceSink for RuntimeWmiTrace {
                 monotonic_now(),
                 bytes.len()
             );
+            if !command && id == 0x5003 {
+                // Install completion contains identity/index/status, never key material.
+                eprintln!("ath11k_wmi_key_confirmation bytes={bytes:?}");
+            }
             if !command && id == 0x6006 {
                 // WMI_PEER_ASSOC_CONF carries only vdev and peer identity.
                 eprintln!("ath11k_wmi_peer_assoc_confirmation bytes={bytes:?}");

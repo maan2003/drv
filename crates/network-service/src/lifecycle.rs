@@ -121,7 +121,7 @@ impl WifiLifecycleReceiver {
         header.msg_iov = &mut iov;
         header.msg_iovlen = 1;
         header.msg_control = control.as_mut_ptr().cast();
-        header.msg_controllen = size_of_val(&control);
+        header.msg_controllen = size_of_val(&control) as _;
         let received = unsafe {
             libc::recvmsg(
                 self.channel.as_raw_fd(),
@@ -143,11 +143,11 @@ impl WifiLifecycleReceiver {
         while !cmsg.is_null() {
             let current = unsafe { &*cmsg };
             let header_len = unsafe { libc::CMSG_LEN(0) as usize };
-            if current.cmsg_len < header_len {
+            if (current.cmsg_len as usize) < header_len {
                 ancillary_valid = false;
                 break;
             }
-            let data_len = current.cmsg_len - header_len;
+            let data_len = current.cmsg_len as usize - header_len;
             if current.cmsg_level == libc::SOL_SOCKET
                 && current.cmsg_type == libc::SCM_RIGHTS
                 && data_len.is_multiple_of(size_of::<RawFd>())

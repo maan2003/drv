@@ -32,6 +32,7 @@ fn main() {
         .file(manifest.join("c/htt_oracle.c"))
         .file(manifest.join("c/hal_oracle.c"))
         .include(manifest.join("stubs"))
+        .include(root.join("drivers/net/wireless/ath/ath11k"))
         .warnings(true)
         .flag_if_supported("-std=gnu11")
         .compile("ath11k_c_oracle");
@@ -41,6 +42,11 @@ fn main() {
     println!("cargo:rerun-if-changed=c/htt_oracle.c");
     println!("cargo:rerun-if-changed=c/hal_oracle.c");
     println!("cargo:rerun-if-changed=stubs");
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("drivers/net/wireless/ath/ath11k/rx_desc.h")
+            .display()
+    );
     println!("cargo:rerun-if-changed={}", root.join("COMMIT").display());
     println!(
         "cargo:rerun-if-changed={}",

@@ -265,6 +265,12 @@ pub enum Operation {
         address: [u8; 6],
     },
     DpInstallPeerKey(KeyConfig),
+    DpTransmitData {
+        vdev: VdevId,
+        peer: [u8; 6],
+        bytes: Vec<u8>,
+        flags: ath11k_dp::tx::HostTxFlags,
+    },
     WmiVdevStart {
         vdev: VdevId,
         restart: bool,
@@ -391,7 +397,8 @@ impl Operation {
             | DpVdevTxAttach { .. }
             | DpPeerSetup { .. }
             | DpPeerCleanup { .. }
-            | DpInstallPeerKey(_) => OperationTarget::DpHtt,
+            | DpInstallPeerKey(_)
+            | DpTransmitData { .. } => OperationTarget::DpHtt,
             MacAllocate | MacDestroy | MacRegister | MacUnregister | RadioStart => {
                 OperationTarget::MacMlme
             }
@@ -452,6 +459,10 @@ pub trait Subsystems {
 
     /// Service bounded client data-path work without exposing rings or DMA.
     /// Deterministic subsystem models have no data-path completions to report.
+    fn dp_ring_progress(&mut self) -> Result<Vec<(u16, bool, u32, u32)>, CoreError> {
+        Ok(Vec::new())
+    }
+
     fn service_dp_host<H: ath11k_dp::tx::DpHost>(
         &mut self,
         _work_budget: usize,

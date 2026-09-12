@@ -202,6 +202,32 @@ impl<B: Subsystems> Device<B> {
         self.crash_count
     }
 
+    /// Submit an associated station frame without exposing DP ring or DMA owners.
+    pub fn transmit_data(
+        &mut self,
+        vdev: VdevId,
+        peer: [u8; 6],
+        bytes: &[u8],
+        flags: ath11k_dp::tx::HostTxFlags,
+    ) -> Result<(), CoreError> {
+        if self.state != DeviceState::Ready
+            || !self
+                .vdevs
+                .iter()
+                .any(|item| item.id == vdev && item.started)
+            || !self.peers.contains(&(vdev, peer))
+            || self.uncertain_key_peers.contains(&(vdev, peer))
+        {
+            return Err(CoreError::WrongState);
+        }
+        self.op(Operation::DpTransmitData {
+            vdev,
+            peer,
+            bytes: bytes.to_vec(),
+            flags,
+        })
+    }
+
     /// Service one bounded host-facing data-path slot.
     pub fn service_dp_host<H: ath11k_dp::tx::DpHost>(
         &mut self,

@@ -906,6 +906,12 @@ where
         }
     }
 
+    fn dp_ring_progress(&mut self) -> Result<Vec<(u16, bool, u32, u32)>, CoreError> {
+        Self::protocol(self.dp.as_mut())?
+            .ring_progress()
+            .map_err(Self::dp_error)
+    }
+
     fn service_dp_host<H: ath11k_dp::tx::DpHost>(
         &mut self,
         work_budget: usize,
@@ -1404,8 +1410,17 @@ where
                 }
             }
             Operation::PdevSuspend => {
-                // WCN6750 is single_pdev_only: native core suspends pdev 0
-                // before disabling interrupts and freeing the pdev RX rings.
+                // Native core suspends the firmware pdev ID from MAC/PHY
+                // capabilities, not the host's zero-based single-radio index.
+                let pdev_id = self
+                    .service_ready
+                    .as_ref()
+                    .and_then(|state| state.service_ready_ext.as_ref())
+                    .and_then(|ext| ext.array_groups.get(1))
+                    .and_then(|caps| caps.first())
+                    .and_then(|caps| caps.value.get(4..8))
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .ok_or(CoreError::Protocol)?;
                 let router = Self::protocol(self.router.as_ref())?.clone();
                 let mut control = router
                     .endpoint(ServiceId::RESERVED_CONTROL)
@@ -1418,7 +1433,7 @@ where
                     .is_some()
                 {}
                 self.wmi_send(&PdevSuspend {
-                    pdev_id: 0,
+                    pdev_id,
                     suspend_option: 1, // WMI_PDEV_SUSPEND_AND_DISABLE_INTR
                 })?;
                 let deadline = (self.deadline)();
@@ -1519,6 +1534,20 @@ where
             Operation::DpPeerCleanup { vdev, address } => Self::protocol(self.dp.as_mut())?
                 .cleanup_peer(u32::from(vdev.0), address)
                 .map_err(Self::dp_error),
+            Operation::DpTransmitData {
+                vdev,
+                peer,
+                bytes,
+                flags,
+            } => {
+                let dp = Self::protocol(self.dp.as_mut())?;
+                let peer_id = dp
+                    .peer_security(u32::from(vdev.0), peer)
+                    .and_then(|security| security.peer_id)
+                    .ok_or(CoreError::WrongState)?;
+                dp.submit_host_frame(&bytes, peer_id, flags)
+                    .map_err(Self::dp_error)
+            }
             Operation::DpInstallPeerKey(key) => {
                 let security_type = match key.cipher {
                     Cipher::Ccmp128 => ath11k_dp::reo::PeerSecurityType::Ccmp128,

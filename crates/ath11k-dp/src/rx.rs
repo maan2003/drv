@@ -5,7 +5,7 @@
 
 use crate::{DpError, PeerId};
 
-pub const WCN6750_RX_DESCRIPTOR_BYTES: usize = 388;
+pub const WCN6750_RX_DESCRIPTOR_BYTES: usize = 384;
 pub const RX_HEADER_STATUS_BYTES: usize = 120;
 
 const MSDU_END_INFO4: usize = 46;
@@ -15,13 +15,13 @@ const MSDU_START_INFO1: usize = 96;
 const MSDU_START_INFO2: usize = 100;
 const MSDU_START_INFO3: usize = 112;
 const MSDU_START_PHY_METADATA: usize = 120;
-const MPDU_START_TAG: usize = 136;
-const MPDU_START_INFO9: usize = 168;
-const MPDU_START_PHY_PPDU_ID: usize = 178;
-const MPDU_START_SW_PEER_ID: usize = 182;
-const MPDU_START_INFO11: usize = 184;
-const MPDU_START_ADDR2: usize = 206;
-const HEADER_STATUS: usize = 268;
+const MPDU_START_TAG: usize = 132;
+const MPDU_START_INFO9: usize = 164;
+const MPDU_START_PHY_PPDU_ID: usize = 174;
+const MPDU_START_SW_PEER_ID: usize = 178;
+const MPDU_START_INFO11: usize = 180;
+const MPDU_START_ADDR2: usize = 202;
+const HEADER_STATUS: usize = 264;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Wcn6750RxDescriptor<'a> {

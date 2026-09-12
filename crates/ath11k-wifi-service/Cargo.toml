@@ -9,6 +9,7 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+drv-network-service = { path = "../network-service" }
 ath11k-core = { path = "../ath11k-core" }
 ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }
 ath11k-softmac-adapter = { path = "../ath11k-softmac-adapter" }
@@ -31,3 +32,7 @@ wlan-control-wire = { path = "../wlan-control-wire" }
 wlan-mlme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 wlan-sme = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme" }
 wlan-softmac-host = { path = "../wlan-softmac-host" }
+
+[patch.crates-io]
+trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
+trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }

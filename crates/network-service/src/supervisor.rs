@@ -387,11 +387,11 @@ mod tests {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control_len;
+        message.msg_controllen = control_len as _;
         if !descriptors.is_empty() {
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
-                (*header).cmsg_len = libc::CMSG_LEN(size_of_val(descriptors) as u32) as usize;
+                (*header).cmsg_len = libc::CMSG_LEN(size_of_val(descriptors) as u32) as _;
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
                 std::ptr::copy_nonoverlapping(

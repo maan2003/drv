@@ -264,13 +264,60 @@ fn run() -> Result<(), String> {
     eprintln!(
         "redwood_wifi_diagnostic=ASSOCIATED protected_link=true ethernet_generation_retained=true"
     );
+    // Association-only remains useful for ring diagnostics. The Internet
+    // mode hands the existing capability to the production sandboxed Netstack3
+    // supervisor; it does not create a Linux Wi-Fi interface or duplicate IP.
+    let outcome = if let Some(binary) =
+        std::env::var_os("REDWOOD_NETWORK_SERVICE").filter(|value| !value.is_empty())
+    {
+        let network_result = (|| -> Result<(), String> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:1080")
+                .map_err(|error| format!("bind diagnostic SOCKS listener: {error}"))?;
+            let mut network =
+                drv_network_service::NetworkServiceSupervisor::new(binary, listener, expected_mac)?;
+            network.install_generation(ethernet)?;
+            eprintln!(
+                "redwood_wifi_diagnostic=NETWORK_RUNNING socks5=127.0.0.1:1080 window_seconds=180"
+            );
+            let network_deadline = Instant::now() + Duration::from_secs(180);
+            let result = loop {
+                if let Some(exit) = network.poll_exit()? {
+                    break Err(format!("network service exited: {exit:?}"));
+                }
+                if let Some(exit) = wifi.try_wait().map_err(|error| error.to_string())? {
+                    break Err(format!("Wi-Fi exited during network proof: {exit}"));
+                }
+                if let Some(received) = policy
+                    .try_receive_packet()
+                    .map_err(|error| error.to_string())?
+                {
+                    validator
+                        .validate(&received.packet)
+                        .map_err(|error| error.to_string())?;
+                    if let Message::GenerationEnd(reason) = received.packet.message {
+                        break Err(format!(
+                            "Wi-Fi generation ended during network proof: {reason:?}"
+                        ));
+                    }
+                }
+                if Instant::now() >= network_deadline {
+                    break Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            network.terminate()?;
+            result
+        })();
+        network_result
+    } else {
+        drop(ethernet);
+        Ok(())
+    };
     drop(policy);
-    drop(ethernet);
-    finish_wifi(
-        wifi,
-        "diagnostic completed after protected association".into(),
-        true,
-    )
+    match outcome {
+        Ok(()) => finish_wifi(wifi, "diagnostic window completed".into(), true),
+        Err(error) => finish_wifi(wifi, error, false),
+    }
 }
 
 fn finish_wifi(wifi: Child, outcome: String, succeeded: bool) -> Result<(), String> {

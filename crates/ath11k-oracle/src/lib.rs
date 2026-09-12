@@ -1375,8 +1375,8 @@ mod tests {
         frame.extend([0xde, 0xad]);
         let header_status = [0; 120];
         let mut descriptor = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
-        descriptor[168..172].copy_from_slice(&((6_u32 << 2) | (5 << 15)).to_le_bytes());
-        descriptor[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+        descriptor[164..168].copy_from_slice(&((6_u32 << 2) | (5 << 15)).to_le_bytes());
+        descriptor[180..184].copy_from_slice(&(1_u32 << 9).to_le_bytes());
         let status = Wcn6750RxDescriptor::parse(&descriptor).unwrap().status();
 
         let mut expected = vec![0; 24];
@@ -1546,9 +1546,9 @@ mod tests {
             let mut descriptor = vec![0; WCN6750_RX_DESCRIPTOR_BYTES];
             descriptor[46..48].copy_from_slice(&(u16::from(first_msdu) << 12).to_le_bytes());
             descriptor[100..104].copy_from_slice(&(u32::from(mesh) << 22).to_le_bytes());
-            descriptor[168..172].copy_from_slice(&((u32::from(encryption_type) << 2)
+            descriptor[164..168].copy_from_slice(&((u32::from(encryption_type) << 2)
                 | (u32::from(tid) << 15)).to_le_bytes());
-            descriptor[184..188].copy_from_slice(&(1_u32 << 9).to_le_bytes());
+            descriptor[180..184].copy_from_slice(&(1_u32 << 9).to_le_bytes());
             let status = Wcn6750RxDescriptor::parse(&descriptor).unwrap().status();
             let rust = normalize_native_wifi_frame(
                 frame.clone(), &header_status, status, decrypted).unwrap();

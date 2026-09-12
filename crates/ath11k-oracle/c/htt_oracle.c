@@ -1,6 +1,13 @@
 #include <linux/types.h>
 #include <stddef.h>
 #include <string.h>
+#define ETH_ALEN 6
+#include "rx_desc.h"
+
+/* Compile the pinned header rather than duplicating Rust's offset table. */
+_Static_assert(sizeof(struct hal_rx_desc_qcn9074) == 384, "QCN9074 RX size");
+_Static_assert(offsetof(struct hal_rx_desc_qcn9074, hdr_status) == 264, "RX header");
+_Static_assert(offsetof(struct hal_rx_desc_qcn9074, msdu_payload) == 384, "RX payload");
 
 struct oracle_htt_srng {
     u8 pdev_id, ring_id, ring_type, entry_words; u64 base, head, tail, msi;
@@ -59,12 +66,12 @@ int oracle_htt_event_decode(const u8 *bytes, size_t len, struct oracle_htt_event
     u8 type = w[0]; memset(out, 0, sizeof(*out)); out->kind = type;
     if (type == 0) { out->minor = w[0] >> 8; out->major = w[0] >> 16; return 0; }
     if (type == 3 || type == 0x1e) {
-        if (len < 16) return -22; out->vdev_id = w[0] >> 8; out->peer_id = w[0] >> 16;
+        if (len < (type == 3 ? 12 : 16)) return -22; out->vdev_id = w[0] >> 8; out->peer_id = w[0] >> 16;
         memcpy(out->address, &w[1], 4); memcpy(out->address + 4, &w[2], 2);
-        out->hardware_peer_id = w[2] >> 16; out->v2 = type == 0x1e;
+        out->v2 = type == 0x1e; out->hardware_peer_id = out->v2 ? w[2] >> 16 : 0;
         if (out->v2) out->ast_hash = w[3]; return 0;
     }
-    if (type == 4 || type == 0x1f) { if (len < 12) return -22;
+    if (type == 4 || type == 0x1f) {
         out->peer_id = w[0] >> 16; out->v2 = type == 0x1f; return 0; }
     return 0;
 }
@@ -77,10 +84,10 @@ int oracle_htt_completion_decode(const u8 *bytes, size_t len, struct oracle_htt_
 static u16 get16(const u8 *p) { u16 v; memcpy(&v, p, 2); return v; }
 static u32 get32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 int oracle_qcn9074_rx_decode(const u8 *b, size_t len, struct oracle_qcn_rx *o) {
-    if (len < 388) return -22;
-    u16 end4 = get16(b + 46); u32 a1 = get32(b + 80), a2 = get32(b + 84);
-    u32 m1 = get32(b + 96), m2 = get32(b + 100), m3 = get32(b + 112);
-    u32 mpdu9 = get32(b + 168), mpdu11 = get32(b + 184);
+    if (len < sizeof(struct hal_rx_desc_qcn9074)) return -22;
+    u16 end4 = get16(b + offsetof(struct hal_rx_desc_qcn9074, msdu_end.info4)); u32 a1 = get32(b + offsetof(struct hal_rx_desc_qcn9074, attention.info1)), a2 = get32(b + offsetof(struct hal_rx_desc_qcn9074, attention.info2));
+    u32 m1 = get32(b + offsetof(struct hal_rx_desc_qcn9074, msdu_start.info1)), m2 = get32(b + offsetof(struct hal_rx_desc_qcn9074, msdu_start.info2)), m3 = get32(b + offsetof(struct hal_rx_desc_qcn9074, msdu_start.info3));
+    u32 mpdu9 = get32(b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start.info9)), mpdu11 = get32(b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start.info11));
     memset(o, 0, sizeof(*o)); o->first_msdu = (end4 >> 12) & 1; o->last_msdu = (end4 >> 13) & 1;
     o->l3_padding = (end4 >> 10) & 3; o->msdu_done = a2 >> 31; o->msdu_length_error = (a1 >> 17) & 1;
     o->fcs_error = a1 >> 31; o->decrypt_error = (a1 >> 29) & 1; o->tkip_mic_error = (a1 >> 28) & 1;
@@ -93,15 +100,15 @@ int oracle_qcn9074_rx_decode(const u8 *b, size_t len, struct oracle_qcn_rx *o) {
     o->mesh_control_present = (m2 >> 22) & 1; o->ldpc = (m2 >> 23) & 1;
     o->sgi = (m3 >> 13) & 3; o->mcs = (m3 >> 15) & 0xf; o->bandwidth = (m3 >> 19) & 3;
     o->packet_type = (m3 >> 8) & 0xf; o->spatial_stream_bitmap = m3 >> 24;
-    o->nss = __builtin_popcount(o->spatial_stream_bitmap); o->frequency = get32(b + 120);
-    o->tid = (mpdu9 >> 15) & 0xf; o->peer = get16(b + 182); o->sequence_valid = (mpdu11 >> 6) & 1;
+    o->nss = __builtin_popcount(o->spatial_stream_bitmap); o->frequency = get32(b + offsetof(struct hal_rx_desc_qcn9074, msdu_start.phy_meta_data));
+    o->tid = (mpdu9 >> 15) & 0xf; o->peer = get16(b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start.sw_peer_id)); o->sequence_valid = (mpdu11 >> 6) & 1;
     o->frame_valid = mpdu11 & 1; o->sequence_number = (mpdu11 >> 20) & 0xfff;
     o->encryption_valid = (mpdu11 >> 9) & 1;
     o->encryption_type = o->encryption_valid ? (mpdu9 >> 2) & 0xf : 7;
-    o->phy_ppdu_id = get16(b + 178);
-    o->mpdu_start_valid = ((get32(b + 136) >> 1) & 0x1ff) == 207;
+    o->phy_ppdu_id = get16(b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start.phy_ppdu_id));
+    o->mpdu_start_valid = ((get32(b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start_tag)) >> 1) & 0x1ff) == 207;
     o->address2_valid = (mpdu11 >> 3) & 1;
-    memcpy(o->address2, b + 206, sizeof(o->address2));
+    memcpy(o->address2, b + offsetof(struct hal_rx_desc_qcn9074, mpdu_start.addr2), sizeof(o->address2));
     return 0;
 }
 

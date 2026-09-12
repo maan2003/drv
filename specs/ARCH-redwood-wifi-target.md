@@ -2,17 +2,13 @@
 
 ## Status
 
-Redwood is a bring-up and driver-port bug-discovery target, aiming for scan,
-association, DHCP, and proved Internet connectivity before production
-hardening. Physical bring-up now completes QMI, the full core lifecycle,
-passive scanning, and scan-result collection. A bounded physical run delivered
-management frames and four BSS summaries across channels 1, 6, and 11. The
-same run proved normal scan-result cleanup with WPSS stopped before VFIO
-release and no SMMU or WPSS fault. Association is not yet proved. The ath11k
-SoftMAC adapter now carries association security provenance into the ported
-key, peer-security-index, and REO replay effects, and a separate production
-service composes it behind a fatal WCN6750-specific sandbox, but that path
-still needs renewed physical association and Internet acceptance. An explicitly
+Redwood remains a bring-up and driver-port bug-discovery target, not a
+production-ready driver. Physical diagnostics now prove scanning, SAE,
+WPA3 protected association with PTK/GTK/IGTK installation, and Internet HTTPS
+through the userspace Wi-Fi Ethernet capability and a separately sandboxed
+native Netstack3 service. The Wi-Fi process used the explicitly unsandboxed
+operator diagnostic mode; production Wi-Fi confinement and sustained/recovery
+acceptance remain separate work. An explicitly
 labelled operator diagnostic mode bypasses only that confinement gate and sends
 one exact scan and connect request directly to the existing ClientRuntime/SME
 control seam; it does not make production wlancfg persistence or namespace
@@ -25,15 +21,15 @@ flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
 Runtime polling drains already-completed CE work with a zero deadline.
-The diagnostic now reaches SAE success and an AP-accepted association; a
-driver-side association completion has also been observed. The four-way
-handshake, usable data path, and Internet connectivity remain unproved.
-The earlier host SError during ring cleanup was isolated to a UMAC teardown
-write and fixed. The current blocker is a WPSS firmware receive-ring
-backpressure assertion. Kernel remoteproc can automatically recover WPSS
-without changing the Linux boot ID, so a retained phone boot is not proof of
-firmware continuity. Live diagnostics must account for remoteproc crashes
-and recovery, not merely process and phone-reset state.
+The WBM idle-link pool is populated before common DP setup, and RX descriptors
+use the native QCN9074 384-byte layout. The earlier host cleanup SError and
+WPSS RX backpressure failure no longer occur in the successful Internet run.
+Kernel remoteproc can automatically recover WPSS without changing the Linux
+boot ID, so live diagnostics disable silent recovery and track firmware
+lifetime independently of the phone boot. A containment failure retains DMA
+owners until an attended firmware reset and verified stop. Orderly shutdown
+still triggers a firmware assertion on PdevSuspend; the Internet diagnostic
+required that attended recovery before DMA release.
 
 Use the [reset-debugging procedure](../scripts/redwood/debugging.md) for
 persistent capture, evidence attribution, and build/run details. Reuse a

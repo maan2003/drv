@@ -106,7 +106,7 @@ pub const WCN6750_PARAMS: HardwareParams = HardwareParams {
     num_vdevs: 3,
     num_peers: 512,
     firmware_memory_mode: 0,
-    rx_descriptor_size: 388,
+    rx_descriptor_size: ath11k_dp::rx::WCN6750_RX_DESCRIPTOR_BYTES as u16,
     tx_ring_size: 2048,
     interface_station: true,
     interface_ap: true,

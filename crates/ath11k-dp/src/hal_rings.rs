@@ -84,6 +84,24 @@ impl<B: Backend> HalDpRings<B> {
         self
     }
 
+    /// Snapshot host/device indices without consuming descriptors.
+    pub fn progress(&mut self) -> Result<Vec<(u16, bool, u32, u32)>, DpError> {
+        let mut progress = Vec::with_capacity(self.rings.len());
+        for ring in &mut self.rings {
+            ring.srng
+                .access_begin_remote(&mut self.remote_read_pointers)
+                .map_err(|_| DpError::DeviceFault)?;
+            let (host, device) = ring.srng.progress();
+            progress.push((
+                ring.srng.id.0,
+                ring.srng.direction == ath11k_hal::RingDirection::Source,
+                host,
+                device,
+            ));
+        }
+        Ok(progress)
+    }
+
     fn parameters(&self, spec: DpRingSpec) -> SrngParams {
         let mut params = SrngParams::default();
         match spec.ring_type {

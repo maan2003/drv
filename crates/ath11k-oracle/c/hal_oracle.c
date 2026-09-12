@@ -492,9 +492,9 @@ void oracle_hal_fragment_msdu_slot(u8 out[128], const u8 source[128],
     memcpy(slot + 8, &msdu, sizeof(msdu));
 }
 
-void oracle_dp_wcn6750_set_msdu_length(u8 out[388], const u8 source[388],
+void oracle_dp_wcn6750_set_msdu_length(u8 out[384], const u8 source[384],
                                        u16 length) {
-    memcpy(out, source, 388);
+    memcpy(out, source, 384);
     u32 info = get_u32(out + 96);
     info = (info & ~0x3fffu) | PREP(0x3fff, length);
     memcpy(out + 96, &info, sizeof(info));
