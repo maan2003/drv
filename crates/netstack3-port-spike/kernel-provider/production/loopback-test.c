@@ -51,11 +51,11 @@ static void transfer(int fd, unsigned char *buf, size_t len, int sending) {
 		done += n;
 	}
 }
-static void tcp(int family) {
+static void tcp(int family, unsigned short port) {
 	const size_t length = payload_length;
 	struct timespec begin, end;
 	clock_gettime(CLOCK_MONOTONIC, &begin);
-	struct sockaddr_storage a = addr(family, 23456);
+	struct sockaddr_storage a = addr(family, port);
 	int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	check(listener >= 0, "tcp socket");
 	check(bind(listener, (void *)&a, alen(family)) == 0, "tcp bind");
@@ -138,9 +138,29 @@ static void refused(int family) {
 }
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
+    if (argc == 2 && !strcmp(argv[1], "parallel")) {
+        enum { CLIENTS = 16 };
+        pid_t children[CLIENTS];
+        payload_length = 512 * 1024;
+        for (int i = 0; i < CLIENTS; i++) {
+            children[i] = fork();
+            check(children[i] >= 0, "parallel fork");
+            if (!children[i]) {
+                tcp(i % 2 ? AF_INET6 : AF_INET, 24000 + i);
+                _exit(0);
+            }
+        }
+        for (int i = 0; i < CLIENTS; i++) {
+            int status;
+            check(waitpid(children[i], &status, 0) == children[i] &&
+                WIFEXITED(status) && WEXITSTATUS(status) == 0, "parallel client");
+        }
+        puts("PASS PARALLEL_TCP_16");
+        return 0;
+    }
 	if (argc == 2 && (!strcmp(argv[1], "bench") || !strcmp(argv[1], "bench-long"))) {
         payload_length = (!strcmp(argv[1], "bench-long") ? 64 : 8) * 1024 * 1024;
-        tcp(AF_INET); tcp(AF_INET6); return 0;
+        tcp(AF_INET, 23456); tcp(AF_INET6, 23456); return 0;
     }
 	if (argc == 2 && !strcmp(argv[1], "absent")) {
 		int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -162,6 +182,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     refused(AF_INET); refused(AF_INET6);
-	tcp(AF_INET); udp(AF_INET); tcp(AF_INET6); udp(AF_INET6);
+	tcp(AF_INET, 23456); udp(AF_INET); tcp(AF_INET6, 23456); udp(AF_INET6);
 	puts("PASS LOOPBACK_SUITE"); return 0;
 }

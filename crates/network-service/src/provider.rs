@@ -215,7 +215,7 @@ pub fn run_provider() -> Result<(), String> {
     );
     let mut event = libc::epoll_event {
         events: libc::EPOLLIN as u32,
-        u64: 3,
+        u64: 0, // Socket IDs start at one; zero names registration.
     };
     if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, 3, &mut event) } < 0 {
         return Err(io::Error::last_os_error().to_string());
@@ -224,31 +224,47 @@ pub fn run_provider() -> Result<(), String> {
     let mut fds: HashMap<u64, Rc<OwnedFd>> = HashMap::new();
     let start = Instant::now();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+    // Bootstrap registration discovery without polling every endpoint.
+    events[0].u64 = 0;
+    let mut event_count = 1;
     loop {
         let mut progress = false;
-        loop {
-            let mut id = 0u64;
-            let fd = unsafe { libc::ioctl(3, CLAIM, &mut id) };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    break;
-                }
-                return Err(format!("claim endpoint: {error}"));
+        let mut ready = Vec::with_capacity(64);
+        for event in &events[..event_count] {
+            if event.u64 != 0 {
+                ready.push(event.u64);
             }
-            let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-            let mut event = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
-                u64: id,
-            };
-            if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) } < 0 {
-                return Err(io::Error::last_os_error().to_string());
-            }
-            fds.insert(id, fd);
-            progress = true;
         }
-        let ready: Vec<_> = fds.iter().map(|(&id, fd)| (id, fd.clone())).collect();
-        for (id, fd) in ready {
+        if events[..event_count].iter().any(|event| event.u64 == 0) {
+            for _ in 0..32 {
+                let mut id = 0u64;
+                let fd = unsafe { libc::ioctl(3, CLAIM, &mut id) };
+                if fd < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    return Err(format!("claim endpoint: {error}"));
+                }
+                let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+                let mut event = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: id,
+                };
+                if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) }
+                    < 0
+                {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                fds.insert(id, fd);
+                ready.push(id);
+                progress = true;
+            }
+        }
+        for id in ready {
+            let Some(fd) = fds.get(&id).cloned() else {
+                continue;
+            };
             for _ in 0..32 {
                 let Some(m) = Message::read(fd.clone(), id)? else {
                     break;
@@ -379,7 +395,7 @@ pub fn run_provider() -> Result<(), String> {
                 m.reply(result)?;
             }
         }
-        runtime.borrow_mut().poll_at(start.elapsed(), 64);
+        progress |= runtime.borrow_mut().poll_at(start.elapsed(), 64) != 0;
         let listeners: Vec<_> = endpoints
             .iter()
             .filter(|(_, e)| e.listening && e.accept_ready)
@@ -569,20 +585,23 @@ pub fn run_provider() -> Result<(), String> {
                 progress = true;
             }
         }
-        if progress {
-            continue;
-        }
         let now = start.elapsed();
-        let timeout = runtime
-            .borrow()
-            .next_timer_deadline()
-            .map(|d| {
-                d.saturating_sub(now)
-                    .as_millis()
-                    .min((i32::MAX - 1) as u128) as i32
-                    + 1
-            })
-            .unwrap_or(-1);
+        // Poll even while runnable: level-triggered IPC readiness provides fair
+        // bounded batches without rescanning every idle endpoint.
+        let timeout = if progress || runtime.borrow().has_pending_work() {
+            0
+        } else {
+            runtime
+                .borrow()
+                .next_timer_deadline()
+                .map(|d| {
+                    d.saturating_sub(now)
+                        .as_millis()
+                        .min((i32::MAX - 1) as u128) as i32
+                        + 1
+                })
+                .unwrap_or(-1)
+        };
         let n = unsafe {
             libc::syscall(
                 libc::SYS_epoll_pwait,
@@ -597,6 +616,7 @@ pub fn run_provider() -> Result<(), String> {
         if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return Err(io::Error::last_os_error().to_string());
         }
+        event_count = n.max(0) as usize;
     }
 }
 
@@ -607,9 +627,55 @@ mod tests {
     use netstack3_tcp::{Buffer, BufferSizes, ReceiveBuffer, SendBuffer};
 
     #[test]
+    fn loopback_pump_preserves_reentrant_wakes_with_full_event_queue() {
+        use std::num::{NonZeroU16, NonZeroUsize};
+        use std::time::Duration;
+        let mut runtime = Runtime::new_with_capacities(
+            8,
+            1,
+            [7; 8192],
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_loopback();
+        for _ in 0..16 {
+            runtime.poll_at(Duration::ZERO, 1);
+        }
+        let listener = runtime.tcp_socket().unwrap();
+        let port = NonZeroU16::new(23462).unwrap();
+        runtime
+            .tcp_bind(listener, Some([127, 0, 0, 1]), port)
+            .unwrap();
+        runtime
+            .tcp_listen(listener, NonZeroUsize::new(4).unwrap())
+            .unwrap();
+        let client = runtime.tcp_socket().unwrap();
+        runtime.tcp_connect(client, [127, 0, 0, 1], port).unwrap();
+        assert!(runtime.has_pending_work());
+        assert_eq!(runtime.poll_at(Duration::ZERO, 0), 0);
+        assert!(runtime.has_pending_work());
+        assert_eq!(runtime.poll_at(Duration::ZERO, 1), 1);
+        // Processing SYN enqueues SYN-ACK after the dequeue snapshot was empty.
+        assert!(runtime.has_pending_work());
+        let accepted = (0..16).find_map(|_| {
+            runtime.poll_at(Duration::ZERO, 1);
+            runtime.tcp_accept(listener).ok()
+        });
+        assert!(
+            accepted.is_some(),
+            "handshake must not wait for a TCP timer"
+        );
+    }
+
+    #[test]
     fn tcp_ring_wrap_and_payload_slices_preserve_bytes() {
         use netstack3_base::{Payload, PayloadLen};
-        let app = NativeTcpBuffers::new(BufferSizes { send: 16, receive: 16 });
+        let app = NativeTcpBuffers::new(BufferSizes {
+            send: 16,
+            receive: 16,
+        });
         let mut send = app.send.clone();
         let mut receive = app.receive.clone();
         // Fill/consume at offsets that force both ring slices to be used.
@@ -639,7 +705,10 @@ mod tests {
 
     #[test]
     fn tcp_buffer_shrink_waits_for_readable_and_out_of_order_bytes() {
-        let app = NativeTcpBuffers::new(BufferSizes { send: 16, receive: 16 });
+        let app = NativeTcpBuffers::new(BufferSizes {
+            send: 16,
+            receive: 16,
+        });
         let mut send = app.send.clone();
         assert_eq!(app.write(b"abcdefgh"), 8);
         send.request_capacity(4);
@@ -667,7 +736,6 @@ mod tests {
         assert_eq!(receive.write_at(100, &&b"x"[..]), 0);
         assert_eq!(receive.limits().len, 0);
     }
-
 
     #[test]
     fn polling_unconnected_tcp_does_not_shutdown_future_connection() {

@@ -253,6 +253,7 @@ pub struct NativeBindingsCtx {
     socket_capacity: usize,
     queue_capacity: usize,
     queues: Queues,
+    loopback_rx_ready: bool,
     udp_v4: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_v6: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_pending: usize,
@@ -298,6 +299,7 @@ impl NativeBindingsCtx {
             socket_capacity,
             queue_capacity,
             queues: Queues::default(),
+            loopback_rx_ready: false,
             udp_v4: HashMap::new(),
             udp_v6: HashMap::new(),
             udp_pending: 0,
@@ -966,6 +968,8 @@ impl DeviceSocketBindingsContext<DeviceId<Self>> for NativeBindingsCtx {
 }
 impl ReceiveQueueBindingsContext<LoopbackDeviceId<Self>> for NativeBindingsCtx {
     fn wake_rx_task(&mut self, _device: &LoopbackDeviceId<Self>) {
+        // Runnable state cannot be lost when the diagnostic event queue fills.
+        self.loopback_rx_ready = true;
         let _ = Self::push_bounded(
             self.queue_capacity,
             &mut self.queues.readiness,
@@ -1642,15 +1646,25 @@ impl Runtime {
     }
 
     pub fn dispatch_due(&mut self, budget: usize) -> usize {
-        let timers = self.bindings.dispatch_due(&self.stack, budget);
+        let mut work = self.bindings.dispatch_due(&self.stack, budget);
         if let Some(device) = &self.loopback {
-            for _ in 0..budget {
-                if matches!(self.stack.api(&mut self.bindings).receive_queue()
-                    .handle_queued_frames(device),
-                    netstack3_base::WorkQueueReport::AllDone) { break; }
+            while work < budget && self.bindings.loopback_rx_ready {
+                self.bindings.loopback_rx_ready = false;
+                let report = self.stack.api(&mut self.bindings).receive_queue()
+                    .handle_queued_frames(device);
+                // The report describes the dequeue snapshot. Processing that
+                // batch can enqueue a reply and wake us again (e.g. TCP SYN-ACK).
+                self.bindings.loopback_rx_ready |=
+                    report == netstack3_base::WorkQueueReport::Pending;
+                work += 1;
             }
         }
-        timers
+        work
+    }
+
+    /// True when a bounded pump yielded with local packet work still runnable.
+    pub fn has_pending_work(&self) -> bool {
+        self.bindings.loopback_rx_ready
     }
 
     fn socket_count(&self) -> usize {

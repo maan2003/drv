@@ -108,9 +108,12 @@ out-of-order bytes) drains; growth can take effect immediately.
 The service tests exercise wraparound, payload slicing and deferred shrink.
 
 This adapts Fuchsia's ring/fragmented-payload design to our synchronous embedding,
-not its Zircon executor. Idle allocation reclamation and readiness-driven
-scheduling still need implementation; ring storage alone does not establish
-production readiness.
+not its Zircon executor. IPC uses level-triggered epoll readiness with bounded endpoint batches.
+Loopback work uses a coalesced runnable flag independent of diagnostic queue
+capacity; a bounded pump preserves reentrant wakeups from packet processing.
+The suite covers that invariant and 16 concurrent IPv4/IPv6 TCP connections.
+Idle allocation reclamation and per-socket core readiness callbacks still need
+implementation; ring storage alone does not establish production readiness.
 
 ## Bulk TCP timer pacing fixed
 

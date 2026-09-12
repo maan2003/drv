@@ -100,3 +100,30 @@ BENCH TCP family=10 seconds=0.322550 MBps=416.11
 BENCH TCP family=2 seconds=0.005089 MBps=412.19
 BENCH TCP family=10 seconds=0.004897 MBps=428.29
 PASS_KVM_PRODUCTION_LOOPBACK
+
+Readiness-driven IPC / bounded loopback pump follow-up:
+40 service tests pass. Reentrant-wake negative control fails expected assertion (exit101).
+BENCH TCP family=2 seconds=0.004893 MBps=428.69
+BENCH TCP family=10 seconds=0.004382 MBps=478.64
+BENCH TCP family=2 seconds=0.307452 MBps=436.55
+BENCH TCP family=10 seconds=0.315468 MBps=425.46
+BENCH TCP family=2 seconds=0.040991 MBps=25.58
+BENCH TCP family=2 seconds=0.050221 MBps=20.88
+BENCH TCP family=2 seconds=0.052843 MBps=19.84
+BENCH TCP family=10 seconds=0.055111 MBps=19.03
+BENCH TCP family=2 seconds=0.055774 MBps=18.80
+BENCH TCP family=10 seconds=0.057862 MBps=18.12
+BENCH TCP family=10 seconds=0.059997 MBps=17.48
+BENCH TCP family=2 seconds=0.062146 MBps=16.87
+BENCH TCP family=10 seconds=0.064228 MBps=16.33
+BENCH TCP family=10 seconds=0.066354 MBps=15.80
+BENCH TCP family=2 seconds=0.068425 MBps=15.32
+BENCH TCP family=10 seconds=0.067974 MBps=15.43
+BENCH TCP family=10 seconds=0.072624 MBps=14.44
+BENCH TCP family=10 seconds=0.074626 MBps=14.05
+BENCH TCP family=2 seconds=0.076720 MBps=13.67
+BENCH TCP family=2 seconds=0.078989 MBps=13.28
+PASS PARALLEL_TCP_16
+BENCH TCP family=2 seconds=0.005010 MBps=418.64
+BENCH TCP family=10 seconds=0.004641 MBps=451.96
+PASS_KVM_PRODUCTION_LOOPBACK
