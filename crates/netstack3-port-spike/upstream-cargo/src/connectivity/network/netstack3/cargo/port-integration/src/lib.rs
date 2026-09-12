@@ -36,7 +36,7 @@ use netstack3_base::{
 use netstack3_core::PendingDatagramSocketError;
 use netstack3_core::device::{
     BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceId, EthernetLinkDevice,
-    EthernetWeakDeviceId, LoopbackDeviceId, MaxEthernetFrameSize, PureIpDeviceId,
+    EthernetWeakDeviceId, LoopbackDeviceId, LoopbackDevice, LoopbackCreationProperties, MaxEthernetFrameSize, PureIpDeviceId,
     RecvEthernetFrameMeta, TransmitQueueConfiguration, WeakDeviceId,
 };
 use netstack3_core::device_socket::{
@@ -1135,6 +1135,7 @@ pub struct Runtime {
     tcp_v6: HashMap<TcpSocketHandle, RuntimeTcpSocketV6>,
     dhcp_socket: SocketId<NativeBindingsCtx>,
     device: EthernetDeviceId<NativeBindingsCtx>,
+    loopback: Option<LoopbackDeviceId<NativeBindingsCtx>>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
@@ -1241,6 +1242,7 @@ impl Runtime {
             tcp_v6: HashMap::new(),
             dhcp_socket,
             device,
+            loopback: None,
             ipv4_address: None,
             ipv6_address: None,
             dns_servers: [None, None],
@@ -1252,6 +1254,32 @@ impl Runtime {
 
     pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
         self.bindings.next_timer_deadline()
+    }
+
+    /// Enables Netstack3's actual loopback device, independent of carrier/DHCP.
+    pub fn enable_loopback(&mut self) {
+        if self.loopback.is_some() { return; }
+        let device = self.stack.api(&mut self.bindings).device::<LoopbackDevice>()
+            .add_device(NativeDeviceIdentifier(NonZeroU64::new(u64::MAX).unwrap()),
+                LoopbackCreationProperties { mtu: Mtu::new(65536) },
+                RawMetric(0), NativeDeviceState,
+                netstack3_device::queue::BufVecU8Allocator::default());
+        let id = device.clone().into();
+        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
+            &id, Ipv4DeviceConfigurationUpdate {
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ..Default::default()
+            }).unwrap();
+        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
+            &id, Ipv6DeviceConfigurationUpdate {
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ..Default::default()
+            }).unwrap();
+        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv4Addr::new([127,0,0,1]), 8).unwrap()).unwrap();
+        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap()).unwrap();
+        self.loopback = Some(device);
     }
 
     pub fn ipv4_address(&self) -> Option<[u8; 4]> {
@@ -1560,7 +1588,15 @@ impl Runtime {
     }
 
     pub fn dispatch_due(&mut self, budget: usize) -> usize {
-        self.bindings.dispatch_due(&self.stack, budget)
+        let timers = self.bindings.dispatch_due(&self.stack, budget);
+        if let Some(device) = &self.loopback {
+            for _ in 0..budget {
+                if matches!(self.stack.api(&mut self.bindings).receive_queue()
+                    .handle_queued_frames(device),
+                    netstack3_base::WorkQueueReport::AllDone) { break; }
+            }
+        }
+        timers
     }
 
     fn socket_count(&self) -> usize {

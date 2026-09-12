@@ -7,8 +7,14 @@ Internet connectivity. Applications currently use SOCKS. The independent
 Linux socket-provider spike exercises a deterministic Ethernet peer, but is
 not the production frontend described below: it retains native loopback and
 uses synchronous RPC where native socket buffering and readiness are needed.
-Neither that spike nor connectivity demonstrations establish production
-socket compatibility, confinement, recovery, or the throughput target.
+The production-shaped frontend now owns both Internet families in a KVM
+kernel with native INET excluded. Its sandboxed Netstack3 binding has passed
+IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
+the reproducible harness and evidence live in
+[`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).
+This localhost implementation is not yet the continuously integrated Wi-Fi
+service. These tests do not establish broad socket compatibility, hostile-provider
+robustness, or the throughput target.
 
 The service implementation lives in `drv-network-service`. Its standalone
 supervisor starts offline and replaces children across tested Ethernet

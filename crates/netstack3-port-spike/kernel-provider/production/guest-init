@@ -1,0 +1,49 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+set -eu
+trap 'echo GUEST_TEST_FAILED; reboot -f' EXIT
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+zcat /proc/config.gz | grep -E "CONFIG_(INET|NETSTACK3|SECCOMP)"
+zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
+/bin/loopback-test absent
+start_provider() {
+    /bin/netstack3-provider 3<>/dev/netstack3 > /run/provider.log 2>&1 &
+    provider=$!
+    for i in $(seq 1 50); do
+        if grep -q sandbox_ready=true /run/provider.log; then break; fi
+        sleep .1
+    done
+    kill -0 "$provider"
+    cat /run/provider.log
+}
+start_provider
+cat /proc/$provider/status
+initial_ns=$(readlink /proc/1/ns/net)
+provider_ns=$(readlink /proc/$provider/ns/net)
+echo "served_netns=$initial_ns provider_netns=$provider_ns"
+test "$initial_ns" != "$provider_ns"
+test -z "$(ls -A /proc/$provider/root/)"
+echo SANDBOX_EMPTY_ROOT_VERIFIED
+/bin/loopback-test
+/bin/loopback-test death > /run/death.log 2>&1 &
+death=$!
+for i in $(seq 1 50); do
+    if grep -q DEATH_READY /run/death.log; then break; fi
+    sleep .1
+done
+grep -q DEATH_READY /run/death.log
+kill -KILL "$provider"
+wait "$provider" || true
+/bin/loopback-test absent
+start_provider
+wait "$death"
+cat /run/death.log
+/bin/loopback-test
+kill -KILL "$provider"
+wait "$provider" || true
+/bin/loopback-test absent
+echo PASS_KVM_PRODUCTION_LOOPBACK
+trap - EXIT
+reboot -f

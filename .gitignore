@@ -5,3 +5,6 @@
 
 # Local pinned-source build output
 /result-ath11k
+
+# Agent continuity notes (not project artifacts)
+/agent-notes/

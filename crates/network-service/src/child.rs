@@ -1359,3 +1359,50 @@ mod tests {
         assert!(child.wait().unwrap().success());
     }
 }
+
+
+// The provider endpoint is opened in the served network namespace before
+// setup creates the child's empty network namespace. Possession of fd 3,
+// not the child's namespace or privilege, authorizes this single session.
+pub(crate) fn provider_setup() -> Result<(), String> {
+    unsafe { close(4); close(5); }
+    setup(unsafe { getppid() })?;
+    let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+    if epoll != EPOLL_FD {
+        if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        unsafe { close(epoll); }
+    }
+    let mut filter = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, 4),
+        jump(AUDIT_ARCH, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, 0),
+    ];
+    for (syscall, fds) in [(libc::SYS_read, &[3u32][..]),
+                          (libc::SYS_write, &[1u32, 2, 3][..])] {
+        filter.push(jump(syscall as u32, 0, (fds.len() + 3) as u8));
+        filter.push(arg(0));
+        for (i, fd) in fds.iter().enumerate() {
+            filter.push(jump(*fd, (fds.len() - i) as u8, 0));
+        }
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+    }
+    append_epoll_ctl(&mut filter, EPOLL_FD);
+    append_epoll_pwait(&mut filter, EPOLL_FD);
+    append_no_exec_memory(&mut filter, libc::SYS_mmap);
+    append_no_exec_memory(&mut filter, libc::SYS_mprotect);
+    for syscall in [libc::SYS_close, libc::SYS_munmap, libc::SYS_brk,
+        libc::SYS_mremap, libc::SYS_madvise, libc::SYS_futex, libc::SYS_getrandom,
+        libc::SYS_clock_gettime, libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn, libc::SYS_sigaltstack, libc::SYS_restart_syscall,
+        libc::SYS_exit, libc::SYS_exit_group] {
+        filter.push(jump(syscall as u32, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+    syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
+}

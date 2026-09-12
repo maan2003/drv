@@ -1,0 +1,898 @@
+warning: unexpected `cfg` condition name: `loom`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/sync/src/lib.rs:11:7
+   |
+11 | #[cfg(loom)]
+   |       ^^^^
+   |
+   = help: expected names are: `docsrs`, `feature`, and `test` and 32 more
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `loom`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/sync/src/lib.rs:13:11
+   |
+13 | #[cfg(not(loom))]
+   |           ^^^^
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/sync/src/lib.rs:64:15
+   |
+64 |     #[cfg(not(loom))]
+   |               ^^^^
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/sync/src/lib.rs:147:15
+    |
+147 |     #[cfg(not(loom))]
+    |               ^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `netstack3_sync` (lib) generated 4 warnings
+warning: unexpected `cfg` condition name: `benchmark`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/base/src/lib.rs:222:7
+    |
+222 | #[cfg(benchmark)]
+    |       ^^^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, and `test` and 32 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(benchmark)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(benchmark)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `benchmark`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/base/src/data_structures/token_bucket.rs:346:17
+    |
+346 | #[cfg(any(test, benchmark))]
+    |                 ^^^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(benchmark)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(benchmark)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `netstack3_base` (lib) generated 2 warnings
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/ip/src/./routing.rs:188:53
+    |
+183 |         &'a self,
+    |          -- the lifetime is named here
+184 |         core_ctx: &'a mut CC,
+    |                    -- the lifetime is named here
+185 |         local_device: Option<&'a D>,
+    |                               -- the lifetime is named here
+...
+188 |     ) -> impl Iterator<Item = (Destination<I::Addr, &D>, R)> + 'a {
+    |                                                     ^^         -- the same lifetime is named here
+    |                                                     |
+    |                                                     the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: consistently use `'a`
+    |
+188 |     ) -> impl Iterator<Item = (Destination<I::Addr, &'a D>, R)> + 'a {
+    |                                                      ++
+
+warning: `netstack3_ip` (lib) generated 1 warning (run `cargo fix --lib -p netstack3_ip` to apply 1 suggestion)
+warning: bssl-sys@0.1.0: In file included from /nix/store/m2v7vwf2fvgylww97i34kc34z2yxv4h1-glibc-2.42-67-dev/include/bits/libc-header-start.h:33,
+warning: bssl-sys@0.1.0:                  from /nix/store/m2v7vwf2fvgylww97i34kc34z2yxv4h1-glibc-2.42-67-dev/include/stdint.h:26,
+warning: bssl-sys@0.1.0:                  from /nix/store/cmjirs6g57ddbyjglwic2g2cjrwy3ppr-gcc-15.3.0/lib/gcc/x86_64-unknown-linux-gnu/15.3.0/include/stdint.h:11,
+warning: bssl-sys@0.1.0:                  from /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys/../../src/include/openssl/base.h:24,
+warning: bssl-sys@0.1.0:                  from /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys/../../src/include/openssl/aes.h:18,
+warning: bssl-sys@0.1.0:                  from /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys/../../../../third_party/boringssl/src/rust/bssl-sys/wrapper.h:3,
+warning: bssl-sys@0.1.0:                  from /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys/wrapper.c:1:
+warning: bssl-sys@0.1.0: /nix/store/m2v7vwf2fvgylww97i34kc34z2yxv4h1-glibc-2.42-67-dev/include/features.h:435:4: warning: #warning _FORTIFY_SOURCE requires compiling with optimization (-O) [-Wcpp]
+warning: bssl-sys@0.1.0:   435 | #  warning _FORTIFY_SOURCE requires compiling with optimization (-O)
+warning: bssl-sys@0.1.0:       |    ^~~~~~~
+warning: function `write_commit` is never used
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/fcg-crypto/src/sae/frame.rs:170:8
+    |
+170 | pub fn write_commit(
+    |        ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `wlan-fcg-crypto` (lib) generated 1 warning
+warning: eliding a lifetime that's named elsewhere is confusing
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/datagram/src/./datagram.rs:693:23
+    |
+691 |         &'a self,
+    |          -- the lifetime is named here
+692 |         ctx: &CC,
+693 |     ) -> IpOptionsRef<'_, I::OtherVersion, D> {
+    |                       ^^ the same lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: consistently use `'a`
+    |
+693 -     ) -> IpOptionsRef<'_, I::OtherVersion, D> {
+693 +     ) -> IpOptionsRef<'a, I::OtherVersion, D> {
+    |
+
+warning: `netstack3_datagram` (lib) generated 1 warning (run `cargo fix --lib -p netstack3_datagram` to apply 1 suggestion)
+warning: unexpected `cfg` condition name: `tests`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0/src/serialize/binary/decoder.rs:248:7
+    |
+248 | #[cfg(tests)]
+    |       ^^^^^ help: there is a config with a similar name: `test`
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tests)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(tests)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: `trust-dns-proto` (lib) generated 1 warning
+warning: unused import: `Property`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/inspect.rs:10:64
+   |
+10 |     BoolProperty, BytesProperty, Inspector, IntProperty, Node, Property, StringProperty,
+   |                                                                ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `InspectListClosure` and `InspectUintArray`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/inspect.rs:14:36
+   |
+14 | use fuchsia_inspect_contrib::log::{InspectListClosure, InspectUintArray};
+   |                                    ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `fuchsia_inspect::NumericProperty`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:12:5
+   |
+12 | use fuchsia_inspect::NumericProperty;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `fuchsia_inspect_contrib::log::InspectBytes`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/link_state.rs:12:5
+   |
+12 | use fuchsia_inspect_contrib::log::InspectBytes;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `fuchsia_inspect_contrib::log::InspectBytes`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:24:5
+   |
+24 | use fuchsia_inspect_contrib::log::InspectBytes;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `device_info`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/inspect.rs:67:9
+   |
+67 |         device_info: &fidl_mlme::DeviceInfo,
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_device_info`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `spectrum_management_support`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/inspect.rs:68:9
+   |
+68 |         spectrum_management_support: &fidl_common::SpectrumManagementSupport,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_spectrum_management_support`
+
+warning: unused variable: `sme_inspect`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:733:9
+    |
+733 |         sme_inspect: &Arc<inspect::SmeTree>,
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_sme_inspect`
+
+warning: unused variable: `cfg`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:734:9
+    |
+734 |         cfg: &crate::client::ClientConfig,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_cfg`
+
+warning: unused variable: `device_info`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:735:9
+    |
+735 |         device_info: &fidl_mlme::DeviceInfo,
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_device_info`
+
+warning: unused variable: `security_support`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:736:9
+    |
+736 |         security_support: &fidl_common::SecuritySupport,
+    |         ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_security_support`
+
+warning: unused variable: `session`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:742:21
+    |
+742 |         if let Some(session) = self.scheduled_scan_receivers.get_mut(&txn_id) {
+    |                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session`
+
+warning: unused variable: `context`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/link_state.rs:421:20
+    |
+421 | fn inspect_log_key(context: &mut Context, key: &Key) {
+    |                    ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_context`
+
+warning: unused variable: `cipher`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/link_state.rs:422:10
+    |
+422 |     let (cipher, key_index) = match key {
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_cipher`
+
+warning: unused variable: `key_index`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/link_state.rs:422:18
+    |
+422 |     let (cipher, key_index) = match key {
+    |                  ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_key_index`
+
+warning: unused variable: `eapol_pdu`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:897:17
+    |
+897 |             let eapol_pdu = &ind.data[..];
+    |                 ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_eapol_pdu`
+
+warning: unused variable: `context`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2203:5
+     |
+2203 |     context: &mut Context,
+     |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_context`
+
+warning: unused variable: `msg`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2230:43
+     |
+2230 |             StateChangeContext::Connect { msg, bssid, ssid } => {
+     |                                           ^^^ help: try ignoring the field: `msg: _`
+
+warning: unused variable: `bssid`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2230:48
+     |
+2230 |             StateChangeContext::Connect { msg, bssid, ssid } => {
+     |                                                ^^^^^ help: try ignoring the field: `bssid: _`
+
+warning: unused variable: `ssid`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2230:55
+     |
+2230 |             StateChangeContext::Connect { msg, bssid, ssid } => {
+     |                                                       ^^^^ help: try ignoring the field: `ssid: _`
+
+warning: unused variable: `msg`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2239:40
+     |
+2239 |             StateChangeContext::Roam { msg, bssid } => {
+     |                                        ^^^ help: try ignoring the field: `msg: _`
+
+warning: unused variable: `bssid`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2239:45
+     |
+2239 |             StateChangeContext::Roam { msg, bssid } => {
+     |                                             ^^^^^ help: try ignoring the field: `bssid: _`
+
+warning: unused variable: `msg`
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/state/mod.rs:2247:37
+     |
+2247 |             StateChangeContext::Msg(msg) => {
+     |                                     ^^^ help: if this is intentional, prefix it with an underscore: `_msg`
+
+warning: fields `state_events` and `rsn_events` are never read
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/inspect.rs:40:9
+   |
+33 | pub struct SmeTree {
+   |            ------- fields in this struct
+...
+40 |     pub state_events: Mutex<BoundedListNode>,
+   |         ^^^^^^^^^^^^
+41 |     /// Inspection node to log EAPOL frames processed by supplicant and its output.
+42 |     pub rsn_events: Mutex<BoundedListNode>,
+   |         ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `scan_results_sender` is never read
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme/src/client/scan.rs:106:5
+    |
+105 | pub(crate) struct ScheduledScanState {
+    |                   ------------------ field in this struct
+106 |     scan_results_sender: mpsc::UnboundedSender<fidl::Vmo>,
+    |     ^^^^^^^^^^^^^^^^^^^
+
+warning: `wlan-sme` (lib) generated 25 warnings (run `cargo fix --lib -p wlan-sme` to apply 23 suggestions)
+warning: unexpected `cfg` condition value: `mdns`
+ --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/dns_sd.rs:9:8
+  |
+9 | #![cfg(feature = "mdns")]
+  |        ^^^^^^^^^^^^^^^^
+  |
+  = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+  = help: consider adding `mdns` as a feature in `Cargo.toml`
+  = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+  = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/caching_client.rs:151:23
+    |
+151 |                 #[cfg(feature = "mdns")]
+    |                       ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/caching_client.rs:155:27
+    |
+155 |                 #[cfg(not(feature = "mdns"))]
+    |                           ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/config.rs:294:11
+    |
+294 |     #[cfg(feature = "mdns")]
+    |           ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/config.rs:310:19
+    |
+310 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/config.rs:331:19
+    |
+331 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/config.rs:352:19
+    |
+352 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `backtrace`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/error.rs:21:7
+   |
+21 | #[cfg(feature = "backtrace")]
+   |       ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `backtrace` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `backtrace`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/error.rs:107:11
+    |
+107 |     #[cfg(feature = "backtrace")]
+    |           ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `backtrace` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `backtrace`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/error.rs:137:19
+    |
+137 |             #[cfg(feature = "backtrace")]
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `backtrace` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `backtrace`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/error.rs:276:22
+    |
+276 |             if #[cfg(feature = "backtrace")] {
+    |                      ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `backtrace` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `backtrace`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/error.rs:294:19
+    |
+294 |             #[cfg(feature = "backtrace")]
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `backtrace` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/mod.rs:21:7
+   |
+21 | #[cfg(feature = "mdns")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/connection_provider.rs:30:7
+   |
+30 | #[cfg(feature = "mdns")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/connection_provider.rs:219:19
+    |
+219 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/connection_provider.rs:292:11
+    |
+292 |     #[cfg(feature = "mdns")]
+    |           ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/connection_provider.rs:342:19
+    |
+342 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server.rs:17:7
+   |
+17 | #[cfg(feature = "mdns")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server.rs:22:7
+   |
+22 | #[cfg(feature = "mdns")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server.rs:261:7
+    |
+261 | #[cfg(feature = "mdns")]
+    |       ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:24:7
+   |
+24 | #[cfg(feature = "mdns")]
+   |       ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:380:7
+    |
+380 | #[cfg(feature = "mdns")]
+    |       ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:42:11
+   |
+42 |     #[cfg(feature = "mdns")]
+   |           ^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+   = help: consider adding `mdns` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:142:15
+    |
+142 |     #[cfg(not(feature = "mdns"))]
+    |               ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:156:11
+    |
+156 |     #[cfg(feature = "mdns")]
+    |           ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:108:19
+    |
+108 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:135:19
+    |
+135 |             #[cfg(feature = "mdns")]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:244:15
+    |
+244 |         #[cfg(feature = "mdns")]
+    |               ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition value: `mdns`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:248:19
+    |
+248 |         #[cfg(not(feature = "mdns"))]
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `dns-over-https`, `dns-over-https-rustls`, `dns-over-native-tls`, `dns-over-openssl`, `dns-over-quic`, `dns-over-rustls`, `dns-over-tls`, `dnssec`, `dnssec-openssl`, `dnssec-ring`, `ipconfig`, `resolv-conf`, `rustls`, `serde`, `serde-config`, `system-config`, `testing`, `tokio`, `tokio-native-tls`, `tokio-openssl`, `tokio-runtime`, `tokio-rustls`, and `webpki-roots`
+    = help: consider adding `mdns` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `std::sync::Mutex`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_stats.rs:11:5
+   |
+11 | use std::sync::Mutex;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `AtomicUsize` and `self`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_stats.rs:12:25
+   |
+12 | use std::sync::atomic::{self, AtomicUsize};
+   |                         ^^^^  ^^^^^^^^^^^
+
+warning: unused variable: `retained_errors`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_stats.rs:82:57
+   |
+82 |         let Self { successes, failures, success_streak, retained_errors, recent_errors } = self;
+   |                                                         ^^^^^^^^^^^^^^^ help: try ignoring the field: `retained_errors: _`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `recent_errors`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_stats.rs:82:74
+   |
+82 |         let Self { successes, failures, success_streak, retained_errors, recent_errors } = self;
+   |                                                                          ^^^^^^^^^^^^^ help: try ignoring the field: `recent_errors: _`
+
+warning: missing documentation for a method
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/async_resolver.rs:76:5
+    |
+ 76 |     pub fn name_server_stats(&self) -> Vec<NameServerStats> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: the lint level is defined here
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/lib.rs:238:5
+    |
+238 |     missing_docs,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server.rs:189:5
+    |
+189 |     pub fn stats(&self) -> NameServerStats {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0/src/name_server/name_server_pool.rs:222:5
+    |
+222 |     pub fn name_server_stats(&self) -> Vec<NameServerStats> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `trust-dns-resolver` (lib) generated 36 warnings (run `cargo fix --lib -p trust-dns-resolver` to apply 4 suggestions)
+   Compiling netstack3-port-integration v0.1.0 (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration)
+warning: unused import: `ArenaBox`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/client/bound.rs:11:18
+   |
+11 | use fdf::{Arena, ArenaBox, ArenaStaticBox};
+   |                  ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `log::error`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:18:5
+   |
+18 | use log::error;
+   |     ^^^^^^^^^^
+
+warning: unused import: `std::fmt::Display`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:19:5
+   |
+19 | use std::fmt::Display;
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::mem`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:20:5
+   |
+20 | use std::mem;
+   |     ^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:21:5
+   |
+21 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `TimeUnit`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:24:19
+   |
+24 | use wlan_common::{TimeUnit, tx_vector};
+   |                   ^^^^^^^^
+
+warning: unused import: `wlan_trace as wtrace`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:27:5
+   |
+27 | use wlan_trace as wtrace;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `fidl_fuchsia_wlan_common as fidl_common`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/lib.rs:33:5
+   |
+33 | use fidl_fuchsia_wlan_common as fidl_common;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `wlan_trace as wtrace`
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/lib.rs:56:5
+   |
+56 | use wlan_trace as wtrace;
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `trace_bss`
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs:565:13
+    |
+565 |         let trace_bss = wlan_common::bss::BssDescription::try_from(bss.clone())
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_trace_bss`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: trait `WlanTxPacketExt` is never used
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/lib.rs:79:7
+   |
+79 | trait WlanTxPacketExt {
+   |       ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `handle_ap_advertisement` is never used
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs:303:12
+    |
+128 | impl<'a, D: DeviceOps> BoundScanner<'a, D> {
+    | ------------------------------------------ method in this implementation
+...
+303 |     pub fn handle_ap_advertisement(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `send_scan_result` is never used
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/client/scanner.rs:549:4
+    |
+549 | fn send_scan_result<D: DeviceOps>(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: constant `MSDU_TRACE_NAME` is never used
+   --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/client/state.rs:815:15
+    |
+815 |         const MSDU_TRACE_NAME: &'static str = "States::on_data_frame => MSDU";
+    |               ^^^^^^^^^^^^^^^
+
+warning: constant `REQUIRED_WLAN_HEADER_LEN` is never used
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:97:7
+   |
+97 | const REQUIRED_WLAN_HEADER_LEN: usize = 10;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PEER_ADDR_OFFSET` is never used
+  --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust/src/device.rs:98:7
+   |
+98 | const PEER_ADDR_OFFSET: usize = 4;
+   |       ^^^^^^^^^^^^^^^^
+
+warning: `wlan-mlme` (lib) generated 16 warnings (run `cargo fix --lib -p wlan-mlme` to apply 10 suggestions)
+warning: unreachable pattern
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration/src/lib.rs:1054:9
+     |
+1049 |         netstack3_datagram::ConnectError::Ip(IpSockCreationError::Route(_)) => {
+     |         ------------------------------------------------------------------- matches all the relevant values
+...
+1054 |         netstack3_datagram::ConnectError::Ip(_)
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration/src/lib.rs:1087:11
+     |
+1080 |         UdpSendToError::CreateSock(IpSockCreationError::Route(_))
+     |         --------------------------------------------------------- matches all the relevant values
+...
+1087 |         | UdpSendToError::CreateSock(_)
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+   Compiling drv-network-service v0.1.0 (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service)
+warning: `netstack3-port-integration` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.89s
+     Running unittests src/lib.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/drv_network_service-2dcac4481c843ac7)
+
+running 35 tests
+test child::tests::network_filter_denial_fixture ... ok
+test child::tests::network_filter_fixture ... ok
+test child::tests::network_service_filter_fixture ... ok
+test child::tests::resource_admission_filter_fixture ... ok
+test lifecycle::tests::receiver_rejects_unconnected_seqpacket_capability ... ok
+test provider::tests::polling_unconnected_tcp_does_not_shutdown_future_connection ... ok
+test scheduler_tests::admission_is_derived_from_descriptor_and_connection_state_budgets ... ok
+test scheduler_tests::runnable_queue_coalesces_and_preserves_round_robin_order ... ok
+test child::tests::network_filter_allows_runtime_and_teardown ... ok
+test supervisor::tests::bootstrap_rejects_non_protocol_bytes ... ok
+test supervisor::tests::bootstrap_requires_exact_ready_and_acknowledges_go ... ok
+test integration_test::associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss ... ok
+test child::tests::production_socks_relay_runs_under_network_filter ... ok
+test supervisor::tests::accepted_clients_inherit_accounted_listener_socket_buffers ... ok
+test scheduler_tests::epoll_interests_apply_relay_backpressure ... ok
+test supervisor::tests::bootstrap_rejects_eof_before_started ... ok
+test supervisor::tests::supervisor_fixture_child ... ok
+test supervisor::tests::lifecycle_receiver_commits_identity_and_closes_failed_install ... ok
+test supervisor::tests::supervisor_starts_without_a_generation_and_rejects_invalid_mac ... ok
+
+running 1 test
+
+running 1 test
+test supervisor::tests::supervisor_fixture_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+
+running 1 test
+test integration_test::socks_connect_relays_application_bytes_over_ethernet ... ok
+
+running 1 test
+test supervisor::tests::lifecycle_receiver_installs_revokes_and_replaces_real_process_capabilities ... ok
+test supervisor::tests::wifi_capability_revocation_requires_a_fresh_generation ... ok
+test supervisor::tests::lifecycle_receiver_rejects_bad_records_and_ancillary_descriptors ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test supervisor::tests::supervisor_fixture_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+
+running 1 test
+
+running 1 test
+test supervisor::tests::supervisor_fixture_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+test integration_test::revoked_frame_generation_exits_and_replacement_starts ... ok
+
+running 1 test
+test supervisor::tests::supervisor_reaps_revoked_generation_before_installing_replacement ... ok
+test supervisor::tests::supervisor_fixture_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+test supervisor::tests::supervisor_restarts_exited_process_with_retained_generation ... ok
+
+running 1 test
+test supervisor::tests::lifecycle_receiver_replaces_an_active_generation ... ok
+test child::tests::production_service_core_runs_under_network_filter ... ok
+test integration_test::idle_epoll_waits_for_deadline_without_busy_polling ... ok
+test integration_test::offline_service_returns_socks_network_unreachable_and_keeps_serving ... ok
+test integration_test::epoll_serves_more_than_twenty_four_clients_with_isolated_failures ... ok
+idle_epoll wall_us=120433 cpu_us=0 waits=1 blocking_waits=1
+test child::tests::epoll_scaling_idle_and_deadline_run_under_network_filter ... ok
+resource_admission mode=emfile capacity=72 waits=22 blocking_waits=22
+resource_admission mode=boundary capacity=72 waits=18 blocking_waits=18test child::tests::filtered_emfile_pause_recovers_on_external_resource_timer ... 
+ok
+test child::tests::filtered_resource_derived_admission_exceeds_sixty_four_and_recovers_slot ... ok
+test child::tests::network_filter_forbidden_operations_are_fatal ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+
+     Running unittests src/main.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/drv_network_service-cc16bdf5cd6131f3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/netstack3-provider.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/netstack3_provider-7e109bddc99500a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests drv_network_service
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

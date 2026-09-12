@@ -305,10 +305,17 @@ impl NativeSocketProvider {
             TcpSocketState::FinWait1 | TcpSocketState::FinWait2 => v2.write_closed = true,
             TcpSocketState::Closing
             | TcpSocketState::LastAck
-            | TcpSocketState::TimeWait
-            | TcpSocketState::Close => {
+            | TcpSocketState::TimeWait => {
                 v2.read_closed = true;
                 v2.write_closed = true;
+            }
+            TcpSocketState::Close => {
+                // Unbound sockets are also in Close; polling an unopened
+                // connection must not permanently shut down its data paths.
+                if v2.peer.is_some() && !v2.connecting {
+                    v2.read_closed = true;
+                    v2.write_closed = true;
+                }
             }
             TcpSocketState::SynSent | TcpSocketState::SynRecv | TcpSocketState::Listen => {}
         }

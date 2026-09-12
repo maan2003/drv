@@ -1,0 +1,7 @@
+config NETSTACK3
+	bool "Userspace-backed Internet sockets"
+	depends on NET && !INET
+	help
+	  Provide AF_INET and AF_INET6 sockets through a scoped userspace
+	  transport provider. Native TCP/IP is not built. Provider loss fails
+	  sockets closed; localhost is not a separate backend.

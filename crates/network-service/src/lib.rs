@@ -24,6 +24,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 mod child;
+mod provider;
+pub use provider::run_provider;
 mod ethernet_device;
 mod lifecycle;
 mod supervisor;
