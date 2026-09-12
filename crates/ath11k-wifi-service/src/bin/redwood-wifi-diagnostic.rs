@@ -2,10 +2,11 @@
 
 //! Operator-attended launcher for the explicitly unsandboxed Redwood association diagnostic.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -437,8 +438,19 @@ fn parse_mac(value: &str) -> Result<[u8; 6], String> {
 }
 
 fn spawn_with_fds(program: &str, args: &[String], fd3: RawFd, fd4: RawFd) -> Result<Child, String> {
+    // The phone wrapper redirects stderr to its persistent diagnostic file.
+    // Reopen it with synchronous data writes: inherited buffered file output
+    // otherwise disappears when a device fault resets the phone.
+    let log = OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_DSYNC)
+        .open("/proc/self/fd/2")
+        .map_err(|e| format!("open synchronous diagnostic log: {e}"))?;
+    let stdout = log
+        .try_clone()
+        .map_err(|e| format!("clone synchronous diagnostic log: {e}"))?;
     let mut command = Command::new(program);
-    command.args(args);
+    command.args(args).stdout(stdout).stderr(log);
     unsafe {
         command.pre_exec(move || {
             let source3 = libc::fcntl(fd3, libc::F_DUPFD_CLOEXEC, 5);
