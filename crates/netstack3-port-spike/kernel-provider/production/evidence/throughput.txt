@@ -1,0 +1,84 @@
+Localhost TCP throughput, np KVM; native Linux 6.18.40, INET=n.
+Real sandboxed Netstack3, anonymous per-socket FD frontend (ABI4).
+MBps = 2 * payload bytes / wall seconds / 1e6; sequential request + echo,
+including setup, allocation, integrity checking; NOT simultaneous duplex.
+One online guest CPU. Rust 1.97 release. No Nix builds or physical networking.
+
+release-64k-1
+BENCH TCP family=2 seconds=5.353282 MBps=3.13
+PASS TCP family=2 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=10.340657 MBps=1.62
+PASS TCP family=10 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.983218 MBps=2.13
+BENCH TCP family=10 seconds=0.983085 MBps=2.13
+PASS_KVM_PRODUCTION_LOOPBACK
+
+release-64k-2
+BENCH TCP family=2 seconds=5.350089 MBps=3.14
+PASS TCP family=2 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=10.336936 MBps=1.62
+PASS TCP family=10 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.982359 MBps=2.14
+BENCH TCP family=10 seconds=0.983597 MBps=2.13
+PASS_KVM_PRODUCTION_LOOPBACK
+
+release-256k-1
+BENCH TCP family=2 seconds=0.046940 MBps=357.42
+PASS TCP family=2 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.046172 MBps=363.36
+PASS TCP family=10 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.005758 MBps=364.28
+BENCH TCP family=10 seconds=0.005100 MBps=411.26
+PASS_KVM_PRODUCTION_LOOPBACK
+
+release-256k-2
+BENCH TCP family=2 seconds=0.047395 MBps=353.99
+PASS TCP family=2 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.048620 MBps=345.07
+PASS TCP family=10 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.005678 MBps=369.40
+BENCH TCP family=10 seconds=0.005248 MBps=399.67
+PASS_KVM_PRODUCTION_LOOPBACK
+
+release-256k-3
+BENCH TCP family=2 seconds=0.049794 MBps=336.93
+PASS TCP family=2 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.051389 MBps=326.48
+PASS TCP family=10 bytes=8388608 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.005586 MBps=375.49
+BENCH TCP family=10 seconds=0.006125 MBps=342.44
+PASS_KVM_PRODUCTION_LOOPBACK
+
+final-64m-1
+BENCH TCP family=2 seconds=0.399374 MBps=336.07
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.436843 MBps=307.24
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.005833 MBps=359.58
+BENCH TCP family=10 seconds=0.005226 MBps=401.32
+PASS_KVM_PRODUCTION_LOOPBACK
+
+final-64m-2
+BENCH TCP family=2 seconds=0.398138 MBps=337.11
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.400893 MBps=334.80
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.006310 MBps=332.39
+BENCH TCP family=10 seconds=0.005190 MBps=404.10
+PASS_KVM_PRODUCTION_LOOPBACK
+
+final-64m-3
+BENCH TCP family=2 seconds=0.401325 MBps=334.44
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.405575 MBps=330.93
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.005557 MBps=377.41
+BENCH TCP family=10 seconds=0.005124 MBps=409.34
+PASS_KVM_PRODUCTION_LOOPBACK
+
+Maintained-suite negative control: optimized old 64KiB defaults.
+Runner exit=124 (50-second timeout), no PASS_KVM_PRODUCTION_LOOPBACK.
+Fixed defaults: maintained suite PASS; 64MiB IPv4 337.17, IPv6 341.26 MB/s.
+SHA256 final overlay lib.rs: fb1d7cd014de42c48896d9aeb022f171380d970ff4c6047fc91f0bf4026ed613
+SHA256 stripped provider: 1609d07e4e28f40c2433fbb010b660b024662c8c34dd6a6b3e2119682de4a2ce
+SHA256 kernel: 9d0dd4e14b8f6abdafa68a92e2d2d2503307f21b43092f8d100dbad5d134282f

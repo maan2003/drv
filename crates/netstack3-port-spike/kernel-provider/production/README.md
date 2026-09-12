@@ -90,12 +90,42 @@ both designs; the old multiplexed frontend also had large variation.
 The fast 1 MiB tests were generally around 64–73 MB/s. This is an unoptimized
 Rust build, and the TCP measurement includes setup, allocation and integrity
 checking. It does not establish deployment throughput or an end-to-end winner.
-The long-transfer stalls remain unexplained; timer/window interactions are
-a hypothesis, not a diagnosed cause.
+A subsequent controlled experiment diagnosed buffer-induced TCP timer pacing;
+see below. The comparison above is retained as historical evidence.
 
 **Decision:** use anonymous per-socket FDs: fewer kernel objects and adapter
 operations, no measured advantage for socket FDs. Keep the registration
 character device only as the authority/admission endpoint.
+
+## Bulk TCP timer pacing fixed
+
+The port's 64 KiB default send/receive buffers left insufficient pipeline
+headroom for the 65,536-byte loopback MTU. Instrumentation found repeated
+40 ms timer waits with queued transmit data and available receive credits.
+Core inspection implicates Nagle plus delayed ACK after initial quick ACKs;
+the negotiated MSS was not directly captured. TCP algorithms remain unchanged.
+
+The default is now 256 KiB per send/receive buffer (allocated on use; the
+4 MiB maximum is unchanged). A 128 KiB experiment still stalled on IPv4.
+This increases default payload capacity fourfold, up to 128 MiB across the
+256-socket quota, excluding kernel queues and other overhead.
+
+With identical optimized Rust builds, the old 64 KiB default delivered
+1.6–3.1 MB/s on repeated 8 MiB transfers; 256 KiB delivered 326–363 MB/s.
+Three larger 64 MiB-per-direction runs delivered **307–337 MB/s** across
+IPv4 and IPv6. These are sequential request/echo payload bytes divided by
+wall time, including setup, allocation and integrity checking, not simultaneous
+full-duplex throughput. Optimization alone did not fix the old configuration.
+
+[Raw before/after results](evidence/throughput.txt),
+[final maintained KVM suite](evidence/throughput-serial.log), and
+[37 service tests](evidence/throughput-tests.log) retain delivery evidence.
+The maintained suite includes `bench-long` (64 MiB per direction) to exhaust
+quick ACKs and catch timer-paced regressions within its existing 50-second
+whole-VM timeout. The old 64 KiB optimized configuration times out (exit 124);
+the fixed configuration passes. This is a hardware-dependent integration
+regression, not a portable 100 MB/s assertion. A virtual-time unit-test
+experiment did not reproduce the actual provider's scheduling and was discarded.
 
 ## What libkrun TSI contributed
 
@@ -122,8 +152,8 @@ This remains a localhost milestone, not deployment readiness:
   16 KiB. Ancillary data, scoped IPv6 and broad flags/ioctl compatibility remain.
 - Shutdown drains admitted output. Complete linger/shutdown semantics, exhaustive
   concurrent lifetime testing and hostile-provider fuzzing are not established.
-- Throughput/CPU/power targets are not established. In particular, the observed
-  long-transfer performance variation must not be hidden by the fast IPC result.
+- Localhost throughput exceeds 100 MB/s in the retained optimized KVM tests.
+  Deployment throughput, CPU/power and physical-link performance remain unproved.
 - No Ethernet/Wi-Fi capability is attached to this entry point. MT7921 and host
   networking were untouched. The minimal guest kernel is not a hardened deployment
   configuration. Although QEMU requests two vCPUs, these captures show only one
@@ -145,7 +175,8 @@ cc -O2 -Wall -Wextra -Werror endpoint-test.c -o "$ROOT/bin/endpoint-test"
 Build `netstack3-provider` from `crates/network-service` with the repository's
 materialized upstream Cargo overlay and vendor setup. The changed
 `port-integration/src/{lib.rs,socket_provider.rs}` overlay files must be copied
-into that reference tree, as for other service builds. No Nix build is required.
+into that reference tree, as for other service builds. Use `cargo build --release`
+for throughput measurements. No Nix build is required.
 
 Stage a static Busybox as `$ROOT/bin/busybox`, the provider as
 `$ROOT/bin/netstack3-provider`, and both test clients above. For dynamically linked
@@ -170,5 +201,6 @@ incremental artifacts; `ipc-delivery-{1,2,3}` contain the final boot captures.
 is the comparison only. For microbenchmarks, insert `endpoint-test bench` before
 provider startup in a copy of `guest-init`. For TCP measurements, replace the
 first `loopback-test` invocation with `loopback-test bench` (8 MiB per direction).
+The maintained suite also runs `bench-long` (64 MiB per direction).
 Apply the comparison patch to a disposable installed kernel tree with `patch -p1`
 and rebuild to reproduce socket-file measurements; never apply it to production.

@@ -138,7 +138,10 @@ static void refused(int family) {
 }
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
-	if (argc == 2 && !strcmp(argv[1], "bench")) { payload_length = 8 * 1024 * 1024; tcp(AF_INET); tcp(AF_INET6); return 0; }
+	if (argc == 2 && (!strcmp(argv[1], "bench") || !strcmp(argv[1], "bench-long"))) {
+        payload_length = (!strcmp(argv[1], "bench-long") ? 64 : 8) * 1024 * 1024;
+        tcp(AF_INET); tcp(AF_INET6); return 0;
+    }
 	if (argc == 2 && !strcmp(argv[1], "absent")) {
 		int fd = socket(AF_INET, SOCK_STREAM, 0);
 		check(fd < 0 && errno == ENETDOWN, "provider absent fails closed");

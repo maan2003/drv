@@ -284,7 +284,10 @@ impl NativeBindingsCtx {
         let mut rng = InjectedEntropy::default();
         rng.inject(entropy);
         let min = std::num::NonZeroUsize::new(4096).unwrap();
-        let default = std::num::NonZeroUsize::new(64 * 1024).unwrap();
+        // Loopback has a 64KiB MTU. Leave room for multiple full segments:
+        // a 64KiB buffer repeatedly becomes delayed-ACK/Nagle timer paced.
+        // 128KiB still stalled in IPv4 bulk tests; 256KiB pipelines both families.
+        let default = std::num::NonZeroUsize::new(256 * 1024).unwrap();
         let max = std::num::NonZeroUsize::new(4 * 1024 * 1024).unwrap();
         let sizes = netstack3_base::BufferSizeSettings::new(min, default, max).unwrap();
         Self {

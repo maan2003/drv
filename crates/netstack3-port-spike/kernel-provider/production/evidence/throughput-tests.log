@@ -1,0 +1,80 @@
+Native np service test run; dependency compiler warning bodies omitted.
+warning: `netstack3_sync` (lib) generated 4 warnings
+warning: `netstack3_base` (lib) generated 2 warnings
+warning: `netstack3_ip` (lib) generated 1 warning (run `cargo fix --lib -p netstack3_ip` to apply 1 suggestion)
+warning: `wlan-fcg-crypto` (lib) generated 1 warning
+warning: `netstack3_datagram` (lib) generated 1 warning (run `cargo fix --lib -p netstack3_datagram` to apply 1 suggestion)
+warning: `trust-dns-proto` (lib) generated 1 warning
+warning: `wlan-sme` (lib) generated 25 warnings (run `cargo fix --lib -p wlan-sme` to apply 23 suggestions)
+warning: `trust-dns-resolver` (lib) generated 36 warnings (run `cargo fix --lib -p trust-dns-resolver` to apply 4 suggestions)
+warning: `wlan-mlme` (lib) generated 16 warnings (run `cargo fix --lib -p wlan-mlme` to apply 10 suggestions)
+warning: `netstack3-port-integration` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.11s
+     Running unittests src/lib.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/drv_network_service-2dcac4481c843ac7)
+running 37 tests
+test child::tests::network_filter_fixture ... ok
+test child::tests::network_filter_denial_fixture ... ok
+test child::tests::network_service_filter_fixture ... ok
+test child::tests::provider_filter_denial_fixture ... ok
+test child::tests::resource_admission_filter_fixture ... ok
+test provider::tests::polling_unconnected_tcp_does_not_shutdown_future_connection ... ok
+test scheduler_tests::admission_is_derived_from_descriptor_and_connection_state_budgets ... ok
+test child::tests::network_filter_allows_runtime_and_teardown ... ok
+test scheduler_tests::runnable_queue_coalesces_and_preserves_round_robin_order ... ok
+test supervisor::tests::accepted_clients_inherit_accounted_listener_socket_buffers ... ok
+test supervisor::tests::bootstrap_rejects_eof_before_started ... ok
+test supervisor::tests::bootstrap_rejects_non_protocol_bytes ... ok
+test supervisor::tests::bootstrap_requires_exact_ready_and_acknowledges_go ... ok
+test integration_test::associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss ... ok
+test child::tests::production_socks_relay_runs_under_network_filter ... ok
+test lifecycle::tests::receiver_rejects_unconnected_seqpacket_capability ... ok
+test scheduler_tests::epoll_interests_apply_relay_backpressure ... ok
+test supervisor::tests::supervisor_fixture_child ... ok
+test supervisor::tests::lifecycle_receiver_commits_identity_and_closes_failed_install ... ok
+running 1 test
+running 1 test
+running 1 test
+test supervisor::tests::lifecycle_receiver_rejects_bad_records_and_ancillary_descriptors ... ok
+running 1 test
+test supervisor::tests::supervisor_starts_without_a_generation_and_rejects_invalid_mac ... ok
+test supervisor::tests::supervisor_fixture_child ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+running 1 test
+running 1 test
+running 1 test
+test supervisor::tests::lifecycle_receiver_installs_revokes_and_replaces_real_process_capabilities ... ok
+running 1 test
+running 1 test
+test supervisor::tests::supervisor_fixture_child ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+test supervisor::tests::supervisor_fixture_child ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+test supervisor::tests::supervisor_reaps_revoked_generation_before_installing_replacement ... ok
+test integration_test::revoked_frame_generation_exits_and_replacement_starts ... ok
+test supervisor::tests::supervisor_restarts_exited_process_with_retained_generation ... ok
+test supervisor::tests::supervisor_fixture_child ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+running 1 test
+test supervisor::tests::lifecycle_receiver_replaces_an_active_generation ... ok
+test integration_test::socks_connect_relays_application_bytes_over_ethernet ... ok
+running 1 test
+test supervisor::tests::wifi_capability_revocation_requires_a_fresh_generation ... ok
+test child::tests::production_service_core_runs_under_network_filter ... ok
+test integration_test::idle_epoll_waits_for_deadline_without_busy_polling ... ok
+test integration_test::offline_service_returns_socks_network_unreachable_and_keeps_serving ... ok
+test integration_test::epoll_serves_more_than_twenty_four_clients_with_isolated_failures ... ok
+test child::tests::epoll_scaling_idle_and_deadline_run_under_network_filter ... ok
+test child::tests::filtered_emfile_pause_recovers_on_external_resource_timer ... ok
+test child::tests::filtered_resource_derived_admission_exceeds_sixty_four_and_recovers_slot ... ok
+test child::tests::provider_filter_forbidden_operations_are_fatal ... ok
+test child::tests::network_filter_forbidden_operations_are_fatal ... ok
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.69s
+     Running unittests src/main.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/drv_network_service-cc16bdf5cd6131f3)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/netstack3-provider.rs (/var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/target/x86_64-unknown-linux-gnu/debug/deps/netstack3_provider-7e109bddc99500a8)
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests drv_network_service
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
