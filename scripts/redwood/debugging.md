@@ -169,3 +169,11 @@ SIGCONT was issued at uptime 281.41 s; ramoops recorded SError `0xbfe7d879`
 at 281.623 s. This strongly implicates the resumed teardown boundary.
 Retain the stopped-state snapshots and exact binary alongside the panic;
 an asynchronous exception still does not identify a unique instruction.
+
+Removing the UMAC register write (SRNG teardown no longer accepts MMIO)
+allowed the same scan/Connect/event-176 path to complete cleanup on boot
+`6aa20f7d-4cdd-4940-b592-d9e3bddecd82`: WPSS offline, VFIO released, wrapper
+inert, same boot retained. Association still failed; heavy tracing delayed
+cleanup past the diagnostic deadline. This is physical evidence for the
+cleanup crash fix, not association acceptance. The cleanup regression test
+rejects MMIO writes and requires complete DP ring teardown to succeed.

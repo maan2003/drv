@@ -807,14 +807,15 @@ impl<B: Backend> Srng<B> {
             .map_err(|_| HalError::DeviceFault)
     }
 
-    /// Quiesce host-owned SRNG state before its coherent ring memory is
-    /// released. The caller must already have stopped firmware/interrupt
-    /// dispatch. Pinned Linux establishes this order in
+    /// Clear host-owned pointer state after firmware/interrupt dispatch has
+    /// been quiesced by the caller. This does not stop a live hardware ring.
+    /// Do not access UMAC registers here: firmware may have already suspended
+    /// their clock/power domain. Pinned `dp.c:ath11k_dp_srng_cleanup` frees
+    /// DMA without a register write. Pinned Linux establishes this order in
     /// `core.c:ath11k_core_deinit`: `ath11k_core_stop` stops firmware and HIF
     /// before `ath11k_core_soc_destroy` reaches `dp.c:ath11k_dp_free`.
     pub fn teardown(
         &mut self,
-        mmio: &MmioRegion<B>,
         remote_read_pointers: &mut CoherentDma<B, Bidirectional>,
         remote_write_pointers: &mut CoherentDma<B, Bidirectional>,
     ) -> Result<(), HalError> {
@@ -826,7 +827,7 @@ impl<B: Backend> Srng<B> {
                 .write(self.firmware_pointer_offset, &0_u32.to_le_bytes())
                 .map_err(|_| HalError::DeviceFault)
         } else {
-            w(mmio, self.r0 + 0x10, 0)
+            Ok(())
         }
     }
 }

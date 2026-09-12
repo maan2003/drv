@@ -1979,9 +1979,15 @@ mod tests {
         );
         assert_eq!(dp.configure_htt(&mut htt), Err(DpError::WrongState));
 
+        // Firmware is quiesced before teardown; UMAC registers may no longer
+        // be accessible. Cleanup must free the rings without any MMIO access.
+        mmio_writes.borrow_mut().clear();
+        fail_mmio_write.set(true);
         dp.ath11k_dp_pdev_free().unwrap();
         dp.ath11k_dp_pdev_reo_cleanup().unwrap();
         dp.ath11k_dp_free().unwrap();
+        assert!(mmio_writes.borrow().is_empty());
+        assert!(fail_mmio_write.replace(false));
 
         let reused_id =
             ath11k_hal::Wcn6750Registers::ring_id(ath11k_hal::RingType::WbmIdleLink, 0, 0).unwrap();

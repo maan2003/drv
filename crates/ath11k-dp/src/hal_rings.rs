@@ -351,7 +351,6 @@ impl<B: Backend> DpRingOps<B> for HalDpRings<B> {
             .position(|ring| ring.srng.id == id)
             .ok_or(HalError::NoResources)?;
         self.rings[index].srng.teardown(
-            &self.mmio,
             &mut self.remote_read_pointers,
             &mut self.remote_write_pointers,
         )?;
