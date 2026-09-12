@@ -12,7 +12,9 @@ kernel with native INET excluded. A namespace registration capability yields
 per-socket provider FDs with independent bounded queues and local accept queues;
 control interruption revokes only the affected socket. Its sandboxed Netstack3 binding has passed
 IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
-the reproducible harness and evidence live in
+the same binding now accepts a frame-only Ethernet capability and passes
+DHCP, application TCP/HTTP and UDP/DNS against a simulated AP, retaining
+localhost after link loss. The reproducible harness and evidence live in
 [`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).
 This localhost implementation is not yet the continuously integrated Wi-Fi
 service. These tests do not establish broad socket compatibility, hostile-provider

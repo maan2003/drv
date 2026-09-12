@@ -10,9 +10,14 @@ use netstack3_port_spike::provider_transport_v2::{
     ProviderSocketAddressV2 as Address, ProviderSocketKindV2,
 };
 use netstack3_port_spike::{
+    EthernetDevice as _, EthernetEventSource as _, StackEthernetEndpoint as _,
+};
+use netstack3_port_spike::{
     NetworkServiceEndpoint, RemoteIpAddress, RemoteIpVersion, RemoteSocketError as Error,
     RemoteSocketHandle, SocketClientId,
 };
+use rand::SeedableRng as _;
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -189,27 +194,54 @@ struct Endpoint {
     pending_accept: Option<ProviderAcceptV2>,
     accept_ready: bool,
 }
-pub fn run_provider() -> Result<(), String> {
+pub fn run_provider(ethernet_mac: Option<[u8; 6]>) -> Result<(), String> {
     // FD3 is the sole provider capability. No IP socket is opened by this process.
     if unsafe { libc::fcntl(3, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
-    let runtime = Rc::new(RefCell::new(
-        Runtime::new_with_capacities(
-            512,
-            1024,
-            (0..65536).map(|_| rand::random::<u8>()),
-            NonZeroU64::new(1).unwrap(),
-            [2, 0, 0, 0, 0, 1],
-            1500,
-        )
-        .map_err(|e| format!("{e:?}"))?,
-    ));
-    runtime.borrow_mut().enable_loopback();
-    let mut provider = NativeSocketProvider::new(runtime.clone());
+    let mac = ethernet_mac.unwrap_or([2, 0, 0, 0, 0, 1]);
+    let mut runtime = Runtime::new_with_capacities(
+        512,
+        1024,
+        (0..65536).map(|_| rand::random::<u8>()),
+        NonZeroU64::new(1).unwrap(),
+        mac,
+        1500,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    runtime.enable_loopback();
+    let mut network = netstack3_port_integration::service::DhcpService::new(
+        runtime,
+        rand::rngs::StdRng::from_os_rng(),
+        mac,
+    );
+    let mut provider = network.socket_provider();
     let client = SocketClientId::from_raw(1);
     Provider::open_client(&mut provider, client, 512).map_err(|e| format!("{e:?}"))?;
-    crate::child::provider_setup()?;
+    let mut ethernet = if ethernet_mac.is_some() {
+        let mut kind = 0i32;
+        let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                4,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&mut kind as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || kind != libc::SOCK_SEQPACKET
+        {
+            return Err("FD4 must be an Ethernet SOCK_SEQPACKET capability".into());
+        }
+        Some(unsafe { crate::ServiceEthernetDevice::from_frame_fd(OwnedFd::from_raw_fd(4), mac) })
+    } else {
+        network.on_device_event(netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(
+            false,
+        ));
+        None
+    };
+    crate::child::provider_setup(ethernet.is_some())?;
     eprintln!(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
     );
@@ -220,6 +252,20 @@ pub fn run_provider() -> Result<(), String> {
     if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, 3, &mut event) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
+    const ETHERNET_TOKEN: u64 = u64::MAX;
+    let mut frame_events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32;
+    if let Some(frame) = &ethernet {
+        let mut event = libc::epoll_event {
+            events: frame_events,
+            u64: ETHERNET_TOKEN,
+        };
+        if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, frame.raw_fd(), &mut event) } < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+    let mut pending_frame = None;
+    let mut ethernet_active = ethernet.is_some();
+    let mut last_network_status = None;
     let mut endpoints: HashMap<u64, Endpoint> = HashMap::new();
     let mut fds: HashMap<u64, Rc<OwnedFd>> = HashMap::new();
     let start = Instant::now();
@@ -231,7 +277,11 @@ pub fn run_provider() -> Result<(), String> {
         let mut progress = false;
         let mut ready = Vec::with_capacity(64);
         for event in &events[..event_count] {
-            if event.u64 != 0 {
+            if event.u64 == ETHERNET_TOKEN {
+                if let Some(frame) = &mut ethernet {
+                    frame.notify_epoll(event.events);
+                }
+            } else if event.u64 != 0 {
                 ready.push(event.u64);
             }
         }
@@ -395,7 +445,74 @@ pub fn run_provider() -> Result<(), String> {
                 m.reply(result)?;
             }
         }
-        progress |= runtime.borrow_mut().poll_at(start.elapsed(), 64) != 0;
+        if let Some(frame) = &mut ethernet {
+            while let Some(event) = frame.take_event() {
+                if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
+                    pending_frame = None;
+                    ethernet_active = false;
+                    // Retain the service and localhost sockets after link loss.
+                    unsafe {
+                        libc::epoll_ctl(
+                            6,
+                            libc::EPOLL_CTL_DEL,
+                            frame.raw_fd(),
+                            std::ptr::null_mut(),
+                        );
+                    }
+                }
+                network.on_device_event(event);
+                progress = true;
+            }
+            for _ in 0..if ethernet_active { 64 } else { 0 } {
+                let Some(packet) = frame.receive() else { break };
+                network
+                    .receive_frame(packet)
+                    .map_err(|_| "Netstack rejected Ethernet frame")?;
+                progress = true;
+            }
+        }
+        progress |= network.poll_at(start.elapsed(), 64) != 0;
+        if let Some(frame) = &mut ethernet {
+            for _ in 0..if ethernet_active { 64 } else { 0 } {
+                let Some(packet) = pending_frame.take().or_else(|| network.take_transmit()) else {
+                    break;
+                };
+                match frame.transmit(packet) {
+                    Ok(()) => progress = true,
+                    Err(packet) => {
+                        pending_frame = Some(packet);
+                        break;
+                    }
+                }
+            }
+            let wanted = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32
+                | if frame.wants_write() {
+                    libc::EPOLLOUT as u32
+                } else {
+                    0
+                };
+            if ethernet_active && wanted != frame_events {
+                let mut event = libc::epoll_event {
+                    events: wanted,
+                    u64: ETHERNET_TOKEN,
+                };
+                if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_MOD, frame.raw_fd(), &mut event) }
+                    < 0
+                {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                frame_events = wanted;
+            }
+            let status = network.status();
+            if last_network_status != Some(status) {
+                eprintln!(
+                    "provider_network_status={status:?} ipv4={:?} dns={:?}",
+                    network.runtime().ipv4_address(),
+                    network.runtime().dns_servers()
+                );
+                last_network_status = Some(status);
+            }
+        }
         let listeners: Vec<_> = endpoints
             .iter()
             .filter(|(_, e)| e.listening && e.accept_ready)
@@ -588,11 +705,10 @@ pub fn run_provider() -> Result<(), String> {
         let now = start.elapsed();
         // Poll even while runnable: level-triggered IPC readiness provides fair
         // bounded batches without rescanning every idle endpoint.
-        let timeout = if progress || runtime.borrow().has_pending_work() {
+        let timeout = if progress || network.runtime().has_pending_work() {
             0
         } else {
-            runtime
-                .borrow()
+            network
                 .next_timer_deadline()
                 .map(|d| {
                     d.saturating_sub(now)

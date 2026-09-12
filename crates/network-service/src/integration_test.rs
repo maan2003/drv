@@ -798,3 +798,114 @@ fn associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss() {
         Err(RemoteSocketError::NetworkUnreachable)
     );
 }
+
+
+// This fixture requires our INET=n guest kernel, not the development host.
+// It exercises application AF_INET sockets through the sandboxed provider's
+// inherited Ethernet capability and the same AP peer used by the service tests.
+#[test]
+fn kernel_provider_ethernet_guest_fixture() {
+    use std::os::unix::process::CommandExt as _;
+    if std::env::var_os("DRV_KERNEL_PROVIDER_ETHERNET_GUEST").is_none() { return; }
+    let (device, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
+    let frame = device.into_frame_fd();
+    let registration = std::fs::OpenOptions::new().read(true).write(true)
+        .open("/dev/netstack3").unwrap();
+    let frame_pass = unsafe { libc::fcntl(frame.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    let registration_pass = unsafe { libc::fcntl(registration.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    assert!(frame_pass >= 10 && registration_pass >= 10);
+    let mut command = std::process::Command::new("/bin/netstack3-provider");
+    command.args(["--ethernet-mac", "02:00:00:00:00:01"]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    unsafe { libc::close(frame_pass); libc::close(registration_pass); }
+    drop((registration, frame));
+
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ap_finished = finished.clone();
+    let ap_thread = std::thread::spawn(move || {
+        let mut ap = AssociatedAp::new();
+        let listener = ap.server.tcp_socket().unwrap();
+        ap.server.tcp_bind(listener, Some(SERVER_IP), NonZeroU16::new(8080).unwrap()).unwrap();
+        ap.server.tcp_listen(listener, NonZeroUsize::new(4).unwrap()).unwrap();
+        sink.set_link(true);
+        let begin = Instant::now();
+        let mut accepted = None;
+        let mut request = Vec::new();
+        let mut sent = false;
+        while !ap_finished.load(std::sync::atomic::Ordering::Acquire) {
+            while let Ok(Some(frame)) = sink.take_transmit() {
+                ap.transmit_ethernet(frame.as_bytes()).unwrap();
+            }
+            ap.server.poll_at(begin.elapsed(), 64);
+            if accepted.is_none() && ap.server.tcp_pending_connections(listener).unwrap() != 0 {
+                accepted = Some(ap.server.tcp_accept(listener).unwrap());
+            }
+            if let Some(socket) = accepted {
+                let mut buffer = [0; 64];
+                let n = ap.server.tcp_read(socket, &mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..n]);
+                if request.len() >= 7 && !sent {
+                    assert_eq!(&request, b"GET /\r\n");
+                    assert_eq!(ap.server.tcp_write(socket, b"HTTP/1.0 200 OK\r\n\r\n").unwrap(), 19);
+                    sent = true;
+                }
+            }
+            ap.collect_server_frames();
+            while let Some(packet) = ap.pending.pop_front() {
+                match sink.deliver(packet.as_bytes()) {
+                    Ok(()) => {}
+                    Err(EthernetIngressError::Backpressure) => {
+                        ap.pending.push_front(packet);
+                        break;
+                    }
+                    Err(error) => panic!("AP delivery: {error:?}"),
+                }
+            }
+            assert!(begin.elapsed() < Duration::from_secs(15), "guest Ethernet proof timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(sent);
+    });
+    let begin = Instant::now();
+    let mut stream = loop {
+        match TcpStream::connect((Ipv4Addr::from(SERVER_IP), 8080)) {
+            Ok(stream) => break stream,
+            Err(error) => {
+                assert!(begin.elapsed() < Duration::from_secs(5), "guest connect: {error}");
+                assert!(child.try_wait().unwrap().is_none(), "provider exited before DHCP/connect");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    stream.write_all(b"GET /\r\n").unwrap();
+    let mut response = [0; 19];
+    stream.read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"HTTP/1.0 200 OK\r\n\r\n");
+    let dns = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x04test\x00\x00\x01\x00\x01";
+    dns.send_to(query, (Ipv4Addr::from(SERVER_IP), 53)).unwrap();
+    let mut response = [0; 512];
+    let (n, source) = dns.recv_from(&mut response).unwrap();
+    assert_eq!(source.ip(), IpAddr::V4(Ipv4Addr::from(SERVER_IP)));
+    assert_eq!(&response[..2], &[0x12, 0x34]);
+    assert_ne!(response[2] & 0x80, 0);
+    assert_eq!(&response[n - 4..n], &SERVER_IP);
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    ap_thread.join().unwrap();
+    // The Ethernet capability is gone. The same provider must keep serving
+    // localhost rather than turning link loss into a process/generation reset.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    println!("PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP");
+}

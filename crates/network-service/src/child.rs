@@ -932,13 +932,18 @@ mod tests {
             "publish-epoll" => [libc::SYS_ioctl, 6, 0xC038B302, 0],
             "unknown-ioctl" => [libc::SYS_ioctl, 4, 0x1234, 0],
             "dup" => [libc::SYS_fcntl, 4, libc::F_DUPFD_CLOEXEC as i64, 7],
+            "ethernet-read" => [libc::SYS_read, 4, 0, 0],
+            "ethernet-write" => [libc::SYS_write, 4, 0, 0],
+            "ethernet-publish" => [libc::SYS_ioctl, 4, 0xC038B302, 0],
+            "ethernet-send-wrong-flags" => [libc::SYS_sendto, 4, 0, 0],
+            "ethernet-recv-wrong-flags" => [libc::SYS_recvfrom, 4, 0, 0],
             _ => panic!("unknown denial"),
         };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
-        let filter = provider_filter();
+        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"));
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 51);
-        unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3]); }
+        unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3], 0usize, 0usize, 0usize); }
         child_exit(52);
     }
 
@@ -946,7 +951,9 @@ mod tests {
     fn provider_filter_forbidden_operations_are_fatal() {
         use std::os::unix::process::ExitStatusExt as _;
         for operation in ["socket", "read-registration", "write-registration", "read-epoll",
-            "claim-wrong-fd", "publish-registration", "publish-epoll", "unknown-ioctl", "dup"] {
+            "claim-wrong-fd", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
+            "ethernet-read", "ethernet-write", "ethernet-publish",
+            "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags"] {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "child::tests::provider_filter_denial_fixture", "--nocapture"])
                 .env("DRV_PROVIDER_FILTER_DENIAL", operation)
@@ -954,6 +961,39 @@ mod tests {
                 .status().unwrap();
             assert_eq!(status.signal(), Some(libc::SIGSYS), "provider operation survived: {operation}; {status}");
         }
+    }
+
+    #[test]
+    fn provider_ethernet_filter_fixture() {
+        if std::env::var_os("DRV_PROVIDER_ETHERNET_FIXTURE").is_none() { return; }
+        let mut pair = [-1; 2];
+        child_require(unsafe { libc::socketpair(libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK, 0, pair.as_mut_ptr()) } == 0, 60);
+        let frame = duplicate(pair[0]);
+        let _peer = duplicate(pair[1]); // dup2 below may replace the original peer FD.
+        child_require(unsafe { libc::send(pair[1], b"ARP".as_ptr().cast(), 3, 0) } == 3, 61);
+        child_require(unsafe { libc::dup2(frame.as_raw_fd(), 4) } == 4, 62);
+        let filter = provider_filter(true);
+        let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+        child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 63);
+        child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 64);
+        let mut data = [0u8; 3];
+        child_require(unsafe { libc::recv(4, data.as_mut_ptr().cast(), 3,
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC) } == 3, 65);
+        child_require(&data == b"ARP", 66);
+        child_require(unsafe { libc::send(4, data.as_ptr().cast(), 3,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } == 3, 67);
+        child_exit(0);
+    }
+
+    #[test]
+    fn provider_filter_allows_only_scoped_ethernet_frames() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child::tests::provider_ethernet_filter_fixture", "--nocapture"])
+            .env("DRV_PROVIDER_ETHERNET_FIXTURE", "1")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
+            .status().unwrap();
+        assert!(status.success(), "Ethernet capability operations failed: {status}");
     }
 
     #[test]
@@ -1401,8 +1441,11 @@ mod tests {
 // The provider endpoint is opened in the served network namespace before
 // setup creates the child's empty network namespace. Possession of fd 3,
 // not the child's namespace or privilege, authorizes this single session.
-pub(crate) fn provider_setup() -> Result<(), String> {
-    unsafe { close(4); close(5); }
+pub(crate) fn provider_setup(ethernet: bool) -> Result<(), String> {
+    unsafe {
+        if !ethernet { close(4); }
+        close(5);
+    }
     setup(unsafe { getppid() })?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
@@ -1410,18 +1453,31 @@ pub(crate) fn provider_setup() -> Result<(), String> {
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
-    let filter = provider_filter();
+    let filter = provider_filter(ethernet);
     let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
     syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
 }
 
-fn provider_filter() -> Vec<SockFilter> {
+fn provider_filter(ethernet: bool) -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
+    if ethernet {
+        append_fd_and_flags(&mut filter, libc::SYS_recvfrom, 4, libc::MSG_DONTWAIT | libc::MSG_TRUNC);
+        append_fd_and_flags(&mut filter, libc::SYS_sendto, 4, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
+        // Frame authority is only usable through bounded datagram operations,
+        // never endpoint ioctl or unframed read/write.
+        for syscall in [libc::SYS_ioctl, libc::SYS_read, libc::SYS_write] {
+            filter.push(jump(syscall as u32, 0, 3));
+            filter.push(arg(0));
+            filter.push(jump(4, 0, 1));
+            filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+            filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+        }
+    }
     filter.push(jump(libc::SYS_ioctl as u32, 0, 11));
     filter.push(arg(1));
     filter.push(jump(0x8008B301, 0, 3));
@@ -1439,7 +1495,8 @@ fn provider_filter() -> Vec<SockFilter> {
         filter.push(jump(syscall as u32, 0, 7));
         filter.push(arg(0));
         filter.push(jump(6, 4, 0));
-        // FD4+ can only originate from CLAIM: open/socket/dup are forbidden.
+        // Apart from reserved frame FD4 (guarded above), FD4+ comes from
+        // CLAIM/PUBLISH_ACCEPT: open/socket/dup are forbidden.
         filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 2, jf: 0, k: 4 });
         filter.push(jump(if syscall == libc::SYS_write { 1 } else { u32::MAX }, 1, 0));
         filter.push(jump(if syscall == libc::SYS_write { 2 } else { u32::MAX }, 0, 1));

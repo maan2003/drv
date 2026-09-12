@@ -1,4 +1,4 @@
-# Native Linux socket frontend: localhost milestone
+# Native Linux socket frontend: localhost and Ethernet integration
 
 Implements the direction in [ARCH-network-service](../../../../specs/ARCH-network-service.md).
 This is separate from the earlier `patches/` experiment: do **not** install both.
@@ -27,8 +27,36 @@ The suite runs before and after replacement. Three consecutive final KVM runs
 passed. [Build evidence](evidence/build.txt) records artifact/source hashes and
 symbol inspection; [service tests](evidence/network-tests.log) pass 37 tests.
 The regression for polling an unconnected TCP socket runs in that service suite.
-The larger upstream workspace test attempt was blocked by an unavailable
+These are the original localhost captures; the Ethernet follow-up below records
+the current acceptance suite. The larger upstream workspace test attempt was blocked by an unavailable
 offline `backtrace` dev dependency; it is not counted as passing.
+
+## Inherited Ethernet capability
+
+`netstack3-provider --ethernet-mac XX:XX:XX:XX:XX:XX` additionally accepts a
+trusted launcher's nonblocking AF_UNIX SOCK_SEQPACKET frame capability on FD4.
+FD3 still owns the application namespace. FD4 cannot be used for endpoint
+ioctls or raw reads/writes; the sandbox permits only the frame transport's
+nonblocking datagram operations. No device/DMA authority crosses this boundary.
+
+The same runtime now runs the existing Fuchsia `DhcpService`, not a second
+stack or DHCP implementation. It reports address/DNS acquisition. Link loss
+revokes external configuration and queued frames without killing the provider
+or its localhost sockets. Replacing a revoked Ethernet capability, publishing
+DNS configuration to applications, and the MT launch path remain integration
+work; this is not yet physical Wi-Fi acceptance.
+
+The maintained guest fixture uses the service tests' simulated associated AP.
+It proves DHCP, application TCP/HTTP and UDP/DNS through the kernel frontend
+and sandboxed provider, followed by localhost operation after the frame peer
+closes. [Ethernet serial evidence](evidence/ethernet-serial.log) includes this
+proof and the complete localhost/concurrent/lifetime suite. The host service
+suite reports 43 passing tests; the guest-only fixture is gated off on the host
+and is explicitly executed inside KVM.
+
+The guest now boots Q35 with virtual Intel IOMMU, IRQ remapping and strict DMA
+invalidation. These initialization checks prepare for VFIO testing; without an
+assigned device they do not prove physical DMA confinement.
 
 ## Per-socket IPC, not a shared RPC queue
 
@@ -172,10 +200,9 @@ This remains a localhost milestone, not deployment readiness:
   concurrent lifetime testing and hostile-provider fuzzing are not established.
 - Localhost throughput exceeds 100 MB/s in the retained optimized KVM tests.
   Deployment throughput, CPU/power and physical-link performance remain unproved.
-- No Ethernet/Wi-Fi capability is attached to this entry point. MT7921 and host
-  networking were untouched. The minimal guest kernel is not a hardened deployment
-  configuration. Although QEMU requests two vCPUs, these captures show only one
-  guest CPU online; they are not multicore concurrency evidence.
+- Ethernet capability integration is tested against a simulated AP, not MT7921.
+  The guest kernel is not a hardened deployment configuration. Earlier captures
+  had only one online CPU; the Q35/ACPI guest enables both requested vCPUs.
 
 ## Reproduce
 
@@ -197,7 +224,10 @@ into that reference tree, as for other service builds. Use `cargo build --releas
 for throughput measurements. No Nix build is required.
 
 Stage a static Busybox as `$ROOT/bin/busybox`, the provider as
-`$ROOT/bin/netstack3-provider`, and both test clients above. For dynamically linked
+`$ROOT/bin/netstack3-provider`, and both test clients above. Build service tests
+with `cargo test --no-run --lib` and stage the reported library test executable
+as `$ROOT/bin/network-service-tests` (strip debug symbols to keep the initrd small).
+For dynamically linked
 binaries, preserve their ELF interpreter and transitive library paths under
 `$ROOT` (the interpreter's `--list BINARY` reports dependencies). Create
 `$ROOT/{dev,proc,sys,run,tmp}`. Then, with cpio/gzip/QEMU in PATH:
@@ -215,8 +245,9 @@ The retained np build area is
 `/var/lib/poco-linux/redwood/work/socket-provider-kvm`.
 `make-kernel` and `build-network` there use existing native toolchains and
 incremental artifacts; `ipc-delivery-{1,2,3}` contain the final boot captures.
-`ipc-comparison/final-anon-bzImage` is the tested kernel; the sibling socket image
-is the comparison only. For microbenchmarks, insert `endpoint-test bench` before
+`wifi-guest-bzImage` and `ethernet-q35-1` are the current kernel and capture.
+`ipc-comparison/final-anon-bzImage` is the earlier non-PCI localhost kernel;
+the sibling socket image is the comparison only. For microbenchmarks, insert `endpoint-test bench` before
 provider startup in a copy of `guest-init`. For TCP measurements, replace the
 first `loopback-test` invocation with `loopback-test bench` (8 MiB per direction).
 The maintained suite also runs `bench-long` (64 MiB per direction).
