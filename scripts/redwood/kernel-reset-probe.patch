@@ -99,3 +99,25 @@ index 695c33e75..121ab7484 100644
  	kernel_shutdown_prepare(SYSTEM_POWER_OFF);
  	do_kernel_power_off_prepare();
  	migrate_to_reboot_cpu();
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -939,6 +939,19 @@
+ 	if (regs)
+ 		__show_regs(regs);
+ 
++	/* Test-only: an SError delivered on SVC entry otherwise hides EL0 state.
++	 * Read only the current task's saved frame, never user memory or VMAs.
++	 */
++	if (!(current->flags & PF_KTHREAD)) {
++		struct pt_regs *user_regs = task_pt_regs(current);
++
++		if (user_mode(user_regs)) {
++			pr_crit("REDWOOD_RESET_PROBE: saved EL0 context syscall=%d orig_x0=%016llx\n",
++				user_regs->syscallno, user_regs->orig_x0);
++			__show_regs(user_regs);
++		}
++	}
++
+ 	nmi_panic(regs, "Asynchronous SError Interrupt");
+ 
+ 	cpu_park_loop();

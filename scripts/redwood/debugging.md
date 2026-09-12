@@ -89,6 +89,21 @@ relinked. Configuration and `Module.symvers` remained identical.
 The patch does not block resets, arm a watchdog, or enable ramoops by itself.
 Its usefulness still depends on a durable ramoops mapping.
 
+The patch also prints the current task's saved EL0 registers on fatal SError
+when that task has a userspace frame. This helps when the exception arrives
+during kernel syscall entry: the original dump only shows the kernel PC.
+It reads no user memory and does not suppress the panic. Treat the saved EL0 PC
+as context, not proof of the faulting access. At early syscall entry,
+`syscallno` can still be stale; the saved `x8` contains the AArch64 syscall
+number. Capture `/proc/$pid/maps` while the service is alive and retain the
+exact executable for address attribution.
+
+With the #13 incremental kernel, saved EL0 `x8 = 0x1d` identified `ioctl`;
+`x1 = 0x3b86` and LR disassembly identified `IOMMU_IOAS_UNMAP`. The SError
+arrived before its handler ran, so this is a DMA-unmap **entry boundary**, not
+proof that unmapping caused the error. Inspect the immediately preceding
+operations and ownership/release path rather than blaming the ioctl itself.
+
 ## Interpret the evidence narrowly
 
 The captured failure was `Asynchronous SError Interrupt`, ESR `0xbfed17ff`,
@@ -96,7 +111,10 @@ CPU7, task `ath11k-wifi-ser`, PC `el0_svc+0x38/0x220`, after Connect and two
 CE2 receive/refills. ESR's IDS bit is set: the syndrome is implementation
 defined. An asynchronous exception's PC is **not proof of the originating
 access**. The faulty access remains to be isolated; neither association nor a
-fix is proved.
+fix is proved. Negotiating the native shadow-register table and redirecting CE/DP
+publications did not remove the failure: the same boundary reproduced with
+syndrome `0xbff517fd`. Both syndromes have IDS set; do not decode the changed ISS
+as a standard architectural fault status.
 
 PMIC GEN3 retained history separately showed PS_HOLD warm reset. Historical
 FIFO entries have no timestamps: attribute a reset only from a fresh
