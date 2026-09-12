@@ -82,3 +82,21 @@ Fixed defaults: maintained suite PASS; 64MiB IPv4 337.17, IPv6 341.26 MB/s.
 SHA256 final overlay lib.rs: fb1d7cd014de42c48896d9aeb022f171380d970ff4c6047fc91f0bf4026ed613
 SHA256 stripped provider: 1609d07e4e28f40c2433fbb010b660b024662c8c34dd6a6b3e2119682de4a2ce
 SHA256 kernel: 9d0dd4e14b8f6abdafa68a92e2d2d2503307f21b43092f8d100dbad5d134282f
+
+Fuchsia-inspired ring-buffer follow-up (39 service tests pass):
+Run 1
+BENCH TCP family=2 seconds=0.005164 MBps=406.14
+BENCH TCP family=10 seconds=0.004780 MBps=438.76
+BENCH TCP family=2 seconds=0.328848 MBps=408.15
+BENCH TCP family=10 seconds=0.316600 MBps=423.93
+BENCH TCP family=2 seconds=0.005058 MBps=414.64
+BENCH TCP family=10 seconds=0.004794 MBps=437.52
+PASS_KVM_PRODUCTION_LOOPBACK
+Run 2
+BENCH TCP family=2 seconds=0.005213 MBps=402.38
+BENCH TCP family=10 seconds=0.004945 MBps=424.16
+BENCH TCP family=2 seconds=0.314453 MBps=426.83
+BENCH TCP family=10 seconds=0.322550 MBps=416.11
+BENCH TCP family=2 seconds=0.005089 MBps=412.19
+BENCH TCP family=10 seconds=0.004897 MBps=428.29
+PASS_KVM_PRODUCTION_LOOPBACK

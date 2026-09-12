@@ -476,6 +476,7 @@ dependencies = [
  "netstack3-port-integration",
  "netstack3-port-spike",
  "netstack3_base",
+ "netstack3_tcp",
  "packet",
  "packet_formats",
  "rand 0.9.4",

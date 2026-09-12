@@ -603,6 +603,72 @@ pub fn run_provider() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netstack3_port_integration::NativeTcpBuffers;
+    use netstack3_tcp::{Buffer, BufferSizes, ReceiveBuffer, SendBuffer};
+
+    #[test]
+    fn tcp_ring_wrap_and_payload_slices_preserve_bytes() {
+        use netstack3_base::{Payload, PayloadLen};
+        let app = NativeTcpBuffers::new(BufferSizes { send: 16, receive: 16 });
+        let mut send = app.send.clone();
+        let mut receive = app.receive.clone();
+        // Fill/consume at offsets that force both ring slices to be used.
+        for round in 0..64u8 {
+            let input: Vec<_> = (0..16).map(|n| n ^ round).collect();
+            assert_eq!(app.write(&input[..11]), 11);
+            send.peek_with(0, |p| {
+                assert_eq!(receive.write_at(0, &p), 11);
+            });
+            send.mark_read(11);
+            receive.make_readable(11, false);
+            let mut out = [0; 11];
+            assert_eq!(app.read(&mut out), 11);
+            assert_eq!(out, input[..11]);
+
+            assert_eq!(app.write(&input), 16);
+            send.peek_with(3, |p| {
+                let p = p.slice(2..10);
+                assert_eq!(p.len(), 8);
+                let mut out = [0; 8];
+                p.partial_copy(0, &mut out);
+                assert_eq!(out, input[5..13]);
+            });
+            send.mark_read(16);
+        }
+    }
+
+    #[test]
+    fn tcp_buffer_shrink_waits_for_readable_and_out_of_order_bytes() {
+        let app = NativeTcpBuffers::new(BufferSizes { send: 16, receive: 16 });
+        let mut send = app.send.clone();
+        assert_eq!(app.write(b"abcdefgh"), 8);
+        send.request_capacity(4);
+        assert_eq!(send.target_capacity(), 4);
+        assert_eq!(send.limits().capacity, 16);
+        send.mark_read(4);
+        assert_eq!(send.limits().capacity, 16);
+        send.mark_read(4);
+        assert_eq!(send.limits().capacity, 4);
+        assert_eq!(app.write(b"12345678"), 4);
+
+        let mut receive = app.receive.clone();
+        assert_eq!(receive.write_at(8, &&b"ijkl"[..]), 4);
+        receive.request_capacity(4);
+        assert_eq!(receive.target_capacity(), 4);
+        assert_eq!(receive.limits().capacity, 16);
+        assert_eq!(receive.write_at(0, &&b"abcdefgh"[..]), 8);
+        receive.make_readable(12, false);
+        let mut out = [0; 12];
+        assert_eq!(app.read(&mut out[..8]), 8);
+        assert_eq!(receive.limits().capacity, 16);
+        assert_eq!(app.read(&mut out[8..]), 4);
+        assert_eq!(&out, b"abcdefghijkl");
+        assert_eq!(receive.limits().capacity, 4);
+        assert_eq!(receive.write_at(100, &&b"x"[..]), 0);
+        assert_eq!(receive.limits().len, 0);
+    }
+
+
     #[test]
     fn polling_unconnected_tcp_does_not_shutdown_future_connection() {
         use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 as V2;

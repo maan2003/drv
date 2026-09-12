@@ -16,6 +16,7 @@ rand = "=0.9.4"
 wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
 
 [dev-dependencies]
+netstack3_tcp = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/tcp" }
 dhcp-protocol = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/dhcpv4/protocol" }
 net_types = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/net-types" }
 netstack3_base = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/base" }

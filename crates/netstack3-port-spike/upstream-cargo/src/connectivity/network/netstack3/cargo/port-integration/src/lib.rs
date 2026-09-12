@@ -480,9 +480,10 @@ impl netstack3_base::socket::SocketWritableListener for NativeWritable {
 
 #[derive(Debug, Default)]
 struct TcpStorage {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
     readable: usize,
     capacity: usize,
+    target_capacity: usize,
 }
 #[derive(Clone, Debug, Default)]
 pub struct NativeReceiveBuffer(Arc<Mutex<TcpStorage>>);
@@ -494,36 +495,71 @@ pub struct NativeTcpBuffers {
     pub send: NativeSendBuffer,
 }
 
+// Keep the storage lock for the synchronous packet-builder callback. Payload
+// slicing changes only the view; it never clones queued TCP bytes.
 #[derive(Debug)]
-pub struct NativePayload(Vec<u8>);
-impl netstack3_base::PayloadLen for NativePayload {
-    fn len(&self) -> usize {
-        self.0.len()
+pub struct NativePayload<'a> {
+    storage: Option<std::sync::MutexGuard<'a, TcpStorage>>,
+    range: std::ops::Range<usize>,
+}
+impl NativePayload<'_> {
+    fn fragments(&self) -> netstack3_base::FragmentedPayload<'_, 2> {
+        use netstack3_base::Payload;
+        match &self.storage {
+            Some(storage) => {
+                let (a, b) = storage.bytes.as_slices();
+                netstack3_base::FragmentedPayload::new([a, b])
+                    .slice(self.range.start as u32..self.range.end as u32)
+            }
+            None => netstack3_base::FragmentedPayload::new_empty(),
+        }
     }
 }
-impl netstack3_base::Payload for NativePayload {
+impl netstack3_base::PayloadLen for NativePayload<'_> {
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+}
+impl netstack3_base::Payload for NativePayload<'_> {
     fn slice(mut self, range: std::ops::Range<u32>) -> Self {
-        self.0 = self.0[range.start as usize..range.end as usize].to_vec();
+        assert!(range.start <= range.end && range.end as usize <= self.range.len());
+        self.range = self.range.start + range.start as usize..self.range.start + range.end as usize;
         self
     }
     fn partial_copy(&self, offset: usize, dst: &mut [u8]) {
-        dst.copy_from_slice(&self.0[offset..offset + dst.len()])
+        self.fragments().partial_copy(offset, dst)
     }
     fn partial_copy_uninit(&self, offset: usize, dst: &mut [std::mem::MaybeUninit<u8>]) {
-        for (to, from) in dst.iter_mut().zip(&self.0[offset..]) {
-            to.write(*from);
-        }
+        self.fragments().partial_copy_uninit(offset, dst)
     }
     fn new_empty() -> Self {
-        Self(Vec::new())
+        Self { storage: None, range: 0..0 }
     }
 }
-impl InnerPacketBuilder for NativePayload {
+impl InnerPacketBuilder for NativePayload<'_> {
     fn bytes_len(&self) -> usize {
-        self.0.len()
+        self.range.len()
     }
     fn serialize(&self, dst: &mut [u8]) {
-        dst.copy_from_slice(&self.0)
+        self.fragments().serialize(dst)
+    }
+}
+
+impl TcpStorage {
+    fn request_capacity(&mut self, size: usize) {
+        self.target_capacity = size;
+        // Never revoke space occupied by readable or out-of-order bytes.
+        if size >= self.capacity || self.bytes.is_empty() {
+            self.capacity = size;
+        }
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.bytes.drain(..count);
+        self.readable -= count;
+        if self.bytes.is_empty() {
+            self.capacity = self.target_capacity;
+        }
     }
 }
 
@@ -536,10 +572,10 @@ impl Buffer for NativeReceiveBuffer {
         }
     }
     fn target_capacity(&self) -> usize {
-        self.0.lock().unwrap().capacity
+        self.0.lock().unwrap().target_capacity
     }
     fn request_capacity(&mut self, size: usize) {
-        self.0.lock().unwrap().capacity = size;
+        self.0.lock().unwrap().request_capacity(size);
     }
 }
 impl ReceiveBuffer for NativeReceiveBuffer {
@@ -547,9 +583,20 @@ impl ReceiveBuffer for NativeReceiveBuffer {
         let mut s = self.0.lock().unwrap();
         let start = s.readable + offset;
         let count = data.len().min(s.capacity.saturating_sub(start));
+        if count == 0 {
+            return 0;
+        }
         let len = s.bytes.len().max(start + count);
         s.bytes.resize(len, 0);
-        data.partial_copy(0, &mut s.bytes[start..start + count]);
+        let (a, b) = s.bytes.as_mut_slices();
+        let first = count.min(a.len().saturating_sub(start));
+        if first != 0 {
+            data.partial_copy(0, &mut a[start..start + first]);
+        }
+        if first != count {
+            let offset = start.saturating_sub(a.len());
+            data.partial_copy(first, &mut b[offset..offset + count - first]);
+        }
         count
     }
     fn make_readable(&mut self, count: usize, _has_outstanding: bool) {
@@ -567,19 +614,18 @@ impl Buffer for NativeSendBuffer {
         }
     }
     fn target_capacity(&self) -> usize {
-        self.0.lock().unwrap().capacity
+        self.0.lock().unwrap().target_capacity
     }
     fn request_capacity(&mut self, size: usize) {
-        self.0.lock().unwrap().capacity = size;
+        self.0.lock().unwrap().request_capacity(size);
     }
 }
 impl SendBuffer for NativeSendBuffer {
-    type Payload<'a> = NativePayload;
+    type Payload<'a> = NativePayload<'a>;
     fn mark_read(&mut self, count: usize) {
         let mut s = self.0.lock().unwrap();
         assert!(count <= s.readable);
-        s.bytes.drain(..count);
-        s.readable -= count;
+        s.consume(count);
     }
     fn peek_with<'a, F, R>(&'a mut self, offset: usize, f: F) -> R
     where
@@ -587,7 +633,8 @@ impl SendBuffer for NativeSendBuffer {
     {
         let s = self.0.lock().unwrap();
         assert!(offset <= s.readable);
-        f(NativePayload(s.bytes[offset..s.readable].to_vec()))
+        let end = s.readable;
+        f(NativePayload { storage: Some(s), range: offset..end })
     }
 }
 impl NativeTcpBuffers {
@@ -595,10 +642,12 @@ impl NativeTcpBuffers {
         Self {
             receive: NativeReceiveBuffer(Arc::new(Mutex::new(TcpStorage {
                 capacity: sizes.receive,
+                target_capacity: sizes.receive,
                 ..Default::default()
             }))),
             send: NativeSendBuffer(Arc::new(Mutex::new(TcpStorage {
                 capacity: sizes.send,
+                target_capacity: sizes.send,
                 ..Default::default()
             }))),
         }
@@ -606,16 +655,18 @@ impl NativeTcpBuffers {
     pub fn write(&self, bytes: &[u8]) -> usize {
         let mut s = self.send.0.lock().unwrap();
         let n = bytes.len().min(s.capacity - s.readable);
-        s.bytes.extend_from_slice(&bytes[..n]);
+        s.bytes.extend(&bytes[..n]);
         s.readable += n;
         n
     }
     pub fn read(&self, out: &mut [u8]) -> usize {
         let mut s = self.receive.0.lock().unwrap();
         let n = out.len().min(s.readable);
-        out[..n].copy_from_slice(&s.bytes[..n]);
-        s.bytes.drain(..n);
-        s.readable -= n;
+        let (a, b) = s.bytes.as_slices();
+        let first = n.min(a.len());
+        out[..first].copy_from_slice(&a[..first]);
+        out[first..n].copy_from_slice(&b[..n - first]);
+        s.consume(n);
         n
     }
 }
@@ -2546,7 +2597,11 @@ mod tests {
         let app = NativeTcpBuffers::new(sizes);
         assert_eq!(app.write(b"hello"), 5);
         let mut core_send = app.send.clone();
-        assert_eq!(core_send.peek_with(0, |p| p.0), b"hello");
+        assert_eq!(core_send.peek_with(0, |p| {
+            let mut bytes = vec![0; 5];
+            netstack3_base::Payload::partial_copy(&p, 0, &mut bytes);
+            bytes
+        }), b"hello");
         core_send.mark_read(5);
 
         let mut core_receive = app.receive.clone();

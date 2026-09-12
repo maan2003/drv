@@ -16,7 +16,8 @@ the reproducible harness and evidence live in
 [`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).
 This localhost implementation is not yet the continuously integrated Wi-Fi
 service. These tests do not establish broad socket compatibility, hostile-provider
-robustness, or the throughput target.
+robustness, or physical-link throughput. Optimized localhost tests exceed
+100 MB/s; this is not evidence of Wi-Fi deployment throughput.
 
 The service implementation lives in `drv-network-service`. Its standalone
 supervisor starts offline and replaces children across tested Ethernet
@@ -111,6 +112,14 @@ kernel frontend, sandboxed Netstack3, and userspace MT7921 inside the guest,
 with the physical Wi-Fi device assigned through VFIO. Host device assignment
 and guest driver DMA confinement are distinct boundaries; a virtual IOMMU
 configuration must be verified rather than inferred from host passthrough.
+
+## Binding reference
+
+Fuchsia's Netstack3 bindings are the primary reference for buffer ownership,
+capacity changes, readiness and core notifications. Adapt their contracts to
+Linux capabilities and the service executor; do not replace Netstack3 transport
+policy with Linux TCP policy. Linux remains the reference for the application
+socket ABI and kernel resource mechanics.
 
 ## Implementation direction and open choices
 

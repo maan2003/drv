@@ -97,6 +97,21 @@ see below. The comparison above is retained as historical evidence.
 operations, no measured advantage for socket FDs. Keep the registration
 character device only as the authority/admission endpoint.
 
+## TCP buffer ownership follows Fuchsia's binding contract
+
+The native binding uses bounded `VecDeque` ring storage. Consumption advances
+the head instead of shifting queued bytes. Packet-builder payloads retain the
+storage guard and borrow fragmented ring slices through Netstack3's
+`FragmentedPayload`; slicing does not clone the readable suffix.
+Capacity shrink requests remain pending until buffered data (including
+out-of-order bytes) drains; growth can take effect immediately.
+The service tests exercise wraparound, payload slicing and deferred shrink.
+
+This adapts Fuchsia's ring/fragmented-payload design to our synchronous embedding,
+not its Zircon executor. Idle allocation reclamation and readiness-driven
+scheduling still need implementation; ring storage alone does not establish
+production readiness.
+
 ## Bulk TCP timer pacing fixed
 
 The port's 64 KiB default send/receive buffers left insufficient pipeline

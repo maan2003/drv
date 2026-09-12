@@ -63,16 +63,16 @@ struct BoundedNetstackProof {
 
 // Admission and staging are separate budgets: idle clients consume descriptors
 // and protocol metadata but cannot reserve the aggregate relay-buffer budget.
-// Each admission is conservatively charged 512 KiB against a 64 MiB
+// Each admission is conservatively charged 896 KiB against a 64 MiB
 // connection-state accounting pool; this is admission policy, not a claim of
 // an exact process-RSS or kernel-memory bound:
-// 128 KiB for Netstack's 64 KiB send/receive buffers, 256 KiB for Linux's
+// 512 KiB for Netstack's 256 KiB send/receive buffers, 256 KiB for Linux's
 // doubled 64 KiB send/receive socket-buffer requests, and 128 KiB for client,
 // scheduler, map, allocator, kernel, and transport metadata. Buffers allocate lazily,
 // but charging their reachable maximum prevents idle admission from granting
 // an unbounded future commitment. Actual relay staging has separate limits.
 pub(crate) const HOST_SOCKET_BUFFER_REQUEST: i32 = 64 * 1024;
-const SOCKS5_CLIENT_STATE_CHARGE: usize = 512 * 1024;
+const SOCKS5_CLIENT_STATE_CHARGE: usize = 896 * 1024;
 const SOCKS5_CONNECTION_STATE_BUDGET: usize = 64 * 1024 * 1024;
 // Netstack's independent TX/event/readiness/UDP queues share a separate 4 MiB
 // accounting budget. Each position is charged 72 KiB: one maximum 64 KiB UDP
