@@ -1402,6 +1402,7 @@ mod tests {
         reset_failure: bool,
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
+        channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
         suppress_auth_response: bool,
         reject_next_auth: bool,
@@ -1555,8 +1556,9 @@ mod tests {
         }
         fn set_channel(
             &mut self,
-            _: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
+            request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
         ) -> Result<(), zx::Status> {
+            self.0.lock().unwrap().channels.push(request);
             record!(self, "channel", ())
         }
         fn join_bss(&mut self, _: fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
@@ -2218,6 +2220,32 @@ mod tests {
         let state = effects.lock().unwrap();
         assert!(state.calls.contains(&"finish_failed_connect_attempt"));
         assert!(state.calls.contains(&"reset"));
+    }
+
+    #[test]
+    fn non_ht_client_joins_wide_bss_on_primary_20mhz() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().simulate_ap = true;
+        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        let mut request = connect_request();
+        request.bss_description.bandwidth = fidl_ieee80211::ChannelBandwidth::Cbw40;
+        futures::executor::block_on(runtime.connect(
+            request,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        let state = effects.lock().unwrap();
+        assert_eq!(state.channels.len(), 1);
+        assert_eq!(state.channels[0].primary, Some(wlan_channel()));
+        assert_eq!(
+            state.channels[0].bandwidth,
+            Some(fidl_ieee80211::ChannelBandwidth::Cbw20)
+        );
+        assert_eq!(
+            state.channels[0].vht_secondary_80_channel.unwrap().number,
+            0
+        );
+        assert!(state.calls.contains(&"assoc"));
     }
 
     #[test]

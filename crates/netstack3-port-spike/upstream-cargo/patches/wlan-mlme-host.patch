@@ -387,6 +387,21 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
 
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
+@@ -443,6 +443,13 @@
+-        let (bandwidth, secondary80_num) = bss.channel.bandwidth.to_fidl();
++        // A non-HT station joins the primary 20 MHz channel even when the AP
++        // advertises a wider BSS. Keep ChannelState (and association config)
++        // aligned with the capabilities advertised by this station.
++        let (bandwidth, secondary80_num) = if join_caps.0.ht_cap.is_none() {
++            (fidl_ieee80211::ChannelBandwidth::Cbw20, 0)
++        } else {
++            bss.channel.bandwidth.to_fidl()
++        };
+         let vht_secondary_80_channel =
+             fidl_ieee80211::ChannelNumber { band: bss.channel.band, number: secondary80_num };
+         self.set_main_channel(bss.channel.into(), bandwidth, vht_secondary_80_channel)
+             .await
+             .map_err(|status| Error::Status(format!("Error setting device channel"), status))?;
 @@ -505,6 +505,7 @@
      pub rates: Vec<ie::SupportedRate>,
      pub ht_cap: Option<ie::HtCapabilities>,
