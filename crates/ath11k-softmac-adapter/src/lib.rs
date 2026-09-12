@@ -24,6 +24,9 @@ use wlan_softmac_host::{
 };
 
 const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
+// Pinned wmi.h: prefix 0xA000 marks a scan initiated by the host.
+const HOST_SCAN_ID_START: u32 = 0xa000;
+const HOST_SCAN_ID_END: u32 = 0xafff;
 const DP_WORK_BUDGET: usize = 64;
 const DP_RECEIVE_BUDGET: usize = 1;
 const MGMT_TX_PENDING_MAX: u32 = 512;
@@ -348,7 +351,7 @@ impl<B: Subsystems> Ath11kClientDevice<B> {
             associated: false,
             link_up: false,
             upcalls: None,
-            next_scan_id: 1,
+            next_scan_id: HOST_SCAN_ID_START,
             active_scan: None,
             drive_calls: 0,
             next_mgmt_buffer_id: 0,
@@ -1175,6 +1178,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         self.next_scan_id = self
             .next_scan_id
             .checked_add(1)
+            .filter(|next| *next <= HOST_SCAN_ID_END + 1)
             .ok_or(zx::Status::NO_RESOURCES)?;
         eprintln!("ath11k_softmac_scan=PASSIVE_START_ENTER");
         self.trace_runtime("passive_scan_send_enter", scan_id as usize);
@@ -1243,6 +1247,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         self.next_scan_id = self
             .next_scan_id
             .checked_add(1)
+            .filter(|next| *next <= HOST_SCAN_ID_END + 1)
             .ok_or(zx::Status::NO_RESOURCES)?;
         self.device
             .start_scan(ScanConfig {
@@ -1651,18 +1656,41 @@ mod tests {
             .start_active_scan(active_scan_request(&[b"redwood", b"lab"]))
             .unwrap();
 
-        assert_eq!(response.scan_id, Some(1));
-        assert_eq!(adapter.active_scan, Some(1));
+        assert_eq!(response.scan_id, Some(u64::from(HOST_SCAN_ID_START)));
+        assert_eq!(adapter.active_scan, Some(HOST_SCAN_ID_START));
         assert_eq!(
             adapter.device.backend().operations(),
             &[Operation::WmiScanStart(ScanConfig {
                 vdev,
-                id: ScanId(1),
+                id: ScanId(HOST_SCAN_ID_START),
                 active: true,
                 channels_mhz: vec![2437],
                 ssids: vec![b"redwood".to_vec(), b"lab".to_vec()],
             })]
         );
+    }
+
+    #[test]
+    fn scan_ids_exhaust_without_leaving_the_host_range() {
+        let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
+        adapter.start(Box::new(NoopUpcalls)).unwrap();
+        adapter.next_scan_id = HOST_SCAN_ID_END;
+        let scan = adapter
+            .start_active_scan(active_scan_request(&[b"lab"]))
+            .unwrap();
+        assert_eq!(scan.scan_id, Some(u64::from(HOST_SCAN_ID_END)));
+        adapter
+            .cancel_scan(WlanSoftmacBaseCancelScanRequest {
+                scan_id: scan.scan_id,
+                ..Default::default()
+            })
+            .unwrap();
+        adapter.device.backend_mut().clear();
+        assert_eq!(
+            adapter.start_active_scan(active_scan_request(&[b"lab"])),
+            Err(zx::Status::NO_RESOURCES)
+        );
+        assert!(adapter.device.backend().operations().is_empty());
     }
 
     #[test]
