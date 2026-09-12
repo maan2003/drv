@@ -24,46 +24,21 @@ firmware regulatory event confirms the country, band rule, active-initiation
 flags, bandwidth, and power bounds. Its SME-managed SAE path advertises PMF
 only with software BIP-CMAC-128/IGTK transmit, receive, and replay handling.
 
-An exact `#9`/32-byte-DT run reached control `Ready`, completed its
-first data-path poll with no delivered or malformed packets, then reset during
-the first control poll. Its bounded CE trace received and refilled one ready
-CE2 frame, then repeatedly found the receive rings empty and completed 10 ms
-waits normally until the 256-record trace cap was exhausted. Source inspection
-found that this runtime poll incorrectly reused the full synchronous control
-deadline after draining ready work. Runtime event polling now uses a zero CE
-deadline so it drains already-completed frames and returns immediately when
-quiet; bring-up and synchronous command paths retain their full deadlines.
+Runtime polling now drains already-completed CE work with a zero deadline,
+rather than reusing the full synchronous control timeout. The diagnostic
+advertises scan offload and uses firmware-prefixed scan IDs; physical runs
+complete a channel-149 scan and dispatch Connect. The remaining failure
+reproduces after the following WMI send and two CE2 receive/refills.
 
-A subsequent exact run containing that fix durably reached the corrected
-runtime poll. An np-local collector acknowledged the exact candidate identity,
-service entry, control readiness, and control-loop entry before recording 70 CE
-markers. The first receive consumed and refilled one ready CE2 frame. Four
-following receives each reported an expired zero deadline and returned empty,
-physically establishing that the changed CE path drains ready work and returns
-when quiet. The separated empty-receive groups also establish that multiple
-corrected control polls returned: without another routed frame, each empty
-group ends its current `poll_wlan_event`, and later groups require a subsequent
-poll. The phone reset after the last acknowledged empty return. The durable
-stream did not distinguish that final poll's return, policy-request dispatch,
-or a following WMI send, so it does not identify the remaining reset boundary
-or cause. Per-marker TCP acknowledgements deliberately perturbed timing, so
-this is evidence for the bounded diagnostic experiment, not production timing
-behavior.
-
-A follow-up run added checkpoints around runtime CE transmission and reproduced
-the same receive prefix through marker 69 without reaching any transmit-entry
-checkpoint. It excludes runtime CE ring publication in that run, but not later
-processing of commands issued during startup. The next bounded discriminator
-therefore checkpoints SoftMAC drive, data-path, control-return, and passive-scan
-dispatch boundaries before narrowing any device mutation further.
-
-The diagnostic ran in a phone-local transient unit with no external timeout or
-transport-owned lifetime; the submitting SSH session had already exited
-normally. The np-local hardware lock remained held across the reset, and the
-fresh recovery boot found WPSS offline and the platform device unbound. The
-recovery pstore record contained no panic or reset signature. A previous run
-completed four control polls, so the failure is not deterministic. Bounded CE
-runtime markers remain capped at 256 records. Association remains unproved.
+A kexec-only instrumented kernel with write-combined ramoops captured an
+asynchronous SError panic (`0xbfed17ff`) while running `ath11k-wifi-ser`.
+The exception PC does not identify the originating access; the root cause
+and association remain unproved. Earlier missing panic records were not
+evidence against a panic: the DT's cached ramoops mapping did not preserve
+the current crash. Use the [reset-debugging procedure](../scripts/redwood/debugging.md)
+for persistent capture, evidence attribution and incremental instrumentation.
+Fine-grained runtime logs are phone-local rather than per-marker TCP
+acknowledgements; the startup identity handshake remains np-acknowledged.
 
 Redwood is a POCO X5 Pro 5G (`xiaomi,redwood`, Qualcomm SM7325) running the
 project's Linux 7.2.0. Its WCN6750 is platform device `17a10040.wifi`,
