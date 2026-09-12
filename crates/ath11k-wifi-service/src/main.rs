@@ -164,7 +164,12 @@ fn activate_and_run(
 ) -> Result<(), String> {
     eprintln!("ath11k_wifi_startup=VFIO_ACTIVATE_ENTER");
     let mut vfio = LinuxVfio::activate_platform(platform).map_err(|error| error.to_string())?;
-    if config.diagnostic_unsandboxed {
+    if config.diagnostic_unsandboxed
+        && (std::env::var("REDWOOD_DIAGNOSTIC_VFIO_TRACE").as_deref() == Ok("1")
+            || DIAGNOSTIC_PAUSE
+                .get()
+                .is_some_and(|stage| stage.starts_with("mmio:")))
+    {
         vfio.with_runtime_trace(trace_vfio_runtime);
     }
     eprintln!("ath11k_wifi_startup=VFIO_ACTIVE");

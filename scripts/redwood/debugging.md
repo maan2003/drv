@@ -149,7 +149,9 @@ a long hold can lead straight into cleanup after resume, not the original
 scan/connect sequence. A stable hold only bounds where an error was observed;
 it does not prove earlier asynchronous accesses harmless.
 
-Runtime-only VFIO tracing records accesses before executing them, including
+Set `REDWOOD_DIAGNOSTIC_VFIO_TRACE=1` for runtime-only VFIO tracing; an
+`mmio:` pause enables it automatically. Otherwise it is disabled to preserve
+bring-up timing. It records accesses before executing them, including
 DMA-unmap entry, without logging thousands of startup allocations. Tracing
 and pauses perturb timing: compare a resumed failing boundary against an
 otherwise identical run, not against a different kernel or service.
@@ -177,3 +179,11 @@ inert, same boot retained. Association still failed; heavy tracing delayed
 cleanup past the diagnostic deadline. This is physical evidence for the
 cleanup crash fix, not association acceptance. The cleanup regression test
 rejects MMIO writes and requires complete DP ring teardown to succeed.
+
+A second run on the same boot, with VFIO access tracing disabled, again
+reached scan/Connect/event 176 and completed containment without a reset.
+The diagnostic reported `DriverFault` during association, then WPSS offline
+and VFIO released. Evidence is in `candidate-6aa20f7d-quiet/`; service SHA-256
+`4f7eab63955a3b7cecf51e789086fb67bf8a7f2373a426ab5e2dadc7d0d16685`.
+This separates the remaining association failure from the fixed cleanup
+SError without the full-access tracing overhead.

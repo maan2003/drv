@@ -47,6 +47,7 @@ case ${1-} in
         --setenv="REDWOOD_EVIDENCE_ENDPOINT=$REDWOOD_EVIDENCE_ENDPOINT" \
         --setenv="REDWOOD_EVIDENCE_RUN_ID=$REDWOOD_EVIDENCE_RUN_ID" \
         --setenv="REDWOOD_DIAGNOSTIC_PAUSE=${REDWOOD_DIAGNOSTIC_PAUSE:-}" \
+        --setenv="REDWOOD_DIAGNOSTIC_VFIO_TRACE=${REDWOOD_DIAGNOSTIC_VFIO_TRACE:-}" \
         --property=Type=exec "$(readlink -f "$0")" --run
     echo "REDWOOD_WPA3_SUBMITTED unit=$UNIT.service log=$RUN/diagnostic.log"
     exit
@@ -71,6 +72,7 @@ EOF
     chmod +x "$t/systemctl" "$t/systemd-run" "$t/nc"
     REDWOOD_SYSTEMCTL="$t/systemctl" REDWOOD_SYSTEMD_RUN="$t/systemd-run" \
         REDWOOD_NC="$t/nc" REDWOOD_DIAGNOSTIC_PAUSE=mmio:0xb81fc \
+        REDWOOD_DIAGNOSTIC_VFIO_TRACE=1 \
         REDWOOD_TEST_ACTIONS="$t/actions" REDWOOD_EVIDENCE_ENDPOINT=127.0.0.1:9 \
         REDWOOD_EVIDENCE_RUN_ID=selftest REDWOOD_EVIDENCE_BOOT_ID=selftest \
         REDWOOD_EVIDENCE_SERVICE_SHA=selftest REDWOOD_EVIDENCE_DIAGNOSTIC_SHA=selftest \
@@ -80,6 +82,7 @@ EOF
     grep -q -- '--setenv=REDWOOD_EVIDENCE_ENDPOINT=127.0.0.1:9' "$t/actions"
     grep -q -- '--setenv=REDWOOD_EVIDENCE_RUN_ID=selftest' "$t/actions"
     grep -q -- '--setenv=REDWOOD_DIAGNOSTIC_PAUSE=mmio:0xb81fc' "$t/actions"
+    grep -q -- '--setenv=REDWOOD_DIAGNOSTIC_VFIO_TRACE=1' "$t/actions"
     grep -q -- '--run' "$t/actions"
     ! grep -Eq -- 'timeout|RuntimeMaxSec|KillSignal' "$t/actions"
     grep -q 'REDWOOD_WPA3_SUBMITTED' "$t/output"
