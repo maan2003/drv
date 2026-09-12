@@ -28,11 +28,11 @@ use ath11k_qmi::{
 use ath11k_wmi::{
     Command, Event, EventId, Transport as WmiTransport, WmiError,
     cmd::{
-        Channel as WmiChannel, HtcWmiTransport, Init, KeySeqCounter, MgmtSend, PeerAssoc,
-        PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam, PdevSuspend, ScanChannel,
-        ScanChannelList, SetCurrentCountry, StaPowerSaveMode, StaPowerSaveParameter, TxRxStreams,
-        VdevCreate, VdevDelete, VdevDown, VdevInstallKey, VdevSetParam, VdevStart, VdevStop,
-        VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
+        Channel as WmiChannel, HtcWmiTransport, Init, KeySeqCounter, MgmtSend, PdevSuspend,
+        PeerAssoc, PeerAssocParams, PeerAuthorize, PeerCreate, PeerDelete, PeerSetParam,
+        ScanChannel, ScanChannelList, SetCurrentCountry, StaPowerSaveMode, StaPowerSaveParameter,
+        TxRxStreams, VdevCreate, VdevDelete, VdevDown, VdevInstallKey, VdevSetParam, VdevStart,
+        VdevStop, VdevUp, Wmi, WmmAccessCategory, WmmUpdate,
     },
 };
 
@@ -719,6 +719,7 @@ where
                     })
                     .collect(),
             ),
+            shadow_registers_v2: Some(ath11k_ce::wcn6750_shadow_registers()),
             ..Default::default()
         }
     }
@@ -985,12 +986,15 @@ where
                     CeAllocatedPipes::alloc_pipes(&self.device)
                         .map_err(|_| CoreError::NoResources)?,
                 );
-                let pipes = Self::protocol(self.allocated.take())?
+                let mut pipes = Self::protocol(self.allocated.take())?
                     .init_pipes(
                         Self::protocol(self.mmio.as_ref())?,
                         Self::protocol(self.rdp.as_ref())?,
                         [None; CE_COUNT],
                     )
+                    .map_err(|_| CoreError::DeviceFault)?;
+                pipes
+                    .use_shadow_registers(&ath11k_ce::wcn6750_shadow_registers())
                     .map_err(|_| CoreError::DeviceFault)?;
                 self.pipes = Some(pipes);
                 Ok(())
@@ -1401,7 +1405,8 @@ where
             Operation::DpAllocate => {
                 let rings =
                     HalDpRings::new(&self.device, Self::protocol(self.dp_mmio.take())?, &[])
-                        .map_err(Self::dp_error)?;
+                        .map_err(Self::dp_error)?
+                        .with_shadow_registers(ath11k_ce::wcn6750_shadow_registers());
                 let dp = ClientDataPath::ath11k_dp_alloc(
                     self.device.clone(),
                     rings,
@@ -1623,6 +1628,10 @@ mod tests {
             ath11k_ce::NoCompletionWait,
             fn() -> u64,
         >::qmi_config();
+        assert_eq!(
+            config.shadow_registers_v2,
+            Some(ath11k_ce::wcn6750_shadow_registers())
+        );
         assert!(config.target_pipes.unwrap().iter().any(|pipe| {
             pipe.pipe_num == 7 && pipe.direction == QmiPipeDirection::InOutHostToHost
         }));

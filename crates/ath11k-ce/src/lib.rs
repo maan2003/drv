@@ -191,6 +191,27 @@ pub const WCN6750_HOST_CE_CONFIG: [HostPipeConfig; CE_COUNT] = [
     },
 ];
 
+/// The firmware table and host publications share this source of truth.
+/// Matches ath11k_ce_shadow_config: source, destination, status per engine.
+pub fn wcn6750_shadow_registers() -> Vec<u32> {
+    ath11k_hal::Wcn6750Registers::shadow_registers(
+        WCN6750_HOST_CE_CONFIG
+            .iter()
+            .enumerate()
+            .flat_map(|(number, config)| {
+                [
+                    (config.source_entries != 0).then_some((RingType::CeSource, number as u8)),
+                    (config.destination_entries != 0)
+                        .then_some((RingType::CeDestination, number as u8)),
+                    (config.destination_entries != 0)
+                        .then_some((RingType::CeDestinationStatus, number as u8)),
+                ]
+                .into_iter()
+                .flatten()
+            }),
+    )
+}
+
 pub const WCN6750_TARGET_CE_CONFIG: [TargetPipeConfig; CE_COUNT] = [
     TargetPipeConfig {
         pipe: 0,
@@ -1593,6 +1614,19 @@ pub struct CePipes<B: Backend> {
 }
 
 impl<B: Backend> CePipes<B> {
+    /// Called only after firmware accepts the corresponding QMI table.
+    pub fn use_shadow_registers(&mut self, targets: &[u32]) -> Result<(), CeError> {
+        for pipe in &mut self.pipes {
+            for ring in [&mut pipe.source, &mut pipe.destination, &mut pipe.status]
+                .into_iter()
+                .flatten()
+            {
+                ring.use_shadow_registers(targets)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_attr_flags(&self, pipe: usize) -> Result<u32, CeError> {
         self.pipes
             .get(pipe)
@@ -2540,6 +2574,56 @@ mod tests {
         fn release_region(&mut self, _: ()) {}
         fn release_dma(&mut self, _: u64) {}
         fn release_interrupt(&mut self, _: ()) {}
+    }
+
+    #[test]
+    fn wcn6750_shadow_table_and_ce_publications_match_native_order() {
+        let targets = wcn6750_shadow_registers();
+        assert_eq!(
+            targets,
+            [
+                0xa3b02c, 0xa3b034, 0xa3b03c, 0xa3b044, 0xa3b05c, 0xa3b018, 0xa3b010, 0xa3b074,
+                0xa46000, 0xa46008, 0xa46010, 0xa46018, 0xa46034, 0xa370b0, 0xa37018, 0xa370c4,
+                0xa370cc, 0xa370d4, 0xa370dc, 0xa370e4, 0x1b80400, 0x1b83400, 0x1b8340c, 0x1b85400,
+                0x1b8540c, 0x1b86400, 0x1b88400, 0x1b8b400, 0x1b8b40c, 0x1b8e400,
+            ]
+        );
+        let state = Rc::new(RefCell::new(LargeState::default()));
+        let device = Device::from_backend(LargeModel {
+            state: state.clone(),
+        });
+        let mmio = device.open_region(0).unwrap();
+        let rdp = device.alloc_coherent::<Bidirectional>(176 * 4, 8).unwrap();
+        let allocated = CeAllocatedPipes::alloc_pipes(&device).unwrap();
+        let mut pipes = allocated.init_pipes(&mmio, &rdp, [None; CE_COUNT]).unwrap();
+        pipes.use_shadow_registers(&targets).unwrap();
+        state.borrow_mut().operations.clear();
+        for pipe in &pipes.pipes {
+            for ring in [&pipe.source, &pipe.destination, &pipe.status]
+                .into_iter()
+                .flatten()
+            {
+                ring.access_end(&mmio).unwrap();
+            }
+        }
+        let writes: Vec<_> = state
+            .borrow()
+            .operations
+            .iter()
+            .filter_map(|op| {
+                if let LargeOperation::Write(offset, value) = op {
+                    Some((*offset, *value))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            (20..30)
+                .map(|index| (0x504 + 4 * index, 0))
+                .collect::<Vec<_>>()
+        );
     }
 
     fn initialized_large_packet_io(state: Rc<RefCell<LargeState>>) -> CePipesPacketIo<LargeModel> {

@@ -1835,6 +1835,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_publishes_tcl_through_negotiated_shadow() {
+        let backend = AggregateBackend::default();
+        let writes = backend.mmio_writes.clone();
+        let device = Device::from_backend(backend);
+        let rings = crate::HalDpRings::new(&device, device.open_region(0).unwrap(), &[])
+            .unwrap()
+            .with_shadow_registers(ath11k_hal::Wcn6750Registers::shadow_registers([]));
+        let mut dp = match ClientDataPath::ath11k_dp_alloc(device, rings, config()) {
+            Ok(dp) => dp,
+            Err(_) => panic!("aggregate allocation failed"),
+        };
+        dp.ath11k_dp_pdev_pre_alloc().unwrap();
+        dp.ath11k_dp_pdev_reo_setup().unwrap();
+        let tcl = dp.data_rings.unwrap().tcl;
+        writes.borrow_mut().clear();
+        dp.rings_mut()
+            .publish(tcl, Descriptor::new(vec![0x5a; 32], 32).unwrap())
+            .unwrap();
+        assert_eq!(*writes.borrow(), [(0x504 + 4 * 8, 8)]);
+    }
+
+    #[test]
     fn aggregate_allocates_sets_up_and_tears_down_every_phase() {
         let backend = AggregateBackend::default();
         let memory = backend.memory.clone();

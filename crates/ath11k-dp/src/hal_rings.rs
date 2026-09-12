@@ -38,6 +38,7 @@ pub struct HalDpRings<B: Backend> {
     remote_write_pointers: CoherentDma<B, Bidirectional>,
     msi: Vec<DpRingMsi>,
     rings: Vec<Ring<B>>,
+    shadow_registers: Option<Vec<u32>>,
 }
 
 impl<B: Backend> HalDpRings<B> {
@@ -73,7 +74,14 @@ impl<B: Backend> HalDpRings<B> {
             remote_write_pointers,
             msi: msi.to_vec(),
             rings: Vec::new(),
+            shadow_registers: None,
         })
+    }
+
+    /// Use the target table already accepted by the running firmware.
+    pub fn with_shadow_registers(mut self, targets: Vec<u32>) -> Self {
+        self.shadow_registers = Some(targets);
+        self
     }
 
     fn parameters(&self, spec: DpRingSpec) -> SrngParams {
@@ -318,7 +326,7 @@ impl<B: Backend> DpRingOps<B> for HalDpRings<B> {
                 .map_err(|_| HalError::DeviceFault)?;
         }
         let params = self.parameters(spec);
-        let srng = Srng::setup(
+        let mut srng = Srng::setup(
             &self.mmio,
             spec.ring_type,
             spec.ring_number,
@@ -327,6 +335,9 @@ impl<B: Backend> DpRingOps<B> for HalDpRings<B> {
             &self.remote_read_pointers,
             params,
         )?;
+        if let Some(targets) = &self.shadow_registers {
+            srng.use_shadow_registers(targets)?;
+        }
         let id = srng.id;
         debug_assert_eq!(id, expected);
         self.rings.push(Ring { spec, srng, params });

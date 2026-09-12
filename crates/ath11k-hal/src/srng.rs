@@ -5,6 +5,7 @@
 //! at commit 509ce3d952d550f93b544c8d94c99e798f09a9b4.
 
 use crate::{HalError, RingId, RingMemory};
+use alloc::vec::Vec;
 use ath11k_platform_backend::{Backend, Bidirectional, CoherentDma, MmioRegion};
 use core::sync::atomic::{Ordering, fence};
 
@@ -104,6 +105,39 @@ struct Config {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Wcn6750Registers;
 impl Wcn6750Registers {
+    /// QMI shadow-v2 target order from hal.c: non-CE UMAC rings first,
+    /// then populated CE rings supplied in ce.c order. LMAC uses WRP DMA.
+    pub fn shadow_registers(ce_rings: impl IntoIterator<Item = (RingType, u8)>) -> Vec<u32> {
+        let non_ce = [
+            RingType::ReoDestination,
+            RingType::ReoException,
+            RingType::ReoReinject,
+            RingType::ReoCommand,
+            RingType::ReoStatus,
+            RingType::TclData,
+            RingType::TclCommand,
+            RingType::TclStatus,
+            RingType::WbmIdleLink,
+            RingType::SwToWbmRelease,
+            RingType::WbmToSwRelease,
+        ];
+        non_ce
+            .into_iter()
+            .flat_map(|kind| (0..config(kind).max_rings).map(move |number| (kind, number)))
+            .chain(ce_rings)
+            .map(|(kind, number)| {
+                let c = config(kind);
+                (c.r2
+                    + usize::from(number) * c.r2_stride
+                    + if c.direction == RingDirection::Destination {
+                        4
+                    } else {
+                        0
+                    }) as u32
+            })
+            .collect()
+    }
+
     pub const fn entry_size(ring_type: RingType) -> usize {
         config(ring_type).entry_words as usize * 4
     }
@@ -729,10 +763,28 @@ impl<B: Backend> Srng<B> {
         };
         w(mmio, self.publication_offset, value)
     }
-    /// Select a firmware-programmed shadow register for subsequent pointer
-    /// publications (`ath11k_hal_srng_update_hp_tp_addr`).
-    pub fn set_shadow_publication_register(&mut self, offset: usize) {
-        self.publication_offset = offset;
+    /// Select the shadow slot from the exact target table accepted by QMI.
+    /// Ring setup itself still uses direct registers, as in pinned hal.c.
+    pub fn use_shadow_registers(&mut self, targets: &[u32]) -> Result<(), HalError> {
+        if config(self.ring_type).lmac {
+            return Ok(());
+        }
+        let target = self.r2
+            + if self.direction == RingDirection::Destination {
+                4
+            } else {
+                0
+            };
+        let index = targets
+            .iter()
+            .position(|&offset| offset as usize == target)
+            .ok_or(HalError::NoResources)?;
+        // wcn6750_regs.hal_shadow_base_addr and HAL_SHADOW_NUM_REGS.
+        if index >= 36 {
+            return Err(HalError::NoResources);
+        }
+        self.publication_offset = 0x504 + 4 * index;
+        Ok(())
     }
     /// LMAC rings publish through the coherent WRP array instead of MMIO.
     /// The fence preserves Linux's dma_wmb/dma_mb before the shared write.
@@ -905,6 +957,33 @@ mod tests {
             0xffff / 4
         );
     }
+    #[test]
+    fn shadow_publication_selects_source_hp_and_destination_tp() {
+        let ops = Rc::new(RefCell::new(Vec::new()));
+        let d = Device::from_backend(Fake {
+            ops: ops.clone(),
+            ..Fake::default()
+        });
+        let mmio = d.open_region(0).unwrap();
+        let rdp = d.alloc_coherent(176 * 4, 4).unwrap();
+        let targets = Wcn6750Registers::shadow_registers([]);
+        for (kind, number, slot) in [(RingType::TclData, 2, 10), (RingType::ReoDestination, 3, 3)] {
+            let entry_bytes = Wcn6750Registers::entry_size(kind);
+            let mem = RingMemory {
+                dma: d.alloc_coherent(entry_bytes * 8, 8).unwrap(),
+                entries: 8,
+                entry_bytes: entry_bytes as u16,
+            };
+            let mut ring =
+                Srng::setup(&mmio, kind, number, 0, mem, &rdp, SrngParams::default()).unwrap();
+            assert_eq!(ring.use_shadow_registers(&[]), Err(HalError::NoResources));
+            ring.use_shadow_registers(&targets).unwrap();
+            ops.borrow_mut().clear();
+            ring.access_end(&mmio).unwrap();
+            assert_eq!(*ops.borrow(), [Op::Write(0x504 + 4 * slot, 0)]);
+        }
+    }
+
     #[test]
     fn source_setup_write_order_matches_hal_c() {
         let ops = Rc::new(RefCell::new(Vec::new()));
