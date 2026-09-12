@@ -127,10 +127,13 @@ application memory, device resources, DMA, or the host kernel, per
 ## Application handoff
 
 All Internet-facing applications and desktop/system components are owned and
-modifiable. Applications currently reach Netstack3 through **SOCKS**; native
-capability-scoped streams and datagrams are the destination. Transparent Linux
-socket compatibility is optional, not a prerequisite, per
-[REQ-application-compatibility](REQ-application-compatibility.md). System UI
+modifiable. Applications currently reach Netstack3 through **SOCKS**. The
+owner-selected production handoff is the userspace-backed Linux Internet
+socket frontend in [ARCH-network-service](ARCH-network-service.md), including
+localhost and compile-time removal of native TCP/UDP implementations. The
+existing socket-provider spike is not that finished implementation.
+[REQ-application-compatibility](REQ-application-compatibility.md) retains scope
+for adapting applications beyond the socket interface. System UI
 controls Wi-Fi through wlancfg's project-native interface, not a required
 NetworkManager, iwd, or nl80211 interface.
 
@@ -231,6 +234,10 @@ sockets. Production startup is valid offline: external DNS/HTTP proof and lab
 deadlines are not service availability conditions. Suspend/resume, reconnect,
 bounded recovery, and power-efficient event-driven operation are laptop
 requirements. Driver and netstack are independently restartable units.
+Wi-Fi reconnect does not automatically restart Netstack3. A Netstack3 crash
+terminates its sockets and wakes applications; its replacement accepts new
+sockets, not reconstructed TCP connections, as specified in
+[ARCH-network-service](ARCH-network-service.md).
 
 ## Kernel portability
 

@@ -47,7 +47,11 @@ by [ARCH-hardware-isolation](ARCH-hardware-isolation.md) and
 ## Product maturity
 
 MT7921's goal is everyday laptop production readiness, beyond its already
-proved Internet path: containment, dependable recovery and reconnect,
+proved Internet path. The immediate deployment goal is np using our driver
+continuously, with application and system networking through Netstack3 rather
+than a bounded diagnostic. The owner-selected socket frontend and its rationale
+are in [ARCH-network-service](ARCH-network-service.md). Acceptance includes
+containment, dependable recovery and reconnect,
 suspend/resume, power efficiency, supported Wi-Fi behavior, sustained
 performance, and application integration. Connectivity alone is not acceptance.
 
