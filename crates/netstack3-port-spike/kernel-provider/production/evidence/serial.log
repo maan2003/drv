@@ -1,5 +1,5 @@
 c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
-Booting from ROM..c[?7l[2J[    0.000000] Linux version 6.18.40 (user@no-plastic) (gcc (GCC) 15.2.0, GNU ld (GNU Binutils) 2.46) #6 SMP Sun Sep 13 00:06:35 IST 2026
+Booting from ROM..c[?7l[2J[    0.000000] Linux version 6.18.40 (user@no-plastic) (gcc (GCC) 15.2.0, GNU ld (GNU Binutils) 2.46) #12 SMP Sun Sep 13 00:49:38 IST 2026
 [    0.000000] Command line: console=ttyS0 panic=-1 rdinit=/init
 [    0.000000] BIOS-provided physical RAM map:
 [    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable
@@ -16,171 +16,175 @@ Booting from ROM..c[?7l[2J[    0.000000] Linux version 6.18.40 (user@no-plast
 [    0.000000] DMI: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org 04/01/2014
 [    0.000000] DMI: Memory slots populated: 1/1
 [    0.000000] tsc: Fast TSC calibration using PIT
-[    0.000000] tsc: Detected 3992.623 MHz processor
+[    0.000000] tsc: Detected 3992.676 MHz processor
 [    0.000169] last_pfn = 0x3ffe0 max_arch_pfn = 0x400000000
 [    0.000195] MTRR map: 4 entries (3 fixed + 1 variable; max 19), built from 8 variable MTRRs
-[    0.000197] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
-[    0.001334] found SMP MP-table at [mem 0x000f54c0-0x000f54cf]
-[    0.001338] Using GB pages for direct mapping
-[    0.001406] RAMDISK: [mem 0x3f8e4000-0x3ffdffff]
-[    0.001408] Intel MultiProcessor Specification v1.4
-[    0.001409] MPTABLE: OEM ID: BOCHSCPU
-[    0.001409] MPTABLE: Product ID: 0.1         
-[    0.001409] MPTABLE: APIC at: 0xFEE00000
-[    0.001430] Zone ranges:
-[    0.001431]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
-[    0.001432]   DMA32    [mem 0x0000000001000000-0x000000003ffdffff]
-[    0.001433]   Normal   empty
-[    0.001433] Movable zone start for each node
-[    0.001433] Early memory node ranges
-[    0.001434]   node   0: [mem 0x0000000000001000-0x000000000009efff]
-[    0.001434]   node   0: [mem 0x0000000000100000-0x000000003ffdffff]
-[    0.001435] Initmem setup node 0 [mem 0x0000000000001000-0x000000003ffdffff]
-[    0.001589] On node 0, zone DMA: 1 pages in unavailable ranges
-[    0.001600] On node 0, zone DMA: 97 pages in unavailable ranges
-[    0.002857] On node 0, zone DMA32: 32 pages in unavailable ranges
-[    0.002861] Intel MultiProcessor Specification v1.4
-[    0.002862] MPTABLE: OEM ID: BOCHSCPU
-[    0.002862] MPTABLE: Product ID: 0.1         
-[    0.002862] MPTABLE: APIC at: 0xFEE00000
-[    0.002865] Processor #0 (Bootup-CPU)
-[    0.002882] IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23
-[    0.002883] Processors: 1
-[    0.002883] TSC deadline timer available
-[    0.002886] CPU topo: Max. logical packages:   1
-[    0.002886] CPU topo: Max. logical dies:       1
-[    0.002887] CPU topo: Max. dies per package:   1
-[    0.002889] CPU topo: Max. threads per core:   1
-[    0.002889] CPU topo: Num. cores per package:     1
-[    0.002889] CPU topo: Num. threads per package:   1
-[    0.002890] CPU topo: Allowing 1 present CPUs plus 0 hotplug CPUs
-[    0.002894] [mem 0x40000000-0xfeffbfff] available for PCI devices
-[    0.002895] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
-[    0.002900] setup_percpu: NR_CPUS:2 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1
-[    0.003008] percpu: Embedded 36 pages/cpu s117056 r0 d30400 u2097152
-[    0.003015] Kernel command line: console=ttyS0 panic=-1 rdinit=/init
-[    0.003240] random: crng init done
-[    0.003240] printk: log buffer data + meta data: 131072 + 458752 = 589824 bytes
-[    0.003254] Dentry cache hash table entries: 131072 (order: 8, 1048576 bytes, linear)
-[    0.003271] Inode-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
-[    0.003283] Built 1 zonelists, mobility grouping on.  Total pages: 262014
-[    0.003285] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
-[    0.004019] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
-[    0.004138] rcu: Hierarchical RCU implementation.
-[    0.004139] rcu: 	RCU event tracing is enabled.
-[    0.004139] rcu: 	RCU restricting CPUs from NR_CPUS=2 to nr_cpu_ids=1.
-[    0.004141] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
-[    0.004141] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
-[    0.004149] NR_IRQS: 4352, nr_irqs: 48, preallocated irqs: 16
-[    0.004306] rcu: srcu_init: Setting srcu_struct sizes based on contention.
-[    0.004402] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
-[    0.004603] Console: colour *CGA 80x25
-[    0.004646] printk: legacy console [ttyS0] enabled
-[    0.088348] APIC: Switch to symmetric I/O mode setup
-[    0.090026] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x731a496ea99, max_idle_ns: 881591228247 ns
-[    0.092066] Calibrating delay loop (skipped), value calculated using timer frequency.. 7985.24 BogoMIPS (lpj=15970492)
-[    0.094190] x86/cpu: User Mode Instruction Prevention (UMIP) activated
-[    0.095453] Last level iTLB entries: 4KB 512, 2MB 255, 4MB 127
-[    0.096065] Last level dTLB entries: 4KB 512, 2MB 255, 4MB 127, 1GB 0
-[    0.096065] mitigations: Enabled attack vectors: SMT mitigations: off
-[    0.096065] Speculative Store Bypass: Vulnerable
-[    0.096065] Spectre V2 : Vulnerable
-[    0.096065] Speculative Return Stack Overflow: Vulnerable
-[    0.096065] Spectre V1 : Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x002: 'SSE registers'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x004: 'AVX registers'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x020: 'AVX-512 opmask'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x040: 'AVX-512 Hi256'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x080: 'AVX-512 ZMM_Hi256'
-[    0.096065] x86/fpu: Supporting XSAVE feature 0x200: 'Protection Keys User registers'
-[    0.096065] x86/fpu: xstate_offset[2]:  576, xstate_sizes[2]:  256
-[    0.096065] x86/fpu: xstate_offset[5]:  832, xstate_sizes[5]:   64
-[    0.096065] x86/fpu: xstate_offset[6]:  896, xstate_sizes[6]:  512
-[    0.096065] x86/fpu: xstate_offset[7]: 1408, xstate_sizes[7]: 1024
-[    0.096065] x86/fpu: xstate_offset[9]: 2432, xstate_sizes[9]:    8
-[    0.096065] x86/fpu: Enabled xstate features 0x2e7, context size is 2440 bytes, using 'compacted' format.
-[    0.096065] Freeing SMP alternatives memory: 20K
-[    0.096065] pid_max: default: 32768 minimum: 301
-[    0.096065] Mount-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
-[    0.096065] Mountpoint-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
-[    0.096065] smpboot: CPU0: AMD Ryzen 9 7940HS w/ Radeon 780M Graphics (family: 0x19, model: 0x74, stepping: 0x1)
-[    0.096065] Performance Events: Fam17h+ core perfctr, AMD PMU driver.
-[    0.096065] ... version:                   2
-[    0.096068] ... bit width:                 48
-[    0.096904] ... generic counters:          6
-[    0.097720] ... generic bitmap:            000000000000003f
-[    0.098793] ... fixed-purpose counters:    0
-[    0.099621] ... fixed-purpose bitmap:      0000000000000000
-[    0.100068] ... value mask:                0000ffffffffffff
-[    0.101132] ... max period:                00007fffffffffff
-[    0.102200] ... global_ctrl mask:          000000000000003f
-[    0.103316] signal: max sigframe size: 2976
-[    0.104082] rcu: Hierarchical SRCU implementation.
-[    0.105000] rcu: 	Max phase no-delay instances is 1000.
-[    0.106035] smp: Bringing up secondary CPUs ...
-[    0.106907] smp: Brought up 1 node, 1 CPU
-[    0.107679] smpboot: Total of 1 processors activated (7985.24 BogoMIPS)
-[    0.108113] Memory: 1008456K/1048056K available (5665K kernel code, 696K rwdata, 844K rodata, 776K init, 500K bss, 36152K reserved, 0K cma-reserved)
-[    0.110664] devtmpfs: initialized
-[    0.111353] posixtimers hash table entries: 512 (order: 1, 8192 bytes, linear)
-[    0.112070] futex hash table entries: 256 (16384 bytes on 1 NUMA nodes, total 16 KiB, linear).
-[    0.113810] NET: Registered PF_NETLINK/PF_ROUTE protocol family
-[    0.115076] NET: Registered PF_INET protocol family
-[    0.116024] NET: Registered PF_INET6 protocol family
-[    0.116087] clocksource: Switched to clocksource tsc-early
-[    0.117361] NET: Registered PF_UNIX/PF_LOCAL protocol family
-[    0.118456] platform rtc_cmos: registered platform RTC device (no PNP device found)
-[    0.119976] Unpacking initramfs...
-[    0.124100] workingset: timestamp_bits=62 max_order=18 bucket_order=0
-[    0.125360] Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
-[    0.126701] serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
-[    0.132276] IPI shorthand broadcast: enabled
-[    0.133224] sched_clock: Marking stable (44406365, 87664335)->(170830895, -38760195)
-[    0.173948] Freeing initrd memory: 7152K
-[    0.175145] Freeing unused kernel image (initmem) memory: 776K
-[    0.176017] Write protecting the kernel read-only data: 8192k
-[    0.176920] Freeing unused kernel image (text/rodata gap) memory: 476K
-[    0.177944] Freeing unused kernel image (rodata/data gap) memory: 1204K
-[    0.178917] Run /init as init process
+[    0.000197] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT
+[    0.001348] found SMP MP-table at [mem 0x000f54c0-0x000f54cf]
+[    0.001352] Using GB pages for direct mapping
+[    0.001417] RAMDISK: [mem 0x3f8e0000-0x3ffdffff]
+[    0.001418] Intel MultiProcessor Specification v1.4
+[    0.001419] MPTABLE: OEM ID: BOCHSCPU
+[    0.001419] MPTABLE: Product ID: 0.1
+[    0.001419] MPTABLE: APIC at: 0xFEE00000
+[    0.001441] Zone ranges:
+[    0.001441]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
+[    0.001442]   DMA32    [mem 0x0000000001000000-0x000000003ffdffff]
+[    0.001443]   Normal   empty
+[    0.001443] Movable zone start for each node
+[    0.001444] Early memory node ranges
+[    0.001444]   node   0: [mem 0x0000000000001000-0x000000000009efff]
+[    0.001445]   node   0: [mem 0x0000000000100000-0x000000003ffdffff]
+[    0.001445] Initmem setup node 0 [mem 0x0000000000001000-0x000000003ffdffff]
+[    0.001591] On node 0, zone DMA: 1 pages in unavailable ranges
+[    0.001601] On node 0, zone DMA: 97 pages in unavailable ranges
+[    0.002761] On node 0, zone DMA32: 32 pages in unavailable ranges
+[    0.002764] Intel MultiProcessor Specification v1.4
+[    0.002765] MPTABLE: OEM ID: BOCHSCPU
+[    0.002766] MPTABLE: Product ID: 0.1
+[    0.002766] MPTABLE: APIC at: 0xFEE00000
+[    0.002768] Processor #0 (Bootup-CPU)
+[    0.002785] IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23
+[    0.002787] Processors: 1
+[    0.002787] TSC deadline timer available
+[    0.002789] CPU topo: Max. logical packages:   1
+[    0.002790] CPU topo: Max. logical dies:       1
+[    0.002790] CPU topo: Max. dies per package:   1
+[    0.002792] CPU topo: Max. threads per core:   1
+[    0.002793] CPU topo: Num. cores per package:     1
+[    0.002793] CPU topo: Num. threads per package:   1
+[    0.002793] CPU topo: Allowing 1 present CPUs plus 0 hotplug CPUs
+[    0.002798] [mem 0x40000000-0xfeffbfff] available for PCI devices
+[    0.002799] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
+[    0.002804] setup_percpu: NR_CPUS:2 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1
+[    0.002923] percpu: Embedded 36 pages/cpu s117056 r0 d30400 u2097152
+[    0.002930] Kernel command line: console=ttyS0 panic=-1 rdinit=/init
+[    0.003160] random: crng init done
+[    0.003160] printk: log buffer data + meta data: 131072 + 458752 = 589824 bytes
+[    0.003175] Dentry cache hash table entries: 131072 (order: 8, 1048576 bytes, linear)
+[    0.003192] Inode-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.003204] Built 1 zonelists, mobility grouping on.  Total pages: 262014
+[    0.003205] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.003957] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.004077] rcu: Hierarchical RCU implementation.
+[    0.004077] rcu: 	RCU event tracing is enabled.
+[    0.004078] rcu: 	RCU restricting CPUs from NR_CPUS=2 to nr_cpu_ids=1.
+[    0.004079] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+[    0.004080] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
+[    0.004088] NR_IRQS: 4352, nr_irqs: 48, preallocated irqs: 16
+[    0.004244] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.004331] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+[    0.004537] Console: colour *CGA 80x25
+[    0.004581] printk: legacy console [ttyS0] enabled
+[    0.088326] APIC: Switch to symmetric I/O mode setup
+[    0.089936] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x731aadb4383, max_idle_ns: 881591160298 ns
+[    0.091931] Calibrating delay loop (skipped), value calculated using timer frequency.. 7985.35 BogoMIPS (lpj=15970704)
+[    0.094039] x86/cpu: User Mode Instruction Prevention (UMIP) activated
+[    0.095283] Last level iTLB entries: 4KB 512, 2MB 255, 4MB 127
+[    0.095931] Last level dTLB entries: 4KB 512, 2MB 255, 4MB 127, 1GB 0
+[    0.095931] mitigations: Enabled attack vectors: SMT mitigations: off
+[    0.095931] Speculative Store Bypass: Vulnerable
+[    0.095931] Spectre V2 : Vulnerable
+[    0.095931] Speculative Return Stack Overflow: Vulnerable
+[    0.095931] Spectre V1 : Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x002: 'SSE registers'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x004: 'AVX registers'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x020: 'AVX-512 opmask'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x040: 'AVX-512 Hi256'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x080: 'AVX-512 ZMM_Hi256'
+[    0.095931] x86/fpu: Supporting XSAVE feature 0x200: 'Protection Keys User registers'
+[    0.095931] x86/fpu: xstate_offset[2]:  576, xstate_sizes[2]:  256
+[    0.095931] x86/fpu: xstate_offset[5]:  832, xstate_sizes[5]:   64
+[    0.095931] x86/fpu: xstate_offset[6]:  896, xstate_sizes[6]:  512
+[    0.095931] x86/fpu: xstate_offset[7]: 1408, xstate_sizes[7]: 1024
+[    0.095931] x86/fpu: xstate_offset[9]: 2432, xstate_sizes[9]:    8
+[    0.095931] x86/fpu: Enabled xstate features 0x2e7, context size is 2440 bytes, using 'compacted' format.
+[    0.095931] Freeing SMP alternatives memory: 20K
+[    0.095931] pid_max: default: 32768 minimum: 301
+[    0.095931] Mount-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.095931] Mountpoint-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.095931] smpboot: CPU0: AMD Ryzen 9 7940HS w/ Radeon 780M Graphics (family: 0x19, model: 0x74, stepping: 0x1)
+[    0.095931] Performance Events: Fam17h+ core perfctr, AMD PMU driver.
+[    0.095931] ... version:                   2
+[    0.095934] ... bit width:                 48
+[    0.096772] ... generic counters:          6
+[    0.097586] ... generic bitmap:            000000000000003f
+[    0.098643] ... fixed-purpose counters:    0
+[    0.099464] ... fixed-purpose bitmap:      0000000000000000
+[    0.099933] ... value mask:                0000ffffffffffff
+[    0.100995] ... max period:                00007fffffffffff
+[    0.102060] ... global_ctrl mask:          000000000000003f
+[    0.103170] signal: max sigframe size: 2976
+[    0.103947] rcu: Hierarchical SRCU implementation.
+[    0.104869] rcu: 	Max phase no-delay instances is 1000.
+[    0.105899] smp: Bringing up secondary CPUs ...
+[    0.106769] smp: Brought up 1 node, 1 CPU
+[    0.107539] smpboot: Total of 1 processors activated (7985.35 BogoMIPS)
+[    0.107979] Memory: 1008440K/1048056K available (5668K kernel code, 696K rwdata, 844K rodata, 776K init, 500K bss, 36168K reserved, 0K cma-reserved)
+[    0.110515] devtmpfs: initialized
+[    0.111202] posixtimers hash table entries: 512 (order: 1, 8192 bytes, linear)
+[    0.111936] futex hash table entries: 256 (16384 bytes on 1 NUMA nodes, total 16 KiB, linear).
+[    0.113675] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.114944] NET: Registered PF_INET protocol family
+[    0.115875] NET: Registered PF_INET6 protocol family
+[    0.115952] clocksource: Switched to clocksource tsc-early
+[    0.117241] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.118339] platform rtc_cmos: registered platform RTC device (no PNP device found)
+[    0.119876] Unpacking initramfs...
+[    0.124019] workingset: timestamp_bits=62 max_order=18 bucket_order=0
+[    0.125286] Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
+[    0.126618] serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
+[    0.132148] IPI shorthand broadcast: enabled
+[    0.133094] sched_clock: Marking stable (44334993, 87600176)->(169913161, -37977992)
+[    0.173154] Freeing initrd memory: 7168K
+[    0.174347] Freeing unused kernel image (initmem) memory: 776K
+[    0.175222] Write protecting the kernel read-only data: 8192k
+[    0.176123] Freeing unused kernel image (text/rodata gap) memory: 472K
+[    0.177145] Freeing unused kernel image (rodata/data gap) memory: 1204K
+[    0.178116] Run /init as init process
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 # CONFIG_SECCOMP_CACHE_DEBUG is not set
 # CONFIG_INET is not set
 CONFIG_NETSTACK3=y
 PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
-netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill provider_fd=3 native_loopback=false
+PASS ENDPOINT_SCOPING_SATURATION_CLOSE
+PASS ENDPOINT_CANCEL_AND_NONBLOCK
+PASS ENDPOINT_LIFETIME_QUOTA
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false
 Name:	netstack3-provi
 Umask:	0022
 State:	S (sleeping)
-Tgid:	38
+Tgid:	41
 Ngid:	0
-Pid:	38
+Pid:	41
 PPid:	1
 TracerPid:	0
 Uid:	65534	65534	65534	65534
 Gid:	65534	65534	65534	65534
 FDSize:	64
-Groups:	 
-NStgid:	38
-NSpid:	38
+Groups:
+NStgid:	41
+NSpid:	41
 NSpgid:	0
 NSsid:	0
 Kthread:	0
-VmPeak:	   15820 kB
-VmSize:	   15788 kB
+VmPeak:	   15860 kB
+VmSize:	   15828 kB
 VmLck:	       0 kB
 VmPin:	       0 kB
-VmHWM:	    9800 kB
-VmRSS:	    9800 kB
-RssAnon:	     680 kB
+VmHWM:	    9492 kB
+VmRSS:	    9492 kB
+RssAnon:	     672 kB
 RssFile:	       4 kB
-RssShmem:	    9116 kB
+RssShmem:	    8816 kB
 VmData:	     360 kB
 VmStk:	     132 kB
-VmExe:	    9360 kB
+VmExe:	    9388 kB
 VmLib:	    1852 kB
-VmPTE:	      72 kB
+VmPTE:	      68 kB
 VmSwap:	       0 kB
 CoreDumping:	0
 THP_enabled:	0
@@ -210,25 +214,29 @@ served_netns=net:[4026531833] provider_netns=net:[4026532032]
 SANDBOX_EMPTY_ROOT_VERIFIED
 PASS REFUSED family=2 SO_ERROR clears
 PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.030914 MBps=67.85
 PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
 PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.031096 MBps=67.45
 PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
 PASS UDP family=10 zero-datagram source peek truncation nonblock
 PASS LOOPBACK_SUITE
 PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
-netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill provider_fd=3 native_loopback=false
-[    1.148455] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x731a496ea99, max_idle_ns: 881591228247 ns
-[    1.150149] clocksource: Switched to clocksource tsc
+netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false
+[    1.148365] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x731aadb4383, max_idle_ns: 881591160298 ns
+[    1.149944] clocksource: Switched to clocksource tsc
 DEATH_READY
 PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION
 PASS REFUSED family=2 SO_ERROR clears
 PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.029877 MBps=70.20
 PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
 PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.030241 MBps=69.36
 PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
 PASS UDP family=10 zero-datagram source peek truncation nonblock
 PASS LOOPBACK_SUITE
 PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
 PASS_KVM_PRODUCTION_LOOPBACK
-[    2.556679] reboot: Restarting system
-[    2.557225] reboot: machine restart
+[    2.566432] reboot: Restarting system
+[    2.566985] reboot: machine restart

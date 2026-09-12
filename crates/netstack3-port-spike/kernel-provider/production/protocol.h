@@ -3,11 +3,15 @@
 #define _NS3_PROTOCOL_H
 #include <linux/types.h>
 /* All scalar fields are little endian. Socket IDs are assigned by the kernel.
- * Each provider FD names exactly one network namespace and one generation.
+ * The registration FD scopes a namespace/generation; claimed FDs each name one socket.
  * Requests and replies have the same opcode, socket and request IDs.
- * RX/STATE events use request=0. No pointers or Linux object layouts cross.
+ * RX/STATE and allocation-free CREDIT/CLOSE/ACCEPT-space notifications use request=0. No pointers or Linux object layouts cross.
  */
-#define NS3_VERSION 3
+#define NS3_VERSION 4
+/* _IOR(0xB3, 1, __u64): returns a new O_CLOEXEC endpoint FD, writes socket ID. */
+#define NS3_CLAIM 0x8008B301
+/* _IOWR(0xB3, 2, ns3_accept_info): publish an accepted child; return its FD. */
+#define NS3_PUBLISH_ACCEPT 0xC038B302
 #define NS3_PAYLOAD 16384
 #define NS3_OPEN 1
 #define NS3_BIND 2
@@ -38,5 +42,9 @@ struct ns3_addr {
 	__le16 port;
 	__u8 address[16];
 	__le32 scope;
+};
+struct ns3_accept_info {
+	struct ns3_addr local, peer;
+	__le64 socket;
 };
 #endif

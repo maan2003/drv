@@ -1,0 +1,20 @@
+anon 1
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.120039 cpu_seconds=0.120014 MBps=13648.87
+anon 2
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.115655 cpu_seconds=0.115631 MBps=14166.28
+anon 3
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.115618 cpu_seconds=0.115591 MBps=14170.79
+anon 4
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.119332 cpu_seconds=0.119305 MBps=13729.80
+anon 5
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.118089 cpu_seconds=0.118061 MBps=13874.24
+socket 1
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.130087 cpu_seconds=0.130056 MBps=12594.65
+socket 2
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.124070 cpu_seconds=0.124045 MBps=13205.45
+socket 3
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.124324 cpu_seconds=0.124298 MBps=13178.49
+socket 4
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.123526 cpu_seconds=0.123497 MBps=13263.63
+socket 5
+BENCH IPC frames=100000 bytes=1638400000 seconds=0.130802 cpu_seconds=0.130778 MBps=12525.76

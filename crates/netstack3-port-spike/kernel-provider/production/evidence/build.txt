@@ -1,26 +1,29 @@
 Linux no-plastic 6.18.43 #1-NixOS SMP PREEMPT_DYNAMIC Thu Aug  6 17:27:09 UTC 2026 x86_64 GNU/Linux
 QEMU emulator version 10.2.4
-675a83a29d9497c18c5c203082fc6a18d644a4cd51fb1ca6e2f73528cc756b2e  linux-6.18.40/arch/x86/boot/bzImage
-b551463a161b13bea1a079011cef3f86edab0e41382dd47c007360a810ff73d6  linux-6.18.40/vmlinux
+9d0dd4e14b8f6abdafa68a92e2d2d2503307f21b43092f8d100dbad5d134282f  ipc-comparison/final-anon-bzImage
+381e9fb638ddc5f2752941fdfed9757500f4bada4cf23c421f346243cf437be5  ipc-comparison/final-anon-vmlinux
 9aeb64113263e2da381a3bc7aeea8358f882302f69a6394844dbae5cb2546d4e  linux-6.18.40/.config
-44a61de9ce6c973b7a87fb94dd93253a3c53b1418ed7c11cc463e31fc9ad448b  root/bin/netstack3-provider
-08e6e76630ff975287b54780357bd02c1a6f41f784798aee6aff0b7fbd66fb7d  root/bin/loopback-test
-2aead78f066c4e5a000f096975a5216c895a78dd308c8672718c4df3e7b3c00e  final-3/initrd.gz
+160e8ed18f01d38c1f7a9a3bb5714220cdb985e2aa87e241902929b10661cf0a  root/bin/netstack3-provider
+cc19e7b852f42841f4dcdcc4e84f5823ea30e4d6c50d4afd7605e59cc82524a8  root/bin/loopback-test
+99abccbacbca2733b53aa3c7d444d0355fe64e21935a91e41ac205e44b798c58  root/bin/endpoint-test
+9d643aaae8c88e9ce5e9285f43800eafffae526a51637461bd990e672ece5ac1  ipc-delivery-3/initrd.gz
+cc5bb907efd0973ab3e565e705363c3075e74d0cf4dd9b665f7547f488230288  ipc-comparison/final-socket-bzImage
 Selected native/provider symbols (native names must be absent):
-ffffffff815526f0 t ns3_create4
-ffffffff815526d0 t ns3_create6
-ffffffff815539a0 t ns3_sendmsg
+ffffffff81554cc0 t ns3_create4
+ffffffff81554ca0 t ns3_create6
+ffffffff81552e80 t ns3_sendmsg
 PASS_KVM_PRODUCTION_LOOPBACK
 PASS_KVM_PRODUCTION_LOOPBACK
 PASS_KVM_PRODUCTION_LOOPBACK
 Build source hashes:
-98850e560f84c29f531c4403cd1521a5f38c32a356fd57e309ff63dd2a760f32  linux-6.18.40/net/netstack3/af_netstack3.c
-c3c58fa46679a8b16a50a64ec0def3ae3dd850ed5f2c5a3693a5ee0fe8c1c087  linux-6.18.40/net/netstack3/protocol.h
-7fec03a2288caa3605256e4a8740408c619e03f2de24da6d1b947a06e16d7c17  linux-6.18.40/net/netstack3/Kconfig
-5cef0df5a6e114b589599f2b84aebb5b9c779fa65bc3acef8b262267150fa04e  linux-6.18.40/net/netstack3/Makefile
-183a083f7d1d93dda492323a1ff00b2484ed4807aa96c1ecfe3dd9415366a7e0  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/provider.rs
-a1c7343494954e487862ba6478be0938c22381d55f36ccc6f6aaa19ca202892e  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/child.rs
+41fe084c0d3e8189dd737f8cd9d6025f574305ff89f827be016204bb5cf0eb64  production/af_netstack3.c
+ccd7103c23bf18606fb2c2f701579c8803e3deeec1aef4219bfa4b548101ecbc  production/protocol.h
+7fec03a2288caa3605256e4a8740408c619e03f2de24da6d1b947a06e16d7c17  production/Kconfig
+5cef0df5a6e114b589599f2b84aebb5b9c779fa65bc3acef8b262267150fa04e  production/Makefile
+8c20245f88f3c0b1f53738e1884a75963339bd4efcc1a16615413e06b82ef421  production/loopback-test.c
+5bc34dfe2177924579b8ed47c15d3374b23dad5bbbc875359fd24e27c5d13817  production/endpoint-test.c
+c58b6d168ea294aada0c4c2b98daf4bc14648de3d3af11494145def1cab94b65  production/guest-init
+e9514f4a96be1e2fe985ebdbe7b5fc06190d6899077d3efc06dc2c7b153002d2  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/provider.rs
+2edb0c1be75c4e5ff5cc44ef78aff30cd0b087e0c2d97d3ea5d619833380c964  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/child.rs
 c0733dea1d9d864f607816e42a19cb3a5c4ca37ab5d02afc90a18798bdbcfe6e  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/lib.rs
 32e2599070bc60175573095e1a4d6f421b204c151485ad081396b595160eaaf1  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/crates/network-service/src/bin/netstack3-provider.rs
-3e650e9db62eaf33b476adf5e6260d3ca7eb12fe3f1b16ff04f97b98fef1cfba  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration/src/lib.rs
-7780e9c0a078046eb667cc2aa03ce1e6a98dccf6d04d60133020a15ecea625e5  /var/lib/poco-linux/redwood/work/driver-takeover-20260912/cargo-cross/reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration/src/socket_provider.rs

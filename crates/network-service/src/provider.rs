@@ -2,7 +2,9 @@
 //! Linux socket frontend binding. This module owns IPC, never TCP/IP state.
 //! ABI is defined by kernel-provider/production/protocol.h.
 use netstack3_port_integration::{Runtime, socket_provider::NativeSocketProvider};
-use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 as Provider;
+use netstack3_port_spike::provider_dispatch_v2::{
+    ProviderAcceptV2, RemoteSocketProviderV2 as Provider,
+};
 use netstack3_port_spike::provider_transport_v2::{
     ProviderNameV2, ProviderReadinessV2 as Ready, ProviderShutdownV2,
     ProviderSocketAddressV2 as Address, ProviderSocketKindV2,
@@ -15,9 +17,11 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
+const CLAIM: libc::c_ulong = 0x8008B301;
 const PAYLOAD: usize = 16384;
 const OPEN: u32 = 1;
 const BIND: u32 = 2;
@@ -33,6 +37,7 @@ const GETNAME: u32 = 11;
 const CREDIT: u32 = 13;
 
 struct Message {
+    fd: Rc<OwnedFd>,
     op: u32,
     socket: u64,
     request: u64,
@@ -51,13 +56,23 @@ impl Message {
         b.extend(&self.data);
         b
     }
-    fn read() -> Result<Option<Self>, String> {
+    fn read(fd: Rc<OwnedFd>, socket: u64) -> Result<Option<Self>, String> {
         let mut b = vec![0; 32 + PAYLOAD + 24];
-        let n = unsafe { libc::read(3, b.as_mut_ptr().cast(), b.len()) };
+        let n = unsafe { libc::read(fd.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
                 return Ok(None);
+            }
+            if e.raw_os_error() == Some(libc::ENETDOWN) {
+                return Ok(Some(Self {
+                    fd,
+                    op: CLOSE,
+                    socket,
+                    request: 0,
+                    status: libc::ENETDOWN as u32,
+                    data: vec![],
+                }));
             }
             return Err(e.to_string());
         }
@@ -69,6 +84,7 @@ impl Message {
             return Err("invalid kernel provider frame".into());
         }
         Ok(Some(Self {
+            fd,
             op: u32::from_le_bytes(b[4..8].try_into().unwrap()),
             socket: u64::from_le_bytes(b[8..16].try_into().unwrap()),
             request: u64::from_le_bytes(b[16..24].try_into().unwrap()),
@@ -79,22 +95,29 @@ impl Message {
     fn write(&self) -> Result<(), String> {
         let b = self.encode();
         loop {
-            let n = unsafe { libc::write(3, b.as_ptr().cast(), b.len()) };
+            let n = unsafe { libc::write(self.fd.as_raw_fd(), b.as_ptr().cast(), b.len()) };
             if n == b.len() as isize {
                 return Ok(());
             }
             if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENETDOWN) {
+                return Ok(());
+            }
             return Err(format!("provider write: {}", io::Error::last_os_error()));
         }
     }
     fn reply(&self, result: Result<Vec<u8>, Error>) -> Result<(), String> {
+        if self.request == 0 {
+            return Ok(());
+        }
         let (data, status) = match result {
             Ok(b) => (b, 0),
             Err(e) => (vec![], errno(e)),
         };
         Self {
+            fd: self.fd.clone(),
             op: self.op,
             socket: self.socket,
             request: self.request,
@@ -163,6 +186,8 @@ struct Endpoint {
     closing: Option<Message>,
     eof: bool,
     listening: bool,
+    pending_accept: Option<ProviderAcceptV2>,
+    accept_ready: bool,
 }
 pub fn run_provider() -> Result<(), String> {
     // FD3 is the sole provider capability. No IP socket is opened by this process.
@@ -186,7 +211,7 @@ pub fn run_provider() -> Result<(), String> {
     Provider::open_client(&mut provider, client, 512).map_err(|e| format!("{e:?}"))?;
     crate::child::provider_setup()?;
     eprintln!(
-        "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill provider_fd=3 native_loopback=false"
+        "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
     );
     let mut event = libc::epoll_event {
         events: libc::EPOLLIN as u32,
@@ -196,151 +221,232 @@ pub fn run_provider() -> Result<(), String> {
         return Err(io::Error::last_os_error().to_string());
     }
     let mut endpoints: HashMap<u64, Endpoint> = HashMap::new();
+    let mut fds: HashMap<u64, Rc<OwnedFd>> = HashMap::new();
     let start = Instant::now();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
     loop {
         let mut progress = false;
-        for _ in 0..256 {
-            let Some(m) = Message::read()? else { break };
-            progress = true;
-            if m.op == OPEN {
-                let result = (|| {
-                    if endpoints.len() >= 256
-                        || endpoints.contains_key(&m.socket)
-                        || m.data.len() != 8
-                    {
-                        return Err(Error::QuotaExceeded);
-                    }
-                    let kind = match scalar(&m.data[..4])? {
-                        1 => ProviderSocketKindV2::Tcp,
-                        2 => ProviderSocketKindV2::Udp,
-                        _ => return Err(Error::WrongSocketKind),
-                    };
-                    let family = match scalar(&m.data[4..])? {
-                        4 => RemoteIpVersion::V4,
-                        6 => RemoteIpVersion::V6,
-                        _ => return Err(Error::AddressFamilyMismatch),
-                    };
-                    let handle = Provider::open_socket(&mut provider, client, kind, family)?;
-                    endpoints.insert(
-                        m.socket,
-                        Endpoint {
-                            handle,
-                            credits: 4,
-                            transmit: VecDeque::new(),
-                            closing: None,
-                            eof: false,
-                            listening: false,
-                        },
-                    );
-                    Ok(vec![])
-                })();
-                m.reply(result)?;
-                continue;
+        loop {
+            let mut id = 0u64;
+            let fd = unsafe { libc::ioctl(3, CLAIM, &mut id) };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return Err(format!("claim endpoint: {error}"));
             }
-            if m.op == ACCEPT {
-                let result = (|| {
-                    let parent = endpoints.get(&m.socket).ok_or(Error::StaleHandle)?.handle;
-                    let child_id = u64::from_le_bytes(
-                        m.data
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| Error::InvalidState)?,
-                    );
-                    if endpoints.len() >= 256 || endpoints.contains_key(&child_id) {
-                        return Err(Error::QuotaExceeded);
-                    }
-                    let child = Provider::accept(&mut provider, parent)?;
-                    let mut result = encode_address(&child.local);
-                    result.extend(encode_address(&child.peer));
-                    endpoints.insert(
-                        child_id,
-                        Endpoint {
-                            handle: child.handle,
-                            credits: 4,
-                            transmit: VecDeque::new(),
-                            closing: None,
-                            eof: false,
-                            listening: false,
-                        },
-                    );
-                    Ok(result)
-                })();
-                m.reply(result)?;
-                continue;
-            }
-            let Some(e) = endpoints.get_mut(&m.socket) else {
-                m.reply(Err(Error::StaleHandle))?;
-                continue;
+            let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: id,
             };
-            if m.op == SEND {
-                e.transmit.push_back((m, 0));
-                continue;
+            if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) } < 0 {
+                return Err(io::Error::last_os_error().to_string());
             }
-            if m.op == CLOSE {
-                e.closing = Some(m);
-                continue;
-            }
-            let result = (|| -> Result<Vec<u8>, Error> {
-                match m.op {
-                    BIND => {
-                        let a = address(&m.data)?.ok_or(Error::InvalidState)?;
-                        let ip = match a.address {
-                            RemoteIpAddress::V4([0, 0, 0, 0]) => None,
-                            RemoteIpAddress::V6(ip) if ip == [0; 16] => None,
-                            ip => Some(ip),
+            fds.insert(id, fd);
+            progress = true;
+        }
+        let ready: Vec<_> = fds.iter().map(|(&id, fd)| (id, fd.clone())).collect();
+        for (id, fd) in ready {
+            for _ in 0..32 {
+                let Some(m) = Message::read(fd.clone(), id)? else {
+                    break;
+                };
+                if m.op == CLOSE && (m.status != 0 || !endpoints.contains_key(&id)) {
+                    if let Some(e) = endpoints.remove(&id) {
+                        if let Some(child) = e.pending_accept {
+                            let _ = Provider::close(&mut provider, child.handle);
+                        }
+                        let _ = Provider::close(&mut provider, e.handle);
+                    }
+                    fds.remove(&id);
+                    progress = true;
+                    break;
+                }
+                progress = true;
+                if m.op == OPEN {
+                    let result = (|| {
+                        if endpoints.len() >= 256
+                            || endpoints.contains_key(&m.socket)
+                            || m.data.len() != 8
+                        {
+                            return Err(Error::QuotaExceeded);
+                        }
+                        let kind = match scalar(&m.data[..4])? {
+                            1 => ProviderSocketKindV2::Tcp,
+                            2 => ProviderSocketKindV2::Udp,
+                            _ => return Err(Error::WrongSocketKind),
                         };
-                        Provider::bind(&mut provider, e.handle, ip, a.port)
-                            .map(|a| encode_address(&a))
+                        let family = match scalar(&m.data[4..])? {
+                            4 => RemoteIpVersion::V4,
+                            6 => RemoteIpVersion::V6,
+                            _ => return Err(Error::AddressFamilyMismatch),
+                        };
+                        let handle = Provider::open_socket(&mut provider, client, kind, family)?;
+                        endpoints.insert(
+                            m.socket,
+                            Endpoint {
+                                handle,
+                                credits: 4,
+                                transmit: VecDeque::new(),
+                                closing: None,
+                                eof: false,
+                                listening: false,
+                                pending_accept: None,
+                                accept_ready: false,
+                            },
+                        );
+                        Ok(vec![])
+                    })();
+                    m.reply(result)?;
+                    continue;
+                }
+                if m.op == ACCEPT {
+                    if let Some(e) = endpoints.get_mut(&id) {
+                        e.accept_ready = true;
                     }
-                    LISTEN => {
-                        let a = Provider::listen(&mut provider, e.handle, scalar(&m.data)?)?;
-                        e.listening = true;
-                        Ok(encode_address(&a))
-                    }
-                    CONNECT => {
-                        Provider::connect(
+                    continue;
+                }
+                let Some(e) = endpoints.get_mut(&m.socket) else {
+                    m.reply(Err(Error::StaleHandle))?;
+                    continue;
+                };
+                if m.op == SEND {
+                    e.transmit.push_back((m, 0));
+                    continue;
+                }
+                if m.op == CLOSE {
+                    e.closing = Some(m);
+                    break;
+                }
+                let result = (|| -> Result<Vec<u8>, Error> {
+                    match m.op {
+                        BIND => {
+                            let a = address(&m.data)?.ok_or(Error::InvalidState)?;
+                            let ip = match a.address {
+                                RemoteIpAddress::V4([0, 0, 0, 0]) => None,
+                                RemoteIpAddress::V6(ip) if ip == [0; 16] => None,
+                                ip => Some(ip),
+                            };
+                            Provider::bind(&mut provider, e.handle, ip, a.port)
+                                .map(|a| encode_address(&a))
+                        }
+                        LISTEN => {
+                            let a = Provider::listen(&mut provider, e.handle, scalar(&m.data)?)?;
+                            e.listening = true;
+                            Ok(encode_address(&a))
+                        }
+                        CONNECT => {
+                            Provider::connect(
+                                &mut provider,
+                                e.handle,
+                                address(&m.data)?.ok_or(Error::InvalidState)?,
+                            )?;
+                            Ok(vec![])
+                        }
+                        SHUTDOWN => {
+                            let how = match scalar(&m.data)? {
+                                1 => ProviderShutdownV2::Read,
+                                2 => ProviderShutdownV2::Write,
+                                3 => ProviderShutdownV2::ReadWrite,
+                                _ => return Err(Error::InvalidState),
+                            };
+                            Provider::shutdown(&mut provider, e.handle, how)?;
+                            Ok(vec![])
+                        }
+                        GETNAME => Provider::get_name(
                             &mut provider,
                             e.handle,
-                            address(&m.data)?.ok_or(Error::InvalidState)?,
-                        )?;
-                        Ok(vec![])
-                    }
-                    SHUTDOWN => {
-                        let how = match scalar(&m.data)? {
-                            1 => ProviderShutdownV2::Read,
-                            2 => ProviderShutdownV2::Write,
-                            3 => ProviderShutdownV2::ReadWrite,
-                            _ => return Err(Error::InvalidState),
-                        };
-                        Provider::shutdown(&mut provider, e.handle, how)?;
-                        Ok(vec![])
-                    }
-                    GETNAME => Provider::get_name(
-                        &mut provider,
-                        e.handle,
-                        if scalar(&m.data)? == 0 {
-                            ProviderNameV2::Local
-                        } else {
-                            ProviderNameV2::Peer
-                        },
-                    )
-                    .map(|a| encode_address(&a)),
-                    CREDIT => {
-                        if !m.data.is_empty() || e.credits >= 4 {
-                            return Err(Error::InvalidState);
+                            if scalar(&m.data)? == 0 {
+                                ProviderNameV2::Local
+                            } else {
+                                ProviderNameV2::Peer
+                            },
+                        )
+                        .map(|a| encode_address(&a)),
+                        CREDIT => {
+                            let count = scalar(&m.data)? as usize;
+                            if count == 0 || count + e.credits > 4 {
+                                return Err(Error::InvalidState);
+                            }
+                            e.credits += count;
+                            Ok(vec![])
                         }
-                        e.credits += 1;
-                        Ok(vec![])
+                        _ => Err(Error::NotSupported),
                     }
-                    _ => Err(Error::NotSupported),
-                }
-            })();
-            m.reply(result)?;
+                })();
+                m.reply(result)?;
+            }
         }
         runtime.borrow_mut().poll_at(start.elapsed(), 64);
+        let listeners: Vec<_> = endpoints
+            .iter()
+            .filter(|(_, e)| e.listening && e.accept_ready)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in listeners {
+            let e = endpoints.get_mut(&id).unwrap();
+            if e.pending_accept.is_none() {
+                e.pending_accept = match Provider::accept(&mut provider, e.handle) {
+                    Ok(child) => Some(child),
+                    Err(Error::WouldBlock) => None,
+                    Err(error) => return Err(format!("accept from Netstack3: {error:?}")),
+                };
+            }
+            let Some(child) = e.pending_accept.as_ref() else {
+                continue;
+            };
+            let mut info = encode_address(&child.local);
+            info.extend(encode_address(&child.peer));
+            info.extend([0u8; 8]);
+            let newfd = unsafe {
+                libc::ioctl(
+                    fds[&id].as_raw_fd(),
+                    0xC038B302u64 as libc::c_ulong,
+                    info.as_mut_ptr(),
+                )
+            };
+            if newfd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    e.accept_ready = false;
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ENETDOWN) {
+                    continue;
+                }
+                return Err(format!("publish accepted endpoint: {error}"));
+            }
+            let child = e.pending_accept.take().unwrap();
+            let child_id = u64::from_le_bytes(info[48..56].try_into().unwrap());
+            let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(newfd) });
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: child_id,
+            };
+            if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) } < 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            fds.insert(child_id, fd);
+            endpoints.insert(
+                child_id,
+                Endpoint {
+                    handle: child.handle,
+                    credits: 4,
+                    transmit: VecDeque::new(),
+                    closing: None,
+                    eof: false,
+                    listening: false,
+                    pending_accept: None,
+                    accept_ready: false,
+                },
+            );
+            progress = true;
+        }
         let mut remove = Vec::new();
         for (&id, e) in endpoints.iter_mut() {
+            let Some(fd) = fds.get(&id) else { continue };
             if let Some((m, offset)) = e.transmit.front_mut() {
                 let result = if m.data.len() < 24 {
                     Err(Error::InvalidState)
@@ -376,6 +482,9 @@ pub fn run_provider() -> Result<(), String> {
             if e.transmit.is_empty()
                 && let Some(m) = e.closing.take()
             {
+                if let Some(child) = e.pending_accept.take() {
+                    let _ = Provider::close(&mut provider, child.handle);
+                }
                 m.reply(Provider::close(&mut provider, e.handle).map(|_| vec![]))?;
                 remove.push(id);
                 progress = true;
@@ -386,6 +495,7 @@ pub fn run_provider() -> Result<(), String> {
                     Ok(packet) => {
                         if packet.eof {
                             Message {
+                                fd: fd.clone(),
                                 op: STATE,
                                 socket: id,
                                 request: 0,
@@ -402,6 +512,7 @@ pub fn run_provider() -> Result<(), String> {
                                 .unwrap_or_else(|| vec![0; 24]);
                             data.extend(packet.data);
                             Message {
+                                fd: fd.clone(),
                                 op: RX,
                                 socket: id,
                                 request: 0,
@@ -414,27 +525,40 @@ pub fn run_provider() -> Result<(), String> {
                         progress = true;
                     }
                     Err(Error::WouldBlock | Error::InvalidState | Error::InProgress) => {}
-                    Err(error) => return Err(format!("receive from Netstack3: {error:?}")),
+                    Err(error) => {
+                        Message {
+                            fd: fd.clone(),
+                            op: STATE,
+                            socket: id,
+                            request: 0,
+                            status: errno(error),
+                            data: 4u32.to_le_bytes().to_vec(),
+                        }
+                        .write()?;
+                        e.eof = true;
+                        progress = true;
+                    }
                 }
             }
         }
         for id in remove {
             endpoints.remove(&id);
+            fds.remove(&id);
         }
         for (_, handle, snapshot) in provider.take_readiness_changes() {
-            let Some((&id, e)) = endpoints.iter().find(|(_, e)| e.handle == handle) else {
+            let Some((&id, _)) = endpoints.iter().find(|(_, e)| e.handle == handle) else {
                 continue;
             };
+            let Some(fd) = fds.get(&id) else { continue };
             let mut state = 0u32;
             if snapshot.readiness.0 & Ready::CONNECTED != 0 {
                 state |= 1;
             }
-            if e.listening && snapshot.readiness.0 & Ready::INCOMING != 0 {
-                state |= 4;
-            }
+
             // EOF is emitted only after bytes have been drained above.
             if state != 0 || snapshot.error.is_some() {
                 Message {
+                    fd: fd.clone(),
                     op: STATE,
                     socket: id,
                     request: 0,

@@ -1,0 +1,150 @@
+--- a/net/netstack3/af_netstack3.c
++++ b/net/netstack3/af_netstack3.c
+@@ -573,9 +573,9 @@
+ 	list_for_each_entry(r, &s->requests, node) if (!r->read) return true;
+ 	return false;
+ }
+-static ssize_t ns3_read(struct file *file, char __user *buf, size_t len, loff_t *off)
+-{
+-	struct ns3_sock *s = file->private_data;
++static ssize_t ns3_read_frame(struct ns3_sock *s, struct iov_iter *to)
++{
++	size_t len = iov_iter_count(to);
+ 	struct ns3_request *r;
+ 	int ret = -EAGAIN;
+ 	mutex_lock(&s->lock);
+@@ -583,8 +583,8 @@
+ 	list_for_each_entry(r, &s->requests, node) {
+ 		if (r->read) continue;
+ 		if (len < sizeof(r->header) + le32_to_cpu(r->header.len)) { ret = -EMSGSIZE; break; }
+-		if (copy_to_user(buf, &r->header, sizeof(r->header)) ||
+-		    copy_to_user(buf + sizeof(r->header), r->data, le32_to_cpu(r->header.len))) { ret = -EFAULT; break; }
++		if (!copy_to_iter_full(&r->header, sizeof(r->header), to) ||
++		    !copy_to_iter_full(r->data, le32_to_cpu(r->header.len), to)) { ret = -EFAULT; break; }
+ 		r->read = true;
+ 		ret = sizeof(r->header) + le32_to_cpu(r->header.len); break;
+ 	}
+@@ -597,8 +597,8 @@
+ 		h.len = cpu_to_le32(closing ? 0 : sizeof(credits));
+ 		ret = sizeof(h) + (closing ? 0 : sizeof(credits));
+ 		if (len < ret) ret = -EMSGSIZE;
+-		else if (copy_to_user(buf, &h, sizeof(h)) ||
+-			 (!closing && copy_to_user(buf + sizeof(h), &credits, sizeof(credits)))) ret = -EFAULT;
++		else if (!copy_to_iter_full(&h, sizeof(h), to) ||
++			 (!closing && !copy_to_iter_full(&credits, sizeof(credits), to))) ret = -EFAULT;
+ 		else if (accepting) s->accept_space = false;
+ 		else if (closing) s->close_read = true;
+ 		else { s->rx_credit += s->credit_return; s->credit_return = 0; }
+@@ -607,9 +607,9 @@
+ 	mutex_unlock(&s->lock);
+ 	return ret;
+ }
+-static ssize_t ns3_write(struct file *file, const char __user *buf, size_t len, loff_t *off)
+-{
+-	struct ns3_sock *s = file->private_data;
++static ssize_t ns3_write_frame(struct ns3_sock *s, struct iov_iter *from)
++{
++	size_t len = iov_iter_count(from);
+ 	struct ns3_msg *h;
+ 	struct ns3_request *r, *tmp;
+ 	struct sk_buff *skb;
+@@ -618,8 +618,9 @@
+ 	u32 op, status;
+ 	int ret = -EPROTO;
+ 	if (len < sizeof(*h) || len > sizeof(*h) + NS3_PAYLOAD + sizeof(struct ns3_addr)) return -EMSGSIZE;
+-	h = memdup_user(buf, len);
+-	if (IS_ERR(h)) return PTR_ERR(h);
++	h = kmalloc(len, GFP_KERNEL);
++	if (!h) return -ENOMEM;
++	if (!copy_from_iter_full(h, len, from)) { kfree(h); return -EFAULT; }
+ 	size = le32_to_cpu(h->len); op = le32_to_cpu(h->op); status = le32_to_cpu(h->status);
+ 	if (le32_to_cpu(h->version) != NS3_VERSION || size != len - sizeof(*h) || status > 4095) goto free;
+ 	data = h + 1;
+@@ -696,7 +697,7 @@
+ 	sock_put(&s->sk);
+ 	return 0;
+ }
+-static const struct file_operations ns3_endpoint_fops;
++static struct file *ns3_endpoint_file(struct ns3_sock *s);
+ static long ns3_publish_accept(struct file *f, unsigned int cmd, unsigned long arg)
+ {
+ 	struct ns3_sock *listener = f->private_data, *child;
+@@ -727,7 +728,7 @@
+ 	info.socket = cpu_to_le64(child->id);
+ 	if (copy_to_user((void __user *)arg, &info, sizeof(info))) { ret = -EFAULT; goto child; }
+ 	sock_hold(&child->sk);
+-	endpoint = anon_inode_getfile("netstack3-endpoint", &ns3_endpoint_fops, child, O_RDWR | O_NONBLOCK);
++	endpoint = ns3_endpoint_file(child);
+ 	if (IS_ERR(endpoint)) { sock_put(&child->sk); ret = PTR_ERR(endpoint); goto child; }
+ 	mutex_lock(&listener->lock);
+ 	if (listener->dead || listener->app_closed || listener->accept_count >= listener->backlog) {
+@@ -744,11 +745,56 @@
+ 	put_unused_fd(fd);
+ 	return ret;
+ }
+-static const struct file_operations ns3_endpoint_fops = {
+-	.owner = THIS_MODULE, .read = ns3_read, .write = ns3_write,
+-	.poll = ns3_endpoint_poll, .release = ns3_endpoint_release,
+-	.unlocked_ioctl = ns3_publish_accept,
++
++static int ns3_socket_send(struct socket *sock, struct msghdr *msg, size_t len)
++{
++	return ns3_write_frame(sock->sk->sk_user_data, &msg->msg_iter);
++}
++static int ns3_socket_recv(struct socket *sock, struct msghdr *msg, size_t len, int flags)
++{
++	return ns3_read_frame(sock->sk->sk_user_data, &msg->msg_iter);
++}
++static __poll_t ns3_socket_poll(struct file *f, struct socket *sock, poll_table *wait)
++{
++	struct file endpoint = { .private_data = sock->sk->sk_user_data };
++	return ns3_endpoint_poll(&endpoint, wait);
++}
++static int ns3_socket_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
++{
++	struct file endpoint = { .private_data = sock->sk->sk_user_data };
++	return ns3_publish_accept(&endpoint, cmd, arg);
++}
++static int ns3_socket_release(struct socket *sock)
++{
++	struct file endpoint = { .private_data = sock->sk->sk_user_data };
++	ns3_endpoint_release(NULL, &endpoint);
++	sock_orphan(sock->sk); sock_put(sock->sk); sock->sk = NULL;
++	return 0;
++}
++static const struct proto_ops ns3_endpoint_ops = {
++	.family = AF_UNSPEC, .owner = THIS_MODULE,
++	.sendmsg = ns3_socket_send, .recvmsg = ns3_socket_recv,
++	.poll = ns3_socket_poll, .ioctl = ns3_socket_ioctl, .release = ns3_socket_release,
+ };
++static struct file *ns3_endpoint_file(struct ns3_sock *s)
++{
++	struct socket *sock;
++	struct sock *sk;
++	struct file *f;
++	int ret = sock_create_lite(AF_UNSPEC, SOCK_SEQPACKET, 0, &sock);
++	if (ret) return ERR_PTR(ret);
++	sk = sk_alloc(sock_net(&s->sk), AF_UNSPEC, GFP_KERNEL, &ns3_proto, false);
++	if (!sk) { sock_release(sock); return ERR_PTR(-ENOMEM); }
++	sock_init_data(sock, sk); sk->sk_user_data = s;
++	sock->ops = &ns3_endpoint_ops;
++	sock->state = SS_CONNECTED;
++	/* sock_alloc_file releases the socket on failure. Extra reference makes
++	 * failure match anon_inode_getfile's caller-owned-reference contract. */
++	sock_hold(&s->sk);
++	f = sock_alloc_file(sock, O_RDWR | O_NONBLOCK | O_CLOEXEC, "netstack3-endpoint");
++	if (!IS_ERR(f)) sock_put(&s->sk);
++	return f;
++}
+ static __poll_t ns3_device_poll(struct file *f, poll_table *wait)
+ {
+ 	struct ns3_session *session = f->private_data;
+@@ -783,7 +829,7 @@
+ 		if (s->claimed || s->dead) continue;
+ 		if (copy_to_user((void __user *)arg, &id, sizeof(id))) { ret = -EFAULT; break; }
+ 		sock_hold(&s->sk);
+-		endpoint = anon_inode_getfile("netstack3-endpoint", &ns3_endpoint_fops, s, O_RDWR | O_NONBLOCK);
++		endpoint = ns3_endpoint_file(s);
+ 		if (IS_ERR(endpoint)) { sock_put(&s->sk); ret = PTR_ERR(endpoint); break; }
+ 		s->claimed = true;
+ 		fd_install(fd, endpoint);

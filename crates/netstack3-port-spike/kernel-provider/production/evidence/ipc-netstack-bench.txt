@@ -1,0 +1,45 @@
+anon 1
+BENCH TCP family=2 seconds=10.677838 MBps=1.57
+BENCH TCP family=10 seconds=0.242477 MBps=69.19
+BENCH TCP family=2 seconds=0.031896 MBps=65.76
+BENCH TCP family=10 seconds=0.031429 MBps=66.74
+anon 2
+BENCH TCP family=2 seconds=10.686139 MBps=1.57
+BENCH TCP family=10 seconds=5.337259 MBps=3.14
+BENCH TCP family=2 seconds=0.030746 MBps=68.22
+BENCH TCP family=10 seconds=0.031151 MBps=67.33
+anon 3
+BENCH TCP family=2 seconds=5.365077 MBps=3.13
+BENCH TCP family=10 seconds=0.236978 MBps=70.80
+BENCH TCP family=2 seconds=0.031418 MBps=66.76
+BENCH TCP family=10 seconds=0.031136 MBps=67.36
+socket 1
+BENCH TCP family=2 seconds=5.380978 MBps=3.12
+BENCH TCP family=10 seconds=0.236843 MBps=70.84
+BENCH TCP family=2 seconds=0.031045 MBps=67.56
+BENCH TCP family=10 seconds=0.031293 MBps=67.02
+socket 2
+BENCH TCP family=2 seconds=0.244731 MBps=68.55
+BENCH TCP family=10 seconds=0.239983 MBps=69.91
+BENCH TCP family=2 seconds=0.032806 MBps=63.93
+BENCH TCP family=10 seconds=0.030774 MBps=68.15
+socket 3
+BENCH TCP family=2 seconds=10.691389 MBps=1.57
+BENCH TCP family=10 seconds=5.544712 MBps=3.03
+BENCH TCP family=2 seconds=0.030699 MBps=68.32
+BENCH TCP family=10 seconds=0.031191 MBps=67.25
+multiplexed 1
+BENCH TCP family=2 seconds=5.312484 MBps=3.16
+BENCH TCP family=10 seconds=0.239313 MBps=70.11
+BENCH TCP family=2 seconds=0.030749 MBps=68.21
+BENCH TCP family=10 seconds=0.029817 MBps=70.34
+multiplexed 2
+BENCH TCP family=2 seconds=5.292049 MBps=3.17
+BENCH TCP family=10 seconds=0.233282 MBps=71.92
+BENCH TCP family=2 seconds=0.030624 MBps=68.49
+BENCH TCP family=10 seconds=0.030087 MBps=69.71
+multiplexed 3
+BENCH TCP family=2 seconds=10.555503 MBps=1.59
+BENCH TCP family=10 seconds=5.451798 MBps=3.08
+BENCH TCP family=2 seconds=0.029532 MBps=71.02
+BENCH TCP family=10 seconds=0.028715 MBps=73.04

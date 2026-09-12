@@ -920,6 +920,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_filter_denial_fixture() {
+        let Some(operation) = std::env::var_os("DRV_PROVIDER_FILTER_DENIAL") else { return };
+        let syscall_args = match operation.to_str().unwrap() {
+            "socket" => [libc::SYS_socket, libc::AF_INET as i64, libc::SOCK_STREAM as i64, 0],
+            "read-registration" => [libc::SYS_read, 3, 0, 0],
+            "write-registration" => [libc::SYS_write, 3, 0, 0],
+            "read-epoll" => [libc::SYS_read, 6, 0, 0],
+            "claim-wrong-fd" => [libc::SYS_ioctl, 4, 0x8008B301, 0],
+            "publish-registration" => [libc::SYS_ioctl, 3, 0xC038B302, 0],
+            "publish-epoll" => [libc::SYS_ioctl, 6, 0xC038B302, 0],
+            "unknown-ioctl" => [libc::SYS_ioctl, 4, 0x1234, 0],
+            "dup" => [libc::SYS_fcntl, 4, libc::F_DUPFD_CLOEXEC as i64, 7],
+            _ => panic!("unknown denial"),
+        };
+        child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
+        let filter = provider_filter();
+        let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+        child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 51);
+        unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3]); }
+        child_exit(52);
+    }
+
+    #[test]
+    fn provider_filter_forbidden_operations_are_fatal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        for operation in ["socket", "read-registration", "write-registration", "read-epoll",
+            "claim-wrong-fd", "publish-registration", "publish-epoll", "unknown-ioctl", "dup"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child::tests::provider_filter_denial_fixture", "--nocapture"])
+                .env("DRV_PROVIDER_FILTER_DENIAL", operation)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                .status().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGSYS), "provider operation survived: {operation}; {status}");
+        }
+    }
+
+    #[test]
     fn network_filter_denial_fixture() {
         let Some(operation) = std::env::var_os("DRV_NETWORK_FILTER_DENIAL") else {
             return;
@@ -1373,23 +1410,44 @@ pub(crate) fn provider_setup() -> Result<(), String> {
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
+    let filter = provider_filter();
+    let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+    syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
+}
+
+fn provider_filter() -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
-    for (syscall, fds) in [(libc::SYS_read, &[3u32][..]),
-                          (libc::SYS_write, &[1u32, 2, 3][..])] {
-        filter.push(jump(syscall as u32, 0, (fds.len() + 3) as u8));
+    filter.push(jump(libc::SYS_ioctl as u32, 0, 11));
+    filter.push(arg(1));
+    filter.push(jump(0x8008B301, 0, 3));
+    filter.push(arg(0));
+    filter.push(jump(3, 5, 6));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(jump(0xC038B302, 0, 4));
+    filter.push(arg(0));
+    filter.push(jump(6, 2, 0));
+    filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 0, jf: 1, k: 4 });
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+    for syscall in [libc::SYS_read, libc::SYS_write] {
+        filter.push(jump(syscall as u32, 0, 7));
         filter.push(arg(0));
-        for (i, fd) in fds.iter().enumerate() {
-            filter.push(jump(*fd, (fds.len() - i) as u8, 0));
-        }
-        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+        filter.push(jump(6, 4, 0));
+        // FD4+ can only originate from CLAIM: open/socket/dup are forbidden.
+        filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 2, jf: 0, k: 4 });
+        filter.push(jump(if syscall == libc::SYS_write { 1 } else { u32::MAX }, 1, 0));
+        filter.push(jump(if syscall == libc::SYS_write { 2 } else { u32::MAX }, 0, 1));
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
     }
+    append_fcntl_commands(&mut filter);
     append_epoll_ctl(&mut filter, EPOLL_FD);
     append_epoll_pwait(&mut filter, EPOLL_FD);
     append_no_exec_memory(&mut filter, libc::SYS_mmap);
@@ -1403,6 +1461,5 @@ pub(crate) fn provider_setup() -> Result<(), String> {
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
-    syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
+    filter
 }

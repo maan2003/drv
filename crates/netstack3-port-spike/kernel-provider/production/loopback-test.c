@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
+static size_t payload_length = 1024 * 1024 + 137;
 static void check(int ok, const char *what) {
 	if (!ok) { fprintf(stderr, "FAIL %s: %s\n", what, strerror(errno)); exit(1); }
 }
@@ -50,12 +52,17 @@ static void transfer(int fd, unsigned char *buf, size_t len, int sending) {
 	}
 }
 static void tcp(int family) {
-	const size_t length = 1024 * 1024 + 137;
+	const size_t length = payload_length;
+	struct timespec begin, end;
+	clock_gettime(CLOCK_MONOTONIC, &begin);
 	struct sockaddr_storage a = addr(family, 23456);
 	int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	check(listener >= 0, "tcp socket");
 	check(bind(listener, (void *)&a, alen(family)) == 0, "tcp bind");
 	check(listen(listener, 8) == 0, "tcp listen");
+    check(fcntl(listener, F_SETFL, O_NONBLOCK) == 0, "listener nonblock");
+    check(accept4(listener, NULL, NULL, 0) < 0 && errno == EAGAIN, "empty accept nonblock");
+    check(fcntl(listener, F_SETFL, 0) == 0, "listener blocking");
 	pid_t child = fork();
 	check(child >= 0, "fork");
 	if (!child) {
@@ -93,6 +100,9 @@ static void tcp(int family) {
 	check(shutdown(dupfd, SHUT_WR) == 0, "server half close");
 	close(dupfd); close(listener); free(buf);
 	int status; check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "client process success");
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double seconds = end.tv_sec - begin.tv_sec + (end.tv_nsec - begin.tv_nsec) / 1e9;
+	printf("BENCH TCP family=%d seconds=%.6f MBps=%.2f\n", family, seconds, length * 2.0 / seconds / 1e6);
 	printf("PASS TCP family=%d bytes=%zu bidirectional integrity epoll nonblock halfclose dup fork\n", family, length); fflush(stdout);
 }
 static void udp(int family) {
@@ -127,7 +137,8 @@ static void refused(int family) {
     printf("PASS REFUSED family=%d SO_ERROR clears\n", family);
 }
 int main(int argc, char **argv) {
-	setbuf(stdout, NULL); alarm(30);
+	setbuf(stdout, NULL); alarm(90);
+	if (argc == 2 && !strcmp(argv[1], "bench")) { payload_length = 8 * 1024 * 1024; tcp(AF_INET); tcp(AF_INET6); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "absent")) {
 		int fd = socket(AF_INET, SOCK_STREAM, 0);
 		check(fd < 0 && errno == ENETDOWN, "provider absent fails closed");

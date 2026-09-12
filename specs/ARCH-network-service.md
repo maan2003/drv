@@ -8,7 +8,9 @@ Linux socket-provider spike exercises a deterministic Ethernet peer, but is
 not the production frontend described below: it retains native loopback and
 uses synchronous RPC where native socket buffering and readiness are needed.
 The production-shaped frontend now owns both Internet families in a KVM
-kernel with native INET excluded. Its sandboxed Netstack3 binding has passed
+kernel with native INET excluded. A namespace registration capability yields
+per-socket provider FDs with independent bounded queues and local accept queues;
+control interruption revokes only the affected socket. Its sandboxed Netstack3 binding has passed
 IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
 the reproducible harness and evidence live in
 [`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).

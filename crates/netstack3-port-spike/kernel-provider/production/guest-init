@@ -1,12 +1,14 @@
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
 set -eu
-trap 'echo GUEST_TEST_FAILED; reboot -f' EXIT
+trap 'cat /run/provider.log 2>/dev/null || true; echo GUEST_TEST_FAILED; reboot -f' EXIT
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 zcat /proc/config.gz | grep -E "CONFIG_(INET|NETSTACK3|SECCOMP)"
 zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
+/bin/loopback-test absent
+/bin/endpoint-test
 /bin/loopback-test absent
 start_provider() {
     /bin/netstack3-provider 3<>/dev/netstack3 > /run/provider.log 2>&1 &

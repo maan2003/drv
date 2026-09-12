@@ -13,6 +13,8 @@
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
 #include <linux/unaligned.h>
 #include <linux/completion.h>
 #include <linux/nsproxy.h>
@@ -22,7 +24,7 @@
 #include <net/netns/generic.h>
 #include "protocol.h"
 
-#define NS3_REQUESTS 256
+#define NS3_REQUESTS 32
 #define NS3_SOCKETS 256
 #define NS3_BUFFER (256 * 1024)
 #define NS3_CONTROL_TIMEOUT (10 * HZ)
@@ -30,16 +32,23 @@
 struct ns3_net {
 	struct mutex lock;
 	wait_queue_head_t wait;
-	struct list_head requests, sockets;
-	u64 next_socket, next_request, generation;
-	unsigned int pending, socket_count;
+	struct list_head sockets;
+	u64 next_socket, generation;
+	atomic_t socket_count;
 	bool online;
 };
 struct ns3_sock {
 	struct sock sk;
-	struct list_head node;
-	u64 id, generation;
+	struct list_head node, requests, accepted, accept_node;
+	struct socket *accept_socket;
+	unsigned int accept_count, backlog;
+	bool accept_space;
+	struct mutex lock;
+	wait_queue_head_t provider_wait;
+	u64 id, generation, next_request;
 	bool dead, opened, connected, listening, eof, connecting;
+	bool claimed, app_closed, close_read;
+	unsigned int pending, credit_return, rx_credit;
 	unsigned int tx_bytes, rx_offset;
 	struct ns3_addr local, peer;
 	struct mutex control, receive, transmit;
@@ -69,7 +78,7 @@ static struct ns3_net *ns3_net(struct sock *sk)
 }
 static bool ns3_alive(struct ns3_net *n, struct ns3_sock *s)
 {
-	return n->online && !s->dead && s->generation == n->generation;
+	return READ_ONCE(n->online) && !READ_ONCE(s->dead) && s->generation == READ_ONCE(n->generation);
 }
 static void ns3_free_request(struct ns3_request *r)
 {
@@ -78,27 +87,34 @@ static void ns3_free_request(struct ns3_request *r)
 	kfree(r->reply);
 	kfree(r);
 }
-/* n->lock held; caller retains any synchronous request until its wait ends. */
-static void ns3_abort(struct ns3_net *n)
+/* Socket-local failure never revokes other endpoints. s->lock held. */
+static void ns3_abort_socket(struct ns3_sock *s)
 {
 	struct ns3_request *r, *tmp;
+	s->dead = true;
+	WRITE_ONCE(s->sk.sk_err, ENETDOWN);
+	s->sk.sk_error_report(&s->sk);
+	s->sk.sk_state_change(&s->sk);
+	list_for_each_entry_safe(r, tmp, &s->requests, node) {
+		list_del_init(&r->node);
+		s->pending--;
+		s->tx_bytes -= r->credit;
+		r->error = -ENETDOWN;
+		r->completed = true;
+		if (r->async) ns3_free_request(r);
+		else complete(&r->done);
+	}
+	wake_up_interruptible_all(&s->provider_wait);
+}
+/* Registration lock held; endpoint operations never acquire it. */
+static void ns3_abort(struct ns3_net *n)
+{
 	struct ns3_sock *s;
 	n->online = false;
 	list_for_each_entry(s, &n->sockets, node) {
-		s->dead = true;
-		WRITE_ONCE(s->sk.sk_err, ENETDOWN);
-		s->sk.sk_error_report(&s->sk);
-		s->sk.sk_state_change(&s->sk);
-	}
-	list_for_each_entry_safe(r, tmp, &n->requests, node) {
-		list_del_init(&r->node);
-		n->pending--;
-		r->error = -ENETDOWN;
-		r->completed = true;
-		if (r->async)
-			ns3_free_request(r);
-		else
-			complete(&r->done);
+		mutex_lock(&s->lock);
+		ns3_abort_socket(s);
+		mutex_unlock(&s->lock);
 	}
 	wake_up_interruptible_all(&n->wait);
 }
@@ -120,14 +136,14 @@ static struct ns3_request *ns3_submit(struct ns3_sock *s, u32 op,
 	if (len && !r->data) { kfree(r); return ERR_PTR(-ENOMEM); }
 	init_completion(&r->done);
 	INIT_LIST_HEAD(&r->node);
-	mutex_lock(&n->lock);
-	if (!ns3_alive(n, s) || n->pending >= NS3_REQUESTS) {
+	mutex_lock(&s->lock);
+	if (!ns3_alive(n, s) || s->pending >= (credit ? NS3_REQUESTS - 8 : NS3_REQUESTS)) {
 		int err = ns3_alive(n, s) ? -EAGAIN : -ENETDOWN;
-		mutex_unlock(&n->lock);
+		mutex_unlock(&s->lock);
 		kfree(r->data); kfree(r); return ERR_PTR(err);
 	}
 	if (credit && s->tx_bytes + credit > NS3_BUFFER) {
-		mutex_unlock(&n->lock);
+		mutex_unlock(&s->lock);
 		kfree(r->data); kfree(r); return ERR_PTR(-EAGAIN);
 	}
 	sock_hold(&s->sk);
@@ -135,35 +151,34 @@ static struct ns3_request *ns3_submit(struct ns3_sock *s, u32 op,
 	r->header = (struct ns3_msg) {
 		.version = cpu_to_le32(NS3_VERSION), .op = cpu_to_le32(op),
 		.socket = cpu_to_le64(s->id),
-		.request = cpu_to_le64(++n->next_request),
+		.request = cpu_to_le64(++s->next_request),
 		.len = cpu_to_le32(len),
 	};
 	s->tx_bytes += credit;
-	list_add_tail(&r->node, &n->requests);
-	n->pending++;
-	mutex_unlock(&n->lock);
-	wake_up_interruptible(&n->wait);
+	list_add_tail(&r->node, &s->requests);
+	s->pending++;
+	mutex_unlock(&s->lock);
+	wake_up_interruptible(&s->provider_wait);
 	return r;
 }
 static int ns3_call(struct ns3_sock *s, u32 op, const void *data, size_t len,
 		    void *reply, size_t capacity)
 {
-	struct ns3_net *n = ns3_net(&s->sk);
 	struct ns3_request *r = ns3_submit(s, op, data, len, false, 0);
 	long waited;
 	int ret;
 	if (IS_ERR(r)) return PTR_ERR(r);
 	waited = wait_for_completion_interruptible_timeout(&r->done, NS3_CONTROL_TIMEOUT);
-	mutex_lock(&n->lock);
+	mutex_lock(&s->lock);
 	/* Interrupted control may already have taken effect remotely. Revoke the
-	 * session instead of freeing an ID and accepting an ambiguous late reply.
+	 * socket instead of freeing an ID and accepting an ambiguous late reply.
 	 */
-	if (!r->completed) ns3_abort(n);
+	if (!r->completed) ns3_abort_socket(s);
 	ret = waited < 0 ? (int)waited : !waited ? -ETIMEDOUT : r->error;
 	if (!ret && r->reply_len > capacity) ret = -EPROTO;
 	if (!ret && r->reply_len) memcpy(reply, r->reply, r->reply_len);
 	if (!ret) ret = r->reply_len;
-	mutex_unlock(&n->lock);
+	mutex_unlock(&s->lock);
 	ns3_free_request(r);
 	return ret;
 }
@@ -172,7 +187,8 @@ static int ns3_open_remote(struct ns3_sock *s)
 	__le32 type[2] = { cpu_to_le32(s->sk.sk_type), cpu_to_le32(s->sk.sk_family == AF_INET ? 4 : 6) };
 	int ret;
 	if (s->opened) return 0;
-	ret = ns3_call(s, NS3_OPEN, &type, sizeof(type), NULL, 0);
+	struct ns3_request *r = ns3_submit(s, NS3_OPEN, &type, sizeof(type), true, 0);
+	ret = IS_ERR(r) ? PTR_ERR(r) : 0;
 	if (!ret) s->opened = true;
 	return ret;
 }
@@ -218,7 +234,10 @@ static int ns3_listen(struct socket *sock, int backlog)
 	mutex_lock(&s->control);
 	ret = ns3_open_remote(s);
 	if (!ret) ret = ns3_call(s, NS3_LISTEN, &value, sizeof(value), &s->local, sizeof(s->local));
-	if (ret == sizeof(s->local)) { s->listening = true; ret = 0; }
+	if (ret == sizeof(s->local)) {
+		mutex_lock(&s->lock); s->listening = true; s->backlog = max(backlog, 1); s->accept_space = true;
+		mutex_unlock(&s->lock); wake_up_interruptible(&s->provider_wait); ret = 0;
+	}
 	else if (ret >= 0) ret = -EPROTO;
 	mutex_unlock(&s->control);
 	return ret;
@@ -255,33 +274,33 @@ static int ns3_create(struct net *net, struct socket *sock, int protocol, int ke
 static int ns3_accept(struct socket *sock, struct socket *new, struct proto_accept_arg *arg)
 {
 	struct ns3_sock *s = ns3_sk(sock), *child;
-	__le64 id;
-	struct ns3_addr names[2];
-	long ret;
-	long timeo = sock_rcvtimeo(&s->sk, arg->flags & O_NONBLOCK);
-	if (!s->listening) return -EINVAL;
-	mutex_lock(&s->control);
+	struct socket *temporary;
+	long ret, timeo = sock_rcvtimeo(&s->sk, arg->flags & O_NONBLOCK);
+	mutex_lock(&s->lock);
 	for (;;) {
+		if (!s->listening) { ret = -EINVAL; break; }
 		if (s->dead) { ret = -ENETDOWN; break; }
-		ret = ns3_create(sock_net(&s->sk), new, IPPROTO_TCP, 0, sock->ops->family);
-		if (ret) break;
-		child = ns3_sk(new);
-		id = cpu_to_le64(child->id);
-		ret = ns3_call(s, NS3_ACCEPT, &id, sizeof(id), names, sizeof(names));
-		if (ret == sizeof(names)) {
-			child->opened = child->connected = true;
-			child->local = names[0]; child->peer = names[1];
-			new->state = SS_CONNECTED; ret = 0; break;
+		if (!list_empty(&s->accepted)) {
+			child = list_first_entry(&s->accepted, struct ns3_sock, accept_node);
+			list_del_init(&child->accept_node); s->accept_count--;
+			temporary = child->accept_socket; child->accept_socket = NULL;
+			temporary->sk = NULL;
+			sock_graft(&child->sk, new); new->state = SS_CONNECTED;
+			s->accept_space = true;
+			wake_up_interruptible(&s->provider_wait);
+			mutex_unlock(&s->lock);
+			sock_release(temporary);
+			return 0;
 		}
-		new->ops->release(new);
-		if (ret != -EAGAIN || !timeo) break;
+		if (!timeo) { ret = -EAGAIN; break; }
+		mutex_unlock(&s->lock);
 		ret = wait_event_interruptible_timeout(*sk_sleep(&s->sk),
-			READ_ONCE(s->eof) || READ_ONCE(s->dead), timeo);
+			READ_ONCE(s->accept_count) || READ_ONCE(s->dead), timeo);
+		mutex_lock(&s->lock);
 		if (ret <= 0) { if (!ret) ret = -EAGAIN; break; }
 		timeo = ret;
-		s->eof = false; /* listener event is an accept-queue notification */
 	}
-	mutex_unlock(&s->control);
+	mutex_unlock(&s->lock);
 	return ret;
 }
 static int ns3_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
@@ -324,7 +343,7 @@ static int ns3_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		ret = PTR_ERR(r);
 		if (ret != -EAGAIN || !timeo || done) break;
 		ret = wait_event_interruptible_timeout(*sk_sleep(&s->sk),
-			(READ_ONCE(s->tx_bytes) + (count ?: 1) <= NS3_BUFFER && READ_ONCE(ns3_net(&s->sk)->pending) < NS3_REQUESTS) ||
+			(READ_ONCE(s->tx_bytes) + (count ?: 1) <= NS3_BUFFER && READ_ONCE(s->pending) < NS3_REQUESTS - 8) ||
 			READ_ONCE(s->dead), timeo);
 		if (ret <= 0) { if (!ret) ret = -EAGAIN; break; }
 		timeo = ret;
@@ -337,19 +356,17 @@ out:
 static int ns3_recvmsg(struct socket *sock, struct msghdr *msg, size_t len, int flags)
 {
 	struct ns3_sock *s = ns3_sk(sock);
-	struct ns3_net *n = ns3_net(&s->sk);
 	struct sk_buff *skb;
 	struct ns3_addr *addr;
 	size_t done = 0, count, available;
 	long ret = 0;
-	bool credit;
+
 	long timeo = sock_rcvtimeo(&s->sk, flags & MSG_DONTWAIT);
 	if (flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_WAITALL | MSG_TRUNC)) return -EOPNOTSUPP;
 	if (!len && sock->type == SOCK_STREAM) return 0;
 	mutex_lock(&s->receive);
 	for (;;) {
-		credit = false;
-		mutex_lock(&n->lock);
+		mutex_lock(&s->lock);
 		skb = skb_peek(&s->sk.sk_receive_queue);
 		if (skb) {
 			addr = (void *)skb->data;
@@ -379,15 +396,13 @@ static int ns3_recvmsg(struct socket *sock, struct msghdr *msg, size_t len, int 
 				if (!(flags & MSG_PEEK)) {
 					s->rx_offset += count;
 					if (count == available || sock->type == SOCK_DGRAM) {
-						skb_unlink(skb, &s->sk.sk_receive_queue); kfree_skb(skb); s->rx_offset = 0; credit = true;
+						skb_unlink(skb, &s->sk.sk_receive_queue); kfree_skb(skb); s->rx_offset = 0; s->credit_return++;
 					}
-					wake_up_interruptible(&n->wait);
+					wake_up_interruptible(&s->provider_wait);
 				}
 			}
-			mutex_unlock(&n->lock);
-			if (credit && IS_ERR(ns3_submit(s, NS3_CREDIT, NULL, 0, true, 0))) {
-				mutex_lock(&n->lock); ns3_abort(n); mutex_unlock(&n->lock);
-			}
+			mutex_unlock(&s->lock);
+
 			if (ret || sock->type == SOCK_DGRAM || flags & MSG_PEEK || done == len || !(flags & MSG_WAITALL)) break;
 			continue;
 		}
@@ -395,7 +410,7 @@ static int ns3_recvmsg(struct socket *sock, struct msghdr *msg, size_t len, int 
 		else if (s->sk.sk_err) ret = sock_error(&s->sk);
 		else if (s->eof || s->sk.sk_shutdown & RCV_SHUTDOWN) ret = 0;
 		else ret = -EAGAIN;
-		mutex_unlock(&n->lock);
+		mutex_unlock(&s->lock);
 		if (ret != -EAGAIN || !timeo || (done && !(flags & MSG_WAITALL))) break;
 		ret = wait_event_interruptible_timeout(*sk_sleep(&s->sk),
 			!skb_queue_empty(&s->sk.sk_receive_queue) || READ_ONCE(s->eof) ||
@@ -410,20 +425,19 @@ static int ns3_recvmsg(struct socket *sock, struct msghdr *msg, size_t len, int 
 static __poll_t ns3_poll(struct file *file, struct socket *sock, poll_table *wait)
 {
 	struct ns3_sock *s = ns3_sk(sock);
-	struct ns3_net *n = ns3_net(&s->sk);
 	__poll_t mask = 0;
 	poll_wait(file, sk_sleep(&s->sk), wait);
-	mutex_lock(&n->lock);
+	mutex_lock(&s->lock);
 	if (s->dead || s->sk.sk_err) mask |= EPOLLERR;
 	if (s->dead) mask |= EPOLLHUP;
-	if (!skb_queue_empty(&s->sk.sk_receive_queue) || s->eof || s->sk.sk_shutdown & RCV_SHUTDOWN)
+	if (!skb_queue_empty(&s->sk.sk_receive_queue) || s->eof || s->accept_count || s->sk.sk_shutdown & RCV_SHUTDOWN)
 		mask |= EPOLLIN | EPOLLRDNORM;
 	if (s->eof && !s->listening) mask |= EPOLLRDHUP;
 	if (!s->dead && !s->connecting && !s->listening &&
 	    (s->connected || sock->type == SOCK_DGRAM) &&
-	    s->tx_bytes < NS3_BUFFER && n->pending < NS3_REQUESTS)
+	    s->tx_bytes < NS3_BUFFER && s->pending < NS3_REQUESTS - 8)
 		mask |= EPOLLOUT | EPOLLWRNORM;
-	mutex_unlock(&n->lock);
+	mutex_unlock(&s->lock);
 	return mask;
 }
 static int ns3_getname(struct socket *sock, struct sockaddr *addr, int peer)
@@ -470,19 +484,23 @@ static int ns3_release(struct socket *sock)
 {
 	struct ns3_sock *s;
 	struct ns3_net *n;
-	struct ns3_request *r;
+	struct ns3_sock *child, *tmp;
+	LIST_HEAD(accepted);
 	if (!sock->sk) return 0;
 	s = ns3_sk(sock); n = ns3_net(&s->sk);
-	if (s->opened && !s->dead) {
-		r = ns3_submit(s, NS3_CLOSE, NULL, 0, true, 0);
-		if (IS_ERR(r)) {
-			mutex_lock(&n->lock); ns3_abort(n); mutex_unlock(&n->lock);
-		}
-	}
 	mutex_lock(&n->lock);
-	list_del_init(&s->node); n->socket_count--;
+	list_del_init(&s->node);
+	mutex_lock(&s->lock);
+	s->app_closed = true;
+	list_splice_init(&s->accepted, &accepted); s->accept_count = 0;
 	skb_queue_purge(&s->sk.sk_receive_queue);
+	if (!s->claimed) ns3_abort_socket(s);
+	wake_up_interruptible_all(&s->provider_wait);
+	mutex_unlock(&s->lock);
 	mutex_unlock(&n->lock);
+	list_for_each_entry_safe(child, tmp, &accepted, accept_node) {
+		list_del_init(&child->accept_node); sock_release(child->accept_socket);
+	}
 	sock_orphan(&s->sk); sock->sk = NULL; sock_put(&s->sk);
 	return 0;
 }
@@ -503,12 +521,18 @@ static const struct proto_ops ns3_ops6 = NS3_OPS(PF_INET6);
 static struct proto ns3_proto = {
 	.name = "NETSTACK3", .owner = THIS_MODULE, .obj_size = sizeof(struct ns3_sock),
 };
+static void ns3_destruct(struct sock *sk)
+{
+	/* Keep the quota charged while provider FDs or queued requests retain the
+	 * socket, not merely until the application closes its file. */
+	atomic_dec(&ns3_net(sk)->socket_count);
+}
 static int ns3_create(struct net *net, struct socket *sock, int protocol, int kern, int family)
 {
 	struct ns3_net *n = net_generic(net, ns3_net_id);
 	struct sock *sk;
 	struct ns3_sock *s;
-	if (kern) return -EOPNOTSUPP;
+	/* Internal accepted endpoints use kern=1, external kernel clients remain unsupported by family wrappers. */
 	if ((sock->type != SOCK_STREAM || (protocol && protocol != IPPROTO_TCP)) &&
 	    (sock->type != SOCK_DGRAM || (protocol && protocol != IPPROTO_UDP)))
 		return -EPROTONOSUPPORT;
@@ -516,6 +540,8 @@ static int ns3_create(struct net *net, struct socket *sock, int protocol, int ke
 	if (!sk) return -ENOMEM;
 	sock_init_data(sock, sk);
 	s = container_of(sk, struct ns3_sock, sk);
+	mutex_init(&s->lock); init_waitqueue_head(&s->provider_wait);
+	INIT_LIST_HEAD(&s->requests); INIT_LIST_HEAD(&s->accepted); INIT_LIST_HEAD(&s->accept_node); s->rx_credit = 4;
 	mutex_init(&s->control);
 	mutex_init(&s->receive); mutex_init(&s->transmit);
 	INIT_LIST_HEAD(&s->node);
@@ -523,36 +549,38 @@ static int ns3_create(struct net *net, struct socket *sock, int protocol, int ke
 	sock->state = SS_UNCONNECTED;
 	sk->sk_protocol = sock->type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP;
 	mutex_lock(&n->lock);
-	if (!n->online || n->socket_count >= NS3_SOCKETS) {
+	if (!n->online || atomic_read(&n->socket_count) >= NS3_SOCKETS) {
 		int err = n->online ? -ENFILE : -ENETDOWN;
 		mutex_unlock(&n->lock); sock_orphan(sk); sock->sk = NULL; sock_put(sk); return err;
 	}
+	s->claimed = kern;
 	s->id = ++n->next_socket; s->generation = n->generation;
 	s->local.family = cpu_to_le16(family == AF_INET ? 4 : 6);
-	list_add_tail(&s->node, &n->sockets); n->socket_count++;
+	list_add_tail(&s->node, &n->sockets); atomic_inc(&n->socket_count);
+	sk->sk_destruct = ns3_destruct;
 	mutex_unlock(&n->lock);
+	wake_up_interruptible(&n->wait);
 	return 0;
 }
-static int ns3_create4(struct net *n, struct socket *s, int p, int k) { return ns3_create(n,s,p,k,PF_INET); }
-static int ns3_create6(struct net *n, struct socket *s, int p, int k) { return ns3_create(n,s,p,k,PF_INET6); }
+static int ns3_create4(struct net *n, struct socket *s, int p, int k) { return k ? -EOPNOTSUPP : ns3_create(n,s,p,0,PF_INET); }
+static int ns3_create6(struct net *n, struct socket *s, int p, int k) { return k ? -EOPNOTSUPP : ns3_create(n,s,p,0,PF_INET6); }
 static const struct net_proto_family ns3_family4 = { .family = PF_INET, .create = ns3_create4, .owner = THIS_MODULE };
 static const struct net_proto_family ns3_family6 = { .family = PF_INET6, .create = ns3_create6, .owner = THIS_MODULE };
 
-static bool ns3_unread(struct ns3_net *n)
+static bool ns3_unread(struct ns3_sock *s)
 {
 	struct ns3_request *r;
-	list_for_each_entry(r, &n->requests, node) if (!r->read) return true;
+	list_for_each_entry(r, &s->requests, node) if (!r->read) return true;
 	return false;
 }
 static ssize_t ns3_read(struct file *file, char __user *buf, size_t len, loff_t *off)
 {
-	struct ns3_session *session = file->private_data;
-	struct ns3_net *n = net_generic(session->net, ns3_net_id);
+	struct ns3_sock *s = file->private_data;
 	struct ns3_request *r;
 	int ret = -EAGAIN;
-	mutex_lock(&n->lock);
-	if (!n->online || n->generation != session->generation) { ret = -ENETDOWN; goto out; }
-	list_for_each_entry(r, &n->requests, node) {
+	mutex_lock(&s->lock);
+	if (s->dead) { ret = -ENETDOWN; goto out; }
+	list_for_each_entry(r, &s->requests, node) {
 		if (r->read) continue;
 		if (len < sizeof(r->header) + le32_to_cpu(r->header.len)) { ret = -EMSGSIZE; break; }
 		if (copy_to_user(buf, &r->header, sizeof(r->header)) ||
@@ -560,16 +588,29 @@ static ssize_t ns3_read(struct file *file, char __user *buf, size_t len, loff_t 
 		r->read = true;
 		ret = sizeof(r->header) + le32_to_cpu(r->header.len); break;
 	}
+	if (ret == -EAGAIN && (s->accept_space || s->credit_return || (s->app_closed && !s->close_read))) {
+		struct ns3_msg h = { .version = cpu_to_le32(NS3_VERSION), .socket = cpu_to_le64(s->id) };
+		__le32 credits = cpu_to_le32(s->credit_return);
+		bool accepting = s->accept_space;
+		bool closing = !accepting && !s->credit_return;
+		h.op = cpu_to_le32(accepting ? NS3_ACCEPT : closing ? NS3_CLOSE : NS3_CREDIT);
+		h.len = cpu_to_le32(closing ? 0 : sizeof(credits));
+		ret = sizeof(h) + (closing ? 0 : sizeof(credits));
+		if (len < ret) ret = -EMSGSIZE;
+		else if (copy_to_user(buf, &h, sizeof(h)) ||
+			 (!closing && copy_to_user(buf + sizeof(h), &credits, sizeof(credits)))) ret = -EFAULT;
+		else if (accepting) s->accept_space = false;
+		else if (closing) s->close_read = true;
+		else { s->rx_credit += s->credit_return; s->credit_return = 0; }
+	}
 out:
-	mutex_unlock(&n->lock);
+	mutex_unlock(&s->lock);
 	return ret;
 }
 static ssize_t ns3_write(struct file *file, const char __user *buf, size_t len, loff_t *off)
 {
-	struct ns3_session *session = file->private_data;
-	struct ns3_net *n = net_generic(session->net, ns3_net_id);
+	struct ns3_sock *s = file->private_data;
 	struct ns3_msg *h;
-	struct ns3_sock *s;
 	struct ns3_request *r, *tmp;
 	struct sk_buff *skb;
 	void *data;
@@ -582,18 +623,19 @@ static ssize_t ns3_write(struct file *file, const char __user *buf, size_t len, 
 	size = le32_to_cpu(h->len); op = le32_to_cpu(h->op); status = le32_to_cpu(h->status);
 	if (le32_to_cpu(h->version) != NS3_VERSION || size != len - sizeof(*h) || status > 4095) goto free;
 	data = h + 1;
-	mutex_lock(&n->lock);
-	if (!n->online || n->generation != session->generation) { ret = -ENETDOWN; goto out; }
+	if (h->socket != cpu_to_le64(s->id)) goto free;
+	mutex_lock(&s->lock);
+	if (s->dead) { ret = -ENETDOWN; goto out; }
 	if (!h->request) {
-		list_for_each_entry(s, &n->sockets, node) {
-			if (cpu_to_le64(s->id) != h->socket || s->generation != session->generation) continue;
+		{
 			if (op == NS3_RX && size >= sizeof(struct ns3_addr)) {
+				if (!s->rx_credit) { ret = -EAGAIN; goto out; }
 				if (atomic_read(&s->sk.sk_rmem_alloc) + size + SKB_DATA_ALIGN(sizeof(struct sk_buff)) > NS3_BUFFER) { ret = -EAGAIN; goto out; }
 				skb = alloc_skb(size, GFP_KERNEL);
 				if (!skb) { ret = -ENOMEM; goto out; }
 				skb_put_data(skb, data, size);
 				skb_set_owner_r(skb, &s->sk);
-				skb_queue_tail(&s->sk.sk_receive_queue, skb);
+				skb_queue_tail(&s->sk.sk_receive_queue, skb); s->rx_credit--;
 				s->sk.sk_data_ready(&s->sk);
 			} else if (op == NS3_STATE && size == 4) {
 				u32 state = get_unaligned_le32(data);
@@ -604,16 +646,14 @@ static ssize_t ns3_write(struct file *file, const char __user *buf, size_t len, 
 			} else goto bad;
 			ret = len; goto out;
 		}
-		/* A file close can race an event already prepared by the provider. */
-		ret = len; goto out;
 	}
-	list_for_each_entry_safe(r, tmp, &n->requests, node) {
+	list_for_each_entry_safe(r, tmp, &s->requests, node) {
 		if (r->header.request != h->request) continue;
 		if (!r->read || r->header.socket != h->socket || r->header.op != h->op) goto bad;
 		r->reply = kmemdup(data, size, GFP_KERNEL);
 		if (size && !r->reply) { ret = -ENOMEM; goto out; }
 		r->reply_len = size; r->error = -(int)status;
-		list_del_init(&r->node); n->pending--;
+		list_del_init(&r->node); s->pending--;
 		r->owner->tx_bytes -= r->credit;
 		if (r->async && status && !(op == NS3_CONNECT && status == EINPROGRESS)) {
 			WRITE_ONCE(r->owner->sk.sk_err, status);
@@ -625,28 +665,135 @@ static ssize_t ns3_write(struct file *file, const char __user *buf, size_t len, 
 		r->owner->sk.sk_write_space(&r->owner->sk);
 		r->completed = true;
 		if (r->async) ns3_free_request(r); else complete(&r->done);
-		list_for_each_entry(s, &n->sockets, node) s->sk.sk_write_space(&s->sk);
-		wake_up_interruptible(&n->wait);
+
+		wake_up_interruptible(&s->provider_wait);
 		ret = len; goto out;
 	}
 bad:
-	ns3_abort(n);
+	ns3_abort_socket(s);
 out:
-	mutex_unlock(&n->lock);
+	mutex_unlock(&s->lock);
 free:
 	kfree(h); return ret;
 }
+static __poll_t ns3_endpoint_poll(struct file *f, poll_table *wait)
+{
+	struct ns3_sock *s = f->private_data;
+	__poll_t mask;
+	poll_wait(f, &s->provider_wait, wait);
+	mutex_lock(&s->lock);
+	mask = s->dead ? EPOLLERR | EPOLLHUP : EPOLLOUT |
+		((ns3_unread(s) || s->accept_space || s->credit_return || (s->app_closed && !s->close_read)) ? EPOLLIN : 0);
+	mutex_unlock(&s->lock);
+	return mask;
+}
+static int ns3_endpoint_release(struct inode *inode, struct file *f)
+{
+	struct ns3_sock *s = f->private_data;
+	mutex_lock(&s->lock);
+	ns3_abort_socket(s);
+	mutex_unlock(&s->lock);
+	sock_put(&s->sk);
+	return 0;
+}
+static const struct file_operations ns3_endpoint_fops;
+static long ns3_publish_accept(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct ns3_sock *listener = f->private_data, *child;
+	struct ns3_accept_info info;
+	struct socket *socket;
+	struct file *endpoint;
+	int fd, ret;
+	if (cmd != NS3_PUBLISH_ACCEPT) return -ENOTTY;
+	if (copy_from_user(&info, (void __user *)arg, sizeof(info))) return -EFAULT;
+	if (info.local.family != listener->local.family || info.peer.family != listener->local.family)
+		return -EAFNOSUPPORT;
+	mutex_lock(&listener->lock);
+	ret = listener->dead || listener->app_closed ? -ENETDOWN :
+		!listener->listening ? -EINVAL :
+		listener->accept_count >= listener->backlog ? -EAGAIN : 0;
+	mutex_unlock(&listener->lock);
+	if (ret) return ret;
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) return fd;
+	ret = sock_create_lite(listener->sk.sk_family, SOCK_STREAM, IPPROTO_TCP, &socket);
+	if (ret) goto unused;
+	ret = ns3_create(sock_net(&listener->sk), socket, IPPROTO_TCP, 1, listener->sk.sk_family);
+	if (ret) { sock_release(socket); goto unused; }
+	child = ns3_sk(socket);
+	child->opened = child->connected = true;
+	child->local = info.local; child->peer = info.peer;
+	child->accept_socket = socket;
+	info.socket = cpu_to_le64(child->id);
+	if (copy_to_user((void __user *)arg, &info, sizeof(info))) { ret = -EFAULT; goto child; }
+	sock_hold(&child->sk);
+	endpoint = anon_inode_getfile("netstack3-endpoint", &ns3_endpoint_fops, child, O_RDWR | O_NONBLOCK);
+	if (IS_ERR(endpoint)) { sock_put(&child->sk); ret = PTR_ERR(endpoint); goto child; }
+	mutex_lock(&listener->lock);
+	if (listener->dead || listener->app_closed || listener->accept_count >= listener->backlog) {
+		mutex_unlock(&listener->lock); fput(endpoint); ret = -EAGAIN; goto child;
+	}
+	list_add_tail(&child->accept_node, &listener->accepted); listener->accept_count++;
+	listener->sk.sk_data_ready(&listener->sk);
+	fd_install(fd, endpoint);
+	mutex_unlock(&listener->lock);
+	return fd;
+child:
+	sock_release(socket);
+unused:
+	put_unused_fd(fd);
+	return ret;
+}
+static const struct file_operations ns3_endpoint_fops = {
+	.owner = THIS_MODULE, .read = ns3_read, .write = ns3_write,
+	.poll = ns3_endpoint_poll, .release = ns3_endpoint_release,
+	.unlocked_ioctl = ns3_publish_accept,
+};
 static __poll_t ns3_device_poll(struct file *f, poll_table *wait)
 {
 	struct ns3_session *session = f->private_data;
 	struct ns3_net *n = net_generic(session->net, ns3_net_id);
-	__poll_t mask;
+	struct ns3_sock *s;
+	__poll_t mask = 0;
 	poll_wait(f, &n->wait, wait);
 	mutex_lock(&n->lock);
-	mask = !n->online || n->generation != session->generation ? EPOLLERR | EPOLLHUP :
-		EPOLLOUT | (ns3_unread(n) ? EPOLLIN : 0);
+	if (!n->online || session->generation != n->generation) mask = EPOLLERR | EPOLLHUP;
+	else list_for_each_entry(s, &n->sockets, node) {
+		if (!s->claimed && !s->dead) { mask = EPOLLIN; break; }
+	}
 	mutex_unlock(&n->lock);
 	return mask;
+}
+/* Claim the next endpoint, like accept: the returned FD grants authority only
+ * to that kernel socket. Failed user copies never consume a claim. */
+static long ns3_claim(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct ns3_session *session = f->private_data;
+	struct ns3_net *n = net_generic(session->net, ns3_net_id);
+	struct ns3_sock *s;
+	struct file *endpoint;
+	int fd, ret = -EAGAIN;
+	if (cmd != NS3_CLAIM) return -ENOTTY;
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) return fd;
+	mutex_lock(&n->lock);
+	if (!n->online || session->generation != n->generation) { ret = -ENETDOWN; goto out; }
+	list_for_each_entry(s, &n->sockets, node) {
+		__le64 id = cpu_to_le64(s->id);
+		if (s->claimed || s->dead) continue;
+		if (copy_to_user((void __user *)arg, &id, sizeof(id))) { ret = -EFAULT; break; }
+		sock_hold(&s->sk);
+		endpoint = anon_inode_getfile("netstack3-endpoint", &ns3_endpoint_fops, s, O_RDWR | O_NONBLOCK);
+		if (IS_ERR(endpoint)) { sock_put(&s->sk); ret = PTR_ERR(endpoint); break; }
+		s->claimed = true;
+		fd_install(fd, endpoint);
+		mutex_unlock(&n->lock);
+		return fd;
+	}
+out:
+	mutex_unlock(&n->lock);
+	put_unused_fd(fd);
+	return ret;
 }
 static int ns3_device_open(struct inode *inode, struct file *f)
 {
@@ -676,7 +823,7 @@ static int ns3_device_release(struct inode *inode, struct file *f)
 }
 static const struct file_operations ns3_fops = {
 	.owner = THIS_MODULE, .open = ns3_device_open, .release = ns3_device_release,
-	.read = ns3_read, .write = ns3_write, .poll = ns3_device_poll,
+	.unlocked_ioctl = ns3_claim, .poll = ns3_device_poll,
 };
 static struct miscdevice ns3_device = {
 	.minor = MISC_DYNAMIC_MINOR, .name = "netstack3", .mode = 0600, .fops = &ns3_fops,
@@ -685,7 +832,7 @@ static int __net_init ns3_net_init(struct net *net)
 {
 	struct ns3_net *n = net_generic(net, ns3_net_id);
 	mutex_init(&n->lock); init_waitqueue_head(&n->wait);
-	INIT_LIST_HEAD(&n->requests); INIT_LIST_HEAD(&n->sockets);
+	INIT_LIST_HEAD(&n->sockets);
 	return 0;
 }
 static struct pernet_operations ns3_pernet = {
