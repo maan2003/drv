@@ -39,7 +39,10 @@ case ${1-} in
         "$REDWOOD_EVIDENCE_RUN_ID" "$BOOT_ID" "$SERVICE_SHA" "$DIAGNOSTIC_SHA" | \
         "$NC" -w 2 "$EVIDENCE_HOST" "$EVIDENCE_PORT")
     [ "$ACK" = ACK ] || { echo "np evidence collector did not acknowledge unit submission" >&2; exit 1; }
-    ! "$SYSTEMCTL" is-active --quiet "$UNIT.service"
+    if "$SYSTEMCTL" is-active --quiet "$UNIT.service"; then
+        echo "diagnostic unit is already active" >&2
+        exit 1
+    fi
     "$SYSTEMD_RUN" --quiet --collect --no-block --unit="$UNIT" \
         --setenv="REDWOOD_EVIDENCE_ENDPOINT=$REDWOOD_EVIDENCE_ENDPOINT" \
         --setenv="REDWOOD_EVIDENCE_RUN_ID=$REDWOOD_EVIDENCE_RUN_ID" \
@@ -78,6 +81,21 @@ EOF
     grep -q -- '--run' "$t/actions"
     ! grep -Eq -- 'timeout|RuntimeMaxSec|KillSignal' "$t/actions"
     grep -q 'REDWOOD_WPA3_SUBMITTED' "$t/output"
+    # An active diagnostic must refuse before submitting another unit. A bare
+    # `! command` is exempt from `set -e` and does not enforce this gate.
+    printf '#!/bin/sh\nexit 0\n' >"$t/systemctl"
+    rm "$t/actions"
+    if REDWOOD_SYSTEMCTL="$t/systemctl" REDWOOD_SYSTEMD_RUN="$t/systemd-run" \
+        REDWOOD_NC="$t/nc" REDWOOD_TEST_ACTIONS="$t/actions" \
+        REDWOOD_EVIDENCE_ENDPOINT=127.0.0.1:9 REDWOOD_EVIDENCE_RUN_ID=selftest \
+        REDWOOD_EVIDENCE_BOOT_ID=selftest REDWOOD_EVIDENCE_SERVICE_SHA=selftest \
+        REDWOOD_EVIDENCE_DIAGNOSTIC_SHA=selftest \
+        "$0" --start >"$t/refused" 2>&1; then
+        echo "active diagnostic was not refused" >&2
+        exit 1
+    fi
+    test ! -e "$t/actions"
+    grep -q 'diagnostic unit is already active' "$t/refused"
     echo REDWOOD_WPA3_SELF_TEST_OK
     exit
     ;;
@@ -104,7 +122,10 @@ test ! -e /run/redwood-lab-watchdog/armed
 test ! -e /dev/watchdog0
 for unit in redwood-lab-watchdog.service boot-watchdog.service \
     ath11k-fast-cycle-deadline.timer ath11k-fast-cycle-deadline.service; do
-    ! systemctl is-active --quiet "$unit"
+    if systemctl is-active --quiet "$unit"; then
+        echo "refusing active automatic recovery unit: $unit" >&2
+        exit 1
+    fi
 done
 systemctl is-active --quiet ath11k-redwood-sleep-inhibit-v2.service
 
