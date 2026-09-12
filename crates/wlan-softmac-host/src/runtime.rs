@@ -267,13 +267,18 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         bandwidth: fidl_ieee80211::ChannelBandwidth,
         secondary: fidl_ieee80211::ChannelNumber,
     ) -> Result<(), zx::Status> {
-        self.device.lock().unwrap().device.set_channel(
+        eprintln!(
+            "client_softmac_channel stage=bridge_enter primary={primary:?} bandwidth={bandwidth:?} secondary={secondary:?}"
+        );
+        let result = self.device.lock().unwrap().device.set_channel(
             fidl_softmac::WlanSoftmacBaseSetChannelRequest {
                 primary: Some(primary),
                 bandwidth: Some(bandwidth),
                 vht_secondary_80_channel: Some(secondary),
             },
-        )
+        );
+        eprintln!("client_softmac_channel stage=bridge_complete result={result:?}");
+        result
     }
     async fn set_mac_address(&mut self, _: [u8; 6]) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
@@ -1284,6 +1289,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     }
 
     fn finish_connect_error(&mut self, error: ConnectError) -> ConnectError {
+        eprintln!("client_softmac_connect stage=failed error={error:?}");
         self.connect_attempt = None;
         if self.revoked {
             return error;
