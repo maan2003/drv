@@ -40,6 +40,13 @@ fn main() {
 
 fn start() -> Result<(), String> {
     let config = Config::parse()?;
+    let pause = std::env::var("REDWOOD_DIAGNOSTIC_PAUSE").unwrap_or_default();
+    if !pause.is_empty() {
+        if !config.diagnostic_unsandboxed {
+            return Err("diagnostic pause requires --diagnostic-unsandboxed".into());
+        }
+        DIAGNOSTIC_PAUSE.set(pause).unwrap();
+    }
     if config.diagnostic_unsandboxed {
         init_evidence()?;
         evidence(format_args!("stage=service_enter"))?;
@@ -156,8 +163,12 @@ fn activate_and_run(
     mut remoteproc_state: File,
 ) -> Result<(), String> {
     eprintln!("ath11k_wifi_startup=VFIO_ACTIVATE_ENTER");
-    let vfio = LinuxVfio::activate_platform(platform).map_err(|error| error.to_string())?;
+    let mut vfio = LinuxVfio::activate_platform(platform).map_err(|error| error.to_string())?;
+    if config.diagnostic_unsandboxed {
+        vfio.with_runtime_trace(trace_vfio_runtime);
+    }
     eprintln!("ath11k_wifi_startup=VFIO_ACTIVE");
+    diagnostic_pause("vfio_active");
     // Keep one VFIO owner outside every fallible post-activation operation.
     // The inner owners may unwind, but mappings cannot be released until WPSS
     // has synchronously reached offline below.
@@ -178,6 +189,7 @@ fn activate_and_run(
         qmi.discover_device_bar()
             .map_err(|error| format!("QMI device BAR discovery: {error:?}"))?;
         eprintln!("ath11k_wifi_startup=QMI_BAR_READY");
+        diagnostic_pause("qmi_bar_ready");
         if qmi.memory().device_bar().is_none() {
             return Err("selected VFIO region did not map the QMI device BAR".into());
         }
@@ -222,20 +234,23 @@ fn activate_and_run(
         ))
         .map_err(|error| format!("activate pinned client runtime: {error}"))?;
         eprintln!("ath11k_wifi_startup=CLIENT_RUNTIME_READY");
+        diagnostic_pause("client_runtime_ready");
         let mut server = endpoints
             .bind_runtime(runtime)
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
         eprintln!("ath11k_wifi_startup=CONTROL_READY");
+        diagnostic_pause("control_ready");
         evidence(format_args!("stage=control_ready"))?;
         TRACE_CE_SEQUENCE.store(0, Ordering::Release);
         TRACE_CE_RUNTIME.store(true, Ordering::Release);
         evidence(format_args!("stage=control_run_enter"))?;
         let result = server.run_to_terminal();
-        TRACE_CE_RUNTIME.store(false, Ordering::Release);
         eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
         let mut runtime = server.into_runtime();
+        diagnostic_pause("runtime_stop_enter");
         let stop = runtime.stop();
+        TRACE_CE_RUNTIME.store(false, Ordering::Release);
         eprintln!(
             "ath11k_wifi_cleanup=RUNTIME_STOP_RETURNED success={}",
             stop.is_ok()
@@ -244,6 +259,7 @@ fn activate_and_run(
         stop.map_err(|error| format!("stop physical runtime: {error}"))
     })();
     eprintln!("ath11k_wifi_cleanup=REMOTEPROC_STOP_ENTER");
+    diagnostic_pause("remoteproc_stop_enter");
     let containment = stop_and_verify_remoteproc(&mut remoteproc_state);
     if let Err(error) = containment {
         eprintln!(
@@ -264,6 +280,36 @@ fn activate_and_run(
 
 static TRACE_CE_RUNTIME: AtomicBool = AtomicBool::new(false);
 static TRACE_CE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+// Diagnostic checkpoints stop the process, not the device. SIGCONT resumes at
+// the same instruction with all owners/mappings intact; never SIGKILL a live run.
+static DIAGNOSTIC_PAUSE: OnceLock<String> = OnceLock::new();
+static DIAGNOSTIC_PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn diagnostic_pause(stage: &str) {
+    if DIAGNOSTIC_PAUSE.get().is_some_and(|target| target == stage)
+        && !DIAGNOSTIC_PAUSED.swap(true, Ordering::AcqRel)
+    {
+        eprintln!(
+            "ath11k_diagnostic=PAUSED stage={stage} pid={} resume=SIGCONT",
+            std::process::id()
+        );
+        // Diagnostic-unsandboxed only. SIGSTOP preserves the entire live stack.
+        unsafe {
+            libc::raise(libc::SIGSTOP);
+        }
+        eprintln!("ath11k_diagnostic=RESUMED stage={stage}");
+    }
+}
+
+fn trace_vfio_runtime(stage: &'static str, resource: u64, offset: usize, value: u64) {
+    if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
+        eprintln!("vfio_{stage} resource={resource:#x} offset={offset:#x} value={value:#x}");
+        if stage.starts_with("mmio_") && DIAGNOSTIC_PAUSE.get().is_some() {
+            diagnostic_pause(&format!("mmio:{offset:#x}"));
+        }
+    }
+}
+
 static EVIDENCE: OnceLock<Mutex<EvidenceSink>> = OnceLock::new();
 
 struct EvidenceSink {
@@ -345,6 +391,9 @@ fn evidence(message: fmt::Arguments<'_>) -> Result<(), String> {
 fn trace_ce_runtime(stage: &'static str, value: usize) {
     if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
         let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if DIAGNOSTIC_PAUSE.get().is_some() {
+            diagnostic_pause(&format!("event:{sequence}"));
+        }
         if sequence < 256 {
             eprintln!("ath11k_ce_runtime sequence={sequence} stage={stage} value={value}");
             // The diagnostic launcher persists stderr with O_DSYNC. Do not
@@ -357,6 +406,9 @@ fn trace_ce_runtime(stage: &'static str, value: usize) {
 fn trace_softmac_runtime(stage: &'static str, value: usize) {
     if TRACE_CE_RUNTIME.load(Ordering::Acquire) {
         let sequence = TRACE_CE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if DIAGNOSTIC_PAUSE.get().is_some() {
+            diagnostic_pause(&format!("event:{sequence}"));
+        }
         if sequence < 256 {
             eprintln!("ath11k_softmac_runtime sequence={sequence} stage={stage} value={value}");
         }

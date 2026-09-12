@@ -127,3 +127,45 @@ Evidence on np:
   build logs, byte-identical self-test snapshots, and experiment notes.
 - `evidence/reset-investigation/candidate-db970e2c/`: actual SError
   `dmesg-ramoops-0`, `console-ramoops-0`, phone logs and PMIC before/after.
+
+## Bisect with driver-side checkpoints, not process destruction
+
+In `--diagnostic-unsandboxed` mode only, set `REDWOOD_DIAGNOSTIC_PAUSE`
+when invoking `redwood-wpa3-diagnostic --start`. The launcher forwards it.
+Supported checkpoints are `vfio_active`, `qmi_bar_ready`,
+`client_runtime_ready`, `control_ready`, `runtime_stop_enter`,
+`remoteproc_stop_enter`, `event:<CE/SoftMAC sequence>`, and
+`mmio:<hex offset>` (for example `mmio:0xb81fc`). Event sequence numbers
+are shared by the existing CE and SoftMAC trace callbacks.
+
+The matching checkpoint logs `ath11k_diagnostic=PAUSED` and raises SIGSTOP
+once. It keeps the complete stack and all DMA owners intact; it does **not**
+stop firmware. Verify the PID's `/proc/<pid>/status` shows state `T`, retain
+the np hardware lock, and observe pstore/kernel logs before resuming with
+`kill -CONT <pid>`. Never SIGKILL or unbind the stopped live service. Resume
+and let cooperative containment finish, or recover to a verified fresh boot.
+The diagnostic client's existing deadline continues to run during a pause;
+a long hold can lead straight into cleanup after resume, not the original
+scan/connect sequence. A stable hold only bounds where an error was observed;
+it does not prove earlier asynchronous accesses harmless.
+
+Runtime-only VFIO tracing records accesses before executing them, including
+DMA-unmap entry, without logging thousands of startup allocations. Tracing
+and pauses perturb timing: compare a resumed failing boundary against an
+otherwise identical run, not against a different kernel or service.
+
+A full-startup trace on #13 (boot `c06f1858-0002-4d5c-8ecf-6d0561647938`)
+exceeded the control deadline without reaching scan and then panicked during
+cleanup. Its final logged access was a zero write to `0xb81fc`, REO destination
+ring MISC, from SRNG teardown. Native `ath11k_dp_srng_cleanup` frees DMA
+without this register write. This is a concrete boundary to bisect, not yet
+proof that it explains the earlier Connect failures. Evidence is under
+`evidence/reset-investigation/candidate-c06f1858/` on np.
+
+The checkpoint run `4219e44d-c0a0-4e6b-9e49-89f23364599c` reproduced
+scan/Connect/event 176, reached that same write, and remained SSH-reachable
+with the service in state `T` for a measured 30-second observation.
+SIGCONT was issued at uptime 281.41 s; ramoops recorded SError `0xbfe7d879`
+at 281.623 s. This strongly implicates the resumed teardown boundary.
+Retain the stopped-state snapshots and exact binary alongside the panic;
+an asynchronous exception still does not identify a unique instruction.

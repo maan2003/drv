@@ -434,6 +434,7 @@ pub struct LinuxVfio {
     ambiguous_irq_indices: HashSet<u32>,
     hash_state: RandomState,
     dma_trace: bool,
+    runtime_trace: Option<fn(&'static str, u64, usize, u64)>,
     prepared_irqs: Option<VecDeque<OwnedFd>>,
 }
 
@@ -522,6 +523,12 @@ impl LinuxVfio {
     /// diagnosis. Disabled by default so production users do not expose IOVAs.
     pub fn enable_dma_trace(&mut self) {
         self.dma_trace = true;
+    }
+
+    /// Diagnostic-only register checkpoints before accesses which may cause
+    /// asynchronous bus errors. Disabled by default.
+    pub fn with_runtime_trace(&mut self, trace: fn(&'static str, u64, usize, u64)) {
+        self.runtime_trace = Some(trace);
     }
 
     /// Query one enumerated region while preserving the ioctl's exact error.
@@ -761,6 +768,7 @@ impl LinuxVfio {
             ambiguous_irq_indices: HashSet::with_hasher(hash_state.clone()),
             hash_state,
             dma_trace: false,
+            runtime_trace: None,
             prepared_irqs,
         }
     }
@@ -785,6 +793,9 @@ impl LinuxVfio {
     fn release_dma_resource(&self, dma: &mut Dma) -> Result<()> {
         match &mut dma.memory {
             DmaMemory::Ioas(mapping) => {
+                if let Some(trace) = self.runtime_trace {
+                    trace("dma_unmap_enter", dma.iova, mapping.len(), 0);
+                }
                 mapping.teardown().map_err(|_| Error::DeviceFault)?;
                 if self.dma_trace {
                     eprintln!(
@@ -957,6 +968,9 @@ impl Backend for LinuxVfio {
     }
 
     fn read_u32(&mut self, region: &u64, offset: usize) -> Result<u32> {
+        if let Some(trace) = self.runtime_trace {
+            trace("mmio_read_enter", *region, offset, 0);
+        }
         let value = self
             .regions
             .get(region)
@@ -968,6 +982,9 @@ impl Backend for LinuxVfio {
     }
 
     fn write_u32(&mut self, region: &u64, offset: usize, value: u32) -> Result<()> {
+        if let Some(trace) = self.runtime_trace {
+            trace("mmio_write_enter", *region, offset, u64::from(value));
+        }
         fence(Ordering::Release);
         self.regions
             .get(region)
