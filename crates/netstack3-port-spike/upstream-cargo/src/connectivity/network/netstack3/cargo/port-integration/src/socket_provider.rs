@@ -851,19 +851,9 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
     ) -> Result<(), RemoteSocketError> {
         let port = NonZeroU16::new(peer.port).ok_or(RemoteSocketError::InvalidState)?;
         if self.v2(handle)?.local.is_none() {
-            let local = match peer.address {
-                RemoteIpAddress::V4(_) => self
-                    .runtime
-                    .borrow()
-                    .ipv4_address()
-                    .map(RemoteIpAddress::V4),
-                RemoteIpAddress::V6(_) => self
-                    .runtime
-                    .borrow()
-                    .ipv6_address()
-                    .map(RemoteIpAddress::V6),
-            };
-            self.bind(handle, local, 0)?;
+            // Let core select the source from the destination route. A configured
+            // Ethernet address must not become the source of a localhost flow.
+            self.bind(handle, None, 0)?;
         }
         let result = match (self.state.borrow().sockets.get(&handle), peer.address) {
             (
@@ -1066,6 +1056,11 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
                 return Err(RemoteSocketError::InvalidState);
             }
             return self.tcp_write(handle, bytes);
+        }
+        // Keep the binding's local-name state in sync with implicit UDP binds.
+        // Otherwise a later connect tries to bind the already-bound core socket.
+        if self.v2(handle)?.local.is_none() {
+            self.bind(handle, None, 0)?;
         }
         match self.state.borrow().sockets.get(&handle) {
             Some(Socket::Udp {

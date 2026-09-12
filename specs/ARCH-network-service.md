@@ -3,7 +3,8 @@
 ## Status
 
 Userspace Wi-Fi and a separately sandboxed Netstack3 service have demonstrated
-Internet connectivity. Applications currently use SOCKS. The independent
+Internet connectivity through both SOCKS and the production-shaped Linux socket
+provider in a VFIO Wi-Fi guest. The independent
 Linux socket-provider spike exercises a deterministic Ethernet peer, but is
 not the production frontend described below: it retains native loopback and
 uses synchronous RPC where native socket buffering and readiness are needed.
@@ -16,9 +17,12 @@ the same binding now accepts a frame-only Ethernet capability and passes
 DHCP, application TCP/HTTP and UDP/DNS against a simulated AP, retaining
 localhost after link loss. The reproducible harness and evidence live in
 [`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).
-This localhost implementation is not yet the continuously integrated Wi-Fi
-service. These tests do not establish broad socket compatibility, hostile-provider
-robustness, or physical-link throughput. Optimized localhost tests exceed
+The same provider has demonstrated WPA3, DHCP, application DNS and verified
+HTTPS through the userspace MT7921 driver in KVM. It is not yet the continuously
+integrated Wi-Fi service. Linux protocol options, notably the error queue required
+by the current glibc resolver, remain unsupported; the guest proof uses an
+application UDP DNS client. These tests do not establish broad socket
+compatibility, hostile-provider robustness, or dependable physical throughput. Optimized localhost tests exceed
 100 MB/s; this is not evidence of Wi-Fi deployment throughput.
 
 The service implementation lives in `drv-network-service`. Its standalone

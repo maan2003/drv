@@ -108,7 +108,7 @@ static void tcp(int family, unsigned short port) {
 static void udp(int family) {
 	struct sockaddr_storage a = addr(family, 23457), source;
 	int server = socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-	int client = socket(family, SOCK_DGRAM, 0);
+	int client = socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	check(server >= 0 && client >= 0, "udp sockets");
 	check(bind(server, (void *)&a, alen(family)) == 0, "udp bind");
 	char b[64]; socklen_t n = sizeof(source);
@@ -121,6 +121,15 @@ static void udp(int family) {
 	wait_event(server, EPOLLIN);
 	check(recv(server, b, 2, MSG_PEEK) == 2 && !memcmp(b,"ab",2), "UDP peek");
 	check(recv(server, b, 2, MSG_TRUNC) == 6, "UDP truncation original length");
+	int enabled = 1;
+	check(setsockopt(client, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+		family == AF_INET ? IP_RECVERR : IPV6_RECVERR, &enabled, sizeof(enabled)) < 0 &&
+		errno == ENOPROTOOPT, "unsupported optional protocol option");
+	check(connect(client, (void *)&a, alen(family)) == 0, "nonblocking UDP connect is immediate");
+	check(send(client, "peer", 4, 0) == 4, "connected UDP send");
+	wait_event(server, EPOLLIN);
+	check(recv(server, b, sizeof(b), 0) == 4 && !memcmp(b, "peer", 4), "connected UDP receive");
+
 	close(client); close(server);
 	printf("PASS UDP family=%d zero-datagram source peek truncation nonblock\n", family); fflush(stdout);
 }

@@ -482,6 +482,7 @@ name = "drv-hardware-backends"
 version = "0.1.0"
 dependencies = [
  "drv-hardware",
+ "linux-self-sandbox",
  "userspace-vfio",
 ]
 
@@ -489,9 +490,11 @@ dependencies = [
 name = "drv-network-service"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "netstack3-port-integration",
  "netstack3-port-spike",
  "rand 0.9.4",
+ "wifi-supervisor-wire",
 ]
 
 [[package]]
@@ -1028,6 +1031,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
+name = "linux-self-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "userspace-vfio",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1149,9 +1160,9 @@ version = "0.1.0"
 dependencies = [
  "drv-hardware",
  "drv-hardware-backends",
+ "linux-self-sandbox",
  "mt7921-core",
  "sha2",
- "userspace-vfio",
  "zeroize",
 ]
 
@@ -2333,6 +2344,10 @@ checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
 ]
+
+[[package]]
+name = "wifi-supervisor-wire"
+version = "0.1.0"
 
 [[package]]
 name = "winapi"

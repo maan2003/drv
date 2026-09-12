@@ -194,8 +194,11 @@ struct Endpoint {
     pending_accept: Option<ProviderAcceptV2>,
     accept_ready: bool,
 }
-pub fn run_provider(ethernet_mac: Option<[u8; 6]>) -> Result<(), String> {
-    // FD3 is the sole provider capability. No IP socket is opened by this process.
+pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<(), String> {
+    if bootstrap && ethernet_mac.is_none() {
+        return Err("bootstrap requires an Ethernet capability".into());
+    }
+    // FD3 owns the socket namespace; optional FD4 owns only Ethernet frames.
     if unsafe { libc::fcntl(3, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
@@ -241,7 +244,8 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>) -> Result<(), String> {
         ));
         None
     };
-    crate::child::provider_setup(ethernet.is_some())?;
+    crate::child::provider_setup(ethernet.is_some(), bootstrap)?;
+    if bootstrap { crate::child::provider_bootstrap_ready()?; }
     eprintln!(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
     );
@@ -266,6 +270,7 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>) -> Result<(), String> {
     let mut pending_frame = None;
     let mut ethernet_active = ethernet.is_some();
     let mut last_network_status = None;
+    let mut bootstrap_pending = bootstrap;
     let mut endpoints: HashMap<u64, Endpoint> = HashMap::new();
     let mut fds: HashMap<u64, Rc<OwnedFd>> = HashMap::new();
     let start = Instant::now();
@@ -511,6 +516,10 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>) -> Result<(), String> {
                     network.runtime().dns_servers()
                 );
                 last_network_status = Some(status);
+            }
+            if bootstrap_pending && status == netstack3_port_integration::service::DhcpStatus::Bound {
+                crate::child::provider_bootstrap_network_ready()?;
+                bootstrap_pending = false;
             }
         }
         let listeners: Vec<_> = endpoints

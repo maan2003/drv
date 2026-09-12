@@ -260,7 +260,8 @@ static int ns3_connect(struct socket *sock, struct sockaddr *addr, int len, int 
 	s->connecting = true;
 	r = ns3_submit(s, NS3_CONNECT, &a, sizeof(a), true, 0);
 	if (IS_ERR(r)) { s->connecting = false; ret = PTR_ERR(r); goto out; }
-	if (flags & O_NONBLOCK) { ret = -EINPROGRESS; goto out; }
+	/* UDP connect configures a peer; it has no transport handshake to defer. */
+	if (sock->type == SOCK_STREAM && flags & O_NONBLOCK) { ret = -EINPROGRESS; goto out; }
 	timeo = sock_sndtimeo(&s->sk, false);
 	ret = wait_event_interruptible_timeout(*sk_sleep(&s->sk),
 			!READ_ONCE(s->connecting) || READ_ONCE(s->dead), timeo);
@@ -507,8 +508,9 @@ static int ns3_release(struct socket *sock)
 static int ns3_setsockopt(struct socket *sock, int level, int opt,
 			  sockptr_t val, unsigned int len)
 {
-	/* Protocol options are deliberately explicit, never silently successful. */
-	return -EOPNOTSUPP;
+	/* Unsupported protocol options use the socket ABI errno; do not claim
+	 * support for options (such as IP_RECVERR) that are not implemented. */
+	return -ENOPROTOOPT;
 }
 #define NS3_OPS(fam) { .family = fam, .owner = THIS_MODULE, \
 	.release = ns3_release, .bind = ns3_bind, .connect = ns3_connect, \

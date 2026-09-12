@@ -1441,10 +1441,10 @@ mod tests {
 // The provider endpoint is opened in the served network namespace before
 // setup creates the child's empty network namespace. Possession of fd 3,
 // not the child's namespace or privilege, authorizes this single session.
-pub(crate) fn provider_setup(ethernet: bool) -> Result<(), String> {
+pub(crate) fn provider_setup(ethernet: bool, bootstrap: bool) -> Result<(), String> {
     unsafe {
         if !ethernet { close(4); }
-        close(5);
+        if !bootstrap { close(5); }
     }
     setup(unsafe { getppid() })?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -1519,4 +1519,21 @@ fn provider_filter(ethernet: bool) -> Vec<SockFilter> {
     }
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     filter
+}
+
+pub(crate) fn provider_bootstrap_ready() -> Result<(), String> {
+    write_all_fd(5, b"READY", "provider bootstrap READY")?;
+    let mut go = [0; 2];
+    read_exact_fd(5, &mut go, "provider bootstrap GO")?;
+    if &go != b"GO" { return Err("invalid provider bootstrap GO".into()); }
+    Ok(())
+}
+
+pub(crate) fn provider_bootstrap_network_ready() -> Result<(), String> {
+    write_all_fd(5, b"NETWORK_READY", "provider network readiness")?;
+    let mut serve = [0; 5];
+    read_exact_fd(5, &mut serve, "provider bootstrap SERVE")?;
+    if &serve != b"SERVE" { return Err("invalid provider bootstrap SERVE".into()); }
+    unsafe { close(5); }
+    Ok(())
 }

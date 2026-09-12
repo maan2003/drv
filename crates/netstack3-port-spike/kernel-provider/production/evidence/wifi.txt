@@ -1,0 +1,85 @@
+MT7921 production socket-provider Wi-Fi guest evidence
+======================================================
+Host: np, physical PCI 0000:05:00.0 (14c3:7961), sole host IOMMU group 19 member.
+Guest: Linux 6.18.40, INET=n, NETSTACK3=y, Q35, Intel virtual IOMMU,
+strict DMA translation and interrupt remapping, two online vCPUs.
+Guest PCI 0000:01:00.0, sole guest IOMMU group 3 member, VFIO cdev/iommufd.
+Control observed during handoff: SSH 172.16.42.1 -> 172.16.42.2 over Redwood USB.
+No guest virtual NIC, NAT, SOCKS frontend or native kernel Internet protocols.
+
+Final uninstrumented maintained runner:
+  /var/lib/poco-linux/redwood/work/socket-provider-kvm/wifi-final-3/serial.log (root-private full trace)
+  /var/lib/wifi-driver-lab/reports/20260913T044702Z-0000_05_00.0.log
+  /var/lib/poco-linux/redwood/work/socket-provider-kvm/wifi-physical-11.log
+Host recovery: RESTORE end failed=0; native-ready + lab idle; watchdog disarmed.
+
+Built artifact SHA-256:
+  kernel:   346be9b7e52f09c1ab4390895fd7c300510de88942ae202594cde85413946ef3
+  provider: 3f109b7a99ad3fc430210ad7f555b1c60ad940d5971a82ecd356af7d7a84a819
+  MT driver:576bb812c007bfe320039238eee8c6d9e6199479226695b71808b0f753d661e2
+  loopback: 5049a2654be4a0d0f51c07534f5635deaf5c44ea8422dd00134349c5fdb2305d
+All builds used existing native np Cargo/make toolchains, not Nix builds.
+
+Verification:
+- 43 service tests pass (one host-gated fixture also run explicitly in the guest).
+- route-source-q35-1: complete maintained KVM suite passes, including localhost
+  with simulated Ethernet/DHCP up and after link loss, socket-generation death/
+  replacement, 16 concurrent streams, IPv4/IPv6 TCP/UDP and 64 MiB transfers.
+- MT signal cleanup regression passes and clean teardown passes on hardware.
+- Full MT full-firmware suite: 156 pass, 19 fail. Exact same 19 failures occur
+  with all five initial changed sources restored to parent 1078ba24: 155 pass,
+  19 fail. The additional passing test is the kernel-provider descriptor audit.
+  Raw mt-baseline-tests.log / mt-final-tests.log remain in the np build area.
+  This suite is NOT green.
+- Direct `cargo test -p netstack3-port-integration` from the service workspace
+  was rejected because it is not a workspace member and needs dev-dependencies.
+  No standalone binding unit-suite pass is claimed; shared changes were exercised
+  through service and full KVM integration tests.
+
+Failures that informed the changes:
+- Physical report 20260913T041428Z: stale old-launcher client MAC rejected before
+  device authority; retained compiled production identity instead of relaxing it.
+- 20260913T041834Z and 042804Z: glibc DNS aborts at IP_RECVERR for EOPNOTSUPP
+  and ENOPROTOOPT alike. The latter is the correct unsupported-option ABI errno,
+  not a glibc compatibility fix.
+- dns-abi-q35-1: UDP sendto implicitly bound core but not wrapper local state;
+  later connect failed EADDRINUSE. Explicit binding now keeps state consistent.
+- 20260913T044149Z: localhost with physical DHCP up failed because wrapper chose
+  the Ethernet source address for all connects. Core now chooses the source via
+  the destination route; the simulated-AP regression and final physical run pass.
+- SIGTERM previously cancelled the cleanup commands themselves. Cancellation
+  remains latched for ordinary work but cannot cancel bounded containment.
+- 20260913T043539Z: 1 MiB HTTPS timed out at 304455 bytes after 20 seconds.
+  The identical 1 MiB probe passed on 043856Z (temporary header-only TCP trace)
+  and on the final uninstrumented run. Native host comparison downloaded 1 MiB
+  in 0.494 seconds. Physical performance/reliability is not established.
+- Two first maintained-launcher attempts failed before VM/device mutation due
+  to missing bash/gzip in the lab's sanitized PATH; adapter PATH corrected,
+  all required tools checked, final maintained runner passed.
+
+Resolver scope:
+Busybox performed actual UDP DNS against the DHCP-advertised server; curl used
+the returned A address with --resolve while validating hostname and CA chain.
+example.com returned the expected page; speed.cloudflare.com returned exactly
+1048576 authenticated TLS bytes. No fixed IP or certificate-verification bypass.
+This does not establish unmodified glibc resolver compatibility, external IPv6,
+all socket options, durable resolver-configuration publication, roaming or
+everyday physical service readiness.
+
+Selected final guest output (no SAE credential/handshake bodies):
+GUEST_MT_IOMMU_GROUP=../../../../kernel/iommu_groups/3 cdev=/dev/vfio/devices/vfio0
+GUEST_DHCP_DNS=172.20.10.1
+PASS_MT_GUEST_LIVE_WIFI_LOCALHOST
+GUEST_APPLICATION_DNS_A=172.66.147.243
+PASS_MT_GUEST_WIFI_DNS_TLS_HTTP
+PASS_MT_GUEST_SECOND_ORIGIN_TLS_1MIB
+netstack_sandbox_fds=true pid=128 descriptors=[("0", "/dev/null"), ("1", "/run/driver.log"), ("2", "/run/driver.log"), ("3", "/dev/netstack3"), ("4", "socket:[38]"), ("5", "socket:[46]"), ("6", "anon_inode:[eventpoll]")] no_device_fds=true no_device_mappings=true
+netstack_sandbox_namespaces=true pid=128 mount=mnt:[4026532070] net=net:[4026532071]
+provider_network_status=Acquiring ipv4=None dns=[None, None]
+provider_network_status=Bound ipv4=Some([172, 20, 10, 6]) dns=[Some(172.20.10.1), None]
+netstack_runtime_fds=true pid=128 descriptors=[("0", "/dev/null"), ("1", "/run/driver.log"), ("2", "/run/driver.log"), ("3", "/dev/netstack3"), ("4", "socket:[38]"), ("6", "anon_inode:[eventpoll]")] bootstrap_closed=true accepted_client_sockets_allowed=true
+{"active_fwdl_event":"transport_quiesced"}
+{"active_mcu_event":"post_reset_safe_state_verified"}
+GUEST_DRIVER_EXIT=0 safety=SAFE
+GUEST_MT_HARDWARE_SAFE
+PASS_MT_GUEST_INTERNET

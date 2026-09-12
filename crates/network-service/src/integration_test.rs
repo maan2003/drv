@@ -814,19 +814,28 @@ fn kernel_provider_ethernet_guest_fixture() {
     let frame_pass = unsafe { libc::fcntl(frame.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     let registration_pass = unsafe { libc::fcntl(registration.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     assert!(frame_pass >= 10 && registration_pass >= 10);
+    let (mut bootstrap, bootstrap_child) = std::os::unix::net::UnixStream::pair().unwrap();
+    bootstrap.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let bootstrap_pass = unsafe { libc::fcntl(bootstrap_child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    assert!(bootstrap_pass >= 10);
     let mut command = std::process::Command::new("/bin/netstack3-provider");
-    command.args(["--ethernet-mac", "02:00:00:00:00:01"]);
+    command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap"]);
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0 {
+            if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0
+                || libc::dup2(bootstrap_pass, 5) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     let mut child = command.spawn().unwrap();
-    unsafe { libc::close(frame_pass); libc::close(registration_pass); }
-    drop((registration, frame));
+    unsafe { libc::close(frame_pass); libc::close(registration_pass); libc::close(bootstrap_pass); }
+    drop((registration, frame, bootstrap_child));
+    let mut ready = [0; 5];
+    bootstrap.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"READY");
+    bootstrap.write_all(b"GO").unwrap();
 
     let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ap_finished = finished.clone();
@@ -874,6 +883,12 @@ fn kernel_provider_ethernet_guest_fixture() {
         }
         assert!(sent);
     });
+    let mut ready = [0; 13];
+    bootstrap.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"NETWORK_READY");
+    bootstrap.write_all(b"SERVE").unwrap();
+    assert_eq!(bootstrap.read(&mut [0; 1]).unwrap(), 0);
+    drop(bootstrap);
     let begin = Instant::now();
     let mut stream = loop {
         match TcpStream::connect((Ipv4Addr::from(SERVER_IP), 8080)) {
@@ -898,6 +913,9 @@ fn kernel_provider_ethernet_guest_fixture() {
     assert_eq!(&response[..2], &[0x12, 0x34]);
     assert_ne!(response[2] & 0x80, 0);
     assert_eq!(&response[n - 4..n], &SERVER_IP);
+    // A configured external address must not steal localhost's source route.
+    assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
+    println!("PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST");
     finished.store(true, std::sync::atomic::Ordering::Release);
     ap_thread.join().unwrap();
     // The Ethernet capability is gone. The same provider must keep serving

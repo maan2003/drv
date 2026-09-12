@@ -428,6 +428,7 @@ extern "C" fn request_stop(_: i32) {
 #[allow(dead_code)]
 struct ActiveSignalGuard {
     previous: [(i32, usize); 3],
+    cleaning_up: std::cell::Cell<bool>,
 }
 #[allow(dead_code)]
 impl ActiveSignalGuard {
@@ -449,10 +450,16 @@ impl ActiveSignalGuard {
             }
             *slot = (number, handler);
         }
-        Ok(Self { previous })
+        Ok(Self { previous, cleaning_up: std::cell::Cell::new(false) })
     }
     fn stop_requested(&self) -> bool {
-        STOP_REQUESTED.load(Ordering::Acquire)
+        !self.cleaning_up.get() && STOP_REQUESTED.load(Ordering::Acquire)
+    }
+
+    fn begin_cleanup(&self) {
+        // Cancellation ends normal work, not the bounded containment transaction.
+        // Keep the request latched, and retain the external watchdog as backstop.
+        self.cleaning_up.set(true);
     }
 }
 impl Drop for ActiveSignalGuard {
@@ -537,11 +544,18 @@ fn poll_network_ready_handshake(
 }
 
 #[cfg(feature = "fuchsia-passive")]
+enum NetworkFrontend {
+    Socks(TcpListener),
+    Kernel(std::fs::File),
+}
+
+#[cfg(feature = "fuchsia-passive")]
 struct NetstackChildGuard {
     child: Child,
     bootstrap: Option<UnixStream>,
     listener: Option<TcpListener>,
     handshake: NetworkReadyHandshake,
+    kernel_provider: bool,
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -554,7 +568,7 @@ impl NetstackChildGuard {
             return Ok(false);
         }
         self.bootstrap = None;
-        audit_netstack_runtime_fds(self.child.id())?;
+        audit_netstack_runtime_fds(self.child.id(), self.kernel_provider)?;
         Ok(true)
     }
 
@@ -684,7 +698,7 @@ fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
+fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)], kernel_provider: bool) -> Result<(), String> {
     if descriptors.len() != 7
         || descriptors
             .iter()
@@ -697,7 +711,12 @@ fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)]) -> 
     }
     for fd in [3usize, 4, 5] {
         let target = &descriptors[fd].1;
-        if !(target.starts_with("socket:[") && target.ends_with(']')) {
+        let valid = if fd == 3 && kernel_provider {
+            target == "/dev/netstack3"
+        } else {
+            target.starts_with("socket:[") && target.ends_with(']')
+        };
+        if !valid {
             return Err(format!(
                 "netstack bootstrap capability has unexpected type: fd={fd} target={target:?}"
             ));
@@ -725,8 +744,7 @@ fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)]) -> 
 #[cfg(feature = "fuchsia-passive")]
 fn spawn_netstack_child(
     device: mt7921_softmac_adapter::ethernet::Mt7921EthernetDevice,
-    listener: TcpListener,
-    listen: SocketAddr,
+    frontend: NetworkFrontend,
     seconds: u64,
 ) -> Result<NetstackChildGuard, String> {
     let binary = env::var("DRV_NETSTACK_BINARY").map_err(|_| "DRV_NETSTACK_BINARY is required")?;
@@ -734,10 +752,14 @@ fn spawn_netstack_child(
     let (bootstrap_parent, bootstrap_child) =
         UnixStream::pair().map_err(|error| format!("create netstack bootstrap pair: {error}"))?;
     let frame_pass = duplicate_capability(frame.as_raw_fd())?;
-    let listener_pass = duplicate_capability(listener.as_raw_fd())?;
+    let kernel_provider = matches!(frontend, NetworkFrontend::Kernel(_));
+    let frontend_pass = duplicate_capability(match &frontend {
+        NetworkFrontend::Socks(listener) => listener.as_raw_fd(),
+        NetworkFrontend::Kernel(registration) => registration.as_raw_fd(),
+    })?;
     let bootstrap_pass = duplicate_capability(bootstrap_child.as_raw_fd())?;
     let frame_fd = frame_pass.as_raw_fd();
-    let listener_fd = listener_pass.as_raw_fd();
+    let frontend_fd = frontend_pass.as_raw_fd();
     let bootstrap_fd = bootstrap_pass.as_raw_fd();
     let mut command = Command::new(binary);
     command
@@ -746,15 +768,30 @@ fn spawn_netstack_child(
             "DRV_SAE_CLIENT_MAC",
             env::var("DRV_SAE_CLIENT_MAC").map_err(|_| "missing client MAC")?,
         )
-        .env("DRV_SOCKS5_LISTEN", listen.to_string())
         .env("DRV_DAEMON_MAX_SECONDS", seconds.to_string())
         .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    match &frontend {
+        NetworkFrontend::Socks(listener) => {
+            command.env("DRV_SOCKS5_LISTEN", listener.local_addr()
+                .map_err(|error| format!("SOCKS listener address: {error}"))?.to_string());
+        }
+        NetworkFrontend::Kernel(_) => {
+            command.args(["--ethernet-mac",
+                &env::var("DRV_SAE_CLIENT_MAC").map_err(|_| "missing client MAC")?,
+                "--bootstrap"]);
+        }
+    }
     unsafe {
         command.pre_exec(move || {
-            for (source, target) in [(frame_fd, 3), (listener_fd, 4), (bootstrap_fd, 5)] {
+            let pass = if kernel_provider {
+                [(frontend_fd, 3), (frame_fd, 4), (bootstrap_fd, 5)]
+            } else {
+                [(frame_fd, 3), (frontend_fd, 4), (bootstrap_fd, 5)]
+            };
+            for (source, target) in pass {
                 if dup2(source, target) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -768,13 +805,17 @@ fn spawn_netstack_child(
     let mut child = NetstackChildGuard {
         child,
         bootstrap: Some(bootstrap_parent),
-        listener: Some(listener),
+        listener: match frontend {
+            NetworkFrontend::Socks(listener) => Some(listener),
+            NetworkFrontend::Kernel(_) => None,
+        },
         handshake: NetworkReadyHandshake::default(),
+        kernel_provider,
     };
     drop((
         frame,
         frame_pass,
-        listener_pass,
+        frontend_pass,
         bootstrap_pass,
         bootstrap_child,
     ));
@@ -804,7 +845,7 @@ fn spawn_netstack_child(
         descriptors.push((name, target));
     }
     descriptors.sort();
-    validate_netstack_bootstrap_descriptors(&descriptors)?;
+    validate_netstack_bootstrap_descriptors(&descriptors, kernel_provider)?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|error| error.to_string())?;
     let maps =
@@ -859,7 +900,7 @@ fn spawn_netstack_child(
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
+fn audit_netstack_runtime_fds(pid: u32, kernel_provider: bool) -> Result<(), String> {
     let fd_dir = format!("/proc/{pid}/fd");
     let mut descriptors = Vec::new();
     for entry in std::fs::read_dir(&fd_dir)
@@ -877,7 +918,7 @@ fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
         ));
     }
     descriptors.sort();
-    validate_netstack_runtime_descriptors(&descriptors)?;
+    validate_netstack_runtime_descriptors(&descriptors, kernel_provider)?;
     println!(
         "netstack_runtime_fds=true pid={pid} descriptors={descriptors:?} bootstrap_closed=true accepted_client_sockets_allowed=true"
     );
@@ -885,7 +926,7 @@ fn audit_netstack_runtime_fds(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Result<(), String> {
+fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)], kernel_provider: bool) -> Result<(), String> {
     let mut base = [false; 5];
     let mut poller = false;
     let mut seen = Vec::new();
@@ -899,7 +940,12 @@ fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Re
         seen.push(fd);
         if fd < base.len() {
             base[fd] = true;
-            if matches!(fd, 3 | 4) && !(target.starts_with("socket:[") && target.ends_with(']')) {
+            let valid = if fd == 3 && kernel_provider {
+                target == "/dev/netstack3"
+            } else {
+                target.starts_with("socket:[") && target.ends_with(']')
+            };
+            if matches!(fd, 3 | 4) && !valid {
                 return Err(format!(
                     "running netstack base capability has unexpected type: fd={fd} target={target:?}"
                 ));
@@ -911,7 +957,11 @@ fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)]) -> Re
                 ));
             }
             poller = true;
-        } else if !(target.starts_with("socket:[") && target.ends_with(']')) {
+        } else if !(if kernel_provider {
+            target == "anon_inode:netstack3-endpoint"
+        } else {
+            target.starts_with("socket:[") && target.ends_with(']')
+        }) {
             return Err(format!(
                 "running netstack has unexpected descriptor: fd={fd} target={target:?}"
             ));
@@ -7379,13 +7429,19 @@ fn run() -> Result<(), String> {
                                     let ethernet_device = client.take_ethernet_device().ok_or(
                                         "controlled-port UP did not publish Ethernet capability",
                                     )?;
-                                    let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
-                                        .map_err(|_| "DRV_SOCKS5_LISTEN is required")?
-                                        .parse()
-                                        .map_err(|_| "DRV_SOCKS5_LISTEN is not a socket address")?;
-                                    if !listen.ip().is_loopback() {
-                                        return Err("DRV_SOCKS5_LISTEN must be loopback".into());
-                                    }
+                                    let frontend = if env::var("DRV_NETSTACK_KERNEL_PROVIDER").as_deref() == Ok("1") {
+                                        NetworkFrontend::Kernel(std::fs::OpenOptions::new()
+                                            .read(true).write(true).open("/dev/netstack3")
+                                            .map_err(|error| format!("open kernel socket registration: {error}"))?)
+                                    } else {
+                                        let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
+                                            .map_err(|_| "DRV_SOCKS5_LISTEN is required")?.parse()
+                                            .map_err(|_| "DRV_SOCKS5_LISTEN is not a socket address")?;
+                                        if !listen.ip().is_loopback() {
+                                            return Err("DRV_SOCKS5_LISTEN must be loopback".into());
+                                        }
+                                        NetworkFrontend::Socks(prebind_socks_listener(listen)?)
+                                    };
                                     let seconds = env::var("DRV_DAEMON_MAX_SECONDS")
                                         .map_or(Ok(360), |value| value.parse::<u64>())
                                         .map_err(|_| "DRV_DAEMON_MAX_SECONDS is not an integer")?;
@@ -7394,15 +7450,11 @@ fn run() -> Result<(), String> {
                                             "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into()
                                         );
                                     }
-                                    let listener = prebind_socks_listener(listen)?;
                                     let mut netstack = spawn_netstack_child(
-                                        ethernet_device,
-                                        listener,
-                                        listen,
-                                        seconds,
+                                        ethernet_device, frontend, seconds,
                                     )?;
                                     record_sae_stage(&format!(
-                                        "internet_proxy_starting=true listen={listen} max_seconds={seconds} process_split=true"
+                                        "internet_proxy_starting=true kernel_provider={} max_seconds={seconds} process_split=true", netstack.kernel_provider
                                     ));
                                     let service_deadline = Instant::now()
                                         + std::time::Duration::from_secs(seconds + 35);
@@ -12727,6 +12779,7 @@ impl FirmwareLoaderTransport for VfioFirmwareLoader<'_> {
 
     fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
         println!(r#"{{"active_fwdl_event":"cleanup_started","state":"{state:?}"}}"#);
+        self.mcu.signal.begin_cleanup();
         let mut errors = Vec::new();
         // The passive boundary always exits through this transaction, whether
         // connect succeeded, failed, reset, or stopped. Disable firmware's BSS
@@ -20553,6 +20606,27 @@ mod tests {
     }
 
     #[test]
+    fn kernel_provider_descriptor_audit_accepts_only_scoped_capabilities() {
+        let base: Vec<_> = [
+            ("0", "/dev/null"), ("1", "/run/log"), ("2", "/run/log"),
+            ("3", "/dev/netstack3"), ("4", "socket:[41]"),
+            ("5", "socket:[42]"), ("6", "anon_inode:[eventpoll]"),
+        ].into_iter().map(|(fd, path)| (fd.to_string(), path.to_string())).collect();
+        validate_netstack_bootstrap_descriptors(&base, true).unwrap();
+        assert!(validate_netstack_bootstrap_descriptors(&base, false).is_err());
+        let mut running = base.clone();
+        running[5].1 = "anon_inode:netstack3-endpoint".into();
+        validate_netstack_runtime_descriptors(&running, true).unwrap();
+        running[5].1 = "socket:[99]".into();
+        assert!(validate_netstack_runtime_descriptors(&running, true).is_err());
+        running[5].1 = "/dev/vfio/devices/vfio0".into();
+        assert!(validate_netstack_runtime_descriptors(&running, true).is_err());
+        let mut bad = base;
+        bad[3].1 = "/dev/iommu".into();
+        assert!(validate_netstack_bootstrap_descriptors(&bad, true).is_err());
+    }
+
+    #[test]
     fn bootstrap_fd_audit_accepts_only_remapped_capabilities_and_child_poller() {
         let descriptors = vec![
             ("0".into(), "/dev/null".into()),
@@ -20563,23 +20637,23 @@ mod tests {
             ("5".into(), "socket:[5]".into()),
             ("6".into(), "anon_inode:[eventpoll]".into()),
         ];
-        validate_netstack_bootstrap_descriptors(&descriptors).unwrap();
+        validate_netstack_bootstrap_descriptors(&descriptors, false).unwrap();
 
         let mut unexpected = descriptors.clone();
         unexpected.push(("7".into(), "socket:[7]".into()));
-        assert!(validate_netstack_bootstrap_descriptors(&unexpected).is_err());
+        assert!(validate_netstack_bootstrap_descriptors(&unexpected, false).is_err());
 
         let mut missing = descriptors.clone();
         missing.remove(5);
-        assert!(validate_netstack_bootstrap_descriptors(&missing).is_err());
+        assert!(validate_netstack_bootstrap_descriptors(&missing, false).is_err());
 
         let mut wrong_poller = descriptors.clone();
         wrong_poller[6].1 = "anon_inode:[eventfd]".into();
-        assert!(validate_netstack_bootstrap_descriptors(&wrong_poller).is_err());
+        assert!(validate_netstack_bootstrap_descriptors(&wrong_poller, false).is_err());
 
         let mut wrong_capability = descriptors;
         wrong_capability[3].1 = "/dev/vfio/1".into();
-        assert!(validate_netstack_bootstrap_descriptors(&wrong_capability).is_err());
+        assert!(validate_netstack_bootstrap_descriptors(&wrong_capability, false).is_err());
     }
 
     #[test]
@@ -20592,24 +20666,24 @@ mod tests {
             ("4".into(), "socket:[4]".into()),
             ("6".into(), "anon_inode:[eventpoll]".into()),
         ];
-        validate_netstack_runtime_descriptors(&descriptors).unwrap();
+        validate_netstack_runtime_descriptors(&descriptors, false).unwrap();
 
         let mut clients = descriptors.clone();
         clients.push(("5".into(), "socket:[5]".into()));
         clients.push(("7".into(), "socket:[7]".into()));
-        validate_netstack_runtime_descriptors(&clients).unwrap();
+        validate_netstack_runtime_descriptors(&clients, false).unwrap();
 
         let mut missing_poller = descriptors.clone();
         missing_poller.pop();
-        assert!(validate_netstack_runtime_descriptors(&missing_poller).is_err());
+        assert!(validate_netstack_runtime_descriptors(&missing_poller, false).is_err());
 
         let mut wrong_poller = descriptors.clone();
         wrong_poller[5].1 = "anon_inode:[eventfd]".into();
-        assert!(validate_netstack_runtime_descriptors(&wrong_poller).is_err());
+        assert!(validate_netstack_runtime_descriptors(&wrong_poller, false).is_err());
 
         let mut nonsocket_extra = descriptors;
         nonsocket_extra.push(("7".into(), "/dev/vfio/1".into()));
-        assert!(validate_netstack_runtime_descriptors(&nonsocket_extra).is_err());
+        assert!(validate_netstack_runtime_descriptors(&nonsocket_extra, false).is_err());
     }
 
     #[test]
@@ -20676,9 +20750,9 @@ mod tests {
         ];
         descriptors.push(("5".into(), accepted_target));
         descriptors.push(("6".into(), "anon_inode:[eventpoll]".into()));
-        validate_netstack_runtime_descriptors(&descriptors).unwrap();
+        validate_netstack_runtime_descriptors(&descriptors, false).unwrap();
         descriptors.push(("7".into(), "/dev/vfio/1".into()));
-        assert!(validate_netstack_runtime_descriptors(&descriptors).is_err());
+        assert!(validate_netstack_runtime_descriptors(&descriptors, false).is_err());
 
         drop((accepted, client, child_listener));
     }
@@ -24249,10 +24323,17 @@ mod tests {
 
     #[test]
     fn active_signal_handler_requests_bounded_cleanup() {
-        STOP_REQUESTED.store(false, Ordering::Release);
+        let guard = ActiveSignalGuard::install().unwrap();
+        assert!(!guard.stop_requested());
         request_stop(SIGTERM);
+        assert!(guard.stop_requested());
+        guard.begin_cleanup();
+        assert!(!guard.stop_requested());
+        request_stop(SIGTERM);
+        assert!(!guard.stop_requested());
         assert!(STOP_REQUESTED.load(Ordering::Acquire));
-        STOP_REQUESTED.store(false, Ordering::Release);
+        drop(guard);
+        assert!(!STOP_REQUESTED.load(Ordering::Acquire));
     }
 
     #[test]

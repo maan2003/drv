@@ -189,7 +189,7 @@ copied into the implementation.
 
 ## Remaining limits
 
-This remains a localhost milestone, not deployment readiness:
+This remains an integration milestone, not deployment readiness:
 - Bind/listen/name controls use synchronous completion with a 10-second
   deadline. Cancellation terminates the affected socket instead of supporting
   reusable canceled operations. Concurrent controls on one socket serialize.
@@ -200,8 +200,8 @@ This remains a localhost milestone, not deployment readiness:
   concurrent lifetime testing and hostile-provider fuzzing are not established.
 - Localhost throughput exceeds 100 MB/s in the retained optimized KVM tests.
   Deployment throughput, CPU/power and physical-link performance remain unproved.
-- Ethernet capability integration is tested against a simulated AP, not MT7921.
-  The guest kernel is not a hardened deployment configuration. Earlier captures
+- Ethernet capability integration is tested against both a simulated AP and
+  MT7921 passthrough. The guest kernel is not a hardened deployment configuration. Earlier captures
   had only one online CPU; the Q35/ACPI guest enables both requested vCPUs.
 
 ## Reproduce
@@ -253,3 +253,80 @@ first `loopback-test` invocation with `loopback-test bench` (8 MiB per direction
 The maintained suite also runs `bench-long` (64 MiB per direction).
 Apply the comparison patch to a disposable installed kernel tree with `patch -p1`
 and rebuild to reproduce socket-file measurements; never apply it to production.
+
+## MT7921 Wi-Fi guest
+
+`wifi-guest-init` and `run-wifi-kvm.sh` exercise the same provider over a physical
+frame capability: host VFIO → Q35/Intel virtual IOMMU → guest VFIO cdev →
+userspace MT7921 → sandboxed Netstack3 → native application socket queues.
+There is no virtual NIC, host NAT, SOCKS listener, or native guest INET stack.
+The MT launcher selects this frontend with `DRV_NETSTACK_KERNEL_PROVIDER=1`;
+registration/frame/bootstrap capabilities are FD3/FD4/FD5. `--bootstrap` on
+the provider reuses READY/GO and NETWORK_READY/SERVE so the driver can audit
+descriptors and sandbox state before serving. Device authority never enters
+Netstack3.
+
+The maintained guest is deliberately the existing **np/ajay/channel-149** lab
+fixture, using the production driver's compiled native client identity. Supply
+the current scanned BSSID, not an old launcher value. It checks the guest's sole
+MT IOMMU-group member, DHCP, IPv4/IPv6 localhost with the external link up, an
+application DNS query, certificate-verified HTTPS, a second origin's 1 MiB
+download, clean driver exit and hardware-safe teardown. Physical throughput is
+variable; this is connectivity evidence, not everyday-service acceptance.
+See [retained results and limitations](evidence/wifi.txt).
+
+### Stage and invoke under the existing lab safety owner
+
+In addition to the ordinary guest root, stage:
+- `mt7921-passive-scan`, built natively with `--no-default-features --features
+  fuchsia-passive,full-firmware-production`, as `/bin/mt7921-passive-scan`;
+- curl, Busybox with `nslookup`, their transitive ELF dependencies, and
+  `/etc/ssl/certs/ca-certificates.crt`;
+- the driver's pinned compressed MT7961 patch/RAM files under
+  `/run/current-system/firmware/mediatek`, plus `zstdcat` and `sha256sum` under
+  `/run/current-system/sw/bin`.
+
+Use the checked-in kernel configuration, including `CONFIG_FW_CFG_SYSFS=y`.
+The runner is a **command of `wifi-driver-lab`**, not a replacement for that
+host safety/recovery owner. Its root launcher supplies the existing unlinked,
+root-owned mode-0600 credential FD3 and bounded regulatory-snapshot FD4.
+No credential is placed in the initrd, repository, command line or log.
+QEMU fw_cfg carries these bytes into the trusted guest launcher; the sandboxed
+network process cannot access that filesystem.
+
+Inside the lab-owned command, with native QEMU/cpio/gzip and core tools in PATH:
+
+```sh
+export DRV_SAE_BSSID=... # current native scan, channel 149, SSID ajay
+./run-wifi-kvm.sh "$BZIMAGE" "$WIFI_ROOT" "$NEW_PRIVATE_OUTPUT_DIRECTORY"
+```
+
+Keep the actual host reboot watchdog armed. The runner requires over 80 seconds
+of lease remaining and limits QEMU to 75 seconds. The lab's command deadline must
+cover that interval. It exports the *actual* watchdog status snapshot through
+fw_cfg and marks the host safety ledger MUTATED before QEMU starts. Only normal
+QEMU exit plus the guest's post-driver SAFE marker permits native rebind; failed
+containment leaves the lab ledger quarantined and watchdog armed. Keep reports
+root-private. After lab restoration, wait for asynchronous native netdev creation,
+restore its original name if necessary, wait for the iwd scan/connect operation,
+and verify native connectivity plus lab idleness before disarming. Do not stop
+iwd between observing and renaming its managed netdev: that deletes/recreates it.
+
+Control SSH must remain independent of the assigned MT7921. The tested control
+path was Redwood's own Wi-Fi → restricted reverse SSH on devbox →
+Redwood USB → np. Verify the np SSH connection is from 172.16.42.1 to
+172.16.42.2 before handing off the device. No native runtime fallback is added
+to the guest by the host's lab recovery.
+
+### Resolver compatibility is not faked
+
+Unsupported protocol options return `ENOPROTOOPT`. Current glibc nonetheless
+requires successful `IP_RECVERR` setup and aborts resolution without it.
+Netstack3's pending datagram-error notification is not a Linux extended-error
+queue; the binding does not pretend otherwise. The acceptance test therefore
+uses Busybox's actual UDP DNS query and passes the returned A address to curl's
+`--resolve`; TLS still validates the original hostname and CA chain. This is
+not evidence that arbitrary glibc-resolving applications work unchanged.
+Durable DNS configuration publication and the owned userspace resolver boundary
+remain integration work; parsing the provider's DHCP diagnostic is test-fixture
+plumbing, not the production configuration API.

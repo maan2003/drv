@@ -1,0 +1,93 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+set -eu
+finish() {
+    if test -n "${driver-}"; then
+        kill -TERM "$driver" 2>/dev/null || true
+        wait "$driver" 2>/dev/null || true
+    fi
+    echo GUEST_WIFI_FAILURE
+    cat /run/driver.log 2>/dev/null || true
+    if test "$(cat /run/driver.safety 2>/dev/null)" = SAFE; then echo GUEST_MT_HARDWARE_SAFE; fi
+    reboot -f
+}
+trap finish EXIT
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
+fw=/sys/firmware/qemu_fw_cfg/by_name
+/bin/curl --version | head -1
+/run/current-system/sw/bin/zstdcat /run/current-system/firmware/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin.zst | sha256sum
+device=/sys/bus/pci/devices/0000:01:00.0
+test "$(cat "$device/vendor")" = 0x14c3
+test "$(cat "$device/device")" = 0x7961
+test "$(ls "$device/iommu_group/devices" | wc -l)" = 1
+echo vfio-pci > "$device/driver_override"
+echo 0000:01:00.0 > /sys/bus/pci/drivers_probe
+test -e /dev/iommu
+vfio=$(ls /dev/vfio/devices/vfio*)
+test -c "$vfio"
+echo "GUEST_MT_IOMMU_GROUP=$(readlink "$device/iommu_group") cdev=$vfio"
+printf 'SAFE\n' >/run/driver.safety
+export DRV_PCI_BDF=0000:01:00.0
+export DRV_IOMMU_GROUP=$(basename "$(readlink "$device/iommu_group")")
+export DRV_VFIO_DEVICE="$vfio" DRV_LAB_SAFETY_STATE=/run/driver.safety
+export DRV_ACTIVE_CLIENT=1 DRV_NETSTACK_KERNEL_PROVIDER=1
+export DRV_SAE_BSSID=$(cat "$fw/opt/drv-bssid/raw")
+export DRV_SAE_CHANNEL=149 DRV_SAE_SSID=ajay DRV_SAE_CLIENT_MAC=da:61:40:51:27:e8
+export DRV_SAE_CREDENTIAL_FD=3 DRV_SAE_CREDENTIAL_LEN=$(wc -c < "$fw/opt/drv-credential/raw")
+export DRV_REGULATORY_SNAPSHOT_FD=4 DRV_REGULATORY_SNAPSHOT_LEN=$(wc -c < "$fw/opt/drv-regulatory/raw")
+export DRV_REGULATORY_SOURCE_SHA256=2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b
+export DRV_NETSTACK_BINARY=/bin/netstack3-provider DRV_DAEMON_MAX_SECONDS=30
+/bin/mt7921-passive-scan --run-one-shot-sae-auth 3<"$fw/opt/drv-credential/raw" 4<"$fw/opt/drv-regulatory/raw" >/run/driver.log 2>&1 &
+driver=$!
+ready=false
+for i in $(seq 1 500); do
+    if grep -q 'provider_network_status=Bound' /run/driver.log; then ready=true; break; fi
+    if ! kill -0 "$driver" 2>/dev/null; then break; fi
+    sleep .1
+done
+result=1
+if $ready; then
+    dns=$(sed -n 's/.* dns=\[Some(\([^)]*\)).*/\1/p' /run/driver.log | head -1)
+    test -n "$dns"
+    printf 'nameserver %s\n' "$dns" >/etc/resolv.conf
+    printf 'hosts: files dns\n' >/etc/nsswitch.conf
+    echo "GUEST_DHCP_DNS=$dns"
+    /bin/loopback-test
+    echo PASS_MT_GUEST_LIVE_WIFI_LOCALHOST
+    /bin/busybox nslookup -type=A example.com "$dns" >/run/dns.log 2>&1
+    cat /run/dns.log
+    address=$(awk '/^Name:/ {answer=1} answer && /^Address: / && $2 ~ /^[0-9]+\./ {print $2; exit}' /run/dns.log)
+    test -n "$address"
+    echo "GUEST_APPLICATION_DNS_A=$address"
+    if /bin/curl --resolve "example.com:443:$address" --noproxy '*' --http1.1 --fail --show-error --connect-timeout 5 --max-time 10 \
+       https://example.com/ -o /run/example.html &&
+       grep -q 'Example Domain' /run/example.html; then
+       echo PASS_MT_GUEST_WIFI_DNS_TLS_HTTP
+       /bin/busybox nslookup -type=A speed.cloudflare.com "$dns" >/run/download-dns.log 2>&1
+       cat /run/download-dns.log
+       download_address=$(awk '/^Name:/ {answer=1} answer && /^Address: / && $2 ~ /^[0-9]+\./ {print $2; exit}' /run/download-dns.log)
+       if test -n "$download_address" &&
+          /bin/curl --resolve "speed.cloudflare.com:443:$download_address" --noproxy '*' --http1.1             --fail --show-error --connect-timeout 5 --max-time 20             'https://speed.cloudflare.com/__down?bytes=1048576' -o /run/download &&
+          test "$(wc -c </run/download)" = 1048576; then
+          echo PASS_MT_GUEST_SECOND_ORIGIN_TLS_1MIB
+          result=0
+       fi
+    fi
+fi
+kill -TERM "$driver" 2>/dev/null || true
+set +e
+wait "$driver"
+driver_rc=$?
+set -e
+cat /run/driver.log
+echo "GUEST_DRIVER_EXIT=$driver_rc safety=$(cat /run/driver.safety)"
+test "$(cat /run/driver.safety)" = SAFE
+echo GUEST_MT_HARDWARE_SAFE
+test "$result" = 0
+test "$driver_rc" = 0
+echo PASS_MT_GUEST_INTERNET
+trap - EXIT
+reboot -f
