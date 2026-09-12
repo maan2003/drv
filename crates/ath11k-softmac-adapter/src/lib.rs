@@ -783,7 +783,13 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         })
     }
     fn query_discovery_support(&mut self) -> Result<DiscoverySupport, zx::Status> {
-        Ok(Default::default())
+        Ok(DiscoverySupport {
+            scan_offload: Some(fidl_fuchsia_wlan_softmac::ScanOffloadExtension {
+                supported: Some(true),
+                scan_cancel_supported: Some(true),
+            }),
+            ..Default::default()
+        })
     }
     fn query_mac_sublayer_support(&mut self) -> Result<MacSublayerSupport, zx::Status> {
         Ok(Default::default())
@@ -1327,6 +1333,14 @@ mod tests {
     use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
 
     const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
+
+    #[test]
+    fn advertises_implemented_scan_offload_and_cancel() {
+        let mut device = Ath11kClientDevice::deterministic(CLIENT);
+        let scan = device.query_discovery_support().unwrap().scan_offload.unwrap();
+        assert_eq!(scan.supported, Some(true));
+        assert_eq!(scan.scan_cancel_supported, Some(true));
+    }
 
     struct NoopUpcalls;
     impl WlanSoftmacUpcalls for NoopUpcalls {
