@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 #include <sys/socket.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
 #include <arpa/inet.h>
@@ -174,8 +175,11 @@ static void refused(int family) {
     int error = 0; socklen_t size = sizeof(error);
     check(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == ECONNREFUSED, "refused SO_ERROR");
     check(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0, "SO_ERROR clears");
+    struct pollfd terminal = {.fd=fd, .events=POLLOUT};
+    check(poll(&terminal, 1, 0) == 1 && (terminal.revents & POLLOUT) &&
+          (terminal.revents & POLLHUP), "failed connect remains ready after SO_ERROR consumption");
     close(fd);
-    printf("PASS REFUSED family=%d SO_ERROR clears\n", family);
+    printf("PASS REFUSED family=%d SO_ERROR clears terminal readiness retained\n", family);
 }
 
 /* Linux adds MSG_BATCH internally for all but the last sendmmsg element.

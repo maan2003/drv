@@ -61,7 +61,9 @@ metadata, result, request-retirement or wake publication. A TCP connection
 outcome is correlated separately from its acknowledgement and retained separately
 from consume-on-read errors. `ConnectAttempt` owns acknowledgement/outcome and
 waiter attachment transitions; a completed but unclaimed attempt cannot be
-replaced by another caller. TX seals count TCP bytes or UDP records including
+replaced by another caller. Failed attempts retain poll readiness after SO_ERROR
+consumption; interrupted waits claim already-committed outcomes before detaching.
+TX seals count TCP bytes or UDP records including
 empty datagrams. Datagram destinations are fixed at app admission.
 
 `linux.rs`/`rust_main.rs` isolate native references and iterator callbacks.
@@ -102,7 +104,7 @@ for OpenSSH application acceptance.
 
 [evidence.txt](evidence.txt) records ABI6 native and KVM acceptance before the
 historical ABI5 capture. Core tests: 36 passed. Service tests: 49 passed serially.
-KVM covers both connection-transition KUnit tests, endpoint ownership/quotas,
+KVM covers four connection-transition KUnit tests, endpoint ownership/quotas,
 shared-FD waits and wake-flood deadlines, TCP/UDP v4/v6, DHCP/DNS/NSS,
 provider replacement and absence. Private no-login overlay OpenSSH passes PTY
 and exact random 8MiB, 8MiB and 64MiB roundtrips.

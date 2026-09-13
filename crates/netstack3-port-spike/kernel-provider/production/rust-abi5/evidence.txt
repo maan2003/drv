@@ -1,3 +1,29 @@
+Focused connection-lifecycle follow-up, 2026-09-13
+Fresh advisor adv-8ecy inspected current connection lifecycle (not migration diff).
+Two confirmed issues corrected: failed asynchronous connect readiness survives
+SO_ERROR consumption; an outcome committed before wait-lock reacquisition wins
+over timeout/signal. ConnectAttempt owns both retained failure and finish_wait.
+
+The new v4/v6 syscall regression FAILS against previous kernel #17:
+FAIL failed connect remains ready after SO_ERROR consumption
+The corrected kernel #18 passes full lock-debug no-INET KVM:
+  ns3_connection_attempt: pass:4 fail:0 skip:0 total:4
+  PASS REFUSED family=2 SO_ERROR clears terminal readiness retained
+  PASS REFUSED family=10 SO_ERROR clears terminal readiness retained
+  PASS_KVM_PRODUCTION_LOOPBACK
+Run: /var/lib/poco-linux/redwood/work/socket-provider-kvm/rust-abi5/connect-fix-kvm
+Four KUnit tests include deterministic transition-order success/refusal vs
+timeout/signal, and retained/replaced terminal readiness. This is state-transition
+coverage, not a deterministic scheduler-level syscall race injection.
+Advisor inspected and approved focused fixes; primary agent ran verification.
+Private-overlay acceptance below was on #17, not rerun for this focused fix.
+
+Latest artifacts:
+1d87ab44143ab9111bfb9eb993afa385fff9aed405216a741bb6e4192af8941f  /var/lib/poco-linux/redwood/work/socket-provider-kvm/rust-abi5/linux-7.3-rc2/arch/x86/boot/bzImage
+057bcd7f6fb2e318ac4cfa885e0c8423d367805cb8237b947c639ac46d4ae328  /var/lib/poco-linux/redwood/work/socket-provider-kvm/rust-abi5/root/bin/loopback-test
+
+---------------- Architecture acceptance before focused follow-up ----------------
+
 Owned socket / ABI6 acceptance, np, 2026-09-13
 Native Cargo/GCC/plain make only, no Nix builds or host kernel installation.
 Linux 7.3-rc2 build #17; Rust 1.97.0; GCC 15.2.0.

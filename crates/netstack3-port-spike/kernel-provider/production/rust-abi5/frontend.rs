@@ -421,9 +421,16 @@ impl Socket {
                 return result.map(|_| ());
             }
             if let Err(error) = self.wait(&mut s, &timeout) {
-                s.attempt.as_mut().ok_or(EPROTO)?.detach(id)?;
+                if !self.alive(&s) {
+                    return Err(ENETDOWN);
+                }
+                let result = s
+                    .attempt
+                    .as_mut()
+                    .ok_or(EPROTO)?
+                    .finish_wait(id, if error == EAGAIN { EINPROGRESS } else { error });
                 self.wake();
-                return Err(if error == EAGAIN { EINPROGRESS } else { error });
+                return result.map(|_| ());
             }
         }
     }
@@ -677,6 +684,11 @@ impl Socket {
         }
         if !alive {
             mask |= b::POLLHUP
+        }
+        // SO_ERROR is consumable by another caller; terminal connect readiness
+        // belongs to the retained attempt, not the native error slot.
+        if alive && self.kind == 1 && s.attempt.as_ref().is_some_and(ConnectAttempt::failed) {
+            mask |= b::POLLOUT | b::POLLWRNORM | b::POLLHUP;
         }
         if !s.rx.is_empty() || s.eof || !s.accepted.is_empty() || s.shutdown & 1 != 0 {
             mask |= b::POLLIN | b::POLLRDNORM

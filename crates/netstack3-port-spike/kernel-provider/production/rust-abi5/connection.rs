@@ -42,6 +42,9 @@ impl ConnectAttempt {
     pub(crate) fn pending(&self) -> bool {
         !matches!(self.phase, Phase::Complete(_))
     }
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self.phase, Phase::Complete(Err(_)))
+    }
     pub(crate) fn blocks_replacement(&self) -> bool {
         self.pending() || matches!(self.waiter, Waiter::Attached)
     }
@@ -75,12 +78,12 @@ impl ConnectAttempt {
             _ => Ok(None),
         }
     }
-    pub(crate) fn detach(&mut self, id: u64) -> Result {
-        if id != self.id {
-            return Err(EPROTO);
-        }
+    /// Finish an interrupted wait under the reacquired socket lock. An outcome
+    /// committed before reacquisition wins; detachment must never discard it.
+    pub(crate) fn finish_wait(&mut self, id: u64, error: Error) -> Result<Names> {
+        let completed = self.claim(id)?;
         self.waiter = Waiter::Detached;
-        Ok(())
+        completed.unwrap_or(Err(error))
     }
 }
 
@@ -109,7 +112,10 @@ mod tests {
     fn detached_attempt_retains_correlation_until_complete() {
         let mut slot = None;
         ConnectAttempt::begin(&mut slot, 1, true).unwrap();
-        slot.as_mut().unwrap().detach(1).unwrap();
+        assert!(matches!(
+            slot.as_mut().unwrap().finish_wait(1, EINPROGRESS),
+            Err(EINPROGRESS)
+        ));
         assert_eq!(ConnectAttempt::begin(&mut slot, 2, false), Err(EALREADY));
         let names = Names {
             local: Address::default(),
@@ -123,5 +129,57 @@ mod tests {
         slot.as_mut().unwrap().complete(1, Ok(names)).unwrap();
         assert_eq!(slot.as_mut().unwrap().complete(1, Ok(names)), Err(EPROTO));
         ConnectAttempt::begin(&mut slot, 2, false).unwrap();
+    }
+    #[test]
+    fn committed_outcome_wins_interrupted_wait_reacquisition() {
+        for interruption in [EINPROGRESS, ERESTARTSYS] {
+            for refused in [false, true] {
+                let mut slot = None;
+                ConnectAttempt::begin(&mut slot, 1, true).unwrap();
+                let names = Names {
+                    local: Address::default(),
+                    peer: Address::default(),
+                };
+                slot.as_mut()
+                    .unwrap()
+                    .acknowledge(1, true, Ok(names))
+                    .unwrap();
+                // Sleep has ended but its caller has not reacquired the lock.
+                // The provider commits first; SO_ERROR is independent of this owner.
+                slot.as_mut()
+                    .unwrap()
+                    .complete(
+                        1,
+                        if refused {
+                            Err(ECONNREFUSED)
+                        } else {
+                            Ok(names)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(ConnectAttempt::begin(&mut slot, 2, false), Err(EALREADY));
+                let result = slot.as_mut().unwrap().finish_wait(1, interruption);
+                if refused {
+                    assert!(matches!(result, Err(ECONNREFUSED)));
+                } else {
+                    assert!(result.is_ok());
+                }
+                ConnectAttempt::begin(&mut slot, 2, false).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn terminal_failure_survives_claim_until_replaced() {
+        let mut slot = None;
+        ConnectAttempt::begin(&mut slot, 1, true).unwrap();
+        slot.as_mut()
+            .unwrap()
+            .acknowledge(1, true, Err(ECONNREFUSED))
+            .unwrap();
+        assert!(slot.as_ref().unwrap().failed());
+        slot.as_mut().unwrap().claim(1).unwrap();
+        assert!(slot.as_ref().unwrap().failed());
+        ConnectAttempt::begin(&mut slot, 2, false).unwrap();
+        assert!(!slot.as_ref().unwrap().failed());
     }
 }
