@@ -3,19 +3,12 @@
 //! ABI is defined by kernel-provider/production/protocol.h.
 //! Linux registration, sandboxing and service scheduling live in provider.rs.
 #![forbid(unsafe_code)]
-use netstack3_port_integration::socket_provider::NativeSocketProvider;
-use netstack3_port_spike::provider_dispatch_v2::{
-    ProviderAcceptV2, RemoteSocketProviderV2 as Provider,
-};
-use netstack3_port_spike::provider_transport_v2::{
-    ProviderNameV2, ProviderReadinessV2 as Ready, ProviderShutdownV2,
-    ProviderSocketAddressV2 as Address, ProviderSocketKindV2,
-};
-use netstack3_port_spike::{
-    RemoteIpAddress, RemoteIpVersion, RemoteSocketError as Error, RemoteSocketHandle,
-    SocketClientId,
+use netstack3_port_integration::{
+    NativeIpAddress as Ip, NativeSocketAddress as Address, RuntimeError as Error, TcpShutdown,
+    sockets::{Connection, IpVersion, Sockets, TcpListener, TcpSocket, UdpSocket},
 };
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
@@ -120,7 +113,7 @@ impl Message {
 fn errno(e: Error) -> u32 {
     (match e {
         Error::WouldBlock => libc::EAGAIN,
-        Error::InProgress => libc::EINPROGRESS,
+        Error::ConnectionPending => libc::EINPROGRESS,
         Error::ConnectionRefused => libc::ECONNREFUSED,
         Error::TimedOut => libc::ETIMEDOUT,
         Error::NetworkUnreachable => libc::ENETUNREACH,
@@ -129,9 +122,9 @@ fn errno(e: Error) -> u32 {
         Error::AlreadyConnected => libc::EISCONN,
         Error::NotSupported => libc::EOPNOTSUPP,
         Error::PayloadTooLarge => libc::EMSGSIZE,
-        Error::QuotaExceeded | Error::ResourceExhausted => libc::ENOBUFS,
+        Error::SocketLimit => libc::ENOBUFS,
         Error::PermissionDenied => libc::EACCES,
-        Error::StaleHandle | Error::UnknownClient => libc::EBADF,
+        Error::UnknownSocket => libc::EBADF,
         _ => libc::EINVAL,
     }) as u32
 }
@@ -143,9 +136,9 @@ fn address(b: &[u8]) -> Result<Option<Address>, Error> {
     let port = u16::from_le_bytes(b[2..4].try_into().unwrap());
     let ip = match family {
         0 => return Ok(None),
-        4 => RemoteIpAddress::V4(b[4..8].try_into().unwrap()),
-        6 => RemoteIpAddress::V6(b[4..20].try_into().unwrap()),
-        _ => return Err(Error::AddressFamilyMismatch),
+        4 => Ip::V4(b[4..8].try_into().unwrap()),
+        6 => Ip::V6(b[4..20].try_into().unwrap()),
+        _ => return Err(Error::InvalidAddress),
     };
     Ok(Some(Address { address: ip, port }))
 }
@@ -153,11 +146,11 @@ fn encode_address(a: &Address) -> Vec<u8> {
     let mut b = vec![0; 24];
     b[2..4].copy_from_slice(&a.port.to_le_bytes());
     match a.address {
-        RemoteIpAddress::V4(ip) => {
+        Ip::V4(ip) => {
             b[0] = 4;
             b[4..8].copy_from_slice(&ip);
         }
-        RemoteIpAddress::V6(ip) => {
+        Ip::V6(ip) => {
             b[0] = 6;
             b[4..20].copy_from_slice(&ip);
         }
@@ -177,16 +170,40 @@ trait SendTaskOps {
     fn send(&mut self, peer: Option<Address>, bytes: &[u8]) -> Result<usize, Error>;
     fn finish(&mut self, admitted: &[u8]) -> Result<(), Error>;
 }
-struct SocketOps<'a> {
-    provider: &'a mut NativeSocketProvider,
-    handle: RemoteSocketHandle,
+enum Socket {
+    Tcp(TcpSocket),
+    Listener(TcpListener),
+    Udp(UdpSocket),
 }
-impl SendTaskOps for SocketOps<'_> {
+impl Socket {
+    fn info(&self) -> Result<netstack3_port_integration::NativeSocketInfo, Error> {
+        match self {
+            Self::Tcp(s) => s.info(),
+            Self::Listener(s) => s.info(),
+            Self::Udp(s) => s.info(),
+        }
+    }
+    fn shutdown(&mut self, how: TcpShutdown) -> Result<(), Error> {
+        match self {
+            Self::Tcp(s) => s.shutdown(how),
+            Self::Udp(s) => s.shutdown(how),
+            Self::Listener(_) => Err(Error::InvalidState),
+        }
+    }
+}
+impl SendTaskOps for Socket {
     fn send(&mut self, peer: Option<Address>, bytes: &[u8]) -> Result<usize, Error> {
-        Provider::send_msg(self.provider, self.handle, 0, peer, bytes)
+        match self {
+            Self::Tcp(s) => s.write(bytes),
+            Self::Udp(s) => s.send(peer, bytes).map(|()| bytes.len()),
+            Self::Listener(_) => Err(Error::InvalidState),
+        }
     }
     fn finish(&mut self, admitted: &[u8]) -> Result<(), Error> {
-        self.provider.finish_tcp_send(self.handle, admitted)
+        match self {
+            Self::Tcp(s) => s.finish_write(admitted),
+            _ => Err(Error::InvalidState),
+        }
     }
 }
 struct PendingSend {
@@ -270,25 +287,40 @@ impl ReceiveTask {
         self.credits += count;
         Ok(())
     }
-    fn poll(
-        &mut self,
-        provider: &mut NativeSocketProvider,
-        handle: RemoteSocketHandle,
-        fd: &Rc<OwnedFd>,
-        id: u64,
-    ) -> Result<bool, String> {
+    fn poll(&mut self, socket: &mut Socket, fd: &Rc<OwnedFd>, id: u64) -> Result<bool, String> {
         if self.ended || self.credits == 0 {
             return Ok(false);
         }
-        let result = Provider::recv_msg(provider, handle, PAYLOAD as u32, 0);
+        let result = (|| -> Result<Option<(Option<Address>, Vec<u8>)>, Error> {
+            match socket {
+                Socket::Tcp(s) => {
+                    let (readable, _, eof) = s.readiness()?;
+                    if !readable {
+                        return if eof {
+                            Ok(None)
+                        } else {
+                            Err(Error::WouldBlock)
+                        };
+                    }
+                    let mut bytes = vec![0; PAYLOAD];
+                    let n = s.read(&mut bytes)?;
+                    bytes.truncate(n);
+                    Ok(Some((None, bytes)))
+                }
+                Socket::Udp(s) => s
+                    .receive()?
+                    .map(|p| Some((Some(p.source), p.body)))
+                    .ok_or(Error::WouldBlock),
+                Socket::Listener(_) => Err(Error::InvalidState),
+            }
+        })();
         match result {
-            Ok(packet) if !packet.eof => {
-                let mut data = packet
-                    .source
+            Ok(Some((source, bytes))) => {
+                let mut data = source
                     .as_ref()
                     .map(encode_address)
                     .unwrap_or_else(|| vec![0; 24]);
-                data.extend(packet.data);
+                data.extend(bytes);
                 Message {
                     fd: fd.clone(),
                     op: RX,
@@ -312,7 +344,9 @@ impl ReceiveTask {
                 .write()?;
                 self.ended = true;
             }
-            Err(Error::WouldBlock | Error::InvalidState | Error::InProgress) => return Ok(false),
+            Err(Error::WouldBlock | Error::InvalidState | Error::ConnectionPending) => {
+                return Ok(false);
+            }
             Err(error) => {
                 Message {
                     fd: fd.clone(),
@@ -331,42 +365,31 @@ impl ReceiveTask {
 }
 enum TaskControl {
     Running,
-    Shutdown {
-        request: Message,
-        how: ProviderShutdownV2,
-    },
+    Shutdown { request: Message, how: TcpShutdown },
     Close(Message),
 }
 struct Endpoint {
-    handle: RemoteSocketHandle,
-    tcp: bool,
+    socket: Option<Socket>, // taken only while consuming TcpSocket into TcpListener
     send: SendTask,
     receive: ReceiveTask,
     control: TaskControl,
-    listening: bool,
-    pending_accept: Option<ProviderAcceptV2>,
+    pending_accept: Option<TcpSocket>,
     accept_ready: bool,
-    readiness_sequence: u64,
+    last_state: Option<(u32, Option<Error>)>,
 }
 impl Endpoint {
-    fn new(handle: RemoteSocketHandle) -> Self {
-        Self::with_kind(handle, true)
-    }
-    fn with_kind(handle: RemoteSocketHandle, tcp: bool) -> Self {
+    fn new(socket: Socket) -> Self {
         Self {
-            handle,
-            tcp,
+            socket: Some(socket),
             send: SendTask::default(),
             receive: ReceiveTask::new(),
             control: TaskControl::Running,
-            listening: false,
             pending_accept: None,
             accept_ready: false,
-            readiness_sequence: 0,
+            last_state: None,
         }
     }
 }
-
 // Adapted from Fuchsia 1e1219e3fac944c9a906aea9646939746b6062b3:
 // src/connectivity/network/netstack3/src/bindings/socket/worker.rs,
 // SocketWorker::handle_stream and SocketWorkerHandler's request/close contract.
@@ -375,26 +398,16 @@ impl Endpoint {
 // bounded epoll batches replace FIDL streams, and admitted sends drain before
 // the final close response. Core socket and transport have one lifetime owner.
 pub(super) struct SocketWorker {
-    pub(super) provider: NativeSocketProvider,
+    sockets: Sockets,
     pub(super) id: u64,
     pub(super) fd: Rc<OwnedFd>,
     data: Option<Endpoint>,
 }
 
-impl Drop for SocketWorker {
-    fn drop(&mut self) {
-        if let Some(mut data) = self.data.take() {
-            if let Some(child) = data.pending_accept.take() {
-                let _ = Provider::close(&mut self.provider, child.handle);
-            }
-            let _ = Provider::close(&mut self.provider, data.handle);
-        }
-    }
-}
 impl SocketWorker {
-    pub(super) fn new(provider: NativeSocketProvider, id: u64, fd: Rc<OwnedFd>) -> Self {
+    pub(super) fn new(sockets: Sockets, id: u64, fd: Rc<OwnedFd>) -> Self {
         Self {
-            provider,
+            sockets,
             id,
             fd,
             data: None,
@@ -404,24 +417,33 @@ impl SocketWorker {
     pub(super) fn wants_accept(&self) -> bool {
         self.data
             .as_ref()
-            .is_some_and(|e| e.listening && e.accept_ready)
+            .is_some_and(|e| matches!(e.socket, Some(Socket::Listener(_))) && e.accept_ready)
     }
 
     pub(super) fn accept_info(&mut self) -> Result<Option<Vec<u8>>, String> {
         let e = self.data.as_mut().expect("listener has core socket");
         if e.pending_accept.is_none() {
-            e.pending_accept = match Provider::accept(&mut self.provider, e.handle) {
+            let Some(Socket::Listener(listener)) = e.socket.as_mut() else {
+                return Err("accept on non-listener".into());
+            };
+            e.pending_accept = match listener.accept() {
                 Ok(child) => Some(child),
                 Err(Error::WouldBlock) => None,
                 Err(error) => return Err(format!("accept from Netstack3: {error:?}")),
             };
         }
-        Ok(e.pending_accept.as_ref().map(|child| {
-            let mut info = encode_address(&child.local);
-            info.extend(encode_address(&child.peer));
-            info.extend([0; 8]);
-            info
-        }))
+        e.pending_accept
+            .as_ref()
+            .map(|child| {
+                let names = child.info().map_err(|e| format!("accepted names: {e:?}"))?;
+                let mut info = encode_address(&names.local);
+                info.extend(encode_address(
+                    &names.peer.ok_or("accepted child has no peer")?,
+                ));
+                info.extend([0; 8]);
+                Ok(info)
+            })
+            .transpose()
     }
 
     pub(super) fn pause_accept(&mut self) {
@@ -431,16 +453,13 @@ impl SocketWorker {
     pub(super) fn take_accepted(&mut self, id: u64, fd: Rc<OwnedFd>) -> Self {
         let child = self.data.as_mut().unwrap().pending_accept.take().unwrap();
         Self {
-            provider: self.provider.clone(),
+            sockets: self.sockets.clone(),
             id,
             fd,
-            data: Some(Endpoint::new(child.handle)),
+            data: Some(Endpoint::new(Socket::Tcp(child))),
         }
     }
-    pub(super) fn handle_requests(
-        &mut self,
-        client: SocketClientId,
-    ) -> Result<ControlFlow<(), bool>, String> {
+    pub(super) fn handle_requests(&mut self) -> Result<ControlFlow<(), bool>, String> {
         let mut progress = false;
         for _ in 0..32 {
             let Some(m) = Message::read(self.fd.clone(), self.id)? else {
@@ -455,21 +474,17 @@ impl SocketWorker {
                     if self.data.is_some() || m.data.len() != 8 {
                         return Err(Error::InvalidState);
                     }
-                    let kind = match scalar(&m.data[..4])? {
-                        1 => ProviderSocketKindV2::Tcp,
-                        2 => ProviderSocketKindV2::Udp,
-                        _ => return Err(Error::WrongSocketKind),
+                    let version = match scalar(&m.data[4..])? {
+                        4 => IpVersion::V4,
+                        6 => IpVersion::V6,
+                        _ => return Err(Error::InvalidAddress),
                     };
-                    let family = match scalar(&m.data[4..])? {
-                        4 => RemoteIpVersion::V4,
-                        6 => RemoteIpVersion::V6,
-                        _ => return Err(Error::AddressFamilyMismatch),
+                    let socket = match scalar(&m.data[..4])? {
+                        1 => Socket::Tcp(self.sockets.tcp(version)?),
+                        2 => Socket::Udp(self.sockets.udp(version)?),
+                        _ => return Err(Error::InvalidState),
                     };
-                    let handle = Provider::open_socket(&mut self.provider, client, kind, family)?;
-                    self.data = Some(Endpoint::with_kind(
-                        handle,
-                        kind == ProviderSocketKindV2::Tcp,
-                    ));
+                    self.data = Some(Endpoint::new(socket));
                     Ok(vec![])
                 })();
                 m.reply(result)?;
@@ -482,7 +497,7 @@ impl SocketWorker {
                 continue;
             }
             let Some(e) = self.data.as_mut() else {
-                m.reply(Err(Error::StaleHandle))?;
+                m.reply(Err(Error::UnknownSocket))?;
                 continue;
             };
             if m.op == SEND {
@@ -495,9 +510,9 @@ impl SocketWorker {
             }
             if m.op == SHUTDOWN {
                 let how = scalar(&m.data).and_then(|v| match v {
-                    1 => Ok(ProviderShutdownV2::Read),
-                    2 => Ok(ProviderShutdownV2::Write),
-                    3 => Ok(ProviderShutdownV2::ReadWrite),
+                    1 => Ok(TcpShutdown::Receive),
+                    2 => Ok(TcpShutdown::Send),
+                    3 => Ok(TcpShutdown::SendAndReceive),
                     _ => Err(Error::InvalidState),
                 });
                 match how {
@@ -510,37 +525,54 @@ impl SocketWorker {
                 match m.op {
                     BIND => {
                         let a = address(&m.data)?.ok_or(Error::InvalidState)?;
-                        let ip = match a.address {
-                            RemoteIpAddress::V4([0, 0, 0, 0]) => None,
-                            RemoteIpAddress::V6(ip) if ip == [0; 16] => None,
-                            ip => Some(ip),
-                        };
-                        Provider::bind(&mut self.provider, e.handle, ip, a.port)
-                            .map(|a| encode_address(&a))
+                        match e.socket.as_mut().unwrap() {
+                            Socket::Tcp(s) => s.bind(a)?,
+                            Socket::Udp(s) => s.bind(a)?,
+                            Socket::Listener(_) => return Err(Error::InvalidState),
+                        }
+                        Ok(encode_address(&e.socket.as_ref().unwrap().info()?.local))
                     }
                     LISTEN => {
-                        let a = Provider::listen(&mut self.provider, e.handle, scalar(&m.data)?)?;
-                        e.listening = true;
-                        Ok(encode_address(&a))
+                        let backlog =
+                            NonZeroUsize::new((scalar(&m.data)? as usize).max(1)).unwrap();
+                        match e.socket.take().unwrap() {
+                            Socket::Tcp(s) => match s.listen(backlog) {
+                                Ok(listener) => e.socket = Some(Socket::Listener(listener)),
+                                Err((s, error)) => {
+                                    e.socket = Some(Socket::Tcp(s));
+                                    return Err(error);
+                                }
+                            },
+                            other => {
+                                e.socket = Some(other);
+                                return Err(Error::InvalidState);
+                            }
+                        }
+                        Ok(encode_address(&e.socket.as_ref().unwrap().info()?.local))
                     }
                     CONNECT => {
-                        Provider::connect(
-                            &mut self.provider,
-                            e.handle,
-                            address(&m.data)?.ok_or(Error::InvalidState)?,
-                        )?;
+                        let a = address(&m.data)?.ok_or(Error::InvalidState)?;
+                        match e.socket.as_mut().unwrap() {
+                            Socket::Tcp(s) => s.connect(a)?,
+                            Socket::Udp(s) => s.connect(a)?,
+                            Socket::Listener(_) => return Err(Error::InvalidState),
+                        }
                         Ok(vec![])
                     }
-                    GETNAME => Provider::get_name(
-                        &mut self.provider,
-                        e.handle,
-                        if scalar(&m.data)? == 0 {
-                            ProviderNameV2::Local
+                    GETNAME => {
+                        let socket = e.socket.as_ref().unwrap();
+                        let info = socket.info()?;
+                        let name = if scalar(&m.data)? == 0 {
+                            info.local
                         } else {
-                            ProviderNameV2::Peer
-                        },
-                    )
-                    .map(|a| encode_address(&a)),
+                            match socket {
+                                Socket::Udp(s) => s.peer(),
+                                _ => info.peer,
+                            }
+                            .ok_or(Error::InvalidState)?
+                        };
+                        Ok(encode_address(&name))
+                    }
                     CREDIT => {
                         e.receive.credit(scalar(&m.data)? as usize)?;
                         Ok(vec![])
@@ -563,27 +595,24 @@ impl SocketWorker {
             || matches!(
                 e.control,
                 TaskControl::Shutdown {
-                    how: ProviderShutdownV2::Write | ProviderShutdownV2::ReadWrite,
+                    how: TcpShutdown::Send | TcpShutdown::SendAndReceive,
                     ..
                 }
             );
         {
-            let mut ops = SocketOps {
-                provider: &mut self.provider,
-                handle: e.handle,
-            };
-            if finishing && e.tcp && !e.send.pending.is_empty() {
-                e.send.finish(&mut ops)?;
+            let socket = e.socket.as_mut().unwrap();
+            if finishing && matches!(socket, Socket::Tcp(_)) && !e.send.pending.is_empty() {
+                e.send.finish(socket)?;
                 progress = true;
             } else {
-                progress |= e.send.poll(&mut ops)?;
+                progress |= e.send.poll(socket)?;
             }
         }
         if e.send.pending.is_empty()
             || matches!(
                 e.control,
                 TaskControl::Shutdown {
-                    how: ProviderShutdownV2::Read,
+                    how: TcpShutdown::Receive,
                     ..
                 }
             )
@@ -591,12 +620,9 @@ impl SocketWorker {
             match std::mem::replace(&mut e.control, TaskControl::Running) {
                 TaskControl::Running => {}
                 TaskControl::Shutdown { request, how } => {
-                    let result = Provider::shutdown(&mut self.provider, e.handle, how);
+                    let result = e.socket.as_mut().unwrap().shutdown(how);
                     if result.is_ok()
-                        && matches!(
-                            how,
-                            ProviderShutdownV2::Read | ProviderShutdownV2::ReadWrite
-                        )
+                        && matches!(how, TcpShutdown::Receive | TcpShutdown::SendAndReceive)
                     {
                         e.receive.ended = true;
                     }
@@ -604,35 +630,38 @@ impl SocketWorker {
                     progress = true;
                 }
                 TaskControl::Close(request) => {
-                    if let Some(child) = e.pending_accept.take() {
-                        let _ = Provider::close(&mut self.provider, child.handle);
-                    }
-                    // Stop both tasks before removing core state and responding.
                     e.receive.ended = true;
-                    let result = Provider::close(&mut self.provider, e.handle);
-                    self.data = None;
-                    request.reply(result.map(|_| vec![]))?;
+                    self.data = None; // drops unpublished child and core owner
+                    request.reply(Ok(vec![]))?;
                     return Ok(ControlFlow::Break(()));
                 }
             }
         }
-        if !e.listening {
-            progress |= e.receive.poll(&mut self.provider, e.handle, fd, id)?;
+        if !matches!(e.socket, Some(Socket::Listener(_))) {
+            progress |= e.receive.poll(e.socket.as_mut().unwrap(), fd, id)?;
         }
-        let snapshot = Provider::readiness(&mut self.provider, e.handle)
-            .map_err(|error| format!("socket readiness: {error:?}"))?;
-        if snapshot.sequence != e.readiness_sequence {
-            e.readiness_sequence = snapshot.sequence;
-            let state = u32::from(snapshot.readiness.0 & Ready::CONNECTED != 0);
-            // EOF is emitted only after bytes have drained above.
-            if state != 0 || snapshot.error.is_some() {
+        let state = match e.socket.as_mut().unwrap() {
+            Socket::Tcp(s) => {
+                let connection = s.connection().map_err(|e| format!("connection: {e:?}"))?;
+                let error = s.take_error().map_err(|e| format!("socket error: {e:?}"))?;
+                (
+                    u32::from(matches!(connection, Connection::Finished(Ok(_)))),
+                    error,
+                )
+            }
+            Socket::Udp(s) => (u32::from(s.peer().is_some()), None),
+            Socket::Listener(_) => (0, None),
+        };
+        if e.last_state != Some(state) {
+            e.last_state = Some(state);
+            if state.0 != 0 || state.1.is_some() {
                 Message {
-                    fd: self.fd.clone(),
+                    fd: fd.clone(),
                     op: STATE,
-                    socket: self.id,
+                    socket: id,
                     request: 0,
-                    status: snapshot.error.map(errno).unwrap_or(0),
-                    data: state.to_le_bytes().to_vec(),
+                    status: state.1.map(errno).unwrap_or(0),
+                    data: state.0.to_le_bytes().to_vec(),
                 }
                 .write()?;
                 progress = true;
@@ -668,7 +697,7 @@ mod tests {
         fn finish(&mut self, admitted: &[u8]) -> Result<(), Error> {
             self.finished = true;
             if self.fail_finish {
-                return Err(Error::StaleHandle);
+                return Err(Error::UnknownSocket);
             }
             self.bytes.extend(admitted);
             Ok(())
@@ -758,10 +787,12 @@ mod tests {
     }
     #[test]
     fn pending_and_transferred_children_have_exactly_one_lifetime_owner() {
-        use netstack3_port_integration::Runtime;
-        use std::{cell::RefCell, num::NonZeroU64};
+        use netstack3_port_integration::{Runtime, service::DhcpService};
+        use rand::SeedableRng;
+        use std::num::NonZeroU64;
         for publish in [false, true] {
-            let runtime = Runtime::new(
+            let runtime = Runtime::new_with_capacities(
+                2,
                 8,
                 (0u8..=255).cycle().take(8192),
                 NonZeroU64::new(1).unwrap(),
@@ -769,64 +800,53 @@ mod tests {
                 1500,
             )
             .unwrap();
-            let mut provider = NativeSocketProvider::new(Rc::new(RefCell::new(runtime)));
-            let client = SocketClientId::from_raw(43);
-            Provider::open_client(&mut provider, client, 2).unwrap();
-            let listener = Provider::open_socket(
-                &mut provider,
-                client,
-                ProviderSocketKindV2::Tcp,
-                RemoteIpVersion::V4,
-            )
-            .unwrap();
-            let child = Provider::open_socket(
-                &mut provider,
-                client,
-                ProviderSocketKindV2::Tcp,
-                RemoteIpVersion::V4,
-            )
-            .unwrap();
+            let service = DhcpService::new(
+                runtime,
+                rand::rngs::StdRng::seed_from_u64(1),
+                [2, 0, 0, 0, 0, 1],
+            );
+            let sockets = service.sockets();
+            let listener = sockets.tcp(IpVersion::V4).unwrap();
+            let child = sockets.tcp(IpVersion::V4).unwrap();
+            assert!(matches!(
+                sockets.tcp(IpVersion::V4),
+                Err(Error::SocketLimit)
+            ));
             let (tx, _rx) = UnixDatagram::pair().unwrap();
             let fd = Rc::new(OwnedFd::from(tx));
-            let mut owner = SocketWorker::new(provider.clone(), 1, fd.clone());
-            let mut endpoint = Endpoint::new(listener);
-            let address = Address {
-                address: RemoteIpAddress::V4([127, 0, 0, 1]),
-                port: 1,
-            };
-            endpoint.pending_accept = Some(ProviderAcceptV2 {
-                handle: child,
-                local: address.clone(),
-                peer: address,
-            });
+            let mut owner = SocketWorker::new(sockets.clone(), 1, fd.clone());
+            let mut endpoint = Endpoint::new(Socket::Tcp(listener));
+            endpoint.pending_accept = Some(child);
             owner.data = Some(endpoint);
             if publish {
                 let child_owner = owner.take_accepted(2, fd);
-                // Models failure after successful publication, e.g. epoll ADD.
-                drop(child_owner);
-                assert!(Provider::get_name(&mut provider, listener, ProviderNameV2::Local).is_ok());
-                assert_eq!(
-                    Provider::get_name(&mut provider, child, ProviderNameV2::Local),
-                    Err(Error::StaleHandle)
+                drop(child_owner); // failure after publication (e.g. epoll ADD)
+                assert!(
+                    owner
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .socket
+                        .as_ref()
+                        .unwrap()
+                        .info()
+                        .is_ok()
                 );
+                let replacement = sockets.tcp(IpVersion::V4).unwrap();
+                assert!(matches!(
+                    sockets.tcp(IpVersion::V4),
+                    Err(Error::SocketLimit)
+                ));
+                drop(replacement);
             }
             drop(owner);
-            for handle in [listener, child] {
-                assert_eq!(
-                    Provider::get_name(&mut provider, handle, ProviderNameV2::Local),
-                    Err(Error::StaleHandle)
-                );
-            }
-            // Both handles returned their quota, including the unpublished child.
-            for _ in 0..2 {
-                Provider::open_socket(
-                    &mut provider,
-                    client,
-                    ProviderSocketKindV2::Tcp,
-                    RemoteIpVersion::V4,
-                )
-                .unwrap();
-            }
+            let first = sockets.tcp(IpVersion::V4).unwrap();
+            let second = sockets.tcp(IpVersion::V4).unwrap();
+            assert!(matches!(
+                sockets.tcp(IpVersion::V4),
+                Err(Error::SocketLimit)
+            ));
+            drop((first, second));
         }
     }
 

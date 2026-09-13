@@ -239,7 +239,7 @@ fn run(
             .configure_static(*address, *prefix, *gateway, dns)
             .map_err(invalid_data)?;
     }
-    let mut provider = service.socket_provider();
+    let mut provider = netstack3_port_integration::socket_provider::NativeSocketProvider::from_sockets(service.sockets());
 
     // Provider ownership follows the live data-plane transport, not IP
     // configuration. This preserves normal offline socket semantics while
@@ -425,7 +425,7 @@ mod tests {
         .unwrap();
         client.apply_ipv4([192, 0, 2, 1], 24, None).unwrap();
         let mut service = DhcpService::new(client, StdRng::from_seed([7; 32]), client_mac);
-        let mut provider = service.socket_provider();
+        let mut provider = netstack3_port_integration::socket_provider::NativeSocketProvider::from_sockets(service.sockets());
 
         let mut server = Runtime::new(
             8,

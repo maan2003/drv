@@ -3,9 +3,8 @@
 //! ABI is defined by kernel-provider/production/protocol.h.
 use crate::socket_worker::SocketWorker;
 use netstack3_port_integration::Runtime;
-use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 as Provider;
 use netstack3_port_spike::{
-    EthernetDevice as _, EthernetEventSource as _, NetworkServiceEndpoint, SocketClientId,
+    EthernetDevice as _, EthernetEventSource as _, NetworkServiceEndpoint,
     StackEthernetEndpoint as _,
 };
 use rand::SeedableRng as _;
@@ -46,9 +45,7 @@ pub fn run_provider(
         rand::rngs::StdRng::from_os_rng(),
         mac,
     );
-    let mut provider = network.socket_provider();
-    let client = SocketClientId::from_raw(1);
-    Provider::open_client(&mut provider, client, 512).map_err(|e| format!("{e:?}"))?;
+    let sockets = network.sockets();
     let mut ethernet = if ethernet_mac.is_some() {
         let mut kind = 0i32;
         let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
@@ -169,7 +166,7 @@ pub fn run_provider(
                 {
                     return Err(io::Error::last_os_error().to_string());
                 }
-                workers.insert(id, SocketWorker::new(provider.clone(), id, fd));
+                workers.insert(id, SocketWorker::new(sockets.clone(), id, fd));
                 ready.push(id);
                 progress = true;
             }
@@ -178,7 +175,7 @@ pub fn run_provider(
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
-            match worker.handle_requests(client)? {
+            match worker.handle_requests()? {
                 ControlFlow::Continue(p) => progress |= p,
                 ControlFlow::Break(()) => {
                     workers.remove(&id);
@@ -367,7 +364,7 @@ mod tests {
     use super::*;
     use netstack3_port_integration::NativeTcpBuffers;
     use netstack3_port_integration::socket_provider::NativeSocketProvider;
-    use netstack3_port_spike::RemoteIpVersion;
+    use netstack3_port_spike::{RemoteIpVersion, SocketClientId};
     use netstack3_port_spike::provider_transport_v2::{
         ProviderReadinessV2 as Ready, ProviderSocketKindV2,
     };

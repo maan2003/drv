@@ -83,6 +83,11 @@ pub struct NativeSocketProvider {
 }
 
 impl NativeSocketProvider {
+    /// Tool-only legacy handle table. Production bindings use owned sockets.
+    pub fn from_sockets(sockets: crate::sockets::Sockets) -> Self {
+        Self::new(sockets.runtime)
+    }
+
     pub fn new(runtime: Rc<RefCell<Runtime>>) -> Self {
         Self {
             runtime,

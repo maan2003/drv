@@ -327,7 +327,7 @@ fn associated_link_acquires_dhcp_resolves_dns_transfers_tcp_and_revokes() {
     ap.server
         .tcp_listen(listener, NonZeroUsize::new(1).unwrap())
         .unwrap();
-    let mut provider = runner.stack().socket_provider();
+    let mut provider = netstack3_port_integration::socket_provider::NativeSocketProvider::from_sockets(runner.stack().sockets());
     let client =
         RemoteSocketProvider::open_client(&mut provider, NonZeroUsize::new(2).unwrap()).unwrap();
     let socket = provider.tcp_socket(client, RemoteIpVersion::V4).unwrap();

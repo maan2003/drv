@@ -1,7 +1,6 @@
 //! Native adapters for Fuchsia's production DHCP client core.
 
 use crate::dns_bridge::{DnsLookupHandle, DnsLookupResult, NativeDnsBridge};
-use crate::socket_provider::NativeSocketProvider;
 use crate::{NativeInstant, NativeIpAddress, Runtime, RuntimeError, UdpSocketHandle};
 use dhcp_client_core::{
     client::{
@@ -226,7 +225,7 @@ enum Effect {
 
 /// Owns only native capabilities; all DHCP behavior is the pinned upstream state machine.
 pub struct DhcpService {
-    sockets: NativeSocketProvider,
+    owned_sockets: crate::sockets::Sockets,
     dns: NativeDnsBridge,
     rt: Rc<RefCell<Runtime>>,
     pool: LocalPool,
@@ -332,9 +331,9 @@ impl DhcpService {
                 }
             })
             .expect("spawn DHCP core");
-        let sockets = NativeSocketProvider::new(rt.clone());
+        let owned_sockets = crate::sockets::Sockets::new(rt.clone());
         Self {
-            sockets,
+            owned_sockets,
             dns: NativeDnsBridge::with_capacity(dns_capacity),
             rt,
             pool,
@@ -362,8 +361,8 @@ impl DhcpService {
     pub fn cancel_lookup(&mut self, h: DnsLookupHandle) {
         self.dns.cancel_lookup(h)
     }
-    pub fn socket_provider(&self) -> NativeSocketProvider {
-        self.sockets.clone()
+    pub fn sockets(&self) -> crate::sockets::Sockets {
+        self.owned_sockets.clone()
     }
     pub fn runtime(&self) -> std::cell::Ref<'_, Runtime> {
         self.rt.borrow()
@@ -496,6 +495,7 @@ impl StackEthernetEndpoint for DhcpService {
 }
 impl NetworkServiceEndpoint for DhcpService {
     fn poll_at(&mut self, d: Duration, budget: usize) -> usize {
+        self.owned_sockets.reap();
         let now = NativeInstant::from_nanos(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         self.now.set(now);
         {

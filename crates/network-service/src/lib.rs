@@ -3,15 +3,13 @@
 //! Sandboxed native Netstack3 service and application networking.
 
 use netstack3_port_integration::{
-    Runtime,
+    Runtime, RuntimeError, NativeSocketAddress, NativeIpAddress,
+    sockets::{TcpSocket, IpVersion, Connection},
     dns_bridge::DnsLookupHandle,
     service::{DhcpService, DhcpStatus},
 };
-use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2;
-use netstack3_port_spike::provider_transport_v2::{ProviderReadinessV2, ProviderSocketAddressV2};
 use netstack3_port_spike::{
-    EthernetEventSource, EthernetRunner, NetworkServiceEndpoint, RemoteIpAddress, RemoteIpVersion,
-    RemoteSocketAddress, RemoteSocketHandle, RemoteSocketProvider, SocketClientId,
+    EthernetEventSource, EthernetRunner, NetworkServiceEndpoint,
 };
 use rand::{SeedableRng as _, rngs::StdRng};
 #[cfg(test)]
@@ -57,8 +55,7 @@ struct BoundedNetstackProof {
     now: Duration,
     anchor: Option<std::time::Instant>,
     resolved: Option<[u8; 4]>,
-    socket: Option<netstack3_port_spike::RemoteSocketHandle>,
-    proxy_client: SocketClientId,
+    socket: Option<TcpSocket>,
     admission_capacity: usize,
     frame_events: u32,
 }
@@ -337,7 +334,7 @@ struct Socks5Client {
     host_out: VecDeque<u8>,
     host_to_remote: VecDeque<u8>,
     remote_to_host: VecDeque<u8>,
-    socket: Option<RemoteSocketHandle>,
+    socket: Option<TcpSocket>,
     idle_deadline: std::time::Instant,
     registered_events: u32,
     peer_half_closed: bool,
@@ -458,11 +455,6 @@ impl BoundedNetstackProof {
             ),
             device,
         );
-        let proxy_client = RemoteSocketProvider::open_client(
-            &mut runner.stack().socket_provider(),
-            NonZeroUsize::new(resources.admission_capacity).unwrap(),
-        )
-        .map_err(|_| "SOCKS5 provider client initialization failed")?;
         let proof = Self {
             runner,
             poller,
@@ -471,7 +463,6 @@ impl BoundedNetstackProof {
             anchor: None,
             resolved: None,
             socket: None,
-            proxy_client,
             admission_capacity: resources.admission_capacity,
             frame_events: BASE_EVENTS | libc::EPOLLIN as u32,
         };
@@ -613,29 +604,17 @@ impl BoundedNetstackProof {
 
     pub fn prove_tcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
         let address = self.resolved.ok_or("TCP requires DNS")?;
-        let mut provider = self.runner.stack().socket_provider();
-        let client =
-            RemoteSocketProvider::open_client(&mut provider, NonZeroUsize::new(1).unwrap())
-                .map_err(|_| "socket client failed")?;
-        let socket = provider
-            .tcp_socket(client, RemoteIpVersion::V4)
+        let mut socket = self.runner.stack().sockets().tcp(IpVersion::V4)
             .map_err(|_| "TCP socket failed")?;
-        provider
-            .tcp_connect(
-                socket,
-                RemoteSocketAddress {
-                    address: RemoteIpAddress::V4(address),
-                    port: self.config.server_port,
-                },
-            )
-            .map_err(|_| "TCP connect failed")?;
+        socket.connect(NativeSocketAddress {
+            address: NativeIpAddress::V4(address), port: self.config.server_port.get(),
+        }).map_err(|_| "TCP connect failed")?;
         loop {
             self.drive(Some(deadline))?;
-            let ready = RemoteSocketProvider::readiness(&mut provider, socket)
-                .map_err(|_| "TCP readiness failed")?;
-            if ready.writable {
-                self.socket = Some(socket);
-                return Ok(());
+            match socket.connection().map_err(|_| "TCP state failed")? {
+                Connection::Finished(Ok(_)) => { self.socket = Some(socket); return Ok(()); }
+                Connection::Finished(Err(_)) => return Err("TCP connect failed"),
+                _ => {}
             }
         }
     }
@@ -993,7 +972,7 @@ impl BoundedNetstackProof {
                                     Ok(lookup) => Socks5Phase::Dns { lookup, port },
                                     Err(_) => Self::socks5_failure(
                                         client,
-                                        netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                                        RuntimeError::HostUnreachable,
                                     ),
                                 }
                             }
@@ -1007,7 +986,7 @@ impl BoundedNetstackProof {
                     None => Socks5Phase::Dns { lookup, port },
                     Some(Err(_)) => Self::socks5_failure(
                         client,
-                        netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                        RuntimeError::HostUnreachable,
                     ),
                     Some(Ok(addresses)) => {
                         client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1018,50 +997,34 @@ impl BoundedNetstackProof {
                             Some(address) => Socks5Phase::Connecting { address, port },
                             None => Self::socks5_failure(
                                 client,
-                                netstack3_port_spike::RemoteSocketError::HostUnreachable,
+                                RuntimeError::HostUnreachable,
                             ),
                         }
                     }
                 }
             }
             Socks5Phase::Connecting { address, port } => 'connecting: {
-                let mut provider = self.runner.stack().socket_provider();
                 if client.socket.is_none() {
-                    let socket = match provider.tcp_socket(self.proxy_client, RemoteIpVersion::V4) {
+                    let mut socket = match self.runner.stack().sockets().tcp(IpVersion::V4) {
                         Ok(socket) => socket,
                         Err(error) => break 'connecting Self::socks5_failure(client, error),
                     };
-                    if let Err(error) = RemoteSocketProviderV2::connect(
-                        &mut provider,
-                        socket,
-                        ProviderSocketAddressV2 {
-                            address: RemoteIpAddress::V4(address),
-                            port: port.get(),
-                        },
-                    ) && error != netstack3_port_spike::RemoteSocketError::InProgress
-                    {
-                        let _ = RemoteSocketProviderV2::close(&mut provider, socket);
+                    if let Err(error) = socket.connect(NativeSocketAddress {
+                        address: NativeIpAddress::V4(address), port: port.get(),
+                    }) {
                         break 'connecting Self::socks5_failure(client, error);
                     }
                     client.socket = Some(socket);
                     client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                 }
-                let socket = client.socket.expect("socket was created");
-                let ready = match RemoteSocketProviderV2::readiness(&mut provider, socket) {
-                    Ok(ready) => ready,
+                let connection = match client.socket.as_mut().unwrap().connection() {
+                    Ok(connection) => connection,
                     Err(error) => break 'connecting Self::socks5_failure(client, error),
                 };
-                if ready.readiness.0
-                    & (ProviderReadinessV2::CONNECT_FAILED | ProviderReadinessV2::ERROR)
-                    != 0
-                {
-                    let error = RemoteSocketProviderV2::take_socket_error(&mut provider, socket)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(netstack3_port_spike::RemoteSocketError::InvalidState);
+                if let Connection::Finished(Err(error)) = connection {
                     break 'connecting Self::socks5_failure(client, error);
                 }
-                if ready.readiness.0 & ProviderReadinessV2::CONNECTED != 0 {
+                if matches!(connection, Connection::Finished(Ok(_))) {
                     client.host_out.extend([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
                     println!(
                         "internet_proxy_connect=true remote={}:{} peer={}",
@@ -1081,7 +1044,7 @@ impl BoundedNetstackProof {
                 }
             }
             Socks5Phase::Relay => {
-                let socket = client.socket.ok_or("SOCKS5 relay socket missing")?;
+                let socket = client.socket.as_mut().ok_or("SOCKS5 relay socket missing")?;
                 let mut buffer = [0; 16 * 1024];
                 let read_capacity = MAX_SOCKS5_PENDING_BYTES
                     .saturating_sub(client.host_to_remote.len())
@@ -1102,27 +1065,15 @@ impl BoundedNetstackProof {
                         _ => return Err("SOCKS5 host read failed"),
                     }
                 }
-                let mut provider = self.runner.stack().socket_provider();
-                let ready = RemoteSocketProviderV2::readiness(&mut provider, socket)
+                let (readable, writable, eof) = socket.readiness()
                     .map_err(|_| "SOCKS5 relay readiness failed")?;
-                if ready.readiness.0
-                    & (ProviderReadinessV2::CONNECT_FAILED | ProviderReadinessV2::ERROR)
-                    != 0
-                {
+                if socket.take_error().map_err(|_| "SOCKS5 relay error observation failed")?.is_some() {
                     return Err("SOCKS5 relay socket failed");
                 }
-                if ready.readiness.0 & ProviderReadinessV2::WRITABLE != 0
-                    && !client.host_to_remote.is_empty()
-                {
-                    let written = RemoteSocketProviderV2::send_msg(
-                        &mut provider,
-                        socket,
-                        0,
-                        None,
-                        client.host_to_remote.make_contiguous(),
-                    )
+                if writable && !client.host_to_remote.is_empty() {
+                    let written = socket.write(client.host_to_remote.make_contiguous())
                     .or_else(|error| {
-                        (error == netstack3_port_spike::RemoteSocketError::WouldBlock)
+                        (error == RuntimeError::WouldBlock)
                             .then_some(0)
                             .ok_or(error)
                     })
@@ -1133,7 +1084,7 @@ impl BoundedNetstackProof {
                         client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
                     }
                 }
-                if ready.readiness.0 & ProviderReadinessV2::READABLE != 0
+                if (readable || eof)
                     && client.remote_to_host.len() < MAX_SOCKS5_PENDING_BYTES
                     && aggregate_remaining != 0
                 {
@@ -1141,26 +1092,18 @@ impl BoundedNetstackProof {
                         .saturating_sub(client.remote_to_host.len())
                         .min(aggregate_remaining)
                         .min(buffer.len());
-                    match RemoteSocketProviderV2::recv_msg(
-                        &mut provider,
-                        socket,
-                        receive_capacity as u32,
-                        0,
-                    ) {
-                        Ok(message) if message.eof => Socks5Phase::Closing,
-                        Ok(message) => {
-                            if !message.data.is_empty() {
-                                client.idle_deadline =
-                                    std::time::Instant::now() + Duration::from_secs(30);
-                            }
-                            client.remote_to_host.extend(&message.data);
-                            Socks5Phase::Relay
+                    if !readable && eof {
+                        Socks5Phase::Closing
+                    } else {
+                        let n = socket.read(&mut buffer[..receive_capacity])
+                            .map_err(|_| "SOCKS5 remote read failed")?;
+                        if n != 0 {
+                            client.idle_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                            client.remote_to_host.extend(&buffer[..n]);
                         }
-                        Err(netstack3_port_spike::RemoteSocketError::WouldBlock) => {
-                            Socks5Phase::Relay
-                        }
-                        Err(_) => return Err("SOCKS5 remote read failed"),
+                        Socks5Phase::Relay
                     }
+
                 } else {
                     Socks5Phase::Relay
                 }
@@ -1239,24 +1182,21 @@ impl BoundedNetstackProof {
         if let Socks5Phase::Dns { lookup, .. } = client.phase {
             self.runner.stack_mut().cancel_lookup(lookup);
         }
-        let mut provider = self.runner.stack().socket_provider();
-        if let Some(socket) = client.socket.take() {
-            let _ = RemoteSocketProviderV2::close(&mut provider, socket);
-        }
+        client.socket = None;
     }
 
     fn socks5_failure(
         client: &mut Socks5Client,
-        error: netstack3_port_spike::RemoteSocketError,
+        error: RuntimeError,
     ) -> Socks5Phase {
         let reply = match error {
-            netstack3_port_spike::RemoteSocketError::PermissionDenied => 2,
-            netstack3_port_spike::RemoteSocketError::NetworkUnreachable => 3,
-            netstack3_port_spike::RemoteSocketError::HostUnreachable => 4,
-            netstack3_port_spike::RemoteSocketError::ConnectionRefused => 5,
-            netstack3_port_spike::RemoteSocketError::TimedOut => 6,
-            netstack3_port_spike::RemoteSocketError::NotSupported
-            | netstack3_port_spike::RemoteSocketError::AddressFamilyMismatch => 8,
+            RuntimeError::PermissionDenied => 2,
+            RuntimeError::NetworkUnreachable => 3,
+            RuntimeError::HostUnreachable => 4,
+            RuntimeError::ConnectionRefused => 5,
+            RuntimeError::TimedOut => 6,
+            RuntimeError::NotSupported
+            | RuntimeError::InvalidAddress => 8,
             _ => 1,
         };
         client.host_out.extend([5, reply, 0, 1, 0, 0, 0, 0, 0, 0]);

@@ -9,6 +9,7 @@ pub mod dns_bridge;
 pub mod ethernet_transport;
 pub mod service;
 pub mod socket_provider;
+pub mod sockets;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -1904,6 +1905,12 @@ impl Runtime {
         Ok(self.bindings.take_udp(id).map(|packet| packet.body))
     }
 
+    pub fn udp_readable(&self, handle: UdpSocketHandle) -> Result<bool, RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.udp_v4
+            .get(&format!("{id:?}")).is_some_and(|queue| !queue.is_empty()))
+    }
+
     pub fn udp_receive_msg(
         &mut self,
         handle: UdpSocketHandle,
@@ -2083,6 +2090,12 @@ impl Runtime {
             .get(&handle)
             .ok_or(RuntimeError::UnknownSocket)?;
         Ok(self.bindings.take_udp(id).map(|packet| packet.body))
+    }
+
+    pub fn udp_readable_ipv6(&self, handle: UdpSocketHandle) -> Result<bool, RuntimeError> {
+        let id = self.udp_v6.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        Ok(self.bindings.udp_v6
+            .get(&format!("{id:?}")).is_some_and(|queue| !queue.is_empty()))
     }
 
     pub fn udp_receive_msg_ipv6(
