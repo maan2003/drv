@@ -566,7 +566,30 @@ struct TcpStorage {
 #[derive(Clone, Debug, Default)]
 pub struct NativeReceiveBuffer(Arc<Mutex<TcpStorage>>);
 #[derive(Clone, Debug, Default)]
-pub struct NativeSendBuffer(Arc<Mutex<TcpStorage>>);
+pub struct NativeSendBuffer(Arc<Mutex<SendBufferState>>);
+
+// Adapted from Fuchsia 1e1219e3fac944c9a906aea9646939746b6062b3,
+// bindings/socket/stream/buffer.rs: CoreSendBufferInner::ShuttingDown and
+// send_task_shutdown. Copyright 2024 The Fuchsia Authors, BSD-2-Clause.
+// Linux differences: admitted kernel messages replace the Zircon socket;
+// the bounded remainder is appended to the existing safe ring, rather than
+// using an unsafe initialized-slice conversion and a separate overflow vector.
+#[derive(Debug)]
+enum SendBufferState {
+    Running(TcpStorage),
+    ShuttingDown(TcpStorage),
+}
+impl Default for SendBufferState {
+    fn default() -> Self { Self::Running(TcpStorage::default()) }
+}
+impl SendBufferState {
+    fn storage(&self) -> &TcpStorage {
+        match self { Self::Running(s) | Self::ShuttingDown(s) => s }
+    }
+    fn storage_mut(&mut self) -> &mut TcpStorage {
+        match self { Self::Running(s) | Self::ShuttingDown(s) => s }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct NativeTcpBuffers {
     pub receive: NativeReceiveBuffer,
@@ -577,7 +600,7 @@ pub struct NativeTcpBuffers {
 // slicing changes only the view; it never clones queued TCP bytes.
 #[derive(Debug)]
 pub struct NativePayload<'a> {
-    storage: Option<std::sync::MutexGuard<'a, TcpStorage>>,
+    storage: Option<std::sync::MutexGuard<'a, SendBufferState>>,
     range: std::ops::Range<usize>,
 }
 impl NativePayload<'_> {
@@ -585,7 +608,7 @@ impl NativePayload<'_> {
         use netstack3_base::Payload;
         match &self.storage {
             Some(storage) => {
-                let (a, b) = storage.bytes.as_slices();
+                let (a, b) = storage.storage().bytes.as_slices();
                 netstack3_base::FragmentedPayload::new([a, b])
                     .slice(self.range.start as u32..self.range.end as u32)
             }
@@ -685,23 +708,25 @@ impl ReceiveBuffer for NativeReceiveBuffer {
 }
 impl Buffer for NativeSendBuffer {
     fn limits(&self) -> BufferLimits {
-        let s = self.0.lock().unwrap();
+        let guard = self.0.lock().unwrap();
+        let s = guard.storage();
         BufferLimits {
             capacity: s.capacity,
             len: s.readable,
         }
     }
     fn target_capacity(&self) -> usize {
-        self.0.lock().unwrap().target_capacity
+        self.0.lock().unwrap().storage().target_capacity
     }
     fn request_capacity(&mut self, size: usize) {
-        self.0.lock().unwrap().request_capacity(size);
+        self.0.lock().unwrap().storage_mut().request_capacity(size);
     }
 }
 impl SendBuffer for NativeSendBuffer {
     type Payload<'a> = NativePayload<'a>;
     fn mark_read(&mut self, count: usize) {
-        let mut s = self.0.lock().unwrap();
+        let mut guard = self.0.lock().unwrap();
+        let s = guard.storage_mut();
         assert!(count <= s.readable);
         s.consume(count);
     }
@@ -709,10 +734,11 @@ impl SendBuffer for NativeSendBuffer {
     where
         F: FnOnce(Self::Payload<'a>) -> R,
     {
-        let s = self.0.lock().unwrap();
+        let guard = self.0.lock().unwrap();
+        let s = guard.storage();
         assert!(offset <= s.readable);
         let end = s.readable;
-        f(NativePayload { storage: Some(s), range: offset..end })
+        f(NativePayload { storage: Some(guard), range: offset..end })
     }
 }
 impl NativeTcpBuffers {
@@ -723,19 +749,34 @@ impl NativeTcpBuffers {
                 target_capacity: sizes.receive,
                 ..Default::default()
             }))),
-            send: NativeSendBuffer(Arc::new(Mutex::new(TcpStorage {
+            send: NativeSendBuffer(Arc::new(Mutex::new(SendBufferState::Running(TcpStorage {
                 capacity: sizes.send,
                 target_capacity: sizes.send,
                 ..Default::default()
-            }))),
+            })))),
         }
     }
     pub fn write(&self, bytes: &[u8]) -> usize {
-        let mut s = self.send.0.lock().unwrap();
+        let mut guard = self.send.0.lock().unwrap();
+        let SendBufferState::Running(s) = &mut *guard else { return 0 };
         let n = bytes.len().min(s.capacity - s.readable);
         s.bytes.extend(&bytes[..n]);
         s.readable += n;
         n
+    }
+    /// Seal the producer and transfer its already-admitted, bounded remainder.
+    /// This does not wait for remote ACKs; core owns delivery after this returns.
+    pub fn finish_write(&self, admitted: &[u8]) -> Result<(), RuntimeError> {
+        let mut guard = self.send.0.lock().unwrap();
+        if matches!(*guard, SendBufferState::ShuttingDown(_)) {
+            return if admitted.is_empty() { Ok(()) } else { Err(RuntimeError::InvalidState) };
+        }
+        let SendBufferState::Running(mut s) = std::mem::take(&mut *guard) else { unreachable!() };
+        s.bytes.extend(admitted);
+        s.readable += admitted.len();
+        s.capacity = s.capacity.max(s.readable);
+        *guard = SendBufferState::ShuttingDown(s);
+        Ok(())
     }
     pub fn read(&self, out: &mut [u8]) -> usize {
         let mut s = self.receive.0.lock().unwrap();
@@ -2414,6 +2455,14 @@ impl Runtime {
             .map_err(|_| RuntimeError::InvalidState)
     }
 
+    /// Transfer the frontend's admitted remainder before shutdown or final close.
+    pub fn tcp_finish_write(&mut self, handle: TcpSocketHandle, admitted: &[u8]) -> Result<(), RuntimeError> {
+        let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        socket.buffers.finish_write(admitted)?;
+        self.stack.api(&mut self.bindings).tcp::<Ipv4>().do_send(&socket.id);
+        Ok(())
+    }
+
     pub fn tcp_close(&mut self, handle: TcpSocketHandle) -> Result<(), RuntimeError> {
         let socket = self
             .tcp
@@ -2670,6 +2719,14 @@ impl Runtime {
             .map_err(|_| RuntimeError::InvalidState)
     }
 
+    /// Transfer the frontend's admitted remainder before shutdown or final close.
+    pub fn tcp_finish_write_ipv6(&mut self, handle: TcpSocketHandle, admitted: &[u8]) -> Result<(), RuntimeError> {
+        let socket = self.tcp_v6.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        socket.buffers.finish_write(admitted)?;
+        self.stack.api(&mut self.bindings).tcp::<Ipv6>().do_send(&socket.id);
+        Ok(())
+    }
+
     pub fn tcp_close_ipv6(&mut self, handle: TcpSocketHandle) -> Result<(), RuntimeError> {
         let socket = self
             .tcp_v6
@@ -2743,6 +2800,41 @@ mod tests {
         writable.on_writable_changed(true);
         assert_eq!(writable.take(), Some(ReadinessEvent::UdpWritable(false)));
         assert_eq!(writable.take(), None);
+    }
+
+    // Adapted from Fuchsia stream/buffer.rs send_task_shutdown: vary bytes
+    // already in core and bytes still admitted by the frontend, with no ACKs.
+    #[test]
+    fn terminal_send_handoff_preserves_bytes_without_network_progress() {
+        for before in [0, 1, 7, 8] {
+            for pending in [0, 1, 8, 32] {
+                let app = NativeTcpBuffers::new(BufferSizes { send: 8, receive: 8 });
+                let old: Vec<u8> = (0..before).collect();
+                let extra: Vec<u8> = (32..32 + pending).collect();
+                assert_eq!(app.write(&old), old.len());
+                let mut core = app.send.clone();
+                core.request_capacity(4);
+                app.finish_write(&extra).unwrap();
+                assert_eq!(app.write(b"late"), 0);
+                app.finish_write(&[]).unwrap();
+                assert_eq!(app.finish_write(b"late"), Err(RuntimeError::InvalidState));
+                let expected = [old, extra].concat();
+                assert_eq!(core.limits().len, expected.len());
+                assert!(core.limits().capacity >= expected.len());
+                for offset in 0..=expected.len() {
+                    let actual = core.peek_with(offset, |p| {
+                        let mut out = vec![0; expected.len() - offset];
+                        netstack3_base::Payload::partial_copy(&p, 0, &mut out);
+                        out
+                    });
+                    assert_eq!(actual, expected[offset..]);
+                }
+                core.mark_read(expected.len());
+                assert_eq!(core.limits().len, 0);
+                assert_eq!(core.limits().capacity, 4);
+                assert_eq!(app.write(b"still closed"), 0);
+            }
+        }
     }
 
     #[test]

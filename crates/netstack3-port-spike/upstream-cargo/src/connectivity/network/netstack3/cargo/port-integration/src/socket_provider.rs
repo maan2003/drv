@@ -96,6 +96,19 @@ impl NativeSocketProvider {
         }
     }
 
+    /// Final producer handoff, adapted from Fuchsia's TCP send-task shutdown.
+    /// `admitted` contains only bytes already accepted by the bounded frontend.
+    pub fn finish_tcp_send(&mut self, handle: RemoteSocketHandle, admitted: &[u8]) -> Result<(), RemoteSocketError> {
+        match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Tcp { raw: VersionedTcp::V4(raw), .. }) =>
+                self.runtime.borrow_mut().tcp_finish_write(*raw, admitted).map_err(map_error),
+            Some(Socket::Tcp { raw: VersionedTcp::V6(raw), .. }) =>
+                self.runtime.borrow_mut().tcp_finish_write_ipv6(*raw, admitted).map_err(map_error),
+            Some(Socket::Udp { .. }) => Err(RemoteSocketError::WrongSocketKind),
+            None => Err(RemoteSocketError::StaleHandle),
+        }
+    }
+
     /// Samples all live sockets and returns only readiness states that changed
     /// since the previous call. The daemon uses this to produce unsolicited
     /// ABI-v2 readiness events without lossy edge bookkeeping.

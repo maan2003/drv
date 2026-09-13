@@ -68,6 +68,11 @@ int main(int argc, char **argv) {
 	struct { struct ns3_msg h; unsigned int state; } forged = {
         .h = {.version=NS3_VERSION, .op=NS3_STATE, .socket=bid, .len=4}, .state=NS3_CONNECTED};
 	check(write(ap, &forged, sizeof(forged.h) + 4) < 0 && errno == EPROTO, "cross-FD identity rejected");
+    forged.h.socket = aid;
+    forged.h.version = 4;
+    check(write(ap, &forged, sizeof(forged.h) + 4) < 0 && errno == EPROTO,
+          "ABI4 worker rejected before state mutation");
+    puts("PASS ENDPOINT_ABI5_REJECTS_ABI4");
 	struct sockaddr_in dest = {.sin_family=AF_INET,.sin_port=htons(23460),.sin_addr.s_addr=htonl(0x7f000001)};
 	char data[NS3_PAYLOAD] = {0};
 	size_t admitted = 0;

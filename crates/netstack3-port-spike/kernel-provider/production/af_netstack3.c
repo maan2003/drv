@@ -475,11 +475,10 @@ static int ns3_shutdown(struct socket *sock, int how)
 	if (how < SHUT_RD || how > SHUT_RDWR) return -EINVAL;
 	mutex_lock(&s->transmit);
 	mutex_lock(&s->control);
-	ret = wait_event_interruptible(*sk_sleep(&s->sk), !READ_ONCE(s->tx_bytes) || READ_ONCE(s->dead));
-	if (ret) goto out;
+	/* The socket worker transfers admitted sends to core before replying.
+	 * Do not wait here for ordinary send-buffer space (which can need ACKs). */
 	ret = ns3_call(s, NS3_SHUTDOWN, &value, sizeof(value), NULL, 0);
 	if (!ret) { s->sk.sk_shutdown |= how + 1; s->sk.sk_state_change(&s->sk); }
-out:
 	mutex_unlock(&s->control);
 	mutex_unlock(&s->transmit);
 	return ret;

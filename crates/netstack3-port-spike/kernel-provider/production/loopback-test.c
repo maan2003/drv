@@ -207,6 +207,58 @@ static void udp_batch(int family) {
     puts(family == AF_INET ? "PASS SENDMMSG_UDP_V4" : "PASS SENDMMSG_UDP_V6");
 }
 
+/* The reader cannot release TCP window space until shutdown has returned.
+ * Fill beyond both core and frontend buffering before imposing the barrier. */
+static void shutdown_backpressure(int family) {
+    struct sockaddr_storage a = addr(family, 24567);
+    int listener = socket(family, SOCK_STREAM, 0), gate[2];
+    check(listener >= 0 && pipe(gate) == 0, "shutdown setup");
+    check(bind(listener, (void *)&a, alen(family)) == 0 &&
+          listen(listener, 1) == 0, "shutdown listen");
+    pid_t child = fork();
+    check(child >= 0, "shutdown fork");
+    if (!child) {
+        close(gate[1]);
+        int fd = accept(listener, NULL, NULL);
+        check(fd >= 0, "shutdown accept");
+        size_t expected, done = 0;
+        check(read(gate[0], &expected, sizeof(expected)) == sizeof(expected), "shutdown barrier released");
+        unsigned char bytes[16384];
+        ssize_t n;
+        while ((n = recv(fd, bytes, sizeof(bytes), 0)) > 0) {
+            for (ssize_t i = 0; i < n; ++i)
+                check(bytes[i] == ((done + i) % 251), "shutdown retained byte");
+            done += n;
+        }
+        check(n == 0 && done == expected, "shutdown bytes before EOF");
+        close(fd); close(listener); close(gate[0]); _exit(0);
+    }
+    close(gate[0]);
+    int fd = socket(family, SOCK_STREAM, 0);
+    check(fd >= 0 && connect(fd, (void *)&a, alen(family)) == 0, "shutdown connect");
+    unsigned char bytes[16384];
+    size_t total = 0;
+    /* A blocking 2 MiB send cannot complete with the reader gated. Nonblocking
+     * retries give the worker time to fill the peer window, then leave admitted
+     * data behind it. The timeout is only a test guard, not a correctness oracle. */
+    int stalled = 0;
+    while (stalled < 100) {
+        for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (total + i) % 251;
+        ssize_t n = send(fd, bytes, sizeof(bytes), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && errno == EAGAIN) { usleep(1000); ++stalled; continue; }
+        check(n > 0, "shutdown admission");
+        total += n; stalled = 0;
+        check(total < 16 * 1024 * 1024, "bounded shutdown buffering");
+    }
+    check(shutdown(fd, SHUT_WR) == 0, "shutdown without reader progress");
+    check(write(gate[1], &total, sizeof(total)) == sizeof(total), "release shutdown reader");
+    int status;
+    check(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 0, "shutdown reader status");
+    close(fd); close(listener); close(gate[1]);
+    printf("PASS SHUTDOWN_BACKPRESSURE_V%d bytes=%zu\n", family == AF_INET ? 4 : 6, total);
+}
+
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
     if (argc == 2 && !strcmp(argv[1], "batch")) { udp_batch(AF_INET); udp_batch(AF_INET6); return 0; }
@@ -269,6 +321,7 @@ int main(int argc, char **argv) {
         puts("PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION");
         return 0;
     }
+    shutdown_backpressure(AF_INET); shutdown_backpressure(AF_INET6);
     udp_batch(AF_INET); udp_batch(AF_INET6);
     refused(AF_INET); refused(AF_INET6);
 	tcp(AF_INET, 23456); udp(AF_INET); tcp(AF_INET6, 23456); udp(AF_INET6);

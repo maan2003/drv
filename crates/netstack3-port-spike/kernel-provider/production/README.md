@@ -60,7 +60,7 @@ assigned device they do not prove physical DMA confinement.
 
 ## Per-socket IPC, not a shared RPC queue
 
-`protocol.h` owns ABI4. The privileged registration FD scopes a namespace and
+`protocol.h` owns ABI5. The privileged registration FD scopes a namespace and
 generation. Its CLAIM ioctl returns one O_CLOEXEC anonymous-inode FD per
 application socket, like accepting an endpoint. That FD is permanently bound
 to one kernel socket; the header socket ID is checked, not used to select an
@@ -93,6 +93,57 @@ unclaimed nonblocking connect, and quotas across retained provider FDs. The
 following `loopback-test` runs against **real sandboxed Netstack3**, before and
 after provider replacement. The service suite includes fatal seccomp denial
 tests for the new endpoint/registration syscall boundaries.
+
+## Fuchsia-based task and shutdown redesign (ABI5)
+
+The binding adapts Fuchsia revision
+`1e1219e3fac944c9a906aea9646939746b6062b3`, under
+`src/connectivity/network/netstack3/src/bindings/socket/`:
+
+- `worker.rs`: `SocketWorker::handle_stream` and `SocketWorkerHandler::close`
+  inform the single endpoint/core owner and final-close response.
+- `stream.rs`: `TaskControl::shutdown_send` informs the producer barrier.
+- `stream/buffer.rs`: `send_task`, `send_task_shutdown`,
+  `CoreSendBufferInner::ShuttingDown`, and `receive_task` inform separate
+  bounded send/receive tasks and terminal core ownership.
+- Its `send_task_shutdown` test is adapted to vary existing core occupancy
+  and admitted remainder without any ACKs/network progress. Local tests add
+  partial-write completion, failed handoff, credits, child ownership and ABI
+  rejection. These are adaptations, not verbatim ports or the full Fuchsia
+  test suite. Copyright notices accompany the code; BSD-2-Clause terms are in
+  `../../upstream-cargo/LICENSE.fuchsia`.
+
+Linux dup/fork already shares one endpoint, replacing FIDL clone streams.
+Kernel messages replace Zircon socket buffers; four receive credits replace
+Zircon writable waits. A safe `VecDeque` holds both normal and terminal send
+bytes, instead of Fuchsia's ring plus overflow vector and initialized-slice
+unsafe conversions. Each socket has one worker; send/receive are independently
+polled state machines on the existing executor, not additional OS threads.
+
+Ownership proceeds from kernel-admitted SEND → send task → core send buffer.
+Write shutdown stops kernel admission under the transmit lock and queues an
+ordered barrier. The worker transfers any remaining admitted bytes into a
+terminal core buffer, completes the SENDs, and invokes core shutdown. It never
+waits for peer ACKs or receive-window space. The extra storage is bounded by the
+endpoint's existing 256 KiB outstanding-byte limit; ordinary TCP buffer limits
+remain in force before terminal handoff. Core retains TCP delivery/retransmission
+responsibility after application close. Receive pumping and credit returns
+remain independent; EOF is emitted only after buffered data.
+
+A listener owns its one unpublished accepted child. Publication transfers it
+directly into a child worker before epoll registration, so failed registration
+drops the child rather than leaking a raw core handle. Endpoint revocation
+drops the tasks and closes owned handles; it does not promise delivery after
+cancellation or provider death.
+
+ABI5 deliberately rejects ABI4 peers: the old worker paired with the new
+kernel failed the shutdown byte-count test. This requires coordinated rollout,
+not compatibility negotiation. No kernel Rust rewrite, FIDL/Zircon emulation,
+Fuchsia datagram MessageQueue port, or TCP algorithm rewrite is claimed.
+The Linux queue/capability boundary remains C; the worker forbids unsafe Rust.
+
+See [redesign acceptance evidence](evidence/fuchsia-task-redesign.txt) for
+host tests, no-reader-progress KVM regressions and private-tailnet SSH transfer.
 
 ## Why anonymous FDs, rather than a new provider AF
 

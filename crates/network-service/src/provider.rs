@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Linux service setup and scheduling for the per-socket binding.
 //! ABI is defined by kernel-provider/production/protocol.h.
-use crate::socket_worker::{Endpoint, SocketWorker, encode_address};
+use crate::socket_worker::SocketWorker;
 use netstack3_port_integration::Runtime;
 use netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 as Provider;
 use netstack3_port_spike::{
-    EthernetDevice as _, EthernetEventSource as _, NetworkServiceEndpoint,
-    RemoteSocketError as Error, SocketClientId, StackEthernetEndpoint as _,
+    EthernetDevice as _, EthernetEventSource as _, NetworkServiceEndpoint, SocketClientId,
+    StackEthernetEndpoint as _,
 };
 use rand::SeedableRng as _;
 use std::collections::HashMap;
@@ -169,15 +169,7 @@ pub fn run_provider(
                 {
                     return Err(io::Error::last_os_error().to_string());
                 }
-                workers.insert(
-                    id,
-                    SocketWorker {
-                        provider: provider.clone(),
-                        id,
-                        fd,
-                        data: None,
-                    },
-                );
+                workers.insert(id, SocketWorker::new(provider.clone(), id, fd));
                 ready.push(id);
                 progress = true;
             }
@@ -269,30 +261,14 @@ pub fn run_provider(
         }
         let listeners: Vec<_> = workers
             .iter()
-            .filter(|(_, worker)| {
-                worker
-                    .data
-                    .as_ref()
-                    .is_some_and(|e| e.listening && e.accept_ready)
-            })
+            .filter(|(_, worker)| worker.wants_accept())
             .map(|(&id, _)| id)
             .collect();
         for id in listeners {
             let worker = workers.get_mut(&id).unwrap();
-            let e = worker.data.as_mut().unwrap();
-            if e.pending_accept.is_none() {
-                e.pending_accept = match Provider::accept(&mut provider, e.handle) {
-                    Ok(child) => Some(child),
-                    Err(Error::WouldBlock) => None,
-                    Err(error) => return Err(format!("accept from Netstack3: {error:?}")),
-                };
-            }
-            let Some(child) = e.pending_accept.as_ref() else {
+            let Some(mut info) = worker.accept_info()? else {
                 continue;
             };
-            let mut info = encode_address(&child.local);
-            info.extend(encode_address(&child.peer));
-            info.extend([0u8; 8]);
             let newfd = unsafe {
                 libc::ioctl(
                     worker.fd.as_raw_fd(),
@@ -303,7 +279,7 @@ pub fn run_provider(
             if newfd < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::WouldBlock {
-                    e.accept_ready = false;
+                    worker.pause_accept();
                     continue;
                 }
                 if error.raw_os_error() == Some(libc::ENETDOWN) {
@@ -311,9 +287,11 @@ pub fn run_provider(
                 }
                 return Err(format!("publish accepted endpoint: {error}"));
             }
-            let child = e.pending_accept.take().unwrap();
             let child_id = u64::from_le_bytes(info[48..56].try_into().unwrap());
             let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(newfd) });
+            // Transfer ownership before registration: failure drops and closes
+            // this child, while the listener still owns every unpublished child.
+            let child = worker.take_accepted(child_id, fd.clone());
             let mut event = libc::epoll_event {
                 events: libc::EPOLLIN as u32,
                 u64: child_id,
@@ -321,15 +299,7 @@ pub fn run_provider(
             if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), &mut event) } < 0 {
                 return Err(io::Error::last_os_error().to_string());
             }
-            workers.insert(
-                child_id,
-                SocketWorker {
-                    provider: provider.clone(),
-                    id: child_id,
-                    fd,
-                    data: Some(Endpoint::new(child.handle)),
-                },
-            );
+            workers.insert(child_id, child);
             progress = true;
         }
         let mut remove = Vec::new();

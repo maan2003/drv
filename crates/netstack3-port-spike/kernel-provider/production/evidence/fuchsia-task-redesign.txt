@@ -1,0 +1,178 @@
+Fuchsia-based socket task / ABI5 redesign acceptance, 2026-09-13
+================================================================
+Scope: Linux 6.18.40 no-INET KVM guest on np; native Cargo and GCC/plain
+make builds (no Nix build). No physical Wi-Fi, real host Tailscale changes,
+production login or shared ACL changes. Exact source symbols, adaptations,
+license and ownership map are in ../README.md, Fuchsia revision:
+1e1219e3fac944c9a906aea9646939746b6062b3.
+
+Final release provider SHA256:
+692e0cc0c42598676a64a51d1a3e0fbd6e01ccfd96a5a1566e4eaa8a8dc4dda5
+
+Host checks:
+- drv-network-service: 48 tests passed (including ABI4 rejection,
+  partial send/full-buffer terminal handoff, failure completion, receive
+  credit conservation, pending/transferred child lifetime/quota).
+- netstack3-port-integration: 27 tests passed, including adapted Fuchsia
+  send_task_shutdown occupancy/remainder matrix without network progress.
+- Release provider build and Linux bzImage build succeeded.
+- endpoint-test.c and loopback-test.c: GCC -O2 -Wall -Wextra -Werror.
+- git diff --check passed.
+Existing upstream cfg/dead-code/unreachable-pattern warnings remain.
+
+Negative comparison, before ABI bump:
+New kernel shutdown semantics + preceding worker
+(a33bce27422a45f8845557bb578c8e55c6e9163de53bd164788ab62b31284bcb)
+failed the gated-reader shutdown byte-count check. This is evidence of
+unsafe mixed-version semantics, not a test of the old matched pair:
+FAIL shutdown bytes before EOF: Success
+FAIL shutdown reader status: Resource temporarily unavailable
+GUEST_TEST_FAILED
+
+ABI5 therefore rejects ABI4 on both sides. The kernel-side version-rejection
+test and worker-side frame-rejection test pass. Deployment must coordinate
+kernel and worker; no live negotiation/migration is implemented.
+
+Final full KVM suite highlights:
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS ENDPOINT_ABI5_REJECTS_ABI4
+PASS ENDPOINT_SCOPING_SATURATION_CLOSE
+PASS ENDPOINT_CANCEL_AND_NONBLOCK
+PASS ENDPOINT_LIFETIME_QUOTA
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=851968
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.004268 MBps=491.39
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.004886 MBps=429.30
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+BENCH TCP family=2 seconds=0.233391 MBps=575.08
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.234991 MBps=571.16
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.591763 MBps=226.81
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.575944 MBps=233.04
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+PASS IDLE_SOCKET_TCP
+BENCH TCP family=2 seconds=0.026361 MBps=39.78
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.028339 MBps=37.00
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.031114 MBps=33.70
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.033093 MBps=31.69
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.035012 MBps=29.95
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.037286 MBps=28.12
+BENCH TCP family=10 seconds=0.037254 MBps=28.15
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.039952 MBps=26.25
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.042822 MBps=24.49
+BENCH TCP family=2 seconds=0.042877 MBps=24.46
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.045574 MBps=23.01
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.048433 MBps=21.65
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.050775 MBps=20.65
+BENCH TCP family=10 seconds=0.051403 MBps=20.40
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.054489 MBps=19.24
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=0.056598 MBps=18.53
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS PARALLEL_TCP_16
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.004166 MBps=503.51
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.004820 MBps=435.11
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_NSS_RUST_GLIBC_DNS_ABI_THREADS_FORK_TCP
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.004911 MBps=427.13
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.004654 MBps=450.69
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.004122 MBps=508.87
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.005475 MBps=383.07
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.91s
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_KVM_PRODUCTION_LOOPBACK
+
+The backpressure regression gates the reader on a Unix pipe. The sender
+fills through sustained EAGAIN, then must return from write shutdown before
+releasing the reader. The reader checks each patterned byte and exact total
+before EOF. Ordinary buffering occupancy is scheduling-dependent; the final
+run admitted 835584–851968 bytes. No timing threshold is the success oracle.
+
+Final private-tailnet SSH acceptance:
+Maintained testcontrol/DERP fixture, Tailscale v1.98.10, separate userspace
+host daemon, pinned OpenSSH host key, key-only guest sshd. No interactive
+login. QEMU virtual Ethernet is the external transport. Each random payload
+is uploaded, downloaded, compared byte-for-byte, and SHA256 recorded below.
+Timeouts are 45 seconds per direction. Guest metadata override remains.
+uid=0(root) gid=0(root) groups=0(root)
+6.18.40
+# CONFIG_INET is not set
+CONFIG_NETSTACK3=y
+PASS_FINAL_ABI5_SSH_COMMAND
+/dev/pts/0
+PASS_FINAL_ABI5_PTY
+PASS_ABI5_SSH_ROUNDTRIP bytes=8388608 sha256=aa8618a0c142047fa69d0a52b01bd6979a5f5122ef7b0b9a1e17a987574fbfa2 elapsed=0.767s
+PASS_ABI5_SSH_ROUNDTRIP bytes=8388608 sha256=ace2d429177f9ac4045f7f550c65589b722469c9719fc4df1aa5595dbe6c26f9 elapsed=0.631s
+PASS_ABI5_SSH_ROUNDTRIP bytes=67108864 sha256=363e50ad73c94fff81d670953ce80211b78bb4f1e64584c47e3c0955487576c5 elapsed=2.749s
+
+Limits: does not establish production Tailscale interoperability, a complete
+Linux socket ABI, exhaustive hostile-provider robustness, long-duration
+stability, physical Wi-Fi throughput or a kernel Rust implementation.
+Fuchsia datagram MessageQueue and Zircon/FIDL facilities are not ported.
+Private guest/gateway/controller/peer are stopped after evidence collection.
+Raw private lab output: np socket-provider-kvm/socket-redesign/abi5-final-tests
+and abi5-final-ssh; no keys or private identity files are checked in.
