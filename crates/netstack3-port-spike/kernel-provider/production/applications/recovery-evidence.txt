@@ -121,3 +121,32 @@ recovery-1/serial.log
 Owned KVM units stopped after acceptance. np remained on Linux6.18.43.
 No physical host reboot, EFI/TPM unlock, early watchdog rollback, or
 physical radio acceptance is established by these KVM results.
+
+Current physical-fixture packaging A/B (2026-09-14; no VFIO):
+The newer Ethernet/NSS fixture initially failed zero-byte nonblocking UDP.
+Frozen failing initrd SHA256:
+d320b42b560f4f39145d225ad9bc4c12ceb77add5ac8d7fa946ec76ef67f71cf
+Its staged loopback-test was stale, SHA256:
+5049a2654be4a0d0f51c07534f5635deaf5c44ea8422dd00134349c5fdb2305d
+Disassembly: udp+0xee calls sendto, udp+0xf6 branches directly to failure.
+Unlike current source, it lacks the EAGAIN -> writable -> retry activation path.
+
+Recompiled unchanged current loopback-test.c with GCC15.2 -O2 -Wall -Wextra.
+Source SHA256:
+2f9b06107b2e1fa5da187091f47002edf35719509945b228170d012e1097dd84
+Binary SHA256:
+e9d3b92784f8d73b8b027b2cbec8416d488fefa0955a8c2b9f16833af30df92b
+
+A/B changes ONLY that binary via an appended initramfs archive:
+- Original #21 run reproduces EAGAIN and fixture failure.
+- Replacement #21 run: 1 passed, 49 filtered, 4.03s.
+- Replacement #22 run: 1 passed, 49 filtered, 2.63s.
+Both replacements emit PASS_CURRENT_EXACT_ROOT_NO_VFIO_NSS_FIXTURE,
+online/offline NSS, IPv4/IPv6 zero datagrams, ancillary and full loopback.
+No kernel/provider/test-source workaround was applied.
+All owned A/B VMs have exited. This is not physical-radio acceptance.
+
+Evidence directory on np: socket-provider-kvm/np-host/zero-udp/
+original.log SHA43fd1b0f634d4128dbc8c4d118fd4c2e608922800c25ee493fb30b3b985b9a50
+fixed.log SHAd0c316dc5da205ccc033ce53e85a23b55145380202dd1331b66fdc2f646560eb
+fixed22.log SHAcc4d77e9e40a32408583b2baa6ad3ef563bc655838dd2c2eed1585ccd9e4a979
