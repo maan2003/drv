@@ -293,7 +293,11 @@ impl TcpSocket {
     }
     pub fn finish_write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.write_closed {
-            return Err(Error::InvalidState);
+            return if bytes.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::InvalidState)
+            };
         }
         let (v, h) = self.raw();
         let mut rt = self.lease.sockets.runtime.borrow_mut();
@@ -549,6 +553,55 @@ mod tests {
         assert_eq!(&bytes[..4], b"tail");
     }
     #[test]
+    fn unconnected_stream_io_and_final_close_respect_core_state() {
+        let s = factory();
+        for version in [IpVersion::V4, IpVersion::V6] {
+            for bound in [false, true] {
+                let mut socket = s.tcp(version).unwrap();
+                if bound {
+                    socket
+                        .bind(Address {
+                            address: match version {
+                                IpVersion::V4 => Ip::V4([127, 0, 0, 1]),
+                                IpVersion::V6 => {
+                                    Ip::V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                                }
+                            },
+                            port: 0,
+                        })
+                        .unwrap();
+                }
+                assert_eq!(socket.write(b"unconnected"), Err(Error::InvalidState));
+                assert_eq!(
+                    socket.finish_write(b"unconnected"),
+                    Err(Error::InvalidState)
+                );
+                socket.finish_write(&[]).unwrap();
+                socket.finish_write(&[]).unwrap();
+                drop(socket);
+            }
+        }
+    }
+    #[test]
+    fn connecting_stream_can_seal_before_completion() {
+        let s = factory();
+        let mut socket = s.tcp(IpVersion::V4).unwrap();
+        socket.bind(local(4021)).unwrap();
+        let mut listener = socket
+            .listen(NonZeroUsize::new(1).unwrap())
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let mut client = s.tcp(IpVersion::V4).unwrap();
+        client.connect(local(4021)).unwrap();
+        client.finish_write(b"admitted while connecting").unwrap();
+        client.finish_write(&[]).unwrap();
+        pump(&s);
+        let mut accepted = listener.accept().unwrap();
+        let mut bytes = [0; 64];
+        let n = accepted.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[..n], b"admitted while connecting");
+    }
+    #[test]
     fn failed_attempt_survives_error_consumption() {
         let s = factory();
         let mut client = s.tcp(IpVersion::V4).unwrap();
@@ -564,5 +617,7 @@ mod tests {
             client.connection().unwrap(),
             Connection::Finished(Err(Error::ConnectionRefused))
         );
+        client.finish_write(&[]).unwrap();
+        client.finish_write(&[]).unwrap();
     }
 }

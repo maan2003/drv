@@ -42,7 +42,7 @@ if test -x /bin/sshd; then
     /bin/ssh-keygen -lf /run/ssh/host_ed25519.pub
 fi
 # Kernel interface/address publication is not implemented yet.
-TS_ASSUME_NETWORK_UP_FOR_TEST=true /bin/tailscaled --tun=userspace-networking --state=/run/tailscaled.state     --socket=/run/tailscaled.sock --socks5-server=127.0.0.1:1055     --outbound-http-proxy-listen=127.0.0.1:1056 >/run/tailscaled.log 2>&1 &
+TS_NO_LOGS_NO_SUPPORT=true TS_ASSUME_NETWORK_UP_FOR_TEST=true /bin/tailscaled --tun=userspace-networking --state=/run/tailscaled.state     --socket=/run/tailscaled.sock --socks5-server=127.0.0.1:1055     --outbound-http-proxy-listen=127.0.0.1:1056 >/run/tailscaled.log 2>&1 &
 for i in $(seq 1 100); do test ! -S /run/tailscaled.sock || break; sleep .1; done
 (
     set -- --hostname=drv-netstack3-kvm --accept-dns=false --accept-routes=false --timeout=120s

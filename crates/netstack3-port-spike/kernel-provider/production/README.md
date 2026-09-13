@@ -3,17 +3,20 @@
 Implements the direction in [ARCH-network-service](../../../../specs/ARCH-network-service.md).
 This is separate from the earlier `patches/` experiment: do **not** install both.
 
-## Current frontend: full Rust ABI5
+## Current frontend: owned sockets and ABI6
 
-The [Rust ABI5 implementation](rust-abi5/README.md) is the current Rust delivery,
-including the entire data path and production KVM/SSH acceptance. Use its
-Linux 7.3-rc2 installer and native build instructions. Safe Rust owns frontend
-policy; narrow Rust/C glue handles native object mechanics. The unchanged
-sandboxed userspace provider speaks ABI5 directly.
+The [Rust frontend](rust-abi5/README.md) registers AF_INET/AF_INET6 with native
+INET excluded. Linux and SOCKS are thin consumers of concrete owned sockets in
+port-integration; Runtime is the sole core-ID registry. Legacy framed daemons
+construct their own tool-only handle tables and do not shape production.
 
-The Linux 6.18 C source, parent installer and older captures below remain a
-reference/recovery build, not a runtime fallback. Rust additionally fixes
-read-only name-query cancellation; the extended endpoint test checks that fix.
+`install-kernel.sh` selects this Linux 7.3 frontend. The old C production
+implementation has been retired; its sources and captures remain in Git history.
+The directory name `rust-abi5` is historical, not a compatibility promise.
+Kernel and userspace must be deployed together with the current `protocol.h`.
+Current [ABI6 acceptance](rust-abi5/evidence.txt) records native tests, lock-debug
+no-INET KVM and private-overlay OpenSSH. The captures below are historical
+baselines, not ABI6 acceptance evidence.
 
 ## Original C baseline proof
 
@@ -70,9 +73,9 @@ The guest now boots Q35 with virtual Intel IOMMU, IRQ remapping and strict DMA
 invalidation. These initialization checks prepare for VFIO testing; without an
 assigned device they do not prove physical DMA confinement.
 
-## Per-socket IPC, not a shared RPC queue
+## Historical ABI5 per-socket IPC
 
-`protocol.h` owns ABI5. The privileged registration FD scopes a namespace and
+The former `protocol.h` owned ABI5 (current ABI6 is described above). The privileged registration FD scopes a namespace and
 generation. Its CLAIM ioctl returns one O_CLOEXEC anonymous-inode FD per
 application socket, like accepting an endpoint. That FD is permanently bound
 to one kernel socket; the header socket ID is checked, not used to select an
@@ -108,7 +111,7 @@ following `loopback-test` runs against **real sandboxed Netstack3**, before and
 after provider replacement. The service suite includes fatal seccomp denial
 tests for the new endpoint/registration syscall boundaries.
 
-## Fuchsia-based task and shutdown redesign (ABI5)
+## Historical Fuchsia-based task and shutdown redesign (ABI5)
 
 The binding adapts Fuchsia revision
 `1e1219e3fac944c9a906aea9646939746b6062b3`, under

@@ -1,3 +1,57 @@
+Owned socket / ABI6 acceptance, np, 2026-09-13
+Native Cargo/GCC/plain make only, no Nix builds or host kernel installation.
+Linux 7.3-rc2 build #17; Rust 1.97.0; GCC 15.2.0.
+CONFIG_RUST=y NETSTACK3_RUST=y INET=n KUNIT=y.
+PROVE_LOCKING DEBUG_MUTEXES DEBUG_ATOMIC_SLEEP DEBUG_LIST enabled.
+36 core unit tests passed; 49 service unit tests passed (--test-threads=1).
+Parallel service admission fixtures have an intermittent exit125 timing failure;
+not claimed passing. Existing upstream compile warnings remain.
+Primary agent executed these tests; advisor adv-r6nf inspected structural
+boundaries and confirmed no further structural layer/correction necessary.
+
+Artifact SHA256:
+bzImage 0906a9a9433c488a6fb4751c753293972ff804d668366bef0ad5119d45244421
+netstack3-provider 38744f0e30562653e404658e79a0c1f8aa219b79659f284da130d426e00a09db
+
+KVM runs: rust-abi5/abi6-final-kvm (14.75s), abi6-quota-kvm (19.32s).
+Logs retained under /var/lib/poco-linux/redwood/work/socket-provider-kvm on np.
+Both pass actual sandboxed Netstack3 localhost + simulated Ethernet/DHCP/DNS/NSS.
+Quota run preserves 256 retained-provider-endpoint accounting/recovery regression.
+No FAIL/BUG:/WARNING:/Oops:/kernel panic in accepted logs.
+Selected quota-run output:
+[    0.367707] # ns3_connection_attempt: pass:2 fail:0 skip:0 total:2
+PASS ABI6_CLAIM_ROLLBACK_LAZY_ACTIVATION_METADATA
+PASS ABI6_TX_BOUND_COPY_TRANSACTION_SEAL_NO_REPLIES
+PASS ABI6_RX_OCCUPANCY_ZERO_RECORDS_NO_CREDITS
+PASS ABI6_SHARED_FD_RECV_DONTWAIT_SIGNAL_DEADLINE
+PASS ABI6_SHARED_FD_SEND_DONTWAIT_SIGNAL_DEADLINE_PARTIAL_DEQUEUE
+PASS ABI6_CONTROL_SLOT_CONTENTION
+PASS ABI6_ABSOLUTE_DEADLINE_WAKE_FLOOD
+PASS ABI6_MALFORMED_MUTATION_FAMILY_REVOKES
+PASS ABI6_CONTROL_CANCELLATION
+PASS ABI6_ENDPOINT_LIFETIME_QUOTA
+PASS ABI6_ENDPOINT_SUITE
+PASS_KVM_PRODUCTION_LOOPBACK
+
+Private no-login Tailscale control + peer; unmodified OpenSSH in no-INET KVM:
+/dev/pts/0
+PASS_ABI6_PTY
+PASS_ABI6_SSH_ROUNDTRIP 8388608 sha256=bfa126ba81de4d90a55e0c889b0403b6bad5ad8ce99fd3000583b9df8a7d213d seconds=0.77
+PASS_ABI6_SSH_ROUNDTRIP 8388608 sha256=30743680c92f8997f1d356fd9bb2dc2084ee92e7f1aee91b4ec90c7314ffbfc6 seconds=0.71
+PASS_ABI6_SSH_ROUNDTRIP 67108864 sha256=cc1b2ea1ff9698ae29b3fe64b3e46c52a206150dfd5a049cbcff7c9e09f7d27b seconds=4.14
+
+No guest Ethernet NIC/native TCP/UDP; virtio-serial frames to private QEMU SLIRP.
+Only disposable private peer/controller affected; host Tailscale left untouched.
+Earlier private-overlay failure was a Runtime do_send precondition panic during
+unconnected IPv6 close, confirmed by strace -k. Fixed in Runtime for both IP
+versions; no seccomp relaxation or worker-side lifecycle workaround.
+Final source formatting after these builds is whitespace-only.
+
+Limits: not physical Wi-Fi/device/DMA acceptance, complete SOL_SOCKET/native
+family-layout audit, exact RSS accounting, or a general security proof.
+
+---------------- Historical ABI5 evidence (superseded) ----------------
+
 Full Rust ABI5 acceptance, np, 2026-09-13
 Native Linux 7.3-rc2 / Rust 1.97.0 (matching library sources) / GCC 15.2.0.
 Build #7, native make -j4. No Nix build, host install or physical device use.

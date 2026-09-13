@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Per-socket request, data and close owner; never TCP/IP protocol state.
+//! Per-socket control, data and close owner; never TCP/IP protocol state.
 //! ABI is defined by kernel-provider/production/protocol.h.
 //! Linux registration, sandboxing and service scheduling live in provider.rs.
 #![forbid(unsafe_code)]
@@ -9,10 +9,10 @@ use netstack3_port_integration::{
 };
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::ops::ControlFlow;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
-const VERSION: u32 = 5;
+use std::time::{Duration, Instant};
+const VERSION: u32 = 6;
 const PAYLOAD: usize = 16384;
 const OPEN: u32 = 1;
 const BIND: u32 = 2;
@@ -24,8 +24,51 @@ const SHUTDOWN: u32 = 7;
 const CLOSE: u32 = 8;
 const RX: u32 = 9;
 const STATE: u32 = 10;
-const GETNAME: u32 = 11;
-const CREDIT: u32 = 13;
+const CONNECTION: u32 = 14;
+const ACTIVATE: u32 = 13;
+
+#[derive(Debug)]
+pub(super) enum EndpointFault {
+    Protocol(&'static str),
+    Core(Error),
+    Io(rustix::io::Errno),
+    Allocation,
+}
+impl std::fmt::Display for EndpointFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(reason) => write!(f, "protocol: {reason}"),
+            Self::Core(error) => write!(f, "core: {error:?}"),
+            Self::Io(error) => write!(f, "endpoint I/O: {error}"),
+            Self::Allocation => f.write_str("endpoint allocation failed"),
+        }
+    }
+}
+pub(super) enum Work {
+    Idle,
+    Progress,
+    Closed,
+}
+enum AcceptState {
+    WaitingForListenerSpace,
+    Ready,
+    RetryAt(Instant),
+}
+impl AcceptState {
+    fn due(&self) -> bool {
+        match self {
+            Self::Ready => true,
+            Self::RetryAt(at) => Instant::now() >= *at,
+            _ => false,
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::RetryAt(at) => Some(*at),
+            _ => None,
+        }
+    }
+}
 
 struct Message {
     fd: Rc<OwnedFd>,
@@ -37,19 +80,27 @@ struct Message {
 }
 impl Message {
     fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(32 + self.data.len());
+        let mut b = Vec::with_capacity(24 + self.data.len());
         b.extend(VERSION.to_le_bytes());
         b.extend(self.op.to_le_bytes());
-        b.extend(self.socket.to_le_bytes());
         b.extend(self.request.to_le_bytes());
         b.extend((self.data.len() as u32).to_le_bytes());
         b.extend(self.status.to_le_bytes());
         b.extend(&self.data);
         b
     }
-    fn read(fd: Rc<OwnedFd>, socket: u64) -> Result<Option<Self>, String> {
-        let mut b = vec![0; 32 + PAYLOAD + 24];
-        let n = match rustix::io::read(&*fd, &mut b) {
+    fn read(fd: Rc<OwnedFd>, socket: u64, control: bool) -> Result<Option<Self>, EndpointFault> {
+        let mut b = vec![0; 24 + PAYLOAD + 24];
+        let result = if control {
+            let mut bytes = [0; 128];
+            crate::provider::read_control(&fd, &mut bytes).map(|n| {
+                b[..n].copy_from_slice(&bytes[..n]);
+                n
+            })
+        } else {
+            rustix::io::read(&*fd, &mut b)
+        };
+        let n = match result {
             Ok(n) => n,
             Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Ok(None),
             Err(rustix::io::Errno::NETDOWN) => {
@@ -62,36 +113,46 @@ impl Message {
                     data: vec![],
                 }));
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(EndpointFault::Io(error)),
         };
-        if n < 32
+        if n < 24
             || u32::from_le_bytes(b[0..4].try_into().unwrap()) != VERSION
-            || u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize != n - 32
+            || u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize != n - 24
         {
-            return Err("invalid kernel provider frame".into());
+            return Err(EndpointFault::Protocol("invalid kernel provider frame"));
         }
         Ok(Some(Self {
             fd,
             op: u32::from_le_bytes(b[4..8].try_into().unwrap()),
-            socket: u64::from_le_bytes(b[8..16].try_into().unwrap()),
-            request: u64::from_le_bytes(b[16..24].try_into().unwrap()),
+            socket,
+            request: u64::from_le_bytes(b[8..16].try_into().unwrap()),
             status: 0,
-            data: b[32..n].to_vec(),
+            data: b[24..n].to_vec(),
         }))
     }
-    fn write(&self) -> Result<(), String> {
+    fn write(&self) -> Result<(), EndpointFault> {
+        if self.try_write()? {
+            Ok(())
+        } else {
+            Err(EndpointFault::Protocol(
+                "control output unexpectedly blocked",
+            ))
+        }
+    }
+    fn try_write(&self) -> Result<bool, EndpointFault> {
         let b = self.encode();
         loop {
             match rustix::io::write(&*self.fd, &b) {
-                Ok(n) if n == b.len() => return Ok(()),
-                Ok(_) => return Err("short provider write".into()),
+                Ok(n) if n == b.len() => return Ok(true),
+                Ok(_) => return Err(EndpointFault::Protocol("short provider write")),
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::NETDOWN) => return Ok(()),
-                Err(error) => return Err(format!("provider write: {error}")),
+                Err(rustix::io::Errno::NETDOWN) => return Ok(true),
+                Err(rustix::io::Errno::AGAIN) => return Ok(false),
+                Err(error) => return Err(EndpointFault::Io(error)),
             }
         }
     }
-    fn reply(&self, result: Result<Vec<u8>, Error>) -> Result<(), String> {
+    fn reply(&self, result: Result<Vec<u8>, Error>) -> Result<(), EndpointFault> {
         if self.request == 0 {
             return Ok(());
         }
@@ -216,7 +277,7 @@ struct SendTask {
     pending: VecDeque<PendingSend>,
 }
 impl SendTask {
-    fn admit(&mut self, request: Message) -> Result<(), String> {
+    fn admit(&mut self, request: Message) -> Result<(), EndpointFault> {
         let peer = request
             .data
             .get(..24)
@@ -228,11 +289,11 @@ impl SendTask {
                 peer,
                 offset: 24,
             }),
-            Err(error) => request.reply(Err(error))?,
+            Err(error) => return Err(EndpointFault::Core(error)),
         }
         Ok(())
     }
-    fn poll(&mut self, ops: &mut impl SendTaskOps) -> Result<bool, String> {
+    fn poll(&mut self, ops: &mut impl SendTaskOps) -> Result<bool, EndpointFault> {
         let Some(write) = self.pending.front_mut() else {
             return Ok(false);
         };
@@ -243,61 +304,127 @@ impl SendTask {
             Ok(n) => {
                 write.offset += n;
                 if write.offset == write.request.data.len() {
-                    write.request.reply(Ok(vec![]))?;
                     self.pending.pop_front();
                 }
                 Ok(true)
             }
             Err(error) => {
-                write.request.reply(Err(error))?;
+                Message {
+                    fd: write.request.fd.clone(),
+                    op: STATE,
+                    socket: write.request.socket,
+                    request: 0,
+                    status: errno(error),
+                    data: 0u32.to_le_bytes().to_vec(),
+                }
+                .write()?;
                 self.pending.pop_front();
                 Ok(true)
             }
         }
     }
-    fn finish(&mut self, ops: &mut impl SendTaskOps) -> Result<(), String> {
+    fn finish(&mut self, ops: &mut impl SendTaskOps) -> Result<(), EndpointFault> {
         // Admission is bounded by the kernel endpoint's outstanding send bytes.
         // Unlike normal pumping, shutdown does not wait for buffer space/ACKs.
+        let size: usize = self
+            .pending
+            .iter()
+            .map(|p| p.request.data.len() - p.offset)
+            .sum();
         let mut admitted = Vec::new();
+        admitted
+            .try_reserve_exact(size)
+            .map_err(|_| EndpointFault::Allocation)?;
         for write in &self.pending {
             admitted.extend_from_slice(&write.request.data[write.offset..]);
         }
-        let result = ops.finish(&admitted);
-        for write in self.pending.drain(..) {
-            write.request.reply(result.map(|()| vec![]))?;
-        }
+        ops.finish(&admitted).map_err(EndpointFault::Core)?;
+        self.pending.clear();
         Ok(())
     }
 }
+/// Only transport-admitted data may be retained for RX publication.
+struct RxRecord {
+    source: Option<Address>,
+    payload: Vec<u8>,
+}
+enum DroppedDatagram {
+    Oversized,
+}
+impl RxRecord {
+    fn tcp(payload: Vec<u8>) -> Self {
+        assert!(payload.len() <= PAYLOAD);
+        Self {
+            source: None,
+            payload,
+        }
+    }
+    fn udp(packet: netstack3_port_integration::NativeUdpDatagram) -> Result<Self, DroppedDatagram> {
+        if packet.body.len() > PAYLOAD {
+            return Err(DroppedDatagram::Oversized);
+        }
+        Ok(Self {
+            source: Some(packet.source),
+            payload: packet.body,
+        })
+    }
+    fn try_publish(&self, fd: &Rc<OwnedFd>, id: u64) -> Result<bool, EndpointFault> {
+        let mut data = self
+            .source
+            .as_ref()
+            .map(encode_address)
+            .unwrap_or_else(|| vec![0; 24]);
+        data.extend_from_slice(&self.payload);
+        Message {
+            fd: fd.clone(),
+            op: RX,
+            socket: id,
+            request: 0,
+            status: 0,
+            data,
+        }
+        .try_write()
+    }
+}
+enum Received {
+    Record(RxRecord),
+    Eof,
+    Dropped(DroppedDatagram),
+}
 struct ReceiveTask {
-    credits: usize,
+    pending: Option<RxRecord>,
     ended: bool,
 }
 impl ReceiveTask {
     fn new() -> Self {
         Self {
-            credits: 4,
+            pending: None,
             ended: false,
         }
     }
-    fn credit(&mut self, count: usize) -> Result<(), Error> {
-        if count == 0 || count > 4 - self.credits {
-            return Err(Error::InvalidState);
+    fn poll(
+        &mut self,
+        socket: &mut Socket,
+        fd: &Rc<OwnedFd>,
+        id: u64,
+    ) -> Result<bool, EndpointFault> {
+        if let Some(message) = self.pending.as_ref() {
+            if !message.try_publish(fd, id)? {
+                return Ok(false);
+            }
+            self.pending = None;
+            return Ok(true);
         }
-        self.credits += count;
-        Ok(())
-    }
-    fn poll(&mut self, socket: &mut Socket, fd: &Rc<OwnedFd>, id: u64) -> Result<bool, String> {
-        if self.ended || self.credits == 0 {
+        if self.ended {
             return Ok(false);
         }
-        let result = (|| -> Result<Option<(Option<Address>, Vec<u8>)>, Error> {
+        let result = (|| -> Result<Received, Error> {
             match socket {
                 Socket::Tcp(s) => {
                     let (readable, _, eof) = s.readiness()?;
                     if !readable {
                         return if eof {
-                            Ok(None)
+                            Ok(Received::Eof)
                         } else {
                             Err(Error::WouldBlock)
                         };
@@ -305,34 +432,25 @@ impl ReceiveTask {
                     let mut bytes = vec![0; PAYLOAD];
                     let n = s.read(&mut bytes)?;
                     bytes.truncate(n);
-                    Ok(Some((None, bytes)))
+                    Ok(Received::Record(RxRecord::tcp(bytes)))
                 }
-                Socket::Udp(s) => s
-                    .receive()?
-                    .map(|p| Some((Some(p.source), p.body)))
-                    .ok_or(Error::WouldBlock),
+                Socket::Udp(s) => match s.receive()? {
+                    Some(packet) => Ok(match RxRecord::udp(packet) {
+                        Ok(record) => Received::Record(record),
+                        Err(reason) => Received::Dropped(reason),
+                    }),
+                    None => Err(Error::WouldBlock),
+                },
                 Socket::Listener(_) => Err(Error::InvalidState),
             }
         })();
         match result {
-            Ok(Some((source, bytes))) => {
-                let mut data = source
-                    .as_ref()
-                    .map(encode_address)
-                    .unwrap_or_else(|| vec![0; 24]);
-                data.extend(bytes);
-                Message {
-                    fd: fd.clone(),
-                    op: RX,
-                    socket: id,
-                    request: 0,
-                    status: 0,
-                    data,
+            Ok(Received::Record(record)) => {
+                if !record.try_publish(fd, id)? {
+                    self.pending = Some(record);
                 }
-                .write()?;
-                self.credits -= 1;
             }
-            Ok(_) => {
+            Ok(Received::Eof) => {
                 Message {
                     fd: fd.clone(),
                     op: STATE,
@@ -343,6 +461,20 @@ impl ReceiveTask {
                 }
                 .write()?;
                 self.ended = true;
+            }
+            Ok(Received::Dropped(DroppedDatagram::Oversized)) => {
+                // The binding supports atomic datagrams up to PAYLOAD. Drop an
+                // oversize record atomically and report this endpoint's error;
+                // never let one valid network packet terminate the provider.
+                Message {
+                    fd: fd.clone(),
+                    op: STATE,
+                    socket: id,
+                    request: 0,
+                    status: errno(Error::PayloadTooLarge),
+                    data: 0u32.to_le_bytes().to_vec(),
+                }
+                .write()?;
             }
             Err(Error::WouldBlock | Error::InvalidState | Error::ConnectionPending) => {
                 return Ok(false);
@@ -365,7 +497,11 @@ impl ReceiveTask {
 }
 enum TaskControl {
     Running,
-    Shutdown { request: Message, how: TcpShutdown },
+    Shutdown {
+        request: Message,
+        how: TcpShutdown,
+        seal: u64,
+    },
     Close(Message),
 }
 struct Endpoint {
@@ -374,8 +510,10 @@ struct Endpoint {
     receive: ReceiveTask,
     control: TaskControl,
     pending_accept: Option<TcpSocket>,
-    accept_ready: bool,
+    accept: AcceptState,
     last_state: Option<(u32, Option<Error>)>,
+    dequeued: u64,
+    connection_attempt: Option<u64>,
 }
 impl Endpoint {
     fn new(socket: Socket) -> Self {
@@ -385,8 +523,10 @@ impl Endpoint {
             receive: ReceiveTask::new(),
             control: TaskControl::Running,
             pending_accept: None,
-            accept_ready: false,
+            accept: AcceptState::WaitingForListenerSpace,
             last_state: None,
+            dequeued: 0,
+            connection_attempt: None,
         }
     }
 }
@@ -417,28 +557,40 @@ impl SocketWorker {
     pub(super) fn wants_accept(&self) -> bool {
         self.data
             .as_ref()
-            .is_some_and(|e| matches!(e.socket, Some(Socket::Listener(_))) && e.accept_ready)
+            .is_some_and(|e| matches!(e.socket, Some(Socket::Listener(_))) && e.accept.due())
     }
 
-    pub(super) fn accept_info(&mut self) -> Result<Option<Vec<u8>>, String> {
+    pub(super) fn accept_info(&mut self) -> Result<Option<Vec<u8>>, EndpointFault> {
         let e = self.data.as_mut().expect("listener has core socket");
         if e.pending_accept.is_none() {
             let Some(Socket::Listener(listener)) = e.socket.as_mut() else {
-                return Err("accept on non-listener".into());
+                return Err(EndpointFault::Protocol("accept on non-listener"));
             };
             e.pending_accept = match listener.accept() {
-                Ok(child) => Some(child),
-                Err(Error::WouldBlock) => None,
-                Err(error) => return Err(format!("accept from Netstack3: {error:?}")),
+                Ok(child) => {
+                    e.accept = AcceptState::Ready;
+                    Some(child)
+                }
+                Err(Error::WouldBlock) => {
+                    e.accept = AcceptState::Ready;
+                    None
+                }
+                Err(Error::SocketLimit) => {
+                    e.accept = AcceptState::RetryAt(Instant::now() + Duration::from_millis(100));
+                    None
+                }
+                Err(error) => return Err(EndpointFault::Core(error)),
             };
         }
         e.pending_accept
             .as_ref()
             .map(|child| {
-                let names = child.info().map_err(|e| format!("accepted names: {e:?}"))?;
+                let names = child.info().map_err(EndpointFault::Core)?;
                 let mut info = encode_address(&names.local);
                 info.extend(encode_address(
-                    &names.peer.ok_or("accepted child has no peer")?,
+                    &names
+                        .peer
+                        .ok_or(EndpointFault::Protocol("accepted child has no peer"))?,
                 ));
                 info.extend([0; 8]);
                 Ok(info)
@@ -446,8 +598,16 @@ impl SocketWorker {
             .transpose()
     }
 
+    pub(super) fn accept_deadline(&self) -> Option<Instant> {
+        self.data.as_ref().and_then(|e| e.accept.deadline())
+    }
+    pub(super) fn retry_accept(&mut self) {
+        self.data.as_mut().unwrap().accept =
+            AcceptState::RetryAt(Instant::now() + Duration::from_millis(100));
+    }
+
     pub(super) fn pause_accept(&mut self) {
-        self.data.as_mut().unwrap().accept_ready = false;
+        self.data.as_mut().unwrap().accept = AcceptState::WaitingForListenerSpace;
     }
 
     pub(super) fn take_accepted(&mut self, id: u64, fd: Rc<OwnedFd>) -> Self {
@@ -459,15 +619,15 @@ impl SocketWorker {
             data: Some(Endpoint::new(Socket::Tcp(child))),
         }
     }
-    pub(super) fn handle_requests(&mut self) -> Result<ControlFlow<(), bool>, String> {
+    pub(super) fn handle_requests(&mut self) -> Result<Work, EndpointFault> {
         let mut progress = false;
         for _ in 0..32 {
-            let Some(m) = Message::read(self.fd.clone(), self.id)? else {
+            let Some(m) = Message::read(self.fd.clone(), self.id, true)? else {
                 break;
             };
             progress = true;
             if m.op == CLOSE && (m.status != 0 || self.data.is_none()) {
-                return Ok(ControlFlow::Break(()));
+                return Ok(Work::Closed);
             }
             if m.op == OPEN {
                 let result = (|| {
@@ -484,15 +644,16 @@ impl SocketWorker {
                         2 => Socket::Udp(self.sockets.udp(version)?),
                         _ => return Err(Error::InvalidState),
                     };
+                    let local = socket.info()?.local;
                     self.data = Some(Endpoint::new(socket));
-                    Ok(vec![])
+                    Ok(encode_address(&local))
                 })();
                 m.reply(result)?;
                 continue;
             }
             if m.op == ACCEPT {
                 if let Some(e) = self.data.as_mut() {
-                    e.accept_ready = true;
+                    e.accept = AcceptState::Ready;
                 }
                 continue;
             }
@@ -505,18 +666,31 @@ impl SocketWorker {
                 continue;
             }
             if m.op == CLOSE {
+                if m.data.len() != 8 {
+                    return Err(EndpointFault::Protocol("invalid close seal"));
+                }
                 e.control = TaskControl::Close(m);
                 break;
             }
             if m.op == SHUTDOWN {
-                let how = scalar(&m.data).and_then(|v| match v {
+                if m.data.len() != 12 {
+                    return Err(EndpointFault::Protocol("invalid shutdown control"));
+                }
+                let seal = u64::from_le_bytes(m.data[4..].try_into().unwrap());
+                let how = scalar(&m.data[..4]).and_then(|v| match v {
                     1 => Ok(TcpShutdown::Receive),
                     2 => Ok(TcpShutdown::Send),
                     3 => Ok(TcpShutdown::SendAndReceive),
                     _ => Err(Error::InvalidState),
                 });
                 match how {
-                    Ok(how) => e.control = TaskControl::Shutdown { request: m, how },
+                    Ok(how) => {
+                        e.control = TaskControl::Shutdown {
+                            request: m,
+                            how,
+                            seal,
+                        }
+                    }
                     Err(error) => m.reply(Err(error))?,
                 }
                 continue;
@@ -553,40 +727,38 @@ impl SocketWorker {
                     CONNECT => {
                         let a = address(&m.data)?.ok_or(Error::InvalidState)?;
                         match e.socket.as_mut().unwrap() {
-                            Socket::Tcp(s) => s.connect(a)?,
+                            Socket::Tcp(s) => {
+                                s.connect(a)?;
+                                e.connection_attempt = Some(m.request);
+                            }
                             Socket::Udp(s) => s.connect(a)?,
                             Socket::Listener(_) => return Err(Error::InvalidState),
                         }
-                        Ok(vec![])
+                        let info = e.socket.as_ref().unwrap().info()?;
+                        let mut data = encode_address(&info.local);
+                        data.extend(encode_address(&a));
+                        Ok(data)
                     }
-                    GETNAME => {
-                        let socket = e.socket.as_ref().unwrap();
-                        let info = socket.info()?;
-                        let name = if scalar(&m.data)? == 0 {
-                            info.local
-                        } else {
-                            match socket {
-                                Socket::Udp(s) => s.peer(),
-                                _ => info.peer,
-                            }
-                            .ok_or(Error::InvalidState)?
+                    ACTIVATE => {
+                        let Some(Socket::Udp(socket)) = e.socket.as_mut() else {
+                            return Err(Error::InvalidState);
                         };
-                        Ok(encode_address(&name))
-                    }
-                    CREDIT => {
-                        e.receive.credit(scalar(&m.data)? as usize)?;
-                        Ok(vec![])
+                        let info = socket.info()?;
+                        if info.local.port == 0 {
+                            socket.bind(info.local)?;
+                        }
+                        Ok(encode_address(&socket.info()?.local))
                     }
                     _ => Err(Error::NotSupported),
                 }
             })();
             m.reply(result)?;
         }
-        Ok(ControlFlow::Continue(progress))
+        Ok(if progress { Work::Progress } else { Work::Idle })
     }
-    pub(super) fn poll_data(&mut self) -> Result<ControlFlow<(), bool>, String> {
+    pub(super) fn poll_data(&mut self) -> Result<Work, EndpointFault> {
         let Some(e) = self.data.as_mut() else {
-            return Ok(ControlFlow::Continue(false));
+            return Ok(Work::Idle);
         };
         let id = self.id;
         let fd = &self.fd;
@@ -599,16 +771,67 @@ impl SocketWorker {
                     ..
                 }
             );
+        let seal = match &e.control {
+            TaskControl::Close(m) => Some(u64::from_le_bytes(m.data[..].try_into().unwrap())),
+            TaskControl::Shutdown {
+                seal,
+                how: TcpShutdown::Send | TcpShutdown::SendAndReceive,
+                ..
+            } => Some(*seal),
+            _ => None,
+        };
+        if seal.is_some_and(|seal| e.dequeued > seal) {
+            return Err(EndpointFault::Protocol("TX seal behind dequeued position"));
+        }
+        let tcp = matches!(e.socket, Some(Socket::Tcp(_)));
+        if e.send.pending.is_empty() || (finishing && tcp) {
+            let limit = if finishing { 32 } else { 1 };
+            for _ in 0..limit {
+                if seal == Some(e.dequeued) {
+                    break;
+                }
+                let Some(m) = Message::read(fd.clone(), id, false)? else {
+                    break;
+                };
+                if m.op == CLOSE && m.status != 0 {
+                    return Ok(Work::Closed);
+                }
+                if m.op != SEND || m.request != 0 || m.data.len() < 24 {
+                    return Err(EndpointFault::Protocol("invalid data transfer"));
+                }
+                let step = if tcp { (m.data.len() - 24) as u64 } else { 1 };
+                e.dequeued = e
+                    .dequeued
+                    .checked_add(step)
+                    .ok_or(EndpointFault::Protocol("TX position overflow"))?;
+                if seal.is_some_and(|seal| e.dequeued > seal) {
+                    return Err(EndpointFault::Protocol("TX exceeds seal"));
+                }
+                let staged: usize = e
+                    .send
+                    .pending
+                    .iter()
+                    .map(|p| p.request.data.len() - p.offset)
+                    .sum();
+                if staged + m.data.len() - 24 > netstack3_port_integration::TCP_TERMINAL_ALLOWANCE {
+                    return Err(EndpointFault::Protocol(
+                        "TX staging exceeds reserved allowance",
+                    ));
+                }
+                e.send.admit(m)?;
+                progress = true;
+            }
+        }
         {
             let socket = e.socket.as_mut().unwrap();
-            if finishing && matches!(socket, Socket::Tcp(_)) && !e.send.pending.is_empty() {
+            if finishing && tcp && seal == Some(e.dequeued) {
                 e.send.finish(socket)?;
                 progress = true;
-            } else {
+            } else if !finishing || !tcp {
                 progress |= e.send.poll(socket)?;
             }
         }
-        if e.send.pending.is_empty()
+        if (e.send.pending.is_empty() && seal.is_none_or(|seal| e.dequeued == seal))
             || matches!(
                 e.control,
                 TaskControl::Shutdown {
@@ -619,12 +842,13 @@ impl SocketWorker {
         {
             match std::mem::replace(&mut e.control, TaskControl::Running) {
                 TaskControl::Running => {}
-                TaskControl::Shutdown { request, how } => {
+                TaskControl::Shutdown { request, how, .. } => {
                     let result = e.socket.as_mut().unwrap().shutdown(how);
                     if result.is_ok()
                         && matches!(how, TcpShutdown::Receive | TcpShutdown::SendAndReceive)
                     {
                         e.receive.ended = true;
+                        e.receive.pending = None;
                     }
                     request.reply(result.map(|()| vec![]))?;
                     progress = true;
@@ -633,7 +857,7 @@ impl SocketWorker {
                     e.receive.ended = true;
                     self.data = None; // drops unpublished child and core owner
                     request.reply(Ok(vec![]))?;
-                    return Ok(ControlFlow::Break(()));
+                    return Ok(Work::Closed);
                 }
             }
         }
@@ -642,14 +866,39 @@ impl SocketWorker {
         }
         let state = match e.socket.as_mut().unwrap() {
             Socket::Tcp(s) => {
-                let connection = s.connection().map_err(|e| format!("connection: {e:?}"))?;
-                let error = s.take_error().map_err(|e| format!("socket error: {e:?}"))?;
-                (
-                    u32::from(matches!(connection, Connection::Finished(Ok(_)))),
-                    error,
-                )
+                let connection = s.connection().map_err(EndpointFault::Core)?;
+                if let (Some(attempt), Connection::Finished(result)) =
+                    (e.connection_attempt, connection)
+                {
+                    let (data, status) = match result {
+                        Ok(info) => {
+                            let mut data = encode_address(&info.local);
+                            data.extend(encode_address(&info.peer.ok_or(
+                                EndpointFault::Protocol("completed connection missing peer"),
+                            )?));
+                            (data, 0)
+                        }
+                        Err(error) => (vec![], errno(error)),
+                    };
+                    Message {
+                        fd: fd.clone(),
+                        op: CONNECTION,
+                        socket: id,
+                        request: attempt,
+                        status,
+                        data,
+                    }
+                    .write()?;
+                    e.connection_attempt = None;
+                    // Error was reported with its attempt; do not mirror it as
+                    // an uncorrelated second failure.
+                    s.take_error().map_err(EndpointFault::Core)?;
+                    progress = true;
+                }
+                let error = s.take_error().map_err(EndpointFault::Core)?;
+                (0u32, error)
             }
-            Socket::Udp(s) => (u32::from(s.peer().is_some()), None),
+            Socket::Udp(_) => (0, None),
             Socket::Listener(_) => (0, None),
         };
         if e.last_state != Some(state) {
@@ -667,7 +916,7 @@ impl SocketWorker {
                 progress = true;
             }
         }
-        Ok(ControlFlow::Continue(progress))
+        Ok(if progress { Work::Progress } else { Work::Idle })
     }
 }
 
@@ -675,6 +924,124 @@ impl SocketWorker {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn rx_admission_rejects_oversize_before_pending_publication() {
+        let source = Address {
+            address: Ip::V4([192, 0, 2, 1]),
+            port: 80,
+        };
+        let packet = |n| netstack3_port_integration::NativeUdpDatagram {
+            source,
+            body: vec![7; n],
+        };
+        assert!(matches!(
+            RxRecord::udp(packet(PAYLOAD + 1)),
+            Err(DroppedDatagram::Oversized)
+        ));
+        assert_eq!(
+            RxRecord::udp(packet(PAYLOAD)).ok().unwrap().payload.len(),
+            PAYLOAD
+        );
+        assert!(RxRecord::udp(packet(0)).ok().unwrap().payload.is_empty());
+    }
+
+    #[test]
+    fn fragmented_oversize_udp_is_local_drop_and_supported_record_follows() {
+        use net_types::{ethernet::Mac, ip::Ipv4Addr};
+        use netstack3_port_integration::{Runtime, service::DhcpService};
+        use netstack3_port_spike::{EthernetFrame, StackEthernetEndpoint};
+        use packet::{Buf, NestableSerializer as _, Serializer as _};
+        use packet_formats::{
+            ethernet::{ETHERNET_MIN_BODY_LEN_NO_TAG, EtherType, EthernetFrameBuilder},
+            ip::{FragmentOffset, IpProto, Ipv4Proto},
+            ipv4::Ipv4PacketBuilder,
+            udp::UdpPacketBuilder,
+        };
+        use rand::SeedableRng as _;
+        use std::num::{NonZeroU16, NonZeroU64};
+        let mac = [2, 0, 0, 0, 0, 1];
+        let mut rt = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(65536),
+            NonZeroU64::new(1).unwrap(),
+            mac,
+            1500,
+        )
+        .unwrap();
+        rt.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
+        let mut service = DhcpService::new(rt, rand::rngs::StdRng::seed_from_u64(1), mac);
+        let sockets = service.sockets();
+        let mut udp = sockets.udp(IpVersion::V4).unwrap();
+        udp.bind(Address {
+            address: Ip::V4([192, 0, 2, 2]),
+            port: 9000,
+        })
+        .unwrap();
+        let mut socket = Socket::Udp(udp);
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let fd = Rc::new(OwnedFd::from(tx));
+        let mut receive = ReceiveTask::new();
+        let src = Ipv4Addr::new([192, 0, 2, 1]);
+        let dst = Ipv4Addr::new([192, 0, 2, 2]);
+        for (id, length) in [(1, PAYLOAD + 1), (2, 3)] {
+            let udp = Buf::new(vec![7; length], ..)
+                .wrap_in(UdpPacketBuilder::new(
+                    src,
+                    dst,
+                    NonZeroU16::new(8000),
+                    NonZeroU16::new(9000).unwrap(),
+                ))
+                .serialize_vec_outer(&mut netstack3_base::NetworkSerializationContext::default())
+                .unwrap()
+                .unwrap_b()
+                .into_inner();
+            let chunks = udp.chunks(1480);
+            let count = chunks.len();
+            for (index, chunk) in chunks.enumerate() {
+                let mut ip = Ipv4PacketBuilder::new(src, dst, 64, Ipv4Proto::Proto(IpProto::Udp));
+                ip.id(id);
+                ip.mf_flag(index + 1 != count);
+                ip.fragment_offset(FragmentOffset::new((index * 1480 / 8) as u16).unwrap());
+                let bytes =
+                    Buf::new(chunk.to_vec(), ..)
+                        .wrap_in(ip)
+                        .wrap_in(EthernetFrameBuilder::new(
+                            Mac::new([2, 0, 0, 0, 0, 2]),
+                            Mac::new(mac),
+                            EtherType::Ipv4,
+                            ETHERNET_MIN_BODY_LEN_NO_TAG,
+                        ))
+                        .serialize_vec_outer(
+                            &mut netstack3_base::NetworkSerializationContext::default(),
+                        )
+                        .unwrap()
+                        .unwrap_b()
+                        .into_inner();
+                service
+                    .receive_frame(EthernetFrame::try_from(bytes).unwrap())
+                    .unwrap();
+            }
+            assert!(receive.poll(&mut socket, &fd, 1).unwrap());
+            let mut encoded = [0; 128];
+            let n = rx.recv(&mut encoded).unwrap();
+            if length > PAYLOAD {
+                assert_eq!(n, 28);
+                assert_eq!(u32::from_le_bytes(encoded[4..8].try_into().unwrap()), STATE);
+                assert_eq!(
+                    u32::from_le_bytes(encoded[20..24].try_into().unwrap()),
+                    libc::EMSGSIZE as u32
+                );
+                assert!(receive.pending.is_none());
+                assert!(!receive.ended);
+            } else {
+                assert_eq!(n, 24 + 24 + length);
+                assert_eq!(u32::from_le_bytes(encoded[4..8].try_into().unwrap()), RX);
+                assert_eq!(&encoded[48..n], &[7; 3]);
+            }
+        }
+    }
 
     #[derive(Default)]
     struct FakeSend {
@@ -703,14 +1070,14 @@ mod tests {
             Ok(())
         }
     }
-    fn send(fd: &Rc<OwnedFd>, id: u64, bytes: &[u8]) -> Message {
+    fn send(fd: &Rc<OwnedFd>, _id: u64, bytes: &[u8]) -> Message {
         let mut data = vec![0; 24];
         data.extend(bytes);
         Message {
             fd: fd.clone(),
             op: SEND,
             socket: 1,
-            request: id,
+            request: 0,
             status: 0,
             data,
         }
@@ -732,24 +1099,19 @@ mod tests {
             task.admit(send(&fd, 2, b"world")).unwrap();
             task.poll(&mut ops).unwrap();
             let mut response = [0; 128];
-            if allowance < 5 {
-                assert_eq!(
-                    rx.recv(&mut response).unwrap_err().kind(),
-                    std::io::ErrorKind::WouldBlock
-                );
-            } else {
-                assert_eq!(rx.recv(&mut response).unwrap(), 32);
-            }
+            assert_eq!(
+                rx.recv(&mut response).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
             assert!(!task.poll(&mut ops).unwrap());
             task.finish(&mut ops).unwrap();
             assert!(ops.finished);
             assert_eq!(ops.bytes, b"helloworld");
             assert!(task.pending.is_empty());
-            for id in (if allowance == 5 { 2 } else { 1 })..=2u64 {
-                assert_eq!(rx.recv(&mut response).unwrap(), 32);
-                assert_eq!(u64::from_le_bytes(response[16..24].try_into().unwrap()), id);
-                assert_eq!(&response[28..32], &[0; 4]);
-            }
+            assert_eq!(
+                rx.recv(&mut response).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
     }
     #[test]
@@ -759,31 +1121,28 @@ mod tests {
         let mut old = send(&fd, 1, b"old").encode();
         old[..4].copy_from_slice(&4u32.to_le_bytes());
         tx.send(&old).unwrap();
-        assert!(Message::read(fd, 1).is_err());
+        assert!(Message::read(fd, 1, false).is_err());
     }
 
     #[test]
-    fn failed_terminal_handoff_replies_error_to_every_admitted_send() {
+    fn failed_terminal_handoff_retains_staging_and_fails_the_owner() {
         let (tx, rx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
         let fd = Rc::new(OwnedFd::from(tx));
         let mut task = SendTask::default();
-        task.admit(send(&fd, 1, b"one")).unwrap();
-        task.admit(send(&fd, 2, b"two")).unwrap();
+        task.admit(send(&fd, 0, b"one")).unwrap();
+        task.admit(send(&fd, 0, b"two")).unwrap();
         let mut ops = FakeSend {
             fail_finish: true,
             ..Default::default()
         };
-        task.finish(&mut ops).unwrap();
+        assert!(task.finish(&mut ops).is_err());
         assert!(ops.bytes.is_empty());
-        assert!(task.pending.is_empty());
-        for _ in 0..2 {
-            let mut response = [0; 32];
-            assert_eq!(rx.recv(&mut response).unwrap(), 32);
-            assert_eq!(
-                u32::from_le_bytes(response[28..32].try_into().unwrap()),
-                libc::EBADF as u32
-            );
-        }
+        assert_eq!(task.pending.len(), 2);
+        assert_eq!(
+            rx.recv(&mut [0; 32]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
     #[test]
     fn pending_and_transferred_children_have_exactly_one_lifetime_owner() {
@@ -848,16 +1207,5 @@ mod tests {
             ));
             drop((first, second));
         }
-    }
-
-    #[test]
-    fn receive_credits_cannot_be_created_or_returned_twice() {
-        let mut receive = ReceiveTask::new();
-        assert_eq!(receive.credit(1), Err(Error::InvalidState));
-        receive.credits -= 2;
-        assert_eq!(receive.credit(0), Err(Error::InvalidState));
-        assert_eq!(receive.credit(3), Err(Error::InvalidState));
-        receive.credit(2).unwrap();
-        assert_eq!(receive.credit(1), Err(Error::InvalidState));
     }
 }

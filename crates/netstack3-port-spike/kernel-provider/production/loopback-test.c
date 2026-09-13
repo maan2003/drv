@@ -137,7 +137,13 @@ static void udp(int family) {
 	check(bind(server, (void *)&a, alen(family)) == 0, "udp bind");
 	char b[64]; socklen_t n = sizeof(source);
 	check(recv(server, b, sizeof(b), 0) < 0 && errno == EAGAIN, "empty nonblocking UDP");
-	check(sendto(client, "", 0, 0, (void *)&a, alen(family)) == 0, "zero datagram send");
+	ssize_t sent = sendto(client, "", 0, 0, (void *)&a, alen(family));
+    if (sent < 0 && errno == EAGAIN) {
+        /* Lazy activation consumes no payload; retry after committed metadata. */
+        wait_event(client, EPOLLOUT);
+        sent = sendto(client, "", 0, 0, (void *)&a, alen(family));
+    }
+    check(sent == 0, "zero datagram send");
 	wait_event(server, EPOLLIN);
 	check(recvfrom(server, b, sizeof(b), 0, (void *)&source, &n) == 0, "zero datagram receive");
 	check(source.ss_family == family, "datagram source family");

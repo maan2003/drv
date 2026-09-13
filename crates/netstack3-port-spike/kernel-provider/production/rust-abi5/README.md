@@ -1,42 +1,75 @@
-# ABI5 kernel frontend in Rust
+# Rust kernel frontend: owned socket binding, ABI6
 
-This is the complete ABI5 frontend, not the lifecycle prototype. It registers
-AF_INET/AF_INET6 with native INET excluded and uses the existing, unchanged
-sandboxed Netstack3 provider. Tested on Linux **7.3-rc2**, Rust **1.97.0** and
-GCC **15.2.0** on np using native make, not a Nix build.
+Registers AF_INET/AF_INET6 with native INET excluded. The historical directory
+name is retained; ABI5 peers are not supported. The current private transport is
+[`../protocol.h`](../protocol.h). Linux application syscalls remain unchanged.
 
-## Ownership and trust boundaries
+## Ownership follows actual storage
 
-- `frontend.rs` forbids unsafe code: namespace generations, socket quota,
-  bounded request/TX/RX queues, credits, connect/readiness, accepted children,
-  controls and producer shutdown barriers all live here.
-- `linux.rs` and `rust_main.rs` isolate unsafe native references, address/iterator
-  conversion, foreign Arc ownership and Linux callbacks.
-- `glue.c` only supplies native registration and socket/file/refcount mechanics;
-  it does not implement ABI5 queues or TCP/IP.
-- Shared `../rust-lifecycle/endpoint_file.rs` owns typed file callbacks.
-  Upstream `Arc`, `ARef<File>`, `FileDescriptorReservation`, `PollTable`,
-  `PollCondVar`, mutexes, usercopy and iterator wrappers are reused.
+Linux queues own admitted TX and published RX. `read(endpoint)` transfers TCP
+bytes or one atomic UDP record; `NS3_READ_CONTROL` independently dequeues typed
+control. No SEND replies, mirrored receive credits, GETNAME RPC or redundant
+socket identities occur in ordinary records. Queue occupancy drives readiness.
+Provider staging is one record normally, bounded terminal remainder at a seal.
 
-Application release removes the registry owner. Endpoint FDs can retain socket
-state and quota afterward; final endpoint release revokes that socket.
-Requests are values, not self-owning socket references. Accepted-child
-destruction happens outside listener/namespace locks. FD reservation, usercopy,
-file creation and queue publication are transactional. Failed file creation
-does not invoke endpoint revocation. CLOSE/CREDIT/accept-space reads allocate
-nothing. Interrupted/failed copies do not consume queue state or iterator bytes.
+Linux and SOCKS use concrete `TcpSocket`, `TcpListener`, `UdpSocket` owners in
+port-integration. Runtime alone owns strong core IDs and invokes buffer hooks.
+Connect attempt results survive SO_ERROR consumption. UDP readiness never
+dequeues data. Listener publication transfers an owned child transactionally.
 
-The wire contract remains `../protocol.h`, version 5: 256 sockets per namespace,
-32 request slots (eight reserved for control), 256 KiB TX admission, 16 KiB
-payloads and four RX credits. SHUTDOWN/CLOSE preserve the userspace producer
-handoff barrier; completion is not a remote TCP acknowledgement.
+Runtime storage reservations cover two fixed 256KiB core buffers plus a 272KiB
+terminal allowance per unit. Active/accepted sockets reserve one unit; listeners
+also reserve backlog units before listening. Accepted children get their own
+reservation before core dequeue; conservative backlog reservations are retained
+until core listener teardown returns. A shared lease lives in actual send/receive
+storage, so closing a Runtime handle cannot free a still-live core charge.
+The shared pool has twice the configured socket capacity (active and passive
+populations); retained terminal storage competes with future admission.
 
-**Cancellation refinement:** mutating controls still revoke on ambiguous
-interruption/timeout. GETNAME is read-only: its interrupted waiter detaches,
-but the bounded request ID remains until its late completion. That completion
-cannot overwrite a newer waiter or publish SO_ERROR. This fixes Go SIGURG
-preemption killing name-query sockets, exposed by real Tailscale startup.
-There is no signal-specific special case or disabled Go preemption.
+Kernel TX and RX each bound 256KiB and 32 records per endpoint; namespace quota
+is 256 including endpoint-held closed sockets and unpublished children. The
+binding stages at most one 16KiB record normally; terminal staging is at most
+272KiB. Temporary terminal accumulation/core-copy overlap is bounded by two
+additional remainder copies. VecDeque allocator growth may reserve more than
+logical length; these are payload/accounting bounds, not exact RSS claims.
+No peer-ACK wait occurs at terminal handoff. Runtime owns the terminal core-hook
+precondition: empty termination of an unconnected owner is valid, nonempty
+unconnected writes/handoffs are rejected, and only connection variants invoke
+core `do_send`. Repeated empty sealing is idempotent.
+
+`EndpointFault` retires one endpoint, not the provider generation. Listener
+resource pressure is an `AcceptState` with a scheduler-visible retry deadline.
+`RxRecord` admits bounded payloads before publication; oversize UDP produces
+a local EMSGSIZE and drops that datagram without ending receive pumping.
+
+## Waiting and the hostile-provider boundary
+
+Safe `frontend.rs` owns queue/state transitions, not TCP/IP. There are no
+syscall-long transmit, receive or control mutex guards. Control slot contenders
+and protocol waiters use interruptible waits and one immutable absolute deadline.
+Undispatched cancellation withdraws, except a sealed shutdown revokes rather
+than undoing its producer barrier; dispatched mutation ambiguity revokes.
+Background UDP activation survives a nonblocking caller's EAGAIN.
+
+First nonblocking UDP send can return EAGAIN with zero payload consumed while
+autobind metadata is prepared. Initially poll allows an attempt; activation then
+suppresses writable until completion/error. GETNAME reads committed metadata.
+Explicit bind/connect share the logical operation gate with activation.
+
+Completion opcode, correlation, shape and address family are validated before
+metadata, result, request-retirement or wake publication. A TCP connection
+outcome is correlated separately from its acknowledgement and retained separately
+from consume-on-read errors. `ConnectAttempt` owns acknowledgement/outcome and
+waiter attachment transitions; a completed but unclaimed attempt cannot be
+replaced by another caller. TX seals count TCP bytes or UDP records including
+empty datagrams. Datagram destinations are fixed at app admission.
+
+`linux.rs`/`rust_main.rs` isolate native references and iterator callbacks.
+`glue.c` owns registration/native object mechanics only. Shared typed endpoint
+files reuse upstream Arc/ARef/FD reservation and pollfree/RCU lifetime helpers.
+The installer applies `positionless-poll.patch`: poll callbacks borrow a live
+file without asserting the stronger File/fdget_pos exclusion invariant.
+Native shutdown serializes its own shared safe callers.
 
 ## Build and run
 
@@ -48,7 +81,7 @@ cp ../guest.config "$TREE/.config"
 "$TREE/scripts/config" --file "$TREE/.config" \
   -d INET -d NETSTACK3 -d NETSTACK3_RUST_LIFECYCLE \
   -e RUST -e NETSTACK3_RUST -e DEBUG_KERNEL -e PROVE_LOCKING \
-  -e DEBUG_ATOMIC_SLEEP -e DEBUG_MUTEXES -e DEBUG_LIST
+  -e DEBUG_ATOMIC_SLEEP -e DEBUG_MUTEXES -e DEBUG_LIST -e KUNIT
 # Export RUST_LIB_SRC (matching compiler library sources) and LIBCLANG_PATH.
 # RUSTC/HOSTRUSTC/BINDGEN must be make arguments, not just environment variables.
 make -C "$TREE" RUSTC="$RUSTC" HOSTRUSTC="$RUSTC" BINDGEN="$BINDGEN" olddefconfig
@@ -60,29 +93,22 @@ bash ../run-kvm.sh "$TREE/arch/x86/boot/bzImage" "$ROOT" "$NEW_OUTPUT"
 
 ROOT is the existing [production fixture](../README.md), with BusyBox,
 sandboxed provider, loopback/concurrency/lifetime clients, NSS and service tests
-and their ELF dependencies. No provider rebuild or framing adapter is needed.
+and their ELF dependencies. Rebuild the provider and service tests for the matching ABI. No compatibility adapter is used.
 Use `../run-tailscale-kvm.sh` and its documented private no-login controller/peer
 for OpenSSH application acceptance.
 
-Use this installer for Rust. The parent installer and Linux 6.18 configuration
-remain the historical C reference/recovery build, not a runtime fallback.
-The new GETNAME cancellation regression intentionally exposes that C baseline's
-old cancellation behavior. Do not enable either C or lifecycle frontend with
-`NETSTACK3_RUST`; Kconfig excludes both.
 
-## Verified outcome and limits
+## Evidence status
 
-[Evidence](evidence.txt): three consecutive final full production KVM suites,
-including endpoint failure/credit/cancellation/quota tests, real IPv4/IPv6
-TCP/UDP, sendmmsg, refused SO_ERROR, shutdown backpressure, large and parallel
-transfers, provider death/replacement, sandboxed Ethernet DHCP/DNS/TCP and NSS.
-Real OpenSSH command, PTY and exact 8/8/64 MiB round trips pass through a private
-Tailscale relay on the same lock-debug kernel with `CONFIG_INET=n`.
-The shared infrastructure separately passes the lifecycle suite, including
-4,000 concurrent lifetimes, namespace reclamation and FD-limit rollback.
+[evidence.txt](evidence.txt) records ABI6 native and KVM acceptance before the
+historical ABI5 capture. Core tests: 36 passed. Service tests: 49 passed serially.
+KVM covers both connection-transition KUnit tests, endpoint ownership/quotas,
+shared-FD waits and wake-flood deadlines, TCP/UDP v4/v6, DHCP/DNS/NSS,
+provider replacement and absence. Private no-login overlay OpenSSH passes PTY
+and exact random 8MiB, 8MiB and 64MiB roundtrips.
 
-No significant blocker to using Rust for ABI5 remains. This is not proof of
-hostile-provider safety, exhaustive allocation-failure behavior, release-kernel
-performance or physical Wi-Fi deployment. No KASAN run is claimed. Existing
-unsupported socket options and missing production network-metadata publication
-remain; the private Tailscale lab still uses its documented network-up override.
+The same architecture advisor inspected the structural boundaries and recommended
+no further layer; verification was run by the primary agent on np, not by the
+advisor. A parallel host service resource-admission fixture has an intermittent
+timing failure; serial and guest acceptance pass. This is not physical Wi-Fi
+acceptance, complete Linux socket-option compatibility, or a security proof.

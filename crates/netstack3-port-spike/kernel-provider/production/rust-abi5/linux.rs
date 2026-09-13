@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Audited native lifetime, iterator and address boundary. No ABI5 policy.
+//! Audited native lifetime, iterator and address boundary. No transport policy.
 use core::{ffi::c_void, ptr::NonNull};
 use kernel::{
     bindings,

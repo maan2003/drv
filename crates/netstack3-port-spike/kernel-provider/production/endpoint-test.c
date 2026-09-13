@@ -4,6 +4,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,254 +13,247 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <poll.h>
 #include <time.h>
 #include "protocol.h"
 static void check(int ok, const char *what) {
-	if (!ok) { fprintf(stderr, "FAIL endpoint %s errno=%d\n", what, errno); exit(1); }
+    if (!ok) { fprintf(stderr,"FAIL endpoint %s errno=%d\n",what,errno); exit(1); }
 }
-static int claim(int registration, unsigned long long *id) {
-	int fd = ioctl(registration, NS3_CLAIM, id);
-	check(fd >= 0, "claim");
-	check(fcntl(fd, F_GETFD) & FD_CLOEXEC, "claim CLOEXEC");
-	return fd;
+struct frame { struct ns3_msg h; unsigned char data[NS3_PAYLOAD+24]; };
+static struct ns3_addr addr(unsigned family, unsigned port) {
+    struct ns3_addr a = {.family=family,.port=port};
+    if (family==4) { a.address[0]=127; a.address[3]=1; } else a.address[15]=1;
+    return a;
 }
-static void receive_packet(int endpoint, unsigned long long id) {
-	struct { struct ns3_msg h; struct ns3_addr a; char data[4]; } frame = {
-		.h = {.version=NS3_VERSION, .op=NS3_RX, .socket=id, .len=28},
-		.a = {.family=4, .port=23460}, .data={'t','e','s','t'},
-	};
-	check(write(endpoint, &frame, sizeof(frame.h) + 28) == sizeof(frame.h) + 28, "inject bounded packet");
+static int claim(int registration) {
+    unsigned long long id;
+    int fd=ioctl(registration,NS3_CLAIM,&id);
+    check(fd>=0 && (fcntl(fd,F_GETFD)&FD_CLOEXEC),"claim scoped CLOEXEC endpoint");
+    return fd;
 }
-static void interrupted(int sig) { (void)sig; }
-int main(int argc, char **argv) {
-	alarm(20); setbuf(stdout, NULL);
-	int registration = open("/dev/netstack3", O_RDWR | O_CLOEXEC);
-	check(registration >= 0, "register");
-    if (argc == 2 && !strcmp(argv[1], "bench")) {
-        int app = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-        unsigned long long id;
-        int endpoint = claim(registration, &id);
-        char packet[sizeof(struct ns3_msg) + sizeof(struct ns3_addr) + NS3_PAYLOAD] = {0};
-        struct ns3_msg *h = (void *)packet;
-        h->version = NS3_VERSION; h->op = NS3_RX; h->socket = id;
-        h->len = sizeof(struct ns3_addr) + NS3_PAYLOAD;
-        struct ns3_addr *address = (void *)(h + 1); address->family = 4;
-        char data[NS3_PAYLOAD], credit[64];
-        struct timespec begin, end, cpu_begin, cpu_end;
-        clock_gettime(CLOCK_MONOTONIC, &begin);
-        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_begin);
-        for (int i=0; i<100000; i++) {
-            check(write(endpoint, packet, sizeof(packet)) == sizeof(packet), "benchmark write");
-            check(recv(app, data, sizeof(data), 0) == sizeof(data), "benchmark receive");
-            check(read(endpoint, credit, sizeof(credit)) == sizeof(struct ns3_msg) + 4, "benchmark credit");
+static struct frame control(int fd) {
+    struct frame f={0};
+    for(int i=0;i<2000;i++) {
+        int n=ioctl(fd,NS3_READ_CONTROL,&f);
+        if(n>=0) {
+            check(n==(int)(sizeof(f.h)+f.h.len) && f.h.version==NS3_VERSION,"control framing");
+            return f;
         }
-        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double seconds = end.tv_sec-begin.tv_sec+(end.tv_nsec-begin.tv_nsec)/1e9;
-        double cpu = cpu_end.tv_sec-cpu_begin.tv_sec+(cpu_end.tv_nsec-cpu_begin.tv_nsec)/1e9;
-        printf("BENCH IPC frames=100000 bytes=1638400000 seconds=%.6f cpu_seconds=%.6f MBps=%.2f\n", seconds, cpu, 1638.4/seconds);
-        close(app); close(endpoint); close(registration);
-        return 0;
+        check(errno==EAGAIN,"control read"); usleep(1000);
     }
-    /* A fault copying the claim ID must not consume a queued socket. */
-    int fault_app = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    check(fault_app >= 0, "claim fault socket");
-    check(ioctl(registration, NS3_CLAIM, (void *)1) < 0 && errno == EFAULT,
-          "claim user-copy rollback");
+    check(0,"control timeout"); return f;
+}
+static void reply(int fd, struct frame *f, unsigned status, const void *data, size_t n) {
+    f->h.status=status; f->h.len=n;
+    if(n) memcpy(f->data,data,n);
+    check(write(fd,f,sizeof(f->h)+n)==(ssize_t)(sizeof(f->h)+n),"typed completion");
+}
+static void opened(int fd) {
+    struct frame f=control(fd);
+    check(f.h.op==NS3_OPEN,"OPEN precedes operations");
+    unsigned family; memcpy(&family,f.data+4,4);
+    struct ns3_addr a=addr(family,0);
+    reply(fd,&f,0,&a,sizeof(a));
+}
+static int app_socket(int type) {
+    int fd=socket(AF_INET,type,0); check(fd>=0,"app socket"); return fd;
+}
+static void inject(int fd, unsigned n) {
+    struct frame f={.h={.version=NS3_VERSION,.op=NS3_RX,.len=24+n}};
+    struct ns3_addr a=addr(4,20001); memcpy(f.data,&a,24);
+    memset(f.data+24,'x',n);
+    check(write(fd,&f,sizeof(f.h)+f.h.len)==(ssize_t)(sizeof(f.h)+f.h.len),"RX admission");
+}
+static struct sockaddr_in dest={.sin_family=AF_INET,.sin_port=0};
+static void prepare_udp(int app,int ep) {
+    errno=0;
+    check(sendto(app,"x",1,MSG_DONTWAIT,(void*)&dest,sizeof(dest))<0 && errno==EAGAIN,
+          "lazy activation DONTWAIT consumes no payload");
+    opened(ep);
+    struct frame f=control(ep); check(f.h.op==NS3_ACTIVATE,"ACTIVATE");
+    struct ns3_addr a=addr(4,20002); reply(ep,&f,0,&a,sizeof(a));
+    struct sockaddr_in name; socklen_t len=sizeof(name);
+    check(getsockname(app,(void*)&name,&len)==0 && name.sin_port==htons(20002),"local committed metadata");
+    struct pollfd p={.fd=app,.events=POLLOUT};
+    check(poll(&p,1,0)==1 && p.revents&POLLOUT,"activation wakes writable");
+}
+static void signal_noop(int n) { (void)n; }
+static void child_ok(pid_t p,const char *what) {
+    int status; check(waitpid(p,&status,0)==p && WIFEXITED(status) && !WEXITSTATUS(status),what);
+}
+int main(void) {
+    alarm(30); setbuf(stdout,NULL);
+    dest.sin_port=htons(20001); dest.sin_addr.s_addr=htonl(0x7f000001);
+    int registration=open("/dev/netstack3",O_RDWR|O_CLOEXEC);
+    check(registration>=0,"registration");
+    int a=app_socket(SOCK_DGRAM|SOCK_NONBLOCK);
+    check(ioctl(registration,NS3_CLAIM,(void*)1)<0 && errno==EFAULT,"claim copy rollback");
     struct rlimit original, limited;
-    check(getrlimit(RLIMIT_NOFILE, &original) == 0, "read FD limit");
-    limited = original; limited.rlim_cur = 64;
-    check(setrlimit(RLIMIT_NOFILE, &limited) == 0, "lower FD limit");
-    int fillers[64], filled = 0;
-    while (filled < 64) {
-        int fd = dup(registration);
-        if (fd < 0) { check(errno == EMFILE, "fill FD table"); break; }
-        fillers[filled++] = fd;
-    }
-    unsigned long long unclaimed_id = 0;
-    check(ioctl(registration, NS3_CLAIM, &unclaimed_id) < 0 && errno == EMFILE,
-          "claim FD reservation rollback");
-    while (filled) close(fillers[--filled]);
-    check(setrlimit(RLIMIT_NOFILE, &original) == 0, "restore FD limit");
-    unsigned long long fault_id;
-    int fault_endpoint = claim(registration, &fault_id);
-    receive_packet(fault_endpoint, fault_id);
-    char fault_byte[4];
-    check(recv(fault_app, fault_byte, sizeof(fault_byte), 0) == 4,
-          "claim succeeds after failed copy");
-    close(fault_app); close(fault_endpoint);
-    puts("PASS ENDPOINT_CLAIM_COPY_ROLLBACK");
-	int a = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-	int b = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-	check(a >= 0 && b >= 0, "application sockets");
-	unsigned long long aid, bid;
-	int ap = claim(registration, &aid), bp = claim(registration, &bid);
-	struct { struct ns3_msg h; unsigned int state; } forged = {
-        .h = {.version=NS3_VERSION, .op=NS3_STATE, .socket=bid, .len=4}, .state=NS3_CONNECTED};
-	check(write(ap, &forged, sizeof(forged.h) + 4) < 0 && errno == EPROTO, "cross-FD identity rejected");
-    forged.h.socket = aid;
-    forged.h.version = 4;
-    check(write(ap, &forged, sizeof(forged.h) + 4) < 0 && errno == EPROTO,
-          "ABI4 worker rejected before state mutation");
-    puts("PASS ENDPOINT_ABI5_REJECTS_ABI4");
-	struct sockaddr_in dest = {.sin_family=AF_INET,.sin_port=htons(23460),.sin_addr.s_addr=htonl(0x7f000001)};
-	char data[NS3_PAYLOAD] = {0};
-	size_t admitted = 0;
-	for (;;) {
-		ssize_t n = sendto(a, data, sizeof(data), 0, (void *)&dest, sizeof(dest));
-		if (n < 0) { check(errno == EAGAIN, "bounded admission"); break; }
-		admitted += n;
-		check(admitted <= 256 * 1024, "bounded socket bytes");
-	}
-	check(admitted > 0, "admitted data");
-	receive_packet(bp, bid);
-	check(recv(b, data, 4, 0) == 4 && !memcmp(data, "test", 4), "other socket progresses under saturation");
-	close(a);
-	int saw_close = 0;
-	char frame[sizeof(struct ns3_msg) + sizeof(struct ns3_addr) + NS3_PAYLOAD];
-	for (int i=0; i<64; i++) {
-		ssize_t n = read(ap, frame, sizeof(frame));
-		if (n < 0) { check(errno == EAGAIN, "endpoint drain"); break; }
-		if (((struct ns3_msg *)frame)->op == NS3_CLOSE) saw_close = 1;
-	}
-	check(saw_close, "close notification survives saturated unacknowledged data");
-	close(ap);
-	receive_packet(bp, bid);
-	check(recv(b, data, 4, 0) == 4, "endpoint close does not revoke another socket");
-	puts("PASS ENDPOINT_SCOPING_SATURATION_CLOSE");
-    /* RX admission is exactly four credits, reclaimed only when the provider
-     * reads CREDIT, not merely when the application consumes data. */
-    int q = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    unsigned long long qid;
-    int qp = claim(registration, &qid);
-    for (int i = 0; i < 4; ++i) receive_packet(qp, qid);
-    struct { struct ns3_msg h; struct ns3_addr a; char bytes[4]; } packet = {
-        .h = {.version=NS3_VERSION,.op=NS3_RX,.socket=qid,.len=28},
-        .a = {.family=4}, .bytes = {'t','e','s','t'}
-    };
-    check(write(qp, &packet, sizeof(packet.h) + 28) < 0 && errno == EAGAIN,
-          "fifth receive credit denied");
-    for (int i = 0; i < 4; ++i) check(recv(q, data, 4, 0) == 4, "consume credited packet");
-    check(write(qp, &packet, sizeof(packet.h) + 28) < 0 && errno == EAGAIN,
-          "consumption alone cannot create provider credits");
-    check(read(qp, frame, sizeof(frame)) == sizeof(struct ns3_msg) + 4 &&
-          ((struct ns3_msg *)frame)->op == NS3_CREDIT, "credit batch returned");
-    unsigned int credits;
-    memcpy(&credits, frame + sizeof(struct ns3_msg), 4);
-    check(credits == 4, "credit conservation");
-    receive_packet(qp, qid);
-    check(recv(q, data, 4, 0) == 4, "credit reuse");
-    struct ns3_msg unknown = {.version=NS3_VERSION,.op=NS3_SEND,.socket=qid,.request=999};
-    check(write(qp, &unknown, sizeof(unknown)) < 0 && errno == EPROTO,
-          "unknown completion revokes endpoint");
-    check(recv(q, data, 1, 0) < 0 && errno == ENETDOWN, "revoked endpoint fails closed");
-    close(qp); close(q);
-    puts("PASS ENDPOINT_CREDITS_AND_UNKNOWN_COMPLETION");
+    check(getrlimit(RLIMIT_NOFILE,&original)==0,"fd limit"); limited=original; limited.rlim_cur=64;
+    check(setrlimit(RLIMIT_NOFILE,&limited)==0,"limit fds");
+    int fillers[64],count=0; while(count<64) { int fd=dup(registration); if(fd<0)break; fillers[count++]=fd; }
+    unsigned long long id;
+    check(ioctl(registration,NS3_CLAIM,&id)<0 && errno==EMFILE,"claim reservation rollback");
+    while(count)close(fillers[--count]);
+    check(setrlimit(RLIMIT_NOFILE,&original)==0,"restore limit");
+    int ep=claim(registration);
+    prepare_udp(a,ep);
+    puts("PASS ABI6_CLAIM_ROLLBACK_LAZY_ACTIVATION_METADATA");
 
-	/* Interrupt a real control wait while the provider withholds completion. */
-    /* Read-only control cancellation must not revoke or steal a later result. */
-    int query = socket(AF_INET, SOCK_DGRAM, 0);
-    unsigned long long query_id;
-    int query_ep = claim(registration, &query_id);
-    for (int pass = 0; pass < 2; pass++) {
-        pid_t reader = fork();
-        check(reader >= 0, "query fork");
-        if (!reader) {
-            struct sigaction action = {.sa_handler=interrupted};
-            sigaction(SIGUSR1, &action, NULL);
-            struct sockaddr_storage name;
-            socklen_t size = sizeof(name);
-            int r = getsockname(query, (void *)&name, &size);
-            _exit(pass == 0 ? !(r < 0 && errno == EINTR) :
-                  !(r == 0 && name.ss_family == AF_INET &&
-                    ((struct sockaddr_in *)&name)->sin_port == htons(23461)));
-        }
-        int saw_query = 0;
-        for (int i = 0; i < 1000 && !saw_query; i++) {
-            ssize_t n = read(query_ep, frame, sizeof(frame));
-            if (n > 0) {
-                struct ns3_msg *h = (void *)frame;
-                if (h->op == NS3_GETNAME) saw_query = 1;
-                else { h->len = 0; check(write(query_ep, h, sizeof(*h)) == sizeof(*h), "query OPEN"); }
-            } else usleep(1000);
-        }
-        check(saw_query, "query reached provider");
-        static struct ns3_msg old_query;
-        int status;
-        if (!pass) {
-            old_query = *(struct ns3_msg *)frame;
-            kill(reader, SIGUSR1);
-            check(waitpid(reader, &status, 0) == reader && WIFEXITED(status) &&
-                  WEXITSTATUS(status) == 0, "query interrupted");
-        } else {
-            /* An old error must neither complete this waiter nor set SO_ERROR. */
-            old_query.len = 0; old_query.status = EINVAL;
-            check(write(query_ep, &old_query, sizeof(old_query)) == sizeof(old_query),
-                  "late query reply drained");
-            struct ns3_msg *h = (void *)frame;
-            h->len = sizeof(struct ns3_addr);
-            struct ns3_addr answer = {.family=4, .port=23461};
-            memcpy(h + 1, &answer, sizeof(answer));
-            check(write(query_ep, frame, sizeof(*h) + sizeof(answer)) ==
-                  sizeof(*h) + sizeof(answer), "new query reply");
-            check(waitpid(reader, &status, 0) == reader && WIFEXITED(status) &&
-                  WEXITSTATUS(status) == 0, "query result not stolen");
-            int error = -1; socklen_t size = sizeof(error);
-            check(getsockopt(query, SOL_SOCKET, SO_ERROR, &error, &size) == 0 &&
-                  !error, "cancelled query error not published");
-        }
+    char bytes[NS3_PAYLOAD]={0}; size_t admitted=0;
+    while(sendto(a,bytes,sizeof(bytes),0,(void*)&dest,sizeof(dest))==(ssize_t)sizeof(bytes)) {
+        admitted+=sizeof(bytes); check(admitted<=256*1024,"bounded TX bytes");
     }
-    close(query); close(query_ep);
-    puts("PASS ENDPOINT_QUERY_CANCEL_LATE_REPLY");
-	int c = socket(AF_INET, SOCK_DGRAM, 0);
-	unsigned long long cid;
-	int cp = claim(registration, &cid);
-	pid_t child = fork();
-	check(child >= 0, "fork");
-	if (!child) {
-		struct sigaction action = {.sa_handler=interrupted};
-		sigaction(SIGUSR1, &action, NULL);
-		int r = bind(c, (void *)&dest, sizeof(dest));
-		_exit(r < 0 && errno == EINTR ? 0 : 1);
-	}
-	int saw_bind = 0;
-	for (int i=0; i<1000 && !saw_bind; i++) {
-		ssize_t n = read(cp, frame, sizeof(frame));
-		if (n > 0 && ((struct ns3_msg *)frame)->op == NS3_BIND) saw_bind=1;
-		else usleep(1000);
-	}
-	check(saw_bind, "control request reached provider");
-	kill(child, SIGUSR1);
-	int status;
-	check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status)==0, "control wait interrupted");
-    struct ns3_msg late = *(struct ns3_msg *)frame;
-    late.len = 0;
-    check(write(cp, &late, sizeof(late)) < 0 && errno == ENETDOWN,
-          "late reply cannot resurrect interrupted control");
-	receive_packet(bp, bid);
-	check(recv(b, data, 4, 0) == 4, "interruption leaves other endpoint alive");
-	/* Closing one provider endpoint revokes its application socket. */
-	close(bp);
-	check(sendto(b, "x", 1, 0, (void *)&dest, sizeof(dest)) < 0 && errno == ENETDOWN, "provider endpoint death");
-	int d = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	check(d >= 0, "registration survives individual death");
-	check(connect(d, (void *)&dest, sizeof(dest)) < 0 && errno == EINPROGRESS, "connect does not await provider claim or OPEN");
-	puts("PASS ENDPOINT_CANCEL_AND_NONBLOCK");
-	close(c); close(cp); close(b); close(d);
-    int held[300], count=0;
-    for (; count<300; count++) {
-        int app = socket(AF_INET, SOCK_DGRAM, 0);
-        if (app < 0) { check(errno == ENFILE, "retained endpoint quota"); break; }
-        unsigned long long id;
-        held[count] = claim(registration, &id);
+    check(errno==EAGAIN && admitted==256*1024,"TX occupancy admission");
+    void *fault=mmap(0,sizeof(struct frame),PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    check(fault!=MAP_FAILED,"fault mapping");
+    check(read(ep,fault,sizeof(struct frame))<0 && errno==EFAULT,"TX copy fault rollback");
+    munmap(fault,sizeof(struct frame));
+    struct frame f;
+    check(read(ep,&f,sizeof(f))==(ssize_t)(sizeof(f.h)+24+sizeof(bytes)) && f.h.op==NS3_SEND && !f.h.request,
+          "data ownership transfer has no request ID");
+    check(sendto(a,bytes,sizeof(bytes),0,(void*)&dest,sizeof(dest))==(ssize_t)sizeof(bytes),
+          "dequeue alone restores admission without completion");
+    admitted+=sizeof(bytes);
+    close(a); f=control(ep);
+    check(f.h.op==NS3_CLOSE && f.h.len==8,"allocation-free close lane under TX saturation");
+    unsigned long long seal; memcpy(&seal,f.data,8);
+    check(seal==admitted/NS3_PAYLOAD,"UDP seal counts records");
+    int drained=1;
+    while(read(ep,&f,sizeof(f))>0)drained++;
+    check(errno==EAGAIN && drained==(int)seal,"drain through close seal");
+    close(ep);
+    puts("PASS ABI6_TX_BOUND_COPY_TRANSACTION_SEAL_NO_REPLIES");
+
+    a=app_socket(SOCK_DGRAM|SOCK_NONBLOCK); ep=claim(registration);
+    for(int i=0;i<32;i++)inject(ep,0);
+    f=(struct frame){.h={.version=NS3_VERSION,.op=NS3_RX,.len=24}};
+    struct ns3_addr source=addr(4,1); memcpy(f.data,&source,24);
+    check(write(ep,&f,sizeof(f.h)+24)<0 && errno==EAGAIN,"zero records bounded");
+    check(recv(a,bytes,1,MSG_PEEK)==0,"zero record peek");
+    check(write(ep,&f,sizeof(f.h)+24)<0 && errno==EAGAIN,"peek retains occupancy");
+    check(recv(a,bytes,1,0)==0,"consume zero record");
+    inject(ep,0); // no credit-return message needed
+    close(a);close(ep);
+    puts("PASS ABI6_RX_OCCUPANCY_ZERO_RECORDS_NO_CREDITS");
+
+    // Shared-FD blocked recv must not prevent DONTWAIT or signal delivery.
+    a=app_socket(SOCK_DGRAM); ep=claim(registration);
+    pid_t waiter=fork(); check(waiter>=0,"recv fork");
+    if(!waiter) { struct sigaction sa={.sa_handler=signal_noop}; sigaction(SIGUSR1,&sa,0);
+        int n=recv(a,bytes,1,0); _exit(!(n<0&&errno==EINTR)); }
+    usleep(30000);
+    check(recv(a,bytes,1,MSG_DONTWAIT)<0 && errno==EAGAIN,"shared FD nonblocking contender");
+    kill(waiter,SIGUSR1); child_ok(waiter,"blocked recv remains interruptible");
+    struct timeval timeout={.tv_usec=30000};
+    check(setsockopt(a,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))==0,"receive deadline");
+    check(recv(a,bytes,1,0)<0 && errno==EAGAIN,"finite receive deadline");
+    close(a);close(ep);
+    puts("PASS ABI6_SHARED_FD_RECV_DONTWAIT_SIGNAL_DEADLINE");
+
+    // TCP queue contention uses the same state transition waits, not a
+    // syscall-long transmitter mutex. A short provider read commits a prefix.
+    a=app_socket(SOCK_STREAM|SOCK_NONBLOCK);ep=claim(registration);
+    check(connect(a,(void*)&dest,sizeof(dest))<0&&errno==EINPROGRESS,"TCP connect pending");
+    opened(ep);f=control(ep);check(f.h.op==NS3_CONNECT,"TCP connect ack");
+    struct ns3_addr names[2]={addr(4,20100),addr(4,20001)};
+    reply(ep,&f,0,names,sizeof(names));
+    f.h.op=NS3_CONNECTION;reply(ep,&f,0,names,sizeof(names));
+    check(fcntl(a,F_SETFL,0)==0,"blocking shared TCP descriptor");
+    size_t total=0;
+    while(send(a,bytes,sizeof(bytes),MSG_DONTWAIT|MSG_NOSIGNAL)==sizeof(bytes))total+=sizeof(bytes);
+    check(errno==EAGAIN&&total==256*1024,"saturate TCP queue");
+    waiter=fork();check(waiter>=0,"send fork");
+    if(!waiter) {struct sigaction sa={.sa_handler=signal_noop};sigaction(SIGUSR1,&sa,0);
+        int n=send(a,"x",1,MSG_NOSIGNAL);_exit(!(n<0&&errno==EINTR));}
+    usleep(30000);
+    check(send(a,"x",1,MSG_DONTWAIT|MSG_NOSIGNAL)<0&&errno==EAGAIN,"shared FD send DONTWAIT contender");
+    kill(waiter,SIGUSR1);child_ok(waiter,"blocked send interruptible");
+    check(setsockopt(a,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))==0,"send deadline");
+    check(send(a,"x",1,MSG_NOSIGNAL)<0&&errno==EAGAIN,"finite send deadline");
+    check(read(ep,&f,sizeof(f.h)+25)==(ssize_t)(sizeof(f.h)+25)&&f.h.len==25,"partial TCP dequeue");
+    close(a);f=control(ep);memcpy(&seal,f.data,8);
+    check(f.h.op==NS3_CLOSE&&seal==total,"TCP seal counts bytes");
+    close(ep);
+    puts("PASS ABI6_SHARED_FD_SEND_DONTWAIT_SIGNAL_DEADLINE_PARTIAL_DEQUEUE");
+
+    a=app_socket(SOCK_DGRAM);ep=claim(registration);
+    pid_t first=fork();check(first>=0,"first control contender");
+    if(!first) {_exit(bind(a,(void*)&dest,sizeof(dest))!=0);}
+    opened(ep);f=control(ep);check(f.h.op==NS3_BIND,"first control dispatched");
+    pid_t second=fork();check(second>=0,"second control contender");
+    if(!second) {struct sigaction sa={.sa_handler=signal_noop};sigaction(SIGUSR1,&sa,0);
+        int n=bind(a,(void*)&dest,sizeof(dest));_exit(!(n<0&&errno==EINTR));}
+    usleep(30000);
+    check(sendto(a,"x",1,MSG_DONTWAIT,(void*)&dest,sizeof(dest))<0&&errno==EAGAIN,
+          "nonblocking send behind pending bind");
+    kill(second,SIGUSR1);child_ok(second,"control slot contender interruptible");
+    source=addr(4,20001);reply(ep,&f,0,&source,24);child_ok(first,"first control survives contender signal");
+    close(a);close(ep);
+    puts("PASS ABI6_CONTROL_SLOT_CONTENTION");
+
+    a=app_socket(SOCK_DGRAM);ep=claim(registration);
+    check(setsockopt(a,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))==0,"deadline flood setup");
+    pid_t flood=fork();check(flood>=0,"deadline flood fork");
+    if(!flood) {
+        struct ns3_msg wake={.version=NS3_VERSION,.op=NS3_STATE,.len=4};
+        unsigned char record[sizeof(wake)+4];memcpy(record,&wake,sizeof(wake));memset(record+sizeof(wake),0,4);
+        for(int i=0;i<2000;i++) { if(write(ep,record,sizeof(record))<0)break; usleep(100); }
+        _exit(0);
+    }
+    struct timespec begin,end;clock_gettime(CLOCK_MONOTONIC,&begin);
+    check(recv(a,bytes,1,0)<0&&errno==EAGAIN,"deadline expires amid wakeups");
+    clock_gettime(CLOCK_MONOTONIC,&end);
+    long elapsed=(end.tv_sec-begin.tv_sec)*1000000+(end.tv_nsec-begin.tv_nsec)/1000;
+    check(elapsed<150000,"wakeups cannot repeatedly extend total deadline");
+    kill(flood,SIGKILL);waitpid(flood,0,0);close(a);close(ep);
+    puts("PASS ABI6_ABSOLUTE_DEADLINE_WAKE_FLOOD");
+
+    // Malformed successful mutation is terminal, before any local publication.
+    for(int wrong_family=0;wrong_family<2;wrong_family++) {
+        a=app_socket(SOCK_DGRAM);ep=claim(registration);
+        pid_t binder=fork();check(binder>=0,"bind fork");
+        if(!binder) { int n=bind(a,(void*)&dest,sizeof(dest)); _exit(!(n<0&&errno==ENETDOWN)); }
+        opened(ep);f=control(ep);check(f.h.op==NS3_BIND,"bind dispatch");
+        f.h.len=wrong_family?24:1;
+        struct ns3_addr bad=addr(6,1);memcpy(f.data,&bad,24);
+        check(write(ep,&f,sizeof(f.h)+f.h.len)<0&&errno==EPROTO,"reject malformed typed mutation");
+        child_ok(binder,"malformed mutation wakes revoked waiter");
+        close(a);close(ep);
+    }
+    puts("PASS ABI6_MALFORMED_MUTATION_FAMILY_REVOKES");
+
+    a=app_socket(SOCK_DGRAM);ep=claim(registration);
+    pid_t binder=fork();check(binder>=0,"cancel fork");
+    if(!binder) { struct sigaction sa={.sa_handler=signal_noop};sigaction(SIGUSR1,&sa,0);
+        int n=bind(a,(void*)&dest,sizeof(dest));_exit(!(n<0&&errno==EINTR)); }
+    opened(ep);f=control(ep);check(f.h.op==NS3_BIND,"cancel dispatched bind");
+    kill(binder,SIGUSR1);child_ok(binder,"dispatched control signal");
+    check(recv(a,bytes,1,MSG_DONTWAIT)<0&&errno==ENETDOWN,"ambiguous cancellation revokes");
+    close(a);close(ep);
+    puts("PASS ABI6_CONTROL_CANCELLATION");
+
+    // A completed control cannot be completed twice.
+    a=app_socket(SOCK_DGRAM|SOCK_NONBLOCK);ep=claim(registration);
+    prepare_udp(a,ep);
+    f=(struct frame){.h={.version=NS3_VERSION,.op=NS3_ACTIVATE,.request=2,.len=24}};
+    source=addr(4,20002);memcpy(f.data,&source,24);
+    check(write(ep,&f,sizeof(f.h)+24)<0&&errno==EPROTO,"duplicate completion revokes");
+    check(recv(a,bytes,1,0)<0&&errno==ENETDOWN,"duplicate terminal disposition");
+    close(a);close(ep);
+    int held[300], retained=0;
+    for (; retained<300; retained++) {
+        int app=socket(AF_INET,SOCK_DGRAM,0);
+        if(app<0) { check(errno==ENFILE,"retained endpoint quota"); break; }
+        held[retained]=claim(registration);
         close(app);
     }
-    check(count == 256, "closed application still charged while provider retains endpoint");
-    for (int i=0; i<count; i++) close(held[i]);
-    int recovered = socket(AF_INET, SOCK_DGRAM, 0);
-    check(recovered >= 0, "quota released by final endpoint lifetime");
+    check(retained==256,"closed application charged while provider retains endpoint");
+    for(int i=0;i<retained;i++)close(held[i]);
+    int recovered=app_socket(SOCK_DGRAM);
     close(recovered);
-    puts("PASS ENDPOINT_LIFETIME_QUOTA");
+    puts("PASS ABI6_ENDPOINT_LIFETIME_QUOTA");
     close(registration);
-	return 0;
+    puts("PASS ABI6_ENDPOINT_SUITE");
+    return 0;
 }

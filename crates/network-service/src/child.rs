@@ -928,12 +928,15 @@ mod tests {
             "write-registration" => [libc::SYS_write, 3, 0, 0],
             "read-epoll" => [libc::SYS_read, 6, 0, 0],
             "claim-wrong-fd" => [libc::SYS_ioctl, 4, 0x8008B301, 0],
+            "control-registration" => [libc::SYS_ioctl, 3, 0x8080B303, 0],
+            "control-epoll" => [libc::SYS_ioctl, 6, 0x8080B303, 0],
             "publish-registration" => [libc::SYS_ioctl, 3, 0xC038B302, 0],
             "publish-epoll" => [libc::SYS_ioctl, 6, 0xC038B302, 0],
             "unknown-ioctl" => [libc::SYS_ioctl, 4, 0x1234, 0],
             "dup" => [libc::SYS_fcntl, 4, libc::F_DUPFD_CLOEXEC as i64, 7],
             "ethernet-read" => [libc::SYS_read, 4, 0, 0],
             "ethernet-write" => [libc::SYS_write, 4, 0, 0],
+            "ethernet-control" => [libc::SYS_ioctl, 4, 0x8080B303, 0],
             "ethernet-publish" => [libc::SYS_ioctl, 4, 0xC038B302, 0],
             "ethernet-send-wrong-flags" => [libc::SYS_sendto, 4, 0, 0],
             "ethernet-recv-wrong-flags" => [libc::SYS_recvfrom, 4, 0, 0],
@@ -951,8 +954,8 @@ mod tests {
     fn provider_filter_forbidden_operations_are_fatal() {
         use std::os::unix::process::ExitStatusExt as _;
         for operation in ["socket", "read-registration", "write-registration", "read-epoll",
-            "claim-wrong-fd", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
-            "ethernet-read", "ethernet-write", "ethernet-publish",
+            "claim-wrong-fd", "control-registration", "control-epoll", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
+            "ethernet-read", "ethernet-write", "ethernet-publish", "ethernet-control",
             "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags"] {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "child::tests::provider_filter_denial_fixture", "--nocapture"])
@@ -1484,13 +1487,14 @@ fn provider_filter(ethernet: bool) -> Vec<SockFilter> {
             filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
         }
     }
-    filter.push(jump(libc::SYS_ioctl as u32, 0, 11));
+    filter.push(jump(libc::SYS_ioctl as u32, 0, 12));
     filter.push(arg(1));
     filter.push(jump(0x8008B301, 0, 3));
     filter.push(arg(0));
-    filter.push(jump(3, 5, 6));
+    filter.push(jump(3, 6, 7));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(jump(0xC038B302, 0, 4));
+    filter.push(jump(0xC038B302, 1, 0));
+    filter.push(jump(0x8080B303, 0, 4));
     filter.push(arg(0));
     filter.push(jump(6, 2, 0));
     filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 0, jf: 1, k: 4 });

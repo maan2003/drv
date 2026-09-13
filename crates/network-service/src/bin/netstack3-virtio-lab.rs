@@ -24,7 +24,7 @@ fn run() -> io::Result<()> {
             let mut header = [0; 4];
             input.read_exact(&mut header)?;
             let length = u32::from_be_bytes(header) as usize;
-            if !(14..=1514).contains(&length) { return Err(io::ErrorKind::InvalidData.into()); }
+            if !(14..=1514).contains(&length) { return Err(io::Error::other(format!("incoming frame length {length}"))); }
             let mut frame = [0; 1514];
             input.read_exact(&mut frame[..length])?;
             let sent = rustix::net::send(&*receiver, &frame[..length], SendFlags::NOSIGNAL)?;
@@ -38,7 +38,7 @@ fn run() -> io::Result<()> {
         loop {
             let mut frame = [0; 1515];
             let (n, total) = rustix::net::recv(&*driver, &mut frame, RecvFlags::TRUNC)?;
-            if n != total || !(14..=1514).contains(&n) { return Err(io::ErrorKind::InvalidData.into()); }
+            if n != total || !(14..=1514).contains(&n) { return Err(io::Error::other(format!("provider frame length {n}/{total}"))); }
             output.write_all(&(n as u32).to_be_bytes())?;
             output.write_all(&frame[..n])?;
         }
@@ -50,9 +50,10 @@ fn run() -> io::Result<()> {
             return if status.success() { Ok(()) } else { Err(io::Error::other(format!("provider exited: {status}"))) };
         }
         if let Ok(result) = failures.recv_timeout(Duration::from_millis(100)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return result;
+            let exited = child.try_wait()?;
+            if exited.is_none() { let _ = child.kill(); }
+            let status = child.wait()?;
+            return result.map_err(|error| io::Error::other(format!("{error}; provider status {status}")));
         }
     }
 }

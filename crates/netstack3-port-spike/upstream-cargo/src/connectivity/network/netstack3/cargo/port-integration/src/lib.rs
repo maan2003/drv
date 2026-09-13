@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -366,7 +366,7 @@ impl NativeBindingsCtx {
         // a 64KiB buffer repeatedly becomes delayed-ACK/Nagle timer paced.
         // 128KiB still stalled in IPv4 bulk tests; 256KiB pipelines both families.
         let default = std::num::NonZeroUsize::new(256 * 1024).unwrap();
-        let max = std::num::NonZeroUsize::new(4 * 1024 * 1024).unwrap();
+        let max = default; // storage admission charges the reachable core maximum
         let sizes = netstack3_base::BufferSizeSettings::new(min, default, max).unwrap();
         Self {
             now: NativeInstant::ZERO,
@@ -557,8 +557,29 @@ impl netstack3_base::socket::SocketWritableListener for NativeWritable {
     }
 }
 
+// One storage unit covers two 256KiB core buffers plus a 272KiB terminal
+// remainder. Reserve before admission; leases live in storage, not handle maps.
+pub const TCP_BUFFER_CAPACITY: usize = 256 * 1024;
+pub const TCP_TERMINAL_ALLOWANCE: usize = 256 * 1024 + 16384;
+#[derive(Debug)]
+struct StorageBudget { limit: usize, used: AtomicUsize }
+#[derive(Debug)]
+struct StorageLease { budget: Arc<StorageBudget>, units: usize }
+impl StorageBudget {
+    fn reserve(self: &Arc<Self>, units: usize) -> Result<Arc<StorageLease>, RuntimeError> {
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used|
+            used.checked_add(units).filter(|next| *next <= self.limit))
+            .map_err(|_| RuntimeError::SocketLimit)?;
+        Ok(Arc::new(StorageLease { budget: self.clone(), units }))
+    }
+}
+impl Drop for StorageLease {
+    fn drop(&mut self) { self.budget.used.fetch_sub(self.units, Ordering::Relaxed); }
+}
+
 #[derive(Debug, Default)]
 struct TcpStorage {
+    lease: Option<Arc<StorageLease>>,
     bytes: VecDeque<u8>,
     readable: usize,
     capacity: usize,
@@ -649,6 +670,7 @@ impl InnerPacketBuilder for NativePayload<'_> {
 
 impl TcpStorage {
     fn request_capacity(&mut self, size: usize) {
+        let size = size.min(TCP_BUFFER_CAPACITY);
         self.target_capacity = size;
         // Never revoke space occupied by readable or out-of-order bytes.
         if size >= self.capacity || self.bytes.is_empty() {
@@ -757,6 +779,10 @@ impl NativeTcpBuffers {
             })))),
         }
     }
+    fn attach_lease(&self, lease: Arc<StorageLease>) {
+        self.receive.0.lock().unwrap().lease = Some(lease.clone());
+        self.send.0.lock().unwrap().storage_mut().lease = Some(lease);
+    }
     pub fn write(&self, bytes: &[u8]) -> usize {
         let mut guard = self.send.0.lock().unwrap();
         let SendBufferState::Running(s) = &mut *guard else { return 0 };
@@ -768,10 +794,12 @@ impl NativeTcpBuffers {
     /// Seal the producer and transfer its already-admitted, bounded remainder.
     /// This does not wait for remote ACKs; core owns delivery after this returns.
     pub fn finish_write(&self, admitted: &[u8]) -> Result<(), RuntimeError> {
+        if admitted.len() > TCP_TERMINAL_ALLOWANCE { return Err(RuntimeError::SocketLimit); }
         let mut guard = self.send.0.lock().unwrap();
         if matches!(*guard, SendBufferState::ShuttingDown(_)) {
             return if admitted.is_empty() { Ok(()) } else { Err(RuntimeError::InvalidState) };
         }
+        guard.storage_mut().bytes.try_reserve(admitted.len()).map_err(|_| RuntimeError::SocketLimit)?;
         let SendBufferState::Running(mut s) = std::mem::take(&mut *guard) else { unreachable!() };
         s.bytes.extend(admitted);
         s.readable += admitted.len();
@@ -1292,11 +1320,13 @@ struct RuntimeTcpSocket {
     id: NativeTcpV4,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
+    listener_storage: Vec<Arc<StorageLease>>,
 }
 struct RuntimeTcpSocketV6 {
     id: NativeTcpV6,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
+    listener_storage: Vec<Arc<StorageLease>>,
 }
 
 /// Single-owner facade over one Netstack3 core and one Ethernet interface.
@@ -1316,6 +1346,7 @@ pub struct Runtime {
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
+    storage_budget: Arc<StorageBudget>,
     stack: StackState<NativeBindingsCtx>,
     bindings: NativeBindingsCtx,
 }
@@ -1423,6 +1454,12 @@ impl Runtime {
             ipv6_address: None,
             dns_servers: [None, None],
             next_socket: 0,
+            // Separate active and passive populations each have a capacity-sized
+            // allowance. Retained post-close storage competes for the same pool.
+            storage_budget: Arc::new(StorageBudget {
+                limit: socket_capacity.checked_mul(2).ok_or(RuntimeError::InvalidCapacity)?,
+                used: AtomicUsize::new(0),
+            }),
             stack,
             bindings,
         })
@@ -2155,11 +2192,13 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
+        let lease = self.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
         });
         let buffers = socket_data.client_buffers().unwrap();
+        buffers.attach_lease(lease);
         let notifier = socket_data.clone();
         let id = self
             .stack
@@ -2178,7 +2217,8 @@ impl Runtime {
                     RuntimeTcpSocket {
                         id,
                         buffers,
-                        notifier
+                        notifier,
+                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2227,12 +2267,14 @@ impl Runtime {
         if backlog.get() > self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
-        self.stack
-            .api(&mut self.bindings)
-            .tcp::<Ipv4>()
-            .listen(id, backlog)
-            .map_err(map_tcp_listen_error)
+        let socket = self.tcp.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
+        let extra = backlog.get().saturating_sub(reserved);
+        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
+        self.stack.api(&mut self.bindings).tcp::<Ipv4>()
+            .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
+        if let Some(lease) = lease { socket.listener_storage.push(lease); }
+        Ok(())
     }
 
     pub fn tcp_connect(
@@ -2266,6 +2308,8 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
+        if self.tcp_pending_connections(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
+        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp
             .get(&listener)
@@ -2277,6 +2321,7 @@ impl Runtime {
             .tcp::<Ipv4>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
+        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -2298,7 +2343,8 @@ impl Runtime {
                     RuntimeTcpSocket {
                         id,
                         buffers,
-                        notifier: NativeTcpSocketData::default()
+                        notifier: NativeTcpSocketData::default(),
+                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2322,6 +2368,11 @@ impl Runtime {
         payload: &[u8],
     ) -> Result<usize, RuntimeError> {
         let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        // Core do_send requires the connection variant, not merely a live ID.
+        if !matches!(self.stack.api(&mut self.bindings).tcp::<Ipv4>().get_info(&socket.id),
+            netstack3_tcp::SocketInfo::Connection(_)) {
+            return Err(RuntimeError::InvalidState);
+        }
         let written = socket.buffers.write(payload);
         if written != 0 {
             self.stack
@@ -2471,8 +2522,16 @@ impl Runtime {
     /// Transfer the frontend's admitted remainder before shutdown or final close.
     pub fn tcp_finish_write(&mut self, handle: TcpSocketHandle, admitted: &[u8]) -> Result<(), RuntimeError> {
         let socket = self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let connected = matches!(
+            self.stack.api(&mut self.bindings).tcp::<Ipv4>().get_info(&socket.id),
+            netstack3_tcp::SocketInfo::Connection(_));
+        // Final close also seals unbound/bound sockets, but those cannot have
+        // admitted stream bytes and must never enter core's connection-only hook.
+        if !connected && !admitted.is_empty() { return Err(RuntimeError::InvalidState); }
         socket.buffers.finish_write(admitted)?;
-        self.stack.api(&mut self.bindings).tcp::<Ipv4>().do_send(&socket.id);
+        if connected {
+            self.stack.api(&mut self.bindings).tcp::<Ipv4>().do_send(&socket.id);
+        }
         Ok(())
     }
 
@@ -2492,11 +2551,13 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
+        let lease = self.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
         });
         let buffers = socket_data.client_buffers().unwrap();
+        buffers.attach_lease(lease);
         let notifier = socket_data.clone();
         let id = self
             .stack
@@ -2515,7 +2576,8 @@ impl Runtime {
                     RuntimeTcpSocketV6 {
                         id,
                         buffers,
-                        notifier
+                        notifier,
+                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2574,16 +2636,14 @@ impl Runtime {
         if backlog.get() > self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let id = &self
-            .tcp_v6
-            .get(&handle)
-            .ok_or(RuntimeError::UnknownSocket)?
-            .id;
-        self.stack
-            .api(&mut self.bindings)
-            .tcp::<Ipv6>()
-            .listen(id, backlog)
-            .map_err(map_tcp_listen_error)
+        let socket = self.tcp_v6.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
+        let extra = backlog.get().saturating_sub(reserved);
+        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
+        self.stack.api(&mut self.bindings).tcp::<Ipv6>()
+            .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
+        if let Some(lease) = lease { socket.listener_storage.push(lease); }
+        Ok(())
     }
 
     pub fn tcp_connect_ipv6(
@@ -2621,6 +2681,8 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
+        if self.tcp_pending_connections_ipv6(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
+        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp_v6
             .get(&listener)
@@ -2632,6 +2694,7 @@ impl Runtime {
             .tcp::<Ipv6>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
+        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -2653,7 +2716,8 @@ impl Runtime {
                     RuntimeTcpSocketV6 {
                         id,
                         buffers,
-                        notifier: NativeTcpSocketData::default()
+                        notifier: NativeTcpSocketData::default(),
+                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2680,6 +2744,11 @@ impl Runtime {
             .tcp_v6
             .get(&handle)
             .ok_or(RuntimeError::UnknownSocket)?;
+        // Core do_send requires the connection variant, not merely a live ID.
+        if !matches!(self.stack.api(&mut self.bindings).tcp::<Ipv6>().get_info(&socket.id),
+            netstack3_tcp::SocketInfo::Connection(_)) {
+            return Err(RuntimeError::InvalidState);
+        }
         let written = socket.buffers.write(payload);
         if written != 0 {
             self.stack
@@ -2735,8 +2804,16 @@ impl Runtime {
     /// Transfer the frontend's admitted remainder before shutdown or final close.
     pub fn tcp_finish_write_ipv6(&mut self, handle: TcpSocketHandle, admitted: &[u8]) -> Result<(), RuntimeError> {
         let socket = self.tcp_v6.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let connected = matches!(
+            self.stack.api(&mut self.bindings).tcp::<Ipv6>().get_info(&socket.id),
+            netstack3_tcp::SocketInfo::Connection(_));
+        // Final close also seals unbound/bound sockets, but those cannot have
+        // admitted stream bytes and must never enter core's connection-only hook.
+        if !connected && !admitted.is_empty() { return Err(RuntimeError::InvalidState); }
         socket.buffers.finish_write(admitted)?;
-        self.stack.api(&mut self.bindings).tcp::<Ipv6>().do_send(&socket.id);
+        if connected {
+            self.stack.api(&mut self.bindings).tcp::<Ipv6>().do_send(&socket.id);
+        }
         Ok(())
     }
 
@@ -3056,6 +3133,66 @@ mod tests {
         assert!(client.udp_socket().is_ok());
         assert_eq!(client.udp_socket(), Err(RuntimeError::SocketLimit));
     }
+    #[test]
+    fn accept_pressure_preserves_queued_child_until_storage_release() {
+        let mut rt = Runtime::new_with_capacities(4, 16, (0u8..=255).cycle().take(65536),
+            NonZeroU64::new(1).unwrap(), [2,0,0,0,0,1], 1500).unwrap();
+        rt.enable_loopback();
+        let listener = rt.tcp_socket().unwrap();
+        rt.tcp_bind(listener, Some([127,0,0,1]), NonZeroU16::new(9100).unwrap()).unwrap();
+        rt.tcp_listen(listener, NonZeroUsize::new(1).unwrap()).unwrap();
+        let client = rt.tcp_socket().unwrap();
+        rt.tcp_connect(client, [127,0,0,1], NonZeroU16::new(9100).unwrap()).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 1);
+        let mut retained = Vec::new();
+        while let Ok(h) = rt.tcp_socket() {
+            retained.push(rt.tcp.get(&h).unwrap().buffers.clone());
+            rt.tcp_close(h).unwrap();
+        }
+        assert_eq!(rt.tcp_accept(listener), Err(RuntimeError::SocketLimit));
+        assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 1);
+        retained.pop();
+        let child = rt.tcp_accept(listener).unwrap();
+        assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 0);
+        assert_eq!(rt.tcp_write(client, b"still alive").unwrap(), 11);
+        for _ in 0..32 { rt.dispatch_due(128); }
+        let mut bytes = [0;16];
+        assert_eq!(rt.tcp_read(child, &mut bytes).unwrap(), 11);
+        assert_eq!(&bytes[..11], b"still alive");
+    }
+
+    #[test]
+    fn storage_budget_follows_buffers_after_runtime_handle_removal() {
+        let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
+        let mut held = Vec::new();
+        for _ in 0..rt.storage_budget.limit {
+            let h = rt.tcp_socket().unwrap();
+            held.push(rt.tcp.get(&h).unwrap().buffers.clone());
+            rt.tcp_close(h).unwrap();
+        }
+        assert_eq!(rt.socket_count(), 0);
+        assert_eq!(rt.tcp_socket(), Err(RuntimeError::SocketLimit));
+        held.pop();
+        let h = rt.tcp_socket().unwrap();
+        rt.tcp_close(h).unwrap();
+        drop(held);
+        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn listener_backlog_reservation_survives_failed_reconfiguration_and_releases_after_close() {
+        let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
+        let h = rt.tcp_socket().unwrap();
+        rt.tcp_bind(h, None, None).unwrap();
+        rt.tcp_listen(h, NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        assert_eq!(rt.tcp_listen(h, NonZeroUsize::new(1).unwrap()), Err(RuntimeError::NotSupported));
+        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        rt.tcp_close(h).unwrap();
+        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn two_native_runtimes_resolve_arp_and_exchange_tcp() {
         let mut client = runtime(11, [0x02, 0, 0, 0, 1, 1], [192, 0, 2, 11]);

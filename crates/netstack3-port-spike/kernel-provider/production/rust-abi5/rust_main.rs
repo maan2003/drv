@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Linux ABI callback boundary. Frontend state and protocol code forbids unsafe.
+mod connection;
 mod endpoint_file;
 mod frontend;
 mod linux;

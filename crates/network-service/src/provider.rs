@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Linux service setup and scheduling for the per-socket binding.
 //! ABI is defined by kernel-provider/production/protocol.h.
-use crate::socket_worker::SocketWorker;
+use crate::socket_worker::{SocketWorker, Work};
 use netstack3_port_integration::Runtime;
 use netstack3_port_spike::{
     EthernetDevice as _, EthernetEventSource as _, NetworkServiceEndpoint,
@@ -11,11 +11,18 @@ use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU64;
-use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
 const CLAIM: libc::c_ulong = 0x8008B301;
+
+pub(crate) fn read_control(fd: &OwnedFd, bytes: &mut [u8; 128]) -> rustix::io::Result<usize> {
+    // SAFETY: this operation writes at most its fixed 128-byte ABI buffer.
+    // fd ownership and the writable array remain live throughout the syscall.
+    let result = unsafe { libc::ioctl(fd.as_raw_fd(), 0x8080B303 as libc::c_ulong, bytes.as_mut_ptr()) };
+    if result < 0 { Err(rustix::io::Errno::from_raw_os_error(io::Error::last_os_error().raw_os_error().unwrap())) }
+    else { Ok(result as usize) }
+}
 
 pub fn run_provider(
     ethernet_mac: Option<[u8; 6]>,
@@ -175,14 +182,18 @@ pub fn run_provider(
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
-            match worker.handle_requests()? {
-                ControlFlow::Continue(p) => progress |= p,
-                ControlFlow::Break(()) => {
+            match worker.handle_requests() {
+                Ok(Work::Idle) => {}
+                Ok(Work::Progress) => progress = true,
+                Ok(Work::Closed) => { workers.remove(&id); progress = true; }
+                Err(fault) => {
+                    eprintln!("endpoint {id} retired: {fault}");
                     workers.remove(&id);
                     progress = true;
                 }
             }
         }
+
         if let Some(frame) = &mut ethernet {
             while let Some(event) = frame.take_event() {
                 if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
@@ -263,8 +274,15 @@ pub fn run_provider(
             .collect();
         for id in listeners {
             let worker = workers.get_mut(&id).unwrap();
-            let Some(mut info) = worker.accept_info()? else {
-                continue;
+            let mut info = match worker.accept_info() {
+                Ok(Some(info)) => info,
+                Ok(None) => continue,
+                Err(fault) => {
+                    eprintln!("endpoint {id} accept retired: {fault}");
+                    workers.remove(&id);
+                    progress = true;
+                    continue;
+                }
             };
             let newfd = unsafe {
                 libc::ioctl(
@@ -279,10 +297,14 @@ pub fn run_provider(
                     worker.pause_accept();
                     continue;
                 }
-                if error.raw_os_error() == Some(libc::ENETDOWN) {
+                if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM)) {
+                    worker.retry_accept();
                     continue;
                 }
-                return Err(format!("publish accepted endpoint: {error}"));
+                eprintln!("endpoint {id} publication retired: {error}");
+                workers.remove(&id);
+                progress = true;
+                continue;
             }
             let child_id = u64::from_le_bytes(info[48..56].try_into().unwrap());
             let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(newfd) });
@@ -301,9 +323,12 @@ pub fn run_provider(
         }
         let mut remove = Vec::new();
         for (&id, worker) in workers.iter_mut() {
-            match worker.poll_data()? {
-                ControlFlow::Continue(p) => progress |= p,
-                ControlFlow::Break(()) => {
+            match worker.poll_data() {
+                Ok(Work::Idle) => {}
+                Ok(Work::Progress) => progress = true,
+                Ok(Work::Closed) => { remove.push(id); progress = true; }
+                Err(fault) => {
+                    eprintln!("endpoint {id} retired: {fault}");
                     remove.push(id);
                     progress = true;
                 }
@@ -333,6 +358,13 @@ pub fn run_provider(
                 })
                 .unwrap_or(-1)
         };
+        // Acceptance owns its retry deadline; resource backpressure cannot
+        // be represented without the scheduler knowing when it becomes runnable.
+        if let Some(deadline) = workers.values().filter_map(|w| w.accept_deadline()).min() {
+            let left = deadline.saturating_duration_since(Instant::now()).as_millis()
+                .min(i32::MAX as u128) as i32 + 1;
+            timeout = if timeout < 0 { left } else { timeout.min(left) };
+        }
         if let Some(deadline) = resolver_server.as_ref().and_then(|r| r.deadline()) {
             let left = deadline
                 .saturating_duration_since(Instant::now())
