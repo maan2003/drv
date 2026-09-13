@@ -62,3 +62,89 @@ Tested Mozilla Linux x86-64 archive SHA256:
 `642ab731354a5ca790b894d4556dfb5028c61d0c24eb10d10e10a111a69c89bf`.
 No Nix builds were used. Existing FFmpeg store artifacts also proved ARM64;
 streaming/VPN recovery and isolated Nix fetches remain follow-up gates.
+
+## Service-generation recovery gate
+
+`recovery-guest-init` runs `recovery.js` in the same disposable no-INET image,
+with the provider started directly (no Ethernet FD). This is **100 loopback
+provider-generation/DNS-restart cycles**, not 100 Wi-Fi, DHCP or WAN reconnections.
+The production Quad9 configuration and public-network evidence remain separate.
+The local HTTP/2 TLS A/AAAA upstream is fixture-only; no plaintext DNS fallback
+is added to the service.
+
+Stage the current `../loopback-test.c` binary and `recovery.{js,toml}` alongside
+the existing application files and `ws` dependency. Generate a disposable CA
+and server certificate on the build host; do not copy real private keys:
+
+```sh
+umask 077
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem \
+  -out recovery-ca.pem -days 2 -subj '/CN=drv disposable recovery CA' \
+  -addext 'basicConstraints=critical,CA:TRUE'
+openssl req -newkey rsa:2048 -nodes -keyout recovery-key.pem \
+  -out server.csr -subj '/CN=recovery.test'
+printf '%s\n' 'subjectAltName=DNS:recovery.test' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth' > extensions
+openssl x509 -req -in server.csr -CA recovery-ca.pem -CAkey ca-key.pem \
+  -CAcreateserial -out recovery-cert.pem -days 2 -extfile extensions
+```
+
+Copy only `recovery-{ca,cert,key}.pem` into guest `/etc/applications/`;
+CA/certificate mode 0644, fixture key 0640 (init sets its group to app).
+Keep the CA private key outside the guest. Run the existing private KVM runner
+with `QEMU_MEMORY_MIB=4096` and this optional init:
+
+```sh
+QEMU_MEMORY_MIB=4096 ../run-tailscale-kvm.sh KERNEL ROOT NEW_OUTPUT \
+  recovery-guest-init
+```
+
+The log is retained in `/run/recovery.log` and the host runner’s `serial.log`. Success requires
+`PASS RECOVERY_100_LOOPBACK_GENERATIONS`, not merely a live VM. The runner's
+one-hour bound still applies. Capture the log before stopping the private VM.
+
+Each cycle:
+
+- Restarts DNS alone while Firefox, its same identified WebSocket, the HTTP
+  server and retained IPv4/IPv6 TCP/UDP descriptors remain alive. Browser
+  heartbeat receipts carry unique phase nonces and verified 128KiB download/
+  upload hashes; sequence and connection identity reject stale results.
+- Uses unique wire-DNS names over both loopback families and glibc NSS names;
+  the TLS fixture must observe uncached A/AAAA requests.
+- Kills only Netstack3, then waits for the observer's blocked TCP/UDP reads and
+  blocked TCP writes to fail with ENETDOWN. Before death, writers first reach
+  nonblocking EAGAIN backpressure, and `/proc/PID/{status,syscall}` must show
+  all six workers sleeping inside the intended syscall on the expected FD.
+  Retained listeners expose terminal
+  readiness, including after SO_ERROR consumption; accept fails with ENETDOWN.
+  New IPv4/IPv6 sockets fail closed while the provider is absent.
+- Observes DNS exiting on dead listener errors before reaping it and removing
+  its NSS pathname. Only after the old-socket barrier does the orchestrator
+  replace the application server, provider and DNS. Firefox stays running,
+  observes a WS close, reconnects and exchanges new-generation traffic.
+- Exercises fresh IPv4/IPv6 TCP byte integrity and UDP batches, then verifies
+  the original descriptors remain dead. Listener replacement is explicit
+  orchestration, not transparent restoration of lost transport state.
+
+Deadlines: provider/local readiness 10s; blocked worker safety alarm 15s
+(observer barrier 10s); DNS death and child reap 5s; browser recovery 15s.
+DNS bind teardown retries are limited to EADDRINUSE and 10s; other startup
+failures are fatal. DNS receives real write-only pipes: Node's default stdio
+“pipes” are socketpairs and correctly fail the service's descriptor contract.
+
+Quiescent-cycle resource bounds are declared in the gate: ≤40 userspace
+processes, ≤2048 FDs, RSS <2,000,000KiB and slab <512,000KiB; provider/DNS each
+≤32 FDs. After cycle 10, allow at most +2 processes, +32 FDs, +256MiB RSS and
++64MiB slab over that warm baseline. Reject zombies and kernel WARN/OOPS/BUG.
+A continuously drained `/dev/kmsg` collector runs from before the first
+provider through final cleanup; a collector exit also fails the gate. A unique
+post-cleanup `/dev/kmsg` marker must be observed before PASS. Kernel warning
+severity or worse is rejected in addition to WARN/OOPS/BUG signatures.
+Service pipes are continuously drained. Resource tolerances allow allocator
+warmup, not indefinite accumulation.
+
+Final kernel #21 result: **100/100 hardened cycles passed**; see
+[`recovery-evidence.txt`](recovery-evidence.txt) for measurements, failure
+history and the separate post-gate public Quad9/HTTP2/HTTP3/SSH regressions.

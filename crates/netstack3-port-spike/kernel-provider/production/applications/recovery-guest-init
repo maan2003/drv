@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+set -eu
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/shm /run/applications /home/app /tmp /dev/pts
+mount -t tmpfs -o mode=1777,size=256m tmpfs /dev/shm
+mount -t devpts devpts /dev/pts
+chmod 1777 /tmp
+printf 'root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:app:/home/app:/bin/sh\n' >/etc/passwd
+printf 'root:x:0:\napp:x:1000:\n' >/etc/group
+# The image was assembled by an unprivileged build user. Do not let the app
+# inherit ownership of executables, service configuration or shared libraries.
+chown 0:0 / /run /home /tmp
+for path in /bin /lib /lib64 /nix /etc /opt /usr /var; do
+ test ! -d "$path" || chown -R 0:0 "$path"
+done
+chown -R 1000:1000 /home/app /run/applications
+printf 'hosts: files drv\n' >/etc/nsswitch.conf
+printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
+printf '127.0.0.1 localhost\n::1 localhost\n' >/etc/hosts
+hostname drv-application-lab
+export LD_LIBRARY_PATH=/lib
+zcat /proc/config.gz | grep '^# CONFIG_INET is not set$'
+(while true; do /bin/sh -i 3<>/dev/vport0p2 0<&3 1>&3 2>&3 3<&-; sleep .2; done) &
+chgrp 1000 /etc/applications/recovery-key.pem
+/bin/node /etc/applications/recovery.js 2>&1 | tee /run/recovery.log &
+echo RECOVERY_GUEST_READY
+while true; do sleep 60; done

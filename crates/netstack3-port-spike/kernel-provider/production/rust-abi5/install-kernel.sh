@@ -5,6 +5,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 if ! grep -q 'pub unsafe fn register_wait_raw' "$tree/rust/kernel/sync/poll.rs"; then
     patch -d "$tree" -p1 < "$here/../rust-lifecycle/positionless-poll.patch"
 fi
+# Linux 7.3 moved schedule_work() to the non-deprecated per-CPU queue;
+# keep Rust's existing system() helper on that same source of truth.
+if grep -q 'Queue::from_raw(bindings::system_wq)' "$tree/rust/kernel/workqueue.rs"; then
+    patch -d "$tree" -p1 < "$here/system-workqueue.patch"
+fi
 mkdir -p "$tree/net/netstack3_rust"
 cp "$here"/{Kconfig,Makefile,glue.c,rust_main.rs,linux.rs,frontend.rs,connection.rs} "$tree/net/netstack3_rust/"
 cp "$here/../rust-lifecycle/endpoint_file.rs" "$tree/net/netstack3_rust/"

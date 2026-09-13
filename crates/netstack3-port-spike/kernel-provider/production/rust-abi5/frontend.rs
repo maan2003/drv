@@ -684,7 +684,10 @@ impl Socket {
             mask |= b::POLLERR
         }
         if !alive {
-            mask |= b::POLLHUP
+            // Terminal I/O cannot block, including accept on a dead listener.
+            // Report operation readiness as well as the unconditional error/HUP
+            // bits so event loops can dispatch the operation and observe ENETDOWN.
+            mask |= b::POLLHUP | b::POLLIN | b::POLLRDNORM | b::POLLOUT | b::POLLWRNORM
         }
         // SO_ERROR is consumable by another caller; terminal connect readiness
         // belongs to the retained attempt, not the native error slot.

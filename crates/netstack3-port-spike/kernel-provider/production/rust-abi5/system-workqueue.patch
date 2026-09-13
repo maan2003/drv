@@ -1,0 +1,10 @@
+--- a/rust/kernel/workqueue.rs
++++ b/rust/kernel/workqueue.rs
+@@ -1027,1 +1027,1 @@
+-/// Returns the system work queue (`system_wq`).
++/// Returns the system per-CPU work queue (`system_percpu_wq`).
+@@ -1034,2 +1034,2 @@
+-    // SAFETY: `system_wq` is a C global, always available.
+-    unsafe { Queue::from_raw(bindings::system_wq) }
++    // SAFETY: `system_percpu_wq` is a C global, always available.
++    unsafe { Queue::from_raw(bindings::system_percpu_wq) }

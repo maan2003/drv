@@ -79,6 +79,12 @@ from consume-on-read errors. `ConnectAttempt` owns acknowledgement/outcome and
 waiter attachment transitions; a completed but unclaimed attempt cannot be
 replaced by another caller. Failed attempts retain poll readiness after SO_ERROR
 consumption; interrupted waits claim already-committed outcomes before detaching.
+Dead generations also retain input/output readiness together with ERR/HUP:
+accept/read/write are immediately terminal, not waiting for provider progress.
+This lets libuv dispatch dead listeners without its POLLIN assertion abort.
+The owner must still close/replace those listeners; this is not automatic Node
+listener recovery or exact parity with native Linux's distinct listener poll path.
+The 100-cycle harness is documented in `../applications/README.md`.
 TX seals count TCP bytes or UDP records including
 empty datagrams. Datagram destinations are fixed at app admission.
 
@@ -88,6 +94,16 @@ files reuse upstream Arc/ARef/FD reservation and pollfree/RCU lifetime helpers.
 The installer applies `positionless-poll.patch`: poll callbacks borrow a live
 file without asserting the stronger File/fdget_pos exclusion invariant.
 Native shutdown serializes its own shared safe callers.
+
+The installer also carries `system-workqueue.patch` for Linux 7.3-rc2:
+Rust's existing `workqueue::system()` follows C `schedule_work()` onto
+`system_percpu_wq`. The old queue has identical per-CPU allocation flags plus
+`__WQ_DEPRECATED`; the stale Rust helper triggered a boot-time warning in the
+upstream spinlock self-test. The patch fixes the call target rather than
+disabling that test or suppressing warnings. The replacement is a separate queue:
+code explicitly targeting the deprecated queue no longer shares queue-level
+flush/drain behavior with Rust's helper, which now shares the documented
+`schedule_work()` queue instead.
 
 ## Build and run
 

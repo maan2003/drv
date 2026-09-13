@@ -13,6 +13,8 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <netdb.h>
+#include <sys/syscall.h>
 static size_t payload_length = 1024 * 1024 + 137;
 static void check(int ok, const char *what) {
 	if (!ok) { fprintf(stderr, "FAIL %s: %s\n", what, strerror(errno)); exit(1); }
@@ -345,8 +347,174 @@ static void shutdown_backpressure(int family) {
     printf("PASS SHUTDOWN_BACKPRESSURE_V%d bytes=%zu\n", family == AF_INET ? 4 : 6, total);
 }
 
+
+/* Command barriers keep old descriptors alive until new-generation traffic has
+ * succeeded. Each child blocks on one transport/family; alarms bound wakeups. */
+static void recovery_command(const char *expected) {
+    char line[64];
+    check(fgets(line, sizeof(line), stdin) && !strcmp(line, expected),
+          "recovery command barrier");
+}
+static void recovery(void) {
+    int endpoints[4], peers[4], listeners[2], writers[2], sinks[2];
+    pid_t blocked[6];
+    for (int f = 0; f < 2; ++f) {
+        int family = f ? AF_INET6 : AF_INET;
+        struct sockaddr_storage a = addr(family, 24500);
+        listeners[f] = socket(family, SOCK_STREAM, 0);
+        check(listeners[f] >= 0 && bind(listeners[f], (void *)&a, alen(family)) == 0 &&
+              listen(listeners[f], 4) == 0, "recovery TCP listener");
+        peers[f] = socket(family, SOCK_STREAM, 0);
+        check(peers[f] >= 0 && connect(peers[f], (void *)&a, alen(family)) == 0, "recovery TCP connect");
+        endpoints[f] = accept(listeners[f], NULL, NULL);
+        check(endpoints[f] >= 0, "recovery TCP accept");
+        writers[f] = socket(family, SOCK_STREAM, 0);
+        check(writers[f] >= 0 && connect(writers[f], (void *)&a, alen(family)) == 0, "recovery writer connect");
+        sinks[f] = accept(listeners[f], NULL, NULL);
+        check(sinks[f] >= 0, "recovery writer accept");
+        a = addr(family, 24501);
+        endpoints[2+f] = socket(family, SOCK_DGRAM, 0);
+        peers[2+f] = socket(family, SOCK_DGRAM, 0);
+        check(endpoints[2+f] >= 0 && peers[2+f] >= 0 &&
+              bind(endpoints[2+f], (void *)&a, alen(family)) == 0 &&
+              connect(peers[2+f], (void *)&a, alen(family)) == 0, "recovery UDP pair");
+    }
+    puts("OLD_READY");
+    recovery_command("continuity\n");
+    for (int i = 0; i < 4; ++i) {
+        char b[16];
+        check(send(peers[i], "same-generation", 15, MSG_NOSIGNAL) == 15 &&
+              recv(endpoints[i], b, 15, MSG_WAITALL) == 15 &&
+              !memcmp(b, "same-generation", 15), "DNS restart retained TCP/UDP continuity");
+    }
+    puts("CONTINUITY_OK");
+    recovery_command("arm\n");
+    for (int f = 0; f < 2; ++f) {
+        char bytes[65536] = {};
+        size_t total = 0; ssize_t n;
+        while ((n = send(writers[f], bytes, sizeof(bytes), MSG_DONTWAIT | MSG_NOSIGNAL)) > 0) {
+            total += n;
+            check(total < 16 * 1024 * 1024, "bounded recovery write backpressure");
+        }
+        check(n < 0 && errno == EAGAIN, "writer backpressure before blocking send");
+        printf("BACKPRESSURE family=%d admitted=%zu\n", f ? 6 : 4, total);
+    }
+    for (int i = 0; i < 6; ++i) {
+        blocked[i] = fork();
+        check(blocked[i] >= 0, "recovery blocked worker");
+        if (!blocked[i]) {
+            alarm(15);
+            if (i < 4) {
+                char byte;
+                check(recv(endpoints[i], &byte, 1, 0) < 0 && errno == ENETDOWN,
+                      "provider death wakes blocked TCP/UDP read");
+            } else {
+                char bytes[65536] = {};
+                /* No reader: fill the window then block. Partial admission is
+                 * permitted, but eventual completion must be terminal. */
+                ssize_t n;
+                do { n = send(writers[i-4], bytes, sizeof(bytes), MSG_NOSIGNAL); } while (n > 0);
+                check(n < 0 && errno == ENETDOWN, "provider death wakes blocked TCP write");
+            }
+            _exit(0);
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        struct timespec start, now;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        int observed = 0;
+        do {
+            char path[80], line[256], state = 0;
+            snprintf(path, sizeof(path), "/proc/%d/status", blocked[i]);
+            FILE *status = fopen(path, "r");
+            check(status != NULL, "blocked child status");
+            while (fgets(line, sizeof(line), status))
+                if (sscanf(line, "State: %c", &state) == 1) break;
+            fclose(status);
+            snprintf(path, sizeof(path), "/proc/%d/syscall", blocked[i]);
+            FILE *syscall = fopen(path, "r");
+            check(syscall != NULL, "blocked child syscall");
+            long number = -1; unsigned long fd = 0;
+            int fields = fscanf(syscall, "%ld %lx", &number, &fd);
+            fclose(syscall);
+            observed = state == 'S' && fields == 2 &&
+                number == (i < 4 ? SYS_recvfrom : SYS_sendto) &&
+                fd == (unsigned long)(i < 4 ? endpoints[i] : writers[i-4]);
+            if (observed) {
+                printf("BLOCKED pid=%d syscall=%ld fd=%lu\n", blocked[i], number, fd);
+                break;
+            }
+            check(state != 'Z', "worker must block before death");
+            usleep(1000);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        } while (now.tv_sec - start.tv_sec < 5);
+        check(observed, "worker sleeping in intended socket syscall before provider death");
+    }
+    puts("BLOCKERS_ARMED");
+    recovery_command("dead\n");
+    for (int i = 0; i < 6; ++i) {
+        int status;
+        check(waitpid(blocked[i], &status, 0) == blocked[i] && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0, "bounded blocked operation termination");
+    }
+    for (int f = 0; f < 2; ++f) {
+        int family = f ? AF_INET6 : AF_INET;
+        for (int type = SOCK_STREAM; type <= SOCK_DGRAM; ++type)
+            check(socket(family, type, 0) < 0 && errno == ENETDOWN, "absent generation fails closed");
+    }
+    for (int f = 0; f < 2; ++f) {
+        struct pollfd ready[] = {
+            { .fd = listeners[f], .events = POLLIN | POLLOUT },
+            { .fd = endpoints[f], .events = POLLIN | POLLOUT },
+            { .fd = endpoints[2+f], .events = POLLIN | POLLOUT },
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            check(poll(ready, 3, 0) == 3, "dead sockets immediately ready");
+            for (int i = 0; i < 3; ++i) {
+                check((ready[i].revents & (POLLIN | POLLOUT | POLLERR | POLLHUP)) ==
+                      (POLLIN | POLLOUT | POLLERR | POLLHUP), "terminal I/O readiness");
+                int error; socklen_t len = sizeof(error);
+                check(getsockopt(ready[i].fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0,
+                      "consume SO_ERROR before readiness recheck");
+            }
+        }
+        check(accept4(listeners[f], NULL, NULL, SOCK_NONBLOCK) < 0 &&
+              errno == ENETDOWN, "dead listener accept terminal");
+    }
+    puts("PROVIDER_DEAD_OBSERVED");
+    recovery_command("replacement\n");
+    for (int i = 0; i < 4; ++i) {
+        char b;
+        check(send(peers[i], "new-generation", 14, MSG_NOSIGNAL) < 0 &&
+              errno == ENETDOWN, "old generation cannot send");
+        check(recv(endpoints[i], &b, 1, MSG_DONTWAIT) < 0 &&
+              errno == ENETDOWN, "old generation cannot receive");
+        wait_event(endpoints[i], EPOLLHUP);
+        close(peers[i]); close(endpoints[i]);
+    }
+    for (int f = 0; f < 2; ++f) {
+        close(listeners[f]); close(writers[f]); close(sinks[f]);
+    }
+    puts("OLD_STILL_DEAD");
+}
+
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
+    if (argc == 2 && !strcmp(argv[1], "recovery-fresh")) { tcp(AF_INET, 24500); tcp(AF_INET6, 24500); udp_batch(AF_INET); udp_batch(AF_INET6); return 0; }
+    if (argc == 2 && !strcmp(argv[1], "recovery")) { recovery(); return 0; }
+    if (argc == 3 && !strcmp(argv[1], "resolve")) {
+        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *result;
+        check(getaddrinfo(argv[2], "8080", &hints, &result) == 0, "fresh NSS recovery lookup");
+        int v4 = 0, v6 = 0;
+        for (struct addrinfo *r = result; r; r = r->ai_next) {
+            struct sockaddr_storage expected = addr(r->ai_family, 8080);
+            check(r->ai_addrlen == alen(r->ai_family) &&
+                  !memcmp(r->ai_addr, &expected, r->ai_addrlen), "NSS fixture address");
+            v4 |= r->ai_family == AF_INET; v6 |= r->ai_family == AF_INET6;
+        }
+        freeaddrinfo(result);
+        check(v4 && v6, "NSS both families"); puts("NSS_RECOVERY_OK"); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "ancillary")) { udp_ancillary(AF_INET); udp_ancillary(AF_INET6); return 0; }
     if (argc == 2 && !strcmp(argv[1], "batch")) { udp_batch(AF_INET); udp_batch(AF_INET6); return 0; }
     if (argc == 2 && !strcmp(argv[1], "parallel")) {

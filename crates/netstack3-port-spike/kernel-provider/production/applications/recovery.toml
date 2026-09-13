@@ -1,0 +1,5 @@
+# Test-only deterministic encrypted upstream, not production Quad9 config.
+[[upstreams]]
+address = "127.0.0.1:8443"
+server_name = "recovery.test"
+path = "/dns-query"

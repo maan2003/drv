@@ -1,0 +1,88 @@
+Service-generation recovery acceptance, Linux 7.3.0-rc2 x86-64
+Native np GCC/Rust/plain-make builds only. No Nix builds.
+KVM: q35, 2 vCPU, 4GiB, CONFIG_INET=n; no VFIO, no Ethernet capability
+during the 100-cycle gate. Local test-only HTTP/2 TLS DNS upstream.
+Node 24.18.1 / libuv 1.52.1, ws 8.18.3, Firefox 155.0.1 headless,
+nonroot, normal browser sandbox, one persistent browser across all cycles.
+
+Failures found and fixed:
+- #19: Node listener aborts at libuv uv__server_io POLLIN assertion on
+  provider death. ERR|HUP alone omitted terminal operation readiness.
+  #20 adds read/write readiness to dead application sockets, retaining
+  ERR/HUP independently of SO_ERROR. Provider-facing masks unchanged.
+- #20: 100 functional cycles passed. Hardened measurement rerun failed on
+  a genuine boot-time warning: upstream Rust workqueue::system() still
+  selected the deprecated system_wq.
+  #21 installer patch selects system_percpu_wq, as C schedule_work does.
+  Both allocations use WQ_PERCPU/default max_active; old additionally has
+  __WQ_DEPRECATED. Queue identity/flush-domain difference is documented.
+- Earlier clocksource "Watchdog remote CPU ... read timed out" is
+  pr_info_once in kernel/time/clocksource.c, not a warning. No filter
+  exception was introduced.
+
+Final #21 kernel bzImage SHA256:
+8743f9b51163c0b43cc2788c03253a2ab5e28c19301f19223fef8487aea7be60
+No kernel Git metadata in this source archive. VERSION=7.3.0-rc2.
+kernel/workqueue.c SHA256:
+833270e515f4cb0e29d46975471c2c557376a92a7a53ef3ffd949b3252501179
+patched rust/kernel/workqueue.rs SHA256:
+e38c4ae2d79564ff03adb1beb9f5ef1984ae4b7087ea9d7f3972a2b13769dd5a
+
+Final hardened run: applications/recovery-4 on np
+PASS RECOVERY_100_LOOPBACK_GENERATIONS
+100/100 cycles, 309339ms from first cycle begin through cycle 100 pass.
+100 DNS-only phases: same WebSocket identity, monotonic sequence, phase nonce,
+  verified 128KiB download/upload, retained IPv4/IPv6 TCP/UDP continuity.
+600 workers observed sleeping in the intended syscall on the expected FD
+  before provider death; 200 TCP writers first reached EAGAIN backpressure.
+100 provider-dead barriers; absent provider rejects new IPv4/IPv6 sockets.
+100 old-generation non-resurrection checks after verified new traffic.
+200 fresh TCP integrity checks, 200 fresh UDP batch checks.
+300 fresh glibc NSS checks; every phase requires fixture-observed misses
+  through IPv4/IPv6 wire DNS and NSS A/AAAA. Total upstream requests: 1910.
+100 DNS processes independently observed exiting on provider listener death.
+0 DNS bind teardown retries, 0 Node assertions, 0 kernel warning records.
+Continuous /dev/kmsg collection includes startup and cleanup; observed unique
+post-cleanup checkpoint before collector stop and final PASS.
+
+Resources (KiB for RSS/slab):
+                 min       max     cycle10   cycle100
+userspace procs   21        25          24         24
+FDs              467       596         592        591
+summed RSS       1006120   1241856     1202408    1217304
+kernel slab      49956     56412       53172      56240
+Provider FDs 15..17, RSS 7324..9188KiB.
+DNS FDs exactly 12, RSS 5688..6184KiB.
+No zombies. All direct children reaped before PASS; post-gate process
+inspection showed no remaining browser, provider, DNS or application workers.
+
+Complete gate transcript on np:
+ /var/lib/poco-linux/redwood/work/socket-provider-kvm/applications/recovery-4/gate-complete.log
+SHA256: 5149748257e903642352e0b4876c983f425f2e346cda01174bd704f626690bc6
+
+Scope: service/kernel generation recovery, not radio/Ethernet/DHCP/WAN
+reconnection. Lost TCP state is not reconstructed. The owner explicitly
+replaces dead application listeners after the observer barrier; Firefox
+itself remains running and reconnects. Physical Wi-Fi image #18 was untouched.
+
+Post-gate #21 regressions:
+PASS LOOPBACK_SUITE (including ancillary, shutdown backpressure, batched UDP,
+  failed-connect readiness after SO_ERROR, IPv4/IPv6 TCP/UDP).
+PASS_DNS public Quad9: UDP/TCP over IPv4/IPv6, A/AAAA/MX/TXT/HTTPS,
+  NXDOMAIN/SOA, 32 concurrent requests, NSS/glibc.
+PASS_CURL_LOOPBACK_DOWNLOAD_UPLOAD
+PASS_CURL_DNS_TLS
+PASS_GIT_HTTPS
+CURL_HTTP2_VERSION=2
+CURL_QUIC_VERSION=3 (https://cloudflare-quic.com/, HTTP/3-only)
+PASS_SSH_8MIB_ROUNDTRIP
+PASS_GIT_SSH_CLONE
+POST_RECOVERY_PUBLIC_REGRESSIONS_PASS
+Known unsupported IP_TOS/VRF queries still produce application warnings,
+not kernel warnings; SSH transfer integrity succeeds.
+The initial direct invocation of mode-0644 check-cli.sh was rejected;
+the successful rerun invokes the checked-in shell scripts with /bin/sh.
+After post-gate services exited: no kernel warning-severity records and
+no remaining application/service workers in the guest. All primary recovery
+VMs, gateways and their owned timeout processes were stopped. Physical
+Wi-Fi testing and its control/watchdog processes were not touched.
