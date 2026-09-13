@@ -450,15 +450,19 @@ authentication or transport validation is disabled. Publishing service-owned
 link/address/route state to Linux applications remains needed to remove this
 override. Userspace mode does not by itself fix that integration gap.
 
-The initial run reached the real control plane and obtained an authentication
-URL through Netstack3. That establishes pre-login control connectivity, not
-authenticated tailnet/UDP/DERP interoperability. Login URLs, machine state and
+The run reached the real control plane through Netstack3 and subsequently
+completed user authorization. Direct UDP discovery pings and encrypted TSMP
+pings passed in both directions between the guest and lab host. The guest HTTP
+and SOCKS5 proxies successfully connected to the host's SSH service and received
+its banner. These are same-host virtual-gateway tests, not physical Wi-Fi or
+remote-NAT proof. Login URLs, machine state and
 tailnet membership belong only in the private output directory, never checked-in
 evidence. The guest's state is volatile. The runner bounds its guest and
 gateway lifetime to one hour. `control.sock` is a root shell confined to that
 private VM; its containing host directory is mode 0700.
 
-[Pre-login evidence](evidence/tailscale-prelogin.txt) also records reachable
-DERP HTTPS endpoints. `tailscale netcheck` reported UDP false and no IPv4
-address; its cause is not yet established. Do not infer working UDP tunnels
-or authenticated DERP sessions from an authentication URL or latency probe.
+[Run evidence](evidence/tailscale-prelogin.txt) records pre-login and authenticated
+checks. `tailscale netcheck` reported UDP false and no IPv4 address despite
+successful direct UDP/TSMP traffic; the discrepancy and UDP rebind errors remain
+unexplained. The daemon established a DERP connection, but payload transport
+through DERP has not been isolated and verified.

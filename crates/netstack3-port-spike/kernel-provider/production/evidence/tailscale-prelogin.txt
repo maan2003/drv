@@ -2,7 +2,7 @@ Tailscale 1.98.10 / Go 1.26.5, KVM INET=n, Netstack3, QEMU/SLIRP external gatewa
 Requires upstream TS_ASSUME_NETWORK_UP_FOR_TEST=true because Linux interface/IP metadata is not published.
 No host Tailscale/network settings changed; no physical Wi-Fi assignment.
 Native frame-adapter release build and shell syntax checks passed.
-Pre-login result only; authenticated tailnet data path awaits user authorization.
+Initial pre-login result follows; authenticated follow-up is recorded below.
 
 netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false
 provider_network_status=Acquiring ipv4=None dns=[None, None]
@@ -20,3 +20,29 @@ IPv6: no, but OS has support
 Missing /proc/net/route
 DERP HTTPS latency: Bengaluru 64.5ms; Singapore 98.6ms
 UDP failure cause unverified; this is not a general UDP failure claim.
+
+Authenticated follow-up, 2026-09-13 08:05–08:07 UTC:
+The third interactive login completed; the prior follow-up returned HTTP 410
+after about five minutes. Expiry is suspected, not a proven root cause.
+No daemon restart or network override change was needed for the successful login.
+Guest: Switching ipn state Starting -> Running (WantRunning=true, nm=true)
+Guest: magicsock: derp-6 connected; connGen=1
+Guest -> lab host discovery ping: direct UDP, two replies, 1ms each.
+Lab host -> guest discovery ping: direct UDP, two replies, 1ms each.
+Guest -> lab host encrypted TSMP ping: reply, 55ms.
+Lab host -> guest encrypted TSMP ping: reply, 1ms.
+Guest HTTP proxy (127.0.0.1:1056), CONNECT to lab host TCP/22:
+HTTP/1.1 200 OK
+SSH-2.0-OpenSSH_10.4
+
+The CONNECT probe keeps its stdin open for five seconds: immediate stdin EOF
+canceled the initial request, yielding HTTP 500 / context canceled. This is
+not evidence of a proxy transport failure.
+Actual direct UDP and encrypted TSMP work despite netcheck reporting UDP=false.
+The reason for that discrepancy and UDP rebind EADDRINUSE logs remains unverified.
+An established DERP connection is not proof that tested payloads used DERP.
+This is a same-host virtual-gateway path, not physical Wi-Fi or remote-NAT proof.
+Guest SOCKS5 proxy (127.0.0.1:1055), CONNECT to lab host TCP/22:
+SOCKS5 no-auth negotiation accepted; CONNECT returned success (REP=0).
+Received SSH-2.0-OpenSSH_10.4 followed by CRLF.
+No SSH authentication was attempted.
