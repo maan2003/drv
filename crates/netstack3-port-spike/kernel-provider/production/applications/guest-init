@@ -13,8 +13,9 @@ printf 'root:x:0:\napp:x:1000:\n' >/etc/group
 # The image was assembled by an unprivileged build user. Do not let the app
 # inherit ownership of executables, service configuration or shared libraries.
 chown 0:0 / /run /home /tmp
-chown -R 0:0 /bin /lib /nix /etc
-test ! -d /opt || chown -R 0:0 /opt
+for path in /bin /lib /lib64 /nix /etc /opt /usr /var; do
+ test ! -d "$path" || chown -R 0:0 "$path"
+done
 chown -R 1000:1000 /home/app /run/applications
 printf 'hosts: files drv\n' >/etc/nsswitch.conf
 printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
