@@ -422,3 +422,43 @@ it does not implement Linux extended-error queues or non-NSS resolvers.
 unit tests plus nine integration tests, two NSS tests and one wire test passed;
 MT7921 adapter/passive-scan and ath11k-service downstream Cargo checks passed.
 The final complete no-INET KVM suite passed, including offline NSS checks.
+
+### Tailscale userspace compatibility lab
+
+`run-tailscale-kvm.sh` runs a disposable no-INET guest against an unprivileged
+QEMU/SLIRP Ethernet gateway. This is an external lab uplink, not an alternate
+TCP/IP backend inside the guest and not an MT7921 hardware proof. No host
+interfaces, routes, firewall rules or Tailscale configuration change.
+
+Enable `VIRTIO_MENU`, `VIRTIO_PCI` and `VIRTIO_CONSOLE` in the lab kernel.
+Stage the normal provider/NSS root plus `netstack3-virtio-lab`, an actual
+Tailscale daemon binary (not a distro wrapper), and CA certificates.
+The daemon may be a multicall binary linked as both `tailscale` and
+`tailscaled`. `netstack3-virtio-lab` is a safe-Rust test transport for QEMU's
+length-prefixed Ethernet stream, not a production driver.
+
+The guest starts `tailscaled --tun=userspace-networking`, with local SOCKS5
+port 1055 and HTTP-proxy port 1056. It advertises no routes and disables
+acceptance of Tailscale DNS/routes. DNS servers for Go's independent resolver
+are published from the actual DHCP result in this fixture only.
+
+**Known metadata gap:** Tailscale 1.98.10 observes no configured Linux IP
+interface and pauses its control client. The lab explicitly sets
+`TS_ASSUME_NETWORK_UP_FOR_TEST=true`, the upstream development override checked
+by `ipn/ipnlocal/local.go` and `wgengine/magicsock/magicsock.go`. No certificate,
+authentication or transport validation is disabled. Publishing service-owned
+link/address/route state to Linux applications remains needed to remove this
+override. Userspace mode does not by itself fix that integration gap.
+
+The initial run reached the real control plane and obtained an authentication
+URL through Netstack3. That establishes pre-login control connectivity, not
+authenticated tailnet/UDP/DERP interoperability. Login URLs, machine state and
+tailnet membership belong only in the private output directory, never checked-in
+evidence. The guest's state is volatile. The runner bounds its guest and
+gateway lifetime to one hour. `control.sock` is a root shell confined to that
+private VM; its containing host directory is mode 0700.
+
+[Pre-login evidence](evidence/tailscale-prelogin.txt) also records reachable
+DERP HTTPS endpoints. `tailscale netcheck` reported UDP false and no IPv4
+address; its cause is not yet established. Do not infer working UDP tunnels
+or authenticated DERP sessions from an authentication URL or latency probe.

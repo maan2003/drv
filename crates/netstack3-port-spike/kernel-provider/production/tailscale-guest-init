@@ -1,0 +1,40 @@
+#!/bin/busybox sh
+# Disposable compatibility lab. QEMU/SLIRP is the external gateway, not guest INET.
+set -eu
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
+export LD_LIBRARY_PATH=/lib
+mkdir -p /run /etc
+printf 'root:x:0:0:root:/root:/bin/sh\n' >/etc/passwd
+printf 'root:x:0:\n' >/etc/group
+/bin/sh -i 3<>/dev/vport0p2 0<&3 1>&3 2>&3 3<&- &
+printf 'hosts: files drv\n' >/etc/nsswitch.conf
+for i in $(seq 1 50); do test ! -e /dev/vport0p1 || break; sleep .1; done
+/bin/netstack3-virtio-lab >/run/provider.log 2>&1 &
+for i in $(seq 1 300); do
+    if grep -q 'provider_network_status=Bound' /run/provider.log; then break; fi
+    sleep .1
+done
+cat /run/provider.log
+grep -q 'provider_network_status=Bound' /run/provider.log
+dns=$(sed -n 's/.* dns=\[Some(\([^)]*\)).*/\1/p' /run/provider.log | head -1)
+test -n "$dns"
+# Go may bypass NSS. Publish the actual DHCP result for this fixture only.
+printf 'nameserver %s\n' "$dns" >/etc/resolv.conf
+echo "TAILSCALE_LAB_DNS=$dns"
+# Kernel interface/address publication is not implemented yet.
+TS_ASSUME_NETWORK_UP_FOR_TEST=true /bin/tailscaled --tun=userspace-networking --state=/run/tailscaled.state     --socket=/run/tailscaled.sock --socks5-server=127.0.0.1:1055     --outbound-http-proxy-listen=127.0.0.1:1056 >/run/tailscaled.log 2>&1 &
+for i in $(seq 1 100); do test ! -S /run/tailscaled.sock || break; sleep .1; done
+/bin/tailscale --socket=/run/tailscaled.sock up --hostname=drv-netstack3-kvm     --accept-dns=false --accept-routes=false --timeout=120s >/run/login.log 2>&1 &
+# Bounded diagnostic heartbeat; never dump the private state file.
+for i in $(seq 1 360); do
+    echo "TAILSCALE_LAB_TICK=$i"
+    cat /run/login.log
+    tail -24 /run/tailscaled.log
+    /bin/tailscale --socket=/run/tailscaled.sock status || true
+    sleep 10
+done
+reboot -f

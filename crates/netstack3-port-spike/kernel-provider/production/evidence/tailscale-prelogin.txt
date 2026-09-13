@@ -1,0 +1,22 @@
+Tailscale 1.98.10 / Go 1.26.5, KVM INET=n, Netstack3, QEMU/SLIRP external gateway.
+Requires upstream TS_ASSUME_NETWORK_UP_FOR_TEST=true because Linux interface/IP metadata is not published.
+No host Tailscale/network settings changed; no physical Wi-Fi assignment.
+Native frame-adapter release build and shell syntax checks passed.
+Pre-login result only; authenticated tailnet data path awaits user authorization.
+
+netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false
+provider_network_status=Acquiring ipv4=None dns=[None, None]
+provider_network_status=Bound ipv4=Some([10, 0, 2, 15]) dns=[Some(10.0.2.3), None]
+TAILSCALE_LAB_DNS=10.0.2.3
+Logged out.
+2026/09/13 07:43:35 control: control server key from https://controlplane.tailscale.com: ts2021=[fSeS+], legacy=[nlFWp]
+2026/09/13 07:43:37 control: RegisterReq: got response; nodeKeyExpired=false, machineAuthorized=false; authURL=true
+Log in at: [private login URL omitted]
+
+netcheck before login:
+UDP: false
+IPv4: no addr found
+IPv6: no, but OS has support
+Missing /proc/net/route
+DERP HTTPS latency: Bengaluru 64.5ms; Singapore 98.6ms
+UDP failure cause unverified; this is not a general UDP failure claim.
