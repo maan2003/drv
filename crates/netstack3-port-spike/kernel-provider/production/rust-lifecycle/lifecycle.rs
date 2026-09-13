@@ -4,10 +4,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel::{
-    fs::File,
     prelude::*,
     sync::{
-        poll::{PollCondVar, PollTable},
+        poll::PollCondVar,
         Arc, Mutex,
     },
 };
@@ -153,10 +152,10 @@ impl Socket {
         self.identity.unwrap().0
     }
     /// 0 = pending, 1 = readable/writable, 2 = provider generation dead.
-    pub(crate) fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
+    pub(crate) fn poll(&self, poll: &crate::endpoint_file::Poll<'_>) -> u32 {
         // Register before sampling. Updates release the same mutex before wakeup.
         // Upstream PollCondVar owns pollfree notification and the RCU grace period.
-        table.register_wait(file, &self.namespace.changed);
+        poll.register(&self.namespace.changed);
         let (id, generation) = self.identity.unwrap();
         let state = self.namespace.state.lock();
         if state.online != Some(generation) {

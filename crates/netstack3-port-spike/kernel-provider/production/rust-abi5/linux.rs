@@ -25,7 +25,7 @@ unsafe extern "C" {
 }
 pub(crate) struct NativeSock(NonNull<c_void>);
 // SAFETY: holds a native sock reference; helpers use native atomic/locked
-// interfaces or fields serialized by the frontend's socket/control mutexes.
+// interfaces. In particular ns3_set_shutdown serializes its own shared callers.
 unsafe impl Send for NativeSock {}
 unsafe impl Sync for NativeSock {}
 impl NativeSock {

@@ -1,0 +1,20 @@
+--- a/rust/kernel/sync/poll.rs
++++ b/rust/kernel/sync/poll.rs
+@@ -62,0 +63,11 @@
++        // SAFETY: File guarantees a live struct file.
++        unsafe { self.register_wait_raw(file.as_ptr(), cv) }
++    }
++
++    /// Register a live file without accessing its position.
++    ///
++    /// # Safety
++    ///
++    /// `file` must reference a live struct file for this call. No exclusion
++    /// against fdget_pos is needed: poll_wait never accesses the file position.
++    pub unsafe fn register_wait_raw(&self, file: *mut bindings::file, cv: &PollCondVar) {
+@@ -64 +75 @@
+-        // * `file.as_ptr()` references a valid file for the duration of this call.
++        // * The caller guarantees that `file` references a valid file for the duration of this call.
+@@ -71 +82 @@
+-        unsafe { bindings::poll_wait(file.as_ptr(), cv.wait_queue_head.get(), self.table) }
++        unsafe { bindings::poll_wait(file, cv.wait_queue_head.get(), self.table) }

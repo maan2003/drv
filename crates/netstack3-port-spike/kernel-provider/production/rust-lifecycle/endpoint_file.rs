@@ -7,10 +7,27 @@ use kernel::{
     error::from_err_ptr,
     fs::File,
     prelude::*,
-    sync::{aref::ARef, poll::PollTable, Arc},
+    sync::{aref::ARef, poll::{PollTable, PollCondVar}, Arc},
     types::ForeignOwnable,
     uaccess::{UserPtr, UserSlice, UserSliceReader, UserSliceWriter},
 };
+
+/// Poll callback borrow of a live file, with no file-position access.
+/// Unlike &File this does not assert exclusion of concurrent fdget_pos calls.
+pub(crate) struct Poll<'a> {
+    file: *mut bindings::file,
+    table: PollTable<'a>,
+}
+impl<'a> Poll<'a> {
+    /// Both pointers are valid for this callback; table may be null.
+    pub(crate) unsafe fn new(file: *mut bindings::file, table: *mut bindings::poll_table) -> Self {
+        Self { file, table: unsafe { PollTable::from_raw(table) } }
+    }
+    pub(crate) fn register(&self, cv: &PollCondVar) {
+        // SAFETY: callback's VFS file reference stays live throughout this borrow.
+        unsafe { self.table.register_wait_raw(self.file, cv) }
+    }
+}
 
 pub(crate) trait Endpoint: Send + Sync + 'static {
     fn release(&self) {}
@@ -20,7 +37,7 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
     fn write(&self, _input: &mut UserSliceReader) -> Result<usize> {
         Err(EOPNOTSUPP)
     }
-    fn poll(&self, _file: &File, _table: &PollTable<'_>) -> u32 {
+    fn poll(&self, _poll: &Poll<'_>) -> u32 {
         0
     }
     fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<isize> {
@@ -81,11 +98,8 @@ impl<T: Endpoint> VTable<T> {
     }
     unsafe extern "C" fn poll(file: *mut bindings::file, table: *mut bindings::poll_table) -> u32 {
         let value = unsafe { Arc::<T>::borrow((*file).private_data) };
-        // SAFETY: these stream callbacks are not inside a position operation;
-        // VFS holds file and poll table live for this callback.
-        value.poll(unsafe { File::from_raw_file(file) }, &unsafe {
-            PollTable::from_raw(table)
-        })
+        // SAFETY: VFS keeps file/table live until the callback returns.
+        value.poll(&unsafe { Poll::new(file, table) })
     }
     unsafe extern "C" fn ioctl(file: *mut bindings::file, cmd: u32, arg: usize) -> isize {
         let value = unsafe { Arc::<T>::borrow((*file).private_data) };

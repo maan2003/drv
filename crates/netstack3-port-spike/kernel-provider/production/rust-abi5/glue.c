@@ -63,7 +63,13 @@ void ns3_set_error(void *p, int error) {
 unsigned long ns3_timeout(void *p, bool send, bool nonblock) {
 	return send ? sock_sndtimeo(p, nonblock) : sock_rcvtimeo(p, nonblock);
 }
-void ns3_set_shutdown(void *p, int how) { ((struct sock *)p)->sk_shutdown |= how; }
+void ns3_set_shutdown(void *p, int how) {
+    struct sock *sk = p;
+    /* Serialize all callers here; Rust's safe shared method needs no caller lock. */
+    spin_lock_bh(&sk->sk_lock.slock);
+    WRITE_ONCE(sk->sk_shutdown, READ_ONCE(sk->sk_shutdown) | how);
+    spin_unlock_bh(&sk->sk_lock.slock);
+}
 void ns3_sigpipe(void) { send_sig(SIGPIPE, current, 0); }
 void *ns3_current_net(void) {
 	struct net *n = current->nsproxy->net_ns;

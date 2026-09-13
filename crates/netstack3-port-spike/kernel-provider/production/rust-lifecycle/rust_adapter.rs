@@ -8,9 +8,9 @@ mod lifecycle;
 use core::{ffi::c_void, ptr};
 use kernel::{
     bindings,
-    fs::{file::FileDescriptorReservation, File},
+    fs::file::FileDescriptorReservation,
     prelude::*,
-    sync::{poll::PollTable, Arc},
+    sync::Arc,
     types::ForeignOwnable,
 };
 use lifecycle::{Namespace, Session, Socket};
@@ -86,13 +86,9 @@ unsafe extern "C" fn nsrl_socket_poll(
     file: *const bindings::file,
     table: *mut bindings::poll_table,
 ) -> u32 {
-    // SAFETY: Linux poll holds file/socket alive and provides a valid or null
-    // poll_table for this call. Socket files are positionless streams; this
-    // callback does not run inside fdget_pos. The borrows never escape.
+    // SAFETY: Linux holds socket/file/table live throughout the callback.
     let socket = unsafe { Arc::<Socket>::borrow(p) };
-    let file = unsafe { File::from_raw_file(file) };
-    let table = unsafe { PollTable::from_raw(table) };
-    socket.poll(file, &table)
+    socket.poll(&unsafe { endpoint_file::Poll::new(file.cast_mut(), table) })
 }
 #[no_mangle]
 extern "C" fn nsrl_live_sockets() -> usize {
@@ -110,8 +106,8 @@ impl endpoint_file::Endpoint for SocketEndpoint {
         out.write_slice(&self.0.id().to_le_bytes())?;
         Ok(8)
     }
-    fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
-        match self.0.poll(file, table) {
+    fn poll(&self, poll: &endpoint_file::Poll<'_>) -> u32 {
+        match self.0.poll(poll) {
             0 => 0,
             1 => bindings::POLLIN | bindings::POLLOUT,
             _ => bindings::POLLERR | bindings::POLLHUP,

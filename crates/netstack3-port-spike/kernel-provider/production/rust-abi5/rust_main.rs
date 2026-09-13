@@ -7,9 +7,8 @@ use core::{ffi::c_void, ptr};
 use frontend::{Namespace, Session, Socket};
 use kernel::{
     bindings,
-    fs::File,
     prelude::*,
-    sync::{poll::PollTable, Arc},
+    sync::Arc,
     types::ForeignOwnable,
 };
 
@@ -144,10 +143,8 @@ unsafe extern "C" fn ns3_poll(
     f: *mut bindings::file,
     t: *mut bindings::poll_table,
 ) -> u32 {
-    // SAFETY: socket files are positionless; poll keeps file/table live.
-    unsafe { Arc::<Socket>::borrow(p) }.poll(unsafe { File::from_raw_file(f) }, &unsafe {
-        PollTable::from_raw(t)
-    })
+    // SAFETY: VFS keeps socket, file and table live throughout this callback.
+    unsafe { Arc::<Socket>::borrow(p) }.poll(&unsafe { endpoint_file::Poll::new(f, t) })
 }
 unsafe extern "C" fn provider_open(_inode: *mut bindings::inode, file: *mut bindings::file) -> i32 {
     let result = (|| -> Result {

@@ -4,6 +4,9 @@ set -euo pipefail
 tree=${1:?usage: install-kernel.sh DISPOSABLE_LINUX_SOURCE}
 here=$(cd "$(dirname "$0")" && pwd)
 test -f "$tree/net/Kconfig"
+if ! grep -q 'pub unsafe fn register_wait_raw' "$tree/rust/kernel/sync/poll.rs"; then
+    patch -d "$tree" -p1 < "$here/positionless-poll.patch"
+fi
 mkdir -p "$tree/net/ns3_rust_lifecycle"
 cp "$here"/{Kconfig,Makefile,protocol.h,linux_adapter.c,rust_adapter.rs,lifecycle.rs,endpoint_file.rs} "$tree/net/ns3_rust_lifecycle/"
 grep -qF 'source "net/ns3_rust_lifecycle/Kconfig"' "$tree/net/Kconfig" ||

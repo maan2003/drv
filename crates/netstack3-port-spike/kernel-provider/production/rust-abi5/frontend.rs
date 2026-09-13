@@ -8,10 +8,10 @@ use crate::{
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel::{
     bindings as b,
-    fs::{file::FileDescriptorReservation, File},
+    fs::file::FileDescriptorReservation,
     prelude::*,
     sync::{
-        poll::{PollCondVar, PollTable},
+        poll::PollCondVar,
         Arc, CondVarTimeoutResult, Mutex,
     },
     uaccess::{UserPtr, UserSlice, UserSliceReader, UserSliceWriter},
@@ -573,9 +573,9 @@ impl Socket {
             }
         }
     }
-    pub(crate) fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
-        table.register_wait(file, &self.changed);
-        table.register_wait(file, &self.lease.0.changed);
+    pub(crate) fn poll(&self, poll: &endpoint_file::Poll<'_>) -> u32 {
+        poll.register(&self.changed);
+        poll.register(&self.lease.0.changed);
         let s = self.state.lock();
         let mut mask = 0;
         let alive = self.alive(&s);
@@ -646,8 +646,8 @@ impl Drop for Session {
     }
 }
 impl Endpoint for Session {
-    fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
-        table.register_wait(file, &self.namespace.changed);
+    fn poll(&self, poll: &endpoint_file::Poll<'_>) -> u32 {
+        poll.register(&self.namespace.changed);
         let registry = self.namespace.registry.lock();
         if self.namespace.live.load(Ordering::Acquire) != self.generation {
             return b::POLLERR | b::POLLHUP;
@@ -825,10 +825,10 @@ impl Endpoint for SocketEndpoint {
         socket.wake();
         Ok(len)
     }
-    fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
+    fn poll(&self, poll: &endpoint_file::Poll<'_>) -> u32 {
         let socket = &self.0;
-        table.register_wait(file, &socket.provider_changed);
-        table.register_wait(file, &socket.lease.0.changed);
+        poll.register(&socket.provider_changed);
+        poll.register(&socket.lease.0.changed);
         let s = socket.state.lock();
         if !socket.alive(&s) {
             return b::POLLERR | b::POLLHUP;
