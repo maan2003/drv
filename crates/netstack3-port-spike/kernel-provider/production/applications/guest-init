@@ -12,6 +12,7 @@ printf 'root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:app:/home/app:/bin/sh\n' 
 printf 'root:x:0:\napp:x:1000:\n' >/etc/group
 # The image was assembled by an unprivileged build user. Do not let the app
 # inherit ownership of executables, service configuration or shared libraries.
+chown 0:0 / /run /home /tmp
 chown -R 0:0 /bin /lib /nix /etc
 test ! -d /opt || chown -R 0:0 /opt
 chown -R 1000:1000 /home/app /run/applications
