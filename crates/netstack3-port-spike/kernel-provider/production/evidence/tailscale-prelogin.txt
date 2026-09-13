@@ -68,3 +68,23 @@ Network access authorization is required; no shared policy was changed.
 OpenSSH IP_TOS/VRF options log unsupported warnings but local SSH succeeds.
 A SIGHUP restart initially failed EADDRINUSE; a subsequent daemon start
 bound successfully. Immediate socket-close/rebind semantics need investigation.
+
+After owner policy update, 2026-09-13 08:19–08:21 UTC:
+Lab host -> guest, pinned host key and disposable public-key authentication:
+uid=0(root) gid=0(root) groups=0(root)
+6.18.40
+# CONFIG_INET is not set
+TAILNET_SSH_OK
+Forced PTY: /dev/pts/0, TAILNET_PTY_OK.
+A separate devbox TCP/22 attempt still timed out; its cause was not isolated.
+
+Bulk SSH checks from lab host:
+1 MiB random upload command completed.
+Attempted download of that file timed out at 30 seconds: full round-trip NOT proved.
+Independent 64 KiB download: 65536 bytes, 3.2s, SHA256 matched guest hash.
+Repeat 1 MiB download: timeout at 45.0s, received 826817 of 1048576 bytes.
+Do not report a successful 1 MiB round-trip or sustained SSH throughput.
+The failing path includes Tailscale/gVisor, Netstack3 loopback and outer UDP,
+and QEMU/SLIRP; root cause has not been assigned to any component.
+Temporary payload and guest-local test keys were removed; sshd remains available
+with the owner and lab-host test keys until original VM lifetime expiry.

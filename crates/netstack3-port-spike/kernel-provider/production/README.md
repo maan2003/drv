@@ -473,7 +473,13 @@ The live lab also ran ordinary OpenSSH with a loopback-only listener,
 public-key-only authentication, and `tailscale serve --bg --tcp=22
 tcp://127.0.0.1:2222`. This is not Tailscale SSH or transparent TUN routing.
 Guest-local SSH command execution and PTY allocation passed with native
-INET still excluded. Inbound tailnet SSH was blocked by an empty received
-packet filter; it requires a network access rule for the guest's TCP/22.
-The lab does not modify shared tailnet policy. See the run evidence for
-unsupported socket-option warnings and a transient restart/rebind failure.
+INET still excluded. After the owner updated network access policy, lab-host
+tailnet SSH key authentication, commands, and PTY allocation also passed.
+The lab itself does not modify shared policy.
+
+A 64 KiB SSH download passed its hash check, but two 1 MiB download attempts
+timed out (the repeat received 826817 bytes in 45 seconds). This is not a
+successful bulk-transfer proof. A separate devbox connection also timed out.
+See the run evidence for scope, unsupported socket-option warnings, and a
+transient restart/rebind failure. These unresolved behaviors need isolation
+before treating this as dependable remote management.
