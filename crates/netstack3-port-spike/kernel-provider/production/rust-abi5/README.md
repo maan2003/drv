@@ -42,6 +42,22 @@ resource pressure is an `AcceptState` with a scheduler-visible retry deadline.
 `RxRecord` admits bounded payloads before publication; oversize UDP produces
 a local EMSGSIZE and drops that datagram without ending receive pumping.
 
+## Ancillary send admission
+
+Control messages are validated before implicit socket activation or payload
+consumption. Malformed native headers return EINVAL; unsupported semantics
+return EOPNOTSUPP. A well-formed nonzero UDP_SEGMENT request returns EIO because
+GSO cannot be executed, allowing applications such as curl 8.21.0 to resend
+individual datagrams. This is explicit rejection, not GSO support. Unknown
+metadata is never silently discarded, including when mixed with UDP_SEGMENT.
+
+The current native x86-64 regression reproduces silent acceptance on kernel
+#18 and passes on #19: exact curl and unpadded layouts, malformed headers,
+mixed controls, TCP rejection, sendmmsg partial success and datagram-preserving
+fallback. See [acceptance evidence](ancillary-evidence.txt). The full socket
+suite, Firefox/WebSocket and SSH/Git transfers also pass. End-to-end HTTP/3
+acceptance is separate from the ancillary contract.
+
 ## Waiting and the hostile-provider boundary
 
 Safe `frontend.rs` owns queue/state transitions, not TCP/IP. There are no

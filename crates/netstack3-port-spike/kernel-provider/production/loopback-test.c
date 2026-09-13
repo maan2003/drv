@@ -217,6 +217,82 @@ static void udp_batch(int family) {
     puts(family == AF_INET ? "PASS SENDMMSG_UDP_V4" : "PASS SENDMMSG_UDP_V6");
 }
 
+/* Ancillary semantics must never be silently discarded. Rejected sends leave
+ * both the datagram stream and the socket's asynchronous error state unchanged. */
+static void reject_control(int tx, int rx, struct msghdr *msg, int expected) {
+    errno = 0;
+    check(sendmsg(tx, msg, 0) == -1 && errno == expected, "ancillary synchronous rejection");
+    struct pollfd ready = { .fd = rx, .events = POLLIN };
+    check(poll(&ready, 1, 20) == 0, "rejected ancillary has no received payload");
+    int error = -1; socklen_t size = sizeof(error);
+    check(getsockopt(tx, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && !error,
+          "rejected ancillary has no asynchronous error");
+}
+static void udp_ancillary(int family) {
+    int rx = socket(family, SOCK_DGRAM, 0), tx = socket(family, SOCK_DGRAM, 0);
+    struct sockaddr_storage a = addr(family, 0); socklen_t size = alen(family);
+    check(rx >= 0 && tx >= 0, "ancillary sockets");
+    check(bind(rx, (void *)&a, size) == 0 &&
+          getsockname(rx, (void *)&a, &size) == 0 &&
+          connect(tx, (void *)&a, size) == 0, "ancillary setup");
+    unsigned char payload[2400], received[2400];
+    for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = i % 251;
+    struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
+    union { struct cmsghdr align; unsigned char bytes[2 * CMSG_SPACE(sizeof(int))]; } control = {};
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                         .msg_control = control.bytes, .msg_controllen = CMSG_SPACE(sizeof(int)) };
+    struct cmsghdr *first = CMSG_FIRSTHDR(&msg);
+    first->cmsg_level = IPPROTO_UDP; first->cmsg_type = 103; /* UDP_SEGMENT */
+    first->cmsg_len = CMSG_LEN(sizeof(unsigned short));
+    unsigned short segment = 1200;
+    memcpy(CMSG_DATA(first), &segment, sizeof(segment));
+    reject_control(tx, rx, &msg, EIO); /* exact curl layout: SPACE(int), LEN(u16) */
+    msg.msg_controllen = first->cmsg_len;
+    reject_control(tx, rx, &msg, EIO); /* omitted final padding */
+    msg.msg_controllen = sizeof(struct cmsghdr) - 1;
+    reject_control(tx, rx, &msg, EINVAL);
+    msg.msg_controllen = CMSG_SPACE(sizeof(int));
+    first->cmsg_len = CMSG_LEN(1);
+    reject_control(tx, rx, &msg, EINVAL);
+    first->cmsg_len = sizeof(struct cmsghdr) - 1;
+    reject_control(tx, rx, &msg, EINVAL);
+    first->cmsg_len = msg.msg_controllen + 1;
+    reject_control(tx, rx, &msg, EINVAL);
+    first->cmsg_len = CMSG_LEN(sizeof(unsigned short));
+    first->cmsg_type = 0x7fff;
+    reject_control(tx, rx, &msg, EOPNOTSUPP);
+    first->cmsg_type = 103;
+    msg.msg_controllen = sizeof(control.bytes);
+    struct cmsghdr *second = CMSG_NXTHDR(&msg, first);
+    check(second != NULL, "ancillary second header");
+    second->cmsg_level = IPPROTO_UDP; second->cmsg_type = 0x7fff;
+    second->cmsg_len = CMSG_LEN(sizeof(unsigned short));
+    reject_control(tx, rx, &msg, EOPNOTSUPP); /* GSO does not hide unknown metadata */
+    second->cmsg_len = sizeof(struct cmsghdr) - 1;
+    reject_control(tx, rx, &msg, EINVAL); /* inspect the whole list */
+    msg.msg_controllen = CMSG_SPACE(sizeof(int));
+    int tcp = socket(family, SOCK_STREAM, 0);
+    check(tcp >= 0, "ancillary TCP socket");
+    reject_control(tcp, rx, &msg, EOPNOTSUPP);
+    close(tcp);
+    struct mmsghdr batch[2] = {};
+    struct iovec one = { .iov_base = payload, .iov_len = 1200 };
+    batch[0].msg_hdr = (struct msghdr){ .msg_iov = &one, .msg_iovlen = 1 };
+    batch[1].msg_hdr = msg;
+    check(sendmmsg(tx, batch, 2, 0) == 1 && batch[0].msg_len == 1200,
+          "ancillary sendmmsg partial success");
+    check(recv(rx, received, sizeof(received), 0) == 1200 &&
+          !memcmp(received, payload, 1200), "batch first datagram unchanged");
+    reject_control(tx, rx, &msg, EIO);
+    for (unsigned int i = 0; i < 2; ++i)
+        check(send(tx, payload + i * 1200, 1200, 0) == 1200, "ordinary fallback send");
+    for (unsigned int i = 0; i < 2; ++i)
+        check(recv(rx, received, sizeof(received), 0) == 1200 &&
+              !memcmp(received, payload + i * 1200, 1200), "fallback datagram boundaries");
+    close(tx); close(rx);
+    puts(family == AF_INET ? "PASS_ANCILLARY_V4" : "PASS_ANCILLARY_V6");
+}
+
 /* The reader cannot release TCP window space until shutdown has returned.
  * Fill beyond both core and frontend buffering before imposing the barrier. */
 static void shutdown_backpressure(int family) {
@@ -271,6 +347,7 @@ static void shutdown_backpressure(int family) {
 
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
+    if (argc == 2 && !strcmp(argv[1], "ancillary")) { udp_ancillary(AF_INET); udp_ancillary(AF_INET6); return 0; }
     if (argc == 2 && !strcmp(argv[1], "batch")) { udp_batch(AF_INET); udp_batch(AF_INET6); return 0; }
     if (argc == 2 && !strcmp(argv[1], "parallel")) {
         enum { CLIENTS = 16 };
@@ -333,6 +410,7 @@ int main(int argc, char **argv) {
     }
     shutdown_backpressure(AF_INET); shutdown_backpressure(AF_INET6);
     udp_batch(AF_INET); udp_batch(AF_INET6);
+    udp_ancillary(AF_INET); udp_ancillary(AF_INET6);
     refused(AF_INET); refused(AF_INET6);
 	tcp(AF_INET, 23456); udp(AF_INET); tcp(AF_INET6, 23456); udp(AF_INET6);
 	puts("PASS LOOPBACK_SUITE"); return 0;

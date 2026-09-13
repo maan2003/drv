@@ -492,6 +492,7 @@ impl Socket {
         }
     }
     pub(crate) fn send(&self, msg: &mut Message<'_>, len: usize) -> Result<usize> {
+        msg.validate_control(self.kind == 2)?;
         let flags = msg.flags();
         let timeout = Deadline::new(self.native.timeout(true, flags & b::MSG_DONTWAIT != 0));
         if flags & !(b::MSG_DONTWAIT | b::MSG_NOSIGNAL | b::MSG_MORE | b::MSG_BATCH) != 0 {

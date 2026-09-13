@@ -1,0 +1,29 @@
+Linux drv-application-lab 7.3.0-rc2 #19 SMP PREEMPT Sun Sep 13 23:46:19 IST 2026 x86_64 GNU/Linux
+PASS_ANCILLARY_V4
+PASS_ANCILLARY_V6
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=1032192
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=1048576
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS_ANCILLARY_V4
+PASS_ANCILLARY_V6
+PASS REFUSED family=2 SO_ERROR clears terminal readiness retained
+PASS REFUSED family=10 SO_ERROR clears terminal readiness retained
+BENCH TCP family=2 seconds=0.101402 MBps=20.68
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.092658 MBps=22.64
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+setsockopt socket 3 IP_TOS 184: Protocol not available
+setsockopt socket 3 IP_TOS 184: Protocol not available
+setsockopt socket 3 IP_TOS 0: Protocol not available
+setsockopt socket 3 IP_TOS 184: Protocol not available
+PASS_SSH_8MIB_ROUNDTRIP
+setsockopt socket 3 IP_TOS 184: Protocol not available
+setsockopt socket 3 IP_TOS 184: Protocol not available
+setsockopt socket 3 IP_TOS 0: Protocol not available
+setsockopt socket 3 IP_TOS 184: Protocol not available
+PASS_GIT_SSH_CLONE
+PASS_BROWSER_HTTP_WEBSOCKET

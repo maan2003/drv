@@ -170,6 +170,73 @@ impl<'a> Message<'a> {
             pending_read: 0,
         }
     }
+    /// Reject ancillary semantics we cannot execute before any payload is admitted.
+    pub(crate) fn validate_control(&self, udp: bool) -> Result {
+        let len = self.header.msg_controllen;
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: this method is used only by the send callback; the union's
+        // active arm is the kernel control pointer (never the receive user arm).
+        let pointer = unsafe { self.header.__bindgen_anon_1.msg_control };
+        if pointer.is_null() {
+            return Err(EINVAL);
+        }
+        // SAFETY: sendmsg supplies a kernel-owned copied control buffer of this
+        // length for the duration of the callback. No userspace pointers escape.
+        let control = unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), len) };
+        let header_len = core::mem::size_of::<bindings::cmsghdr>();
+        let alignment = core::mem::size_of::<usize>();
+        let mut offset = 0;
+        let mut gso = false;
+        let mut unsupported = false;
+        while offset < len {
+            let remaining = &control[offset..];
+            if remaining.len() < header_len {
+                return Err(EINVAL);
+            }
+            // SAFETY: header bounds were checked; unaligned read avoids assuming
+            // alignment of each control message supplied by an application.
+            let header = unsafe {
+                remaining
+                    .as_ptr()
+                    .cast::<bindings::cmsghdr>()
+                    .read_unaligned()
+            };
+            if header.cmsg_len < header_len || header.cmsg_len > remaining.len() {
+                return Err(EINVAL);
+            }
+            // Linux SOL_UDP/UDP_SEGMENT carries a native-endian u16 segment size.
+            if udp && header.cmsg_level == bindings::IPPROTO_UDP as i32 && header.cmsg_type == 103 {
+                if header.cmsg_len != header_len + 2 {
+                    return Err(EINVAL);
+                }
+                let size = u16::from_ne_bytes([remaining[header_len], remaining[header_len + 1]]);
+                if size != 0 {
+                    gso = true;
+                } else {
+                    unsupported = true;
+                }
+            } else {
+                unsupported = true;
+            }
+            let step = header.cmsg_len.checked_add(alignment - 1).ok_or(EINVAL)? & !(alignment - 1);
+            // Padding after the final complete message may be omitted.
+            if step >= remaining.len() {
+                break;
+            }
+            offset += step;
+        }
+        if unsupported {
+            Err(EOPNOTSUPP)
+        } else if gso {
+            // Linux reports an unexecutable GSO request as EIO. curl then resends
+            // individual datagrams. Never silently send the concatenated buffer.
+            Err(EIO)
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn flags(&self) -> u32 {
         self.header.msg_flags
     }
