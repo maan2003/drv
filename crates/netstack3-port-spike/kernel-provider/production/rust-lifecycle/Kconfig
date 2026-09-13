@@ -1,0 +1,8 @@
+config NETSTACK3_RUST_LIFECYCLE
+	bool "Experimental Rust Internet socket lifetime slice"
+	depends on NET && !INET && RUST
+	depends on !NETSTACK3
+	help
+	  KVM-only feasibility experiment: Rust owns admission, readiness and
+	  provider generations and poll waits; C adapts Linux socket/FD callbacks.
+	  No TCP/UDP data path. Not a production replacement for NETSTACK3.

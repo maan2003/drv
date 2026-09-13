@@ -1,0 +1,100 @@
+Kernel-Rust lifecycle feasibility, 2026-09-13
+==========================================
+No host kernel installed, no physical hardware assigned, no push.
+Production Linux 6.18.40 / ABI5 frontend is unchanged.
+
+Source selection:
+kernel.org/releases.json reported mainline 7.3-rc2, stable 7.2.5.
+Official archive:
+https://git.kernel.org/torvalds/t/linux-7.3-rc2.tar.gz
+The optional Git tag-object lookup timed out and was stopped; this experiment
+pins the official release archive by content, not a separately verified Git ID.
+Archive SHA256:
+6b97fb9397172e95ed95b56a78524a184bf186858bea7a271b9ebe81a0e57417
+
+Native np tools, no Nix build:
+Linux make -j4, GCC 15.2.0, Rust 1.97.0 (2d8144b78, 2026-07-07),
+bindgen 0.72.1, libclang 21.1.8, QEMU 10.2.4 with KVM, 2 vCPUs, 1GiB.
+Rust core sources extracted from the matching rustc-1.97.0-src.tar.gz.
+Initial availability check passed with a mismatched installed Rust source
+tree, but core compilation failed on intrinsic mismatches. Selecting exact
+matching sources fixed it; rustavailable alone does not prove buildability.
+RUSTC and HOSTRUSTC are make arguments; environment RUSTC was overridden by
+Kbuild defaults. No kernel-source toolchain compatibility patches were needed.
+
+Initial 6.18.40 slice:
+Rust Arc/KBox/Mutex owned generation/admission/readiness and lifetime.
+C still registered, woke and destroyed its per-net wait queue.
+Built and passed the full debug lifecycle suite, including:
+PASS RUST_LIFECYCLE_V4_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_LIFECYCLE_V6_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_POLL_CANCELLATION
+PASS RUST_QUOTA_VALIDATION
+PASS RUST_NETNS_ISOLATION_RECLAMATION
+PASS RUST_WAKE_RACES_100
+PASS RUST_PROVIDER_SIGKILL
+PASS RUST_CONCURRENT_LIFETIMES_8x500
+PASS RUST_LIFECYCLE_SUITE
+PASS_KVM_RUST_LIFECYCLE
+
+7.3-rc2 adaptation:
+Reused kernel::sync::poll::{PollTable, PollCondVar} directly. Removed C
+wait_queue_head_t, initialization, poll_wait and wake_up calls. Safe Rust
+registers before sampling, mutates under a mutex then wakes, and upstream
+PollCondVar handles pollfree plus synchronize_rcu in its destructor.
+Current PinnedDrop expansion implements an unsafe trait: the diagnostic
+namespace drop counter moved to an ordinary unpinned RAII field rather than
+weakening forbid(unsafe_code). Final experiment compiled without warnings.
+C still owns Linux registration/FD callbacks/net refs/user-copy. No upstream
+net_proto_family/proto_ops safe wrapper was found in the inspected net/fs APIs.
+
+Final build artifacts:
+bzImage SHA256:
+74371d63c4b072ee1eee7e4a73e3293cb0015aba621a763dfda50a738d522ab6
+lifecycle-test SHA256:
+a5eb746a837a1d0b4a8501e8275cf77cd7898997db30a5c99518a08a8052b85b
+
+Final configuration:
+CONFIG_RUST=y
+# CONFIG_INET is not set
+CONFIG_NETSTACK3_RUST_LIFECYCLE=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_DEBUG_MUTEXES=y
+CONFIG_LOCKDEP=y
+CONFIG_DEBUG_ATOMIC_SLEEP=y
+CONFIG_DEBUG_LIST=y
+
+Final 7.3-rc2 KVM run:
+PASS RUST_LIFECYCLE_V4_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_LIFECYCLE_V6_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_POLL_CANCELLATION[    0.872453] Callback from call_rcu_tasks() invoked.
+PASS RUST_QUOTA_VALIDATION
+PASS RUST_NETNS_ISOLATION_RECLAMATION
+PASS RUST_WAKE_RACES_100
+PASS RUST_PROVIDER_SIGKILL
+PASS RUST_CONCURRENT_LIFETIMES_8x500
+PASS RUST_LIFECYCLE_SUITE
+PASS_KVM_RUST_LIFECYCLE
+
+Three further full runs passed, each including 100 wake races and 8 x 500
+concurrent lifetimes. Total latest-kernel runs: 4; concurrent lifetime cycles:
+16000. Each runner rejects FAIL, BUG, WARNING, Oops and Kernel panic and requires
+PASS_KVM_RUST_LIFECYCLE. No such failures/warnings were observed.
+Raw logs retained on np under socket-provider-kvm/rust-lifecycle:
+baseline-debug-kvm/serial.log, latest-debug-kvm/serial.log,
+latest-debug-kvm-{2,3,4}/serial.log.
+
+Checks:
+- Rust lifecycle.rs compiles with forbid(unsafe_code).
+- Full native kernel build succeeds; no experiment warnings in final build.
+- lifecycle-test.c compiles GCC -O2 -Wall -Wextra -Werror.
+- Git diff whitespace check and Rust formatting check pass.
+- No guest or gateway remains running; runner guests exit by reboot.
+
+Conclusion:
+Latest Linux materially improves the safe polling boundary. The lifecycle
+slice is feasible with real kernel Rust ownership, not a blanket unsafe Rust
+translation. Keep it experimental; next prove scoped provider-FD/request
+owners, cancellation and resource accounting before replacing ABI5.
+These are synthetic readiness/lifetime tests, not TCP/UDP transfers, SSH,
+hostile-provider exhaustive testing, KASAN coverage, or production readiness.

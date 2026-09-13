@@ -578,3 +578,11 @@ actual PIDs and validate command identity before cleanup.
 old-kernel sendmmsg regression, the fixed-kernel test, and SSH bulk comparisons.
 Unsupported flags must be distinguished from Linux-internal scheduling hints:
 `MSG_BATCH` is added by `__sys_sendmmsg`, even when userspace supplies flags=0.
+
+## Kernel-Rust feasibility experiment
+
+The separate [Rust lifecycle slice](rust-lifecycle/README.md) builds on Linux
+7.3-rc2 and exercises real AF_INET/AF_INET6 creation, polling, final release and
+provider-generation death in no-INET KVM. It reuses upstream Rust polling and
+RCU-teardown wrappers. It has no TCP/UDP data path and does not replace this
+production ABI5 frontend. [Evidence and limits](rust-lifecycle/evidence.txt).

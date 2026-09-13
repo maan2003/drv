@@ -1,0 +1,15 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+set -eu
+trap 'echo FAIL_RUST_LIFECYCLE_GUEST; reboot -f' EXIT
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+zcat /proc/config.gz | grep -E 'CONFIG_(RUST=|INET |NETSTACK3)'
+zcat /proc/config.gz | grep -q '^CONFIG_RUST=y$'
+zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
+if zcat /proc/config.gz | grep -q '^CONFIG_NETSTACK3=y$'; then exit 1; fi
+/bin/lifecycle-test
+echo PASS_KVM_RUST_LIFECYCLE
+trap - EXIT
+reboot -f
