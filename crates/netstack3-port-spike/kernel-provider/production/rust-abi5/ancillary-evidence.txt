@@ -46,3 +46,9 @@ Final browser retry after WAN restoration (reviewed image hash matches):
 *** You are running in headless mode.
 FIREFOX_RETRY_EXIT=0
 8d7433ec150c610a7918a8e394e1d16fdff6f7810eb6586b46b64b5746f2e2b6  /run/applications/firefox-external.png
+
+Same-profile browser repeat after WAN restoration:
+PASS_FIREFOX_JAVASCRIPT
+Terminated
+FIREFOX_EXTERNAL_SCREENSHOT_READY_FOR_VISUAL_REVIEW
+8d7433ec150c610a7918a8e394e1d16fdff6f7810eb6586b46b64b5746f2e2b6  /run/applications/firefox-external.png
