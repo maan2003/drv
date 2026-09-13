@@ -466,3 +466,14 @@ checks. `tailscale netcheck` reported UDP false and no IPv4 address despite
 successful direct UDP/TSMP traffic; the discrepancy and UDP rebind errors remain
 unexplained. The daemon established a DERP connection, but payload transport
 through DERP has not been isolated and verified.
+
+### OpenSSH follow-up
+
+The live lab also ran ordinary OpenSSH with a loopback-only listener,
+public-key-only authentication, and `tailscale serve --bg --tcp=22
+tcp://127.0.0.1:2222`. This is not Tailscale SSH or transparent TUN routing.
+Guest-local SSH command execution and PTY allocation passed with native
+INET still excluded. Inbound tailnet SSH was blocked by an empty received
+packet filter; it requires a network access rule for the guest's TCP/22.
+The lab does not modify shared tailnet policy. See the run evidence for
+unsupported socket-option warnings and a transient restart/rebind failure.

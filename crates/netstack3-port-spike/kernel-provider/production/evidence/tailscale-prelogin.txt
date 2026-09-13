@@ -46,3 +46,25 @@ Guest SOCKS5 proxy (127.0.0.1:1055), CONNECT to lab host TCP/22:
 SOCKS5 no-auth negotiation accepted; CONNECT returned success (REP=0).
 Received SSH-2.0-OpenSSH_10.4 followed by CRLF.
 No SSH authentication was attempted.
+
+OpenSSH follow-up, 2026-09-13 08:14 UTC:
+Staged existing OpenSSH10.4p1 binaries and ELF dependencies into the live guest;
+no Nix build, reboot, Tailscale identity reset, or shared ACL edit.
+sshd listens on 127.0.0.1:2222, public-key authentication only, PAM/password/
+keyboard-interactive/forwarding disabled. Authorized keys live under /root/.ssh.
+Guest tailscale serve exposes tailnet TCP/22 -> 127.0.0.1:2222.
+Local guest SSH with a disposable key and console-pinned host key passed:
+uid=0(root) gid=0(root) groups=0(root)
+6.18.40
+# CONFIG_INET is not set
+LOCAL_SSH_OK
+Forced PTY command passed:
+/dev/pts/0
+PTY_OK
+
+Inbound tailnet SSH remains blocked, NOT verified: TCP/2222 logged
+"no rules matched"; TCP/22 timed out too. Guest netmap PacketFilter is empty.
+Network access authorization is required; no shared policy was changed.
+OpenSSH IP_TOS/VRF options log unsupported warnings but local SSH succeeds.
+A SIGHUP restart initially failed EADDRINUSE; a subsequent daemon start
+bound successfully. Immediate socket-close/rebind semantics need investigation.
