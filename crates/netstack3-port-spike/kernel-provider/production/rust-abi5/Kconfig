@@ -1,0 +1,6 @@
+config NETSTACK3_RUST
+	bool "Rust userspace-backed Internet socket frontend (ABI5)"
+	depends on NET && !INET && RUST && !NETSTACK3 && !NETSTACK3_RUST_LIFECYCLE
+	help
+	  AF_INET and AF_INET6 delegated to Netstack3 over ABI5. All frontend
+	  state and protocol handling is Rust; Linux registration uses C glue.

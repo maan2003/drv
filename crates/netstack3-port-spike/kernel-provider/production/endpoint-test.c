@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -60,6 +61,34 @@ int main(int argc, char **argv) {
         close(app); close(endpoint); close(registration);
         return 0;
     }
+    /* A fault copying the claim ID must not consume a queued socket. */
+    int fault_app = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    check(fault_app >= 0, "claim fault socket");
+    check(ioctl(registration, NS3_CLAIM, (void *)1) < 0 && errno == EFAULT,
+          "claim user-copy rollback");
+    struct rlimit original, limited;
+    check(getrlimit(RLIMIT_NOFILE, &original) == 0, "read FD limit");
+    limited = original; limited.rlim_cur = 64;
+    check(setrlimit(RLIMIT_NOFILE, &limited) == 0, "lower FD limit");
+    int fillers[64], filled = 0;
+    while (filled < 64) {
+        int fd = dup(registration);
+        if (fd < 0) { check(errno == EMFILE, "fill FD table"); break; }
+        fillers[filled++] = fd;
+    }
+    unsigned long long unclaimed_id = 0;
+    check(ioctl(registration, NS3_CLAIM, &unclaimed_id) < 0 && errno == EMFILE,
+          "claim FD reservation rollback");
+    while (filled) close(fillers[--filled]);
+    check(setrlimit(RLIMIT_NOFILE, &original) == 0, "restore FD limit");
+    unsigned long long fault_id;
+    int fault_endpoint = claim(registration, &fault_id);
+    receive_packet(fault_endpoint, fault_id);
+    char fault_byte[4];
+    check(recv(fault_app, fault_byte, sizeof(fault_byte), 0) == 4,
+          "claim succeeds after failed copy");
+    close(fault_app); close(fault_endpoint);
+    puts("PASS ENDPOINT_CLAIM_COPY_ROLLBACK");
 	int a = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	int b = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	check(a >= 0 && b >= 0, "application sockets");
@@ -98,7 +127,90 @@ int main(int argc, char **argv) {
 	receive_packet(bp, bid);
 	check(recv(b, data, 4, 0) == 4, "endpoint close does not revoke another socket");
 	puts("PASS ENDPOINT_SCOPING_SATURATION_CLOSE");
+    /* RX admission is exactly four credits, reclaimed only when the provider
+     * reads CREDIT, not merely when the application consumes data. */
+    int q = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    unsigned long long qid;
+    int qp = claim(registration, &qid);
+    for (int i = 0; i < 4; ++i) receive_packet(qp, qid);
+    struct { struct ns3_msg h; struct ns3_addr a; char bytes[4]; } packet = {
+        .h = {.version=NS3_VERSION,.op=NS3_RX,.socket=qid,.len=28},
+        .a = {.family=4}, .bytes = {'t','e','s','t'}
+    };
+    check(write(qp, &packet, sizeof(packet.h) + 28) < 0 && errno == EAGAIN,
+          "fifth receive credit denied");
+    for (int i = 0; i < 4; ++i) check(recv(q, data, 4, 0) == 4, "consume credited packet");
+    check(write(qp, &packet, sizeof(packet.h) + 28) < 0 && errno == EAGAIN,
+          "consumption alone cannot create provider credits");
+    check(read(qp, frame, sizeof(frame)) == sizeof(struct ns3_msg) + 4 &&
+          ((struct ns3_msg *)frame)->op == NS3_CREDIT, "credit batch returned");
+    unsigned int credits;
+    memcpy(&credits, frame + sizeof(struct ns3_msg), 4);
+    check(credits == 4, "credit conservation");
+    receive_packet(qp, qid);
+    check(recv(q, data, 4, 0) == 4, "credit reuse");
+    struct ns3_msg unknown = {.version=NS3_VERSION,.op=NS3_SEND,.socket=qid,.request=999};
+    check(write(qp, &unknown, sizeof(unknown)) < 0 && errno == EPROTO,
+          "unknown completion revokes endpoint");
+    check(recv(q, data, 1, 0) < 0 && errno == ENETDOWN, "revoked endpoint fails closed");
+    close(qp); close(q);
+    puts("PASS ENDPOINT_CREDITS_AND_UNKNOWN_COMPLETION");
+
 	/* Interrupt a real control wait while the provider withholds completion. */
+    /* Read-only control cancellation must not revoke or steal a later result. */
+    int query = socket(AF_INET, SOCK_DGRAM, 0);
+    unsigned long long query_id;
+    int query_ep = claim(registration, &query_id);
+    for (int pass = 0; pass < 2; pass++) {
+        pid_t reader = fork();
+        check(reader >= 0, "query fork");
+        if (!reader) {
+            struct sigaction action = {.sa_handler=interrupted};
+            sigaction(SIGUSR1, &action, NULL);
+            struct sockaddr_storage name;
+            socklen_t size = sizeof(name);
+            int r = getsockname(query, (void *)&name, &size);
+            _exit(pass == 0 ? !(r < 0 && errno == EINTR) :
+                  !(r == 0 && name.ss_family == AF_INET &&
+                    ((struct sockaddr_in *)&name)->sin_port == htons(23461)));
+        }
+        int saw_query = 0;
+        for (int i = 0; i < 1000 && !saw_query; i++) {
+            ssize_t n = read(query_ep, frame, sizeof(frame));
+            if (n > 0) {
+                struct ns3_msg *h = (void *)frame;
+                if (h->op == NS3_GETNAME) saw_query = 1;
+                else { h->len = 0; check(write(query_ep, h, sizeof(*h)) == sizeof(*h), "query OPEN"); }
+            } else usleep(1000);
+        }
+        check(saw_query, "query reached provider");
+        static struct ns3_msg old_query;
+        int status;
+        if (!pass) {
+            old_query = *(struct ns3_msg *)frame;
+            kill(reader, SIGUSR1);
+            check(waitpid(reader, &status, 0) == reader && WIFEXITED(status) &&
+                  WEXITSTATUS(status) == 0, "query interrupted");
+        } else {
+            /* An old error must neither complete this waiter nor set SO_ERROR. */
+            old_query.len = 0; old_query.status = EINVAL;
+            check(write(query_ep, &old_query, sizeof(old_query)) == sizeof(old_query),
+                  "late query reply drained");
+            struct ns3_msg *h = (void *)frame;
+            h->len = sizeof(struct ns3_addr);
+            struct ns3_addr answer = {.family=4, .port=23461};
+            memcpy(h + 1, &answer, sizeof(answer));
+            check(write(query_ep, frame, sizeof(*h) + sizeof(answer)) ==
+                  sizeof(*h) + sizeof(answer), "new query reply");
+            check(waitpid(reader, &status, 0) == reader && WIFEXITED(status) &&
+                  WEXITSTATUS(status) == 0, "query result not stolen");
+            int error = -1; socklen_t size = sizeof(error);
+            check(getsockopt(query, SOL_SOCKET, SO_ERROR, &error, &size) == 0 &&
+                  !error, "cancelled query error not published");
+        }
+    }
+    close(query); close(query_ep);
+    puts("PASS ENDPOINT_QUERY_CANCEL_LATE_REPLY");
 	int c = socket(AF_INET, SOCK_DGRAM, 0);
 	unsigned long long cid;
 	int cp = claim(registration, &cid);
@@ -120,6 +232,10 @@ int main(int argc, char **argv) {
 	kill(child, SIGUSR1);
 	int status;
 	check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status)==0, "control wait interrupted");
+    struct ns3_msg late = *(struct ns3_msg *)frame;
+    late.len = 0;
+    check(write(cp, &late, sizeof(late)) < 0 && errno == ENETDOWN,
+          "late reply cannot resurrect interrupted control");
 	receive_packet(bp, bid);
 	check(recv(b, data, 4, 0) == 4, "interruption leaves other endpoint alive");
 	/* Closing one provider endpoint revokes its application socket. */

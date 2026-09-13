@@ -3,7 +3,19 @@
 Implements the direction in [ARCH-network-service](../../../../specs/ARCH-network-service.md).
 This is separate from the earlier `patches/` experiment: do **not** install both.
 
-## What is proved
+## Current frontend: full Rust ABI5
+
+The [Rust ABI5 implementation](rust-abi5/README.md) is the current Rust delivery,
+including the entire data path and production KVM/SSH acceptance. Use its
+Linux 7.3-rc2 installer and native build instructions. Safe Rust owns frontend
+policy; narrow Rust/C glue handles native object mechanics. The unchanged
+sandboxed userspace provider speaks ABI5 directly.
+
+The Linux 6.18 C source, parent installer and older captures below remain a
+reference/recovery build, not a runtime fallback. Rust additionally fixes
+read-only name-query cancellation; the extended endpoint test checks that fix.
+
+## Original C baseline proof
 
 Linux 6.18.40 in KVM on np registers our implementation for AF_INET/AF_INET6,
 with `CONFIG_INET=n`. There is no native Linux TCP/UDP implementation or guest
@@ -80,7 +92,9 @@ endpoint ioctl; applications accept from a local kernel queue. One pending
 unpublished child per listener bounds userspace accept state. Closing a
 listener releases its unaccepted children.
 
-A control interruption/timeout revokes only that socket, not the namespace.
+A mutating control interruption/timeout revokes only that socket, not the
+namespace. In Rust, interrupted read-only GETNAME queries detach their waiter
+without revocation; late replies are drained by ID, never applied to a new call.
 Closing an endpoint revokes only its socket. Closing the registration FD or
 provider death revokes the generation; replacement never revives old sockets.
 Read/write byte movement is asynchronous and copied, not an application
@@ -584,5 +598,5 @@ Unsupported flags must be distinguished from Linux-internal scheduling hints:
 The separate [Rust lifecycle slice](rust-lifecycle/README.md) builds on Linux
 7.3-rc2 and exercises real AF_INET/AF_INET6 creation, polling, final release and
 provider-generation death in no-INET KVM. It reuses upstream Rust polling and
-RCU-teardown wrappers. It has no TCP/UDP data path and does not replace this
-production ABI5 frontend. [Evidence and limits](rust-lifecycle/evidence.txt).
+RCU-teardown wrappers. It has no TCP/UDP data path. Its shared typed file infrastructure is now used
+by the [complete Rust ABI5 frontend](rust-abi5/README.md). [Evidence and limits](rust-lifecycle/evidence.txt).

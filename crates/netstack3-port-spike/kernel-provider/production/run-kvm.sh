@@ -15,5 +15,5 @@ timeout 50 "${QEMU:-qemu-system-x86_64}" -enable-kvm -cpu host -m 1024 -smp 2 \
     -initrd "$out/initrd.gz" -append 'console=ttyS0 panic=-1 rdinit=/init intel_iommu=on iommu.strict=1' \
     > "$out/serial.log" 2>&1
 grep -q '^PASS_KVM_PRODUCTION_LOOPBACK' "$out/serial.log"
-if grep -E 'FAIL|BUG:|Oops:|Kernel panic' "$out/serial.log"; then exit 1; fi
+if grep -E 'FAIL|BUG:|WARNING:|Oops:|Kernel panic' "$out/serial.log"; then exit 1; fi
 cat "$out/serial.log"

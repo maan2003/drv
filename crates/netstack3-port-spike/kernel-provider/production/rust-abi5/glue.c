@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <linux/module.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <linux/miscdevice.h>
+#include <linux/poll.h>
+#include <linux/anon_inodes.h>
+#include <linux/nsproxy.h>
+#include <net/sock.h>
+#include <net/net_namespace.h>
+#include <net/netns/generic.h>
+
+struct rust_net { void *state; };
+struct rust_sock { struct sock sk; void *state; };
+static unsigned int net_id;
+static const struct proto_ops ops4, ops6;
+static struct proto proto = { .name = "NETSTACK3_RUST", .owner = THIS_MODULE,
+	.obj_size = sizeof(struct rust_sock) };
+extern void *ns3_net_new(void);
+extern void ns3_net_drop(void *);
+extern int ns3_socket_new(void *, void *, int, int, bool, void **);
+extern void ns3_socket_release(void *);
+extern int ns3_bind(void *, const void *, int);
+extern int ns3_connect(void *, const void *, int, int);
+extern int ns3_listen(void *, int);
+extern int ns3_accept(void *, void *, int);
+extern int ns3_send(void *, struct msghdr *, size_t);
+extern int ns3_recv(void *, struct msghdr *, size_t, int);
+extern int ns3_name(void *, void *, int);
+extern int ns3_shutdown(void *, int);
+extern __poll_t ns3_poll(void *, struct file *, poll_table *);
+extern const struct file_operations *ns3_registration_ops(void);
+static struct rust_net *rn(struct net *n) { return net_generic(n, net_id); }
+static struct rust_sock *rs(struct socket *s) { return container_of(s->sk, struct rust_sock, sk); }
+
+/* Each Rust NativeSock reference owns a sock_hold. Its destructor can safely
+ * put the orphaned native sock after application close. No Rust destructor
+ * runs from sk_destruct. Rust's application owner is consumed by final release. */
+void ns3_hold(void *p);
+void ns3_put(void *p);
+int ns3_error(void *p, bool consume);
+void ns3_set_error(void *p, int error);
+unsigned long ns3_timeout(void *p, bool send, bool nonblock);
+void ns3_set_shutdown(void *p, int how);
+void *ns3_current_net(void);
+void ns3_put_net(void *p);
+void *ns3_net_state(void *p);
+void *ns3_new_accepted(void *p, int family);
+void *ns3_accepted_state(void *p);
+void ns3_accept_transfer(void *p, void *new);
+void ns3_accept_drop(void *p);
+void ns3_sigpipe(void);
+struct file *nsrl_anon_file(const struct file_operations *, void *);
+void ns3_hold(void *p) { sock_hold(p); }
+void ns3_put(void *p) { sock_put(p); }
+int ns3_error(void *p, bool consume) {
+	struct sock *sk = p; return consume ? sock_error(sk) : -READ_ONCE(sk->sk_err);
+}
+void ns3_set_error(void *p, int error) {
+	struct sock *sk = p; WRITE_ONCE(sk->sk_err, error);
+	sk->sk_error_report(sk);
+}
+unsigned long ns3_timeout(void *p, bool send, bool nonblock) {
+	return send ? sock_sndtimeo(p, nonblock) : sock_rcvtimeo(p, nonblock);
+}
+void ns3_set_shutdown(void *p, int how) { ((struct sock *)p)->sk_shutdown |= how; }
+void ns3_sigpipe(void) { send_sig(SIGPIPE, current, 0); }
+void *ns3_current_net(void) {
+	struct net *n = current->nsproxy->net_ns;
+	if (!ns_capable(n->user_ns, CAP_NET_ADMIN)) return ERR_PTR(-EPERM);
+	return get_net(n);
+}
+void ns3_put_net(void *p) { put_net(p); }
+void *ns3_net_state(void *p) { return rn(p)->state; }
+struct file *nsrl_anon_file(const struct file_operations *ops, void *data) {
+	return anon_inode_getfile("netstack3-endpoint", ops, data, O_RDWR | O_NONBLOCK);
+}
+static int release(struct socket *sock) {
+	struct rust_sock *s;
+	if (!sock->sk) return 0;
+	s = rs(sock); ns3_socket_release(s->state); s->state = NULL;
+	sock_orphan(&s->sk); sock->sk = NULL; sock_put(&s->sk); return 0;
+}
+static int create(struct net *net, struct socket *sock, int protocol, int kern, int family) {
+	struct sock *sk; int ret;
+	if ((sock->type != SOCK_STREAM || (protocol && protocol != IPPROTO_TCP)) &&
+	    (sock->type != SOCK_DGRAM || (protocol && protocol != IPPROTO_UDP))) return -EPROTONOSUPPORT;
+	sk = sk_alloc(net, family, GFP_KERNEL, &proto, false);
+	if (!sk) return -ENOMEM;
+	sock_init_data(sock, sk);
+	ret = ns3_socket_new(rn(net)->state, sk, family, sock->type, kern, &rs(sock)->state);
+	if (ret) { sock_orphan(sk); sock->sk = NULL; sock_put(sk); return ret; }
+	sock->ops = family == AF_INET ? &ops4 : &ops6;
+	sock->state = SS_UNCONNECTED;
+	sk->sk_protocol = sock->type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP;
+	return 0;
+}
+void *ns3_new_accepted(void *p, int family) {
+	struct socket *sock;
+	int ret = sock_create_lite(family, SOCK_STREAM, IPPROTO_TCP, &sock);
+	if (ret) return ERR_PTR(ret);
+	ret = create(sock_net(p), sock, IPPROTO_TCP, 1, family);
+	if (ret) { sock_release(sock); return ERR_PTR(ret); }
+	return sock;
+}
+void *ns3_accepted_state(void *p) { return rs(p)->state; }
+void ns3_accept_transfer(void *p, void *new) {
+	struct socket *old = p, *target = new;
+	struct sock *sk = old->sk;
+	old->sk = NULL; sock_graft(sk, target); target->state = SS_CONNECTED;
+	sock_release(old);
+}
+void ns3_accept_drop(void *p) { sock_release(p); }
+static int create4(struct net *n, struct socket *s, int p, int k) {
+	return k ? -EOPNOTSUPP : create(n, s, p, 0, AF_INET);
+}
+static int create6(struct net *n, struct socket *s, int p, int k) {
+	return k ? -EOPNOTSUPP : create(n, s, p, 0, AF_INET6);
+}
+static int bind(struct socket *s, struct sockaddr_unsized *a, int len) { return ns3_bind(rs(s)->state, a, len); }
+static int connect(struct socket *s, struct sockaddr_unsized *a, int len, int flags) {
+	int ret = ns3_connect(rs(s)->state, a, len, flags);
+	if (!ret) s->state = SS_CONNECTED;
+	return ret;
+}
+static int listen(struct socket *s, int n) { return ns3_listen(rs(s)->state, n); }
+static int accept(struct socket *s, struct socket *new, struct proto_accept_arg *arg) {
+	return ns3_accept(rs(s)->state, new, arg->flags);
+}
+static int sendmsg(struct socket *s, struct msghdr *m, size_t n) { return ns3_send(rs(s)->state, m, n); }
+static int recvmsg(struct socket *s, struct msghdr *m, size_t n, int flags) { return ns3_recv(rs(s)->state, m, n, flags); }
+static int socket_getname(struct socket *s, struct sockaddr *a, int peer) { return ns3_name(rs(s)->state, a, peer); }
+static int shutdown(struct socket *s, int how) { return ns3_shutdown(rs(s)->state, how); }
+static __poll_t poll(struct file *f, struct socket *s, poll_table *t) { return ns3_poll(rs(s)->state, f, t); }
+static int setsockopt(struct socket *s, int l, int o, sockptr_t p, unsigned int n) { return -ENOPROTOOPT; }
+#define OPS(f) { .family = f, .owner = THIS_MODULE, .release = release, .bind = bind, \
+	.connect = connect, .listen = listen, .accept = accept, .sendmsg = sendmsg, .recvmsg = recvmsg, \
+	.getname = socket_getname, .shutdown = shutdown, .poll = poll, .setsockopt = setsockopt, \
+	.socketpair = sock_no_socketpair, .ioctl = sock_no_ioctl, .mmap = sock_no_mmap }
+static const struct proto_ops ops4 = OPS(AF_INET), ops6 = OPS(AF_INET6);
+static const struct net_proto_family family4 = { .family = AF_INET, .create = create4, .owner = THIS_MODULE };
+static const struct net_proto_family family6 = { .family = AF_INET6, .create = create6, .owner = THIS_MODULE };
+static int __net_init net_init(struct net *net) {
+	rn(net)->state = ns3_net_new(); return rn(net)->state ? 0 : -ENOMEM;
+}
+static void __net_exit net_exit(struct net *net) { ns3_net_drop(rn(net)->state); }
+static struct pernet_operations pernet = { .init = net_init, .exit = net_exit, .id = &net_id, .size = sizeof(struct rust_net) };
+static struct miscdevice device = { .minor = MISC_DYNAMIC_MINOR, .name = "netstack3", .mode = 0600 };
+static int __init init(void) {
+	int ret = proto_register(&proto, 1);
+	if (ret) return ret;
+	ret = register_pernet_subsys(&pernet); if (ret) goto proto;
+	ret = sock_register(&family4); if (ret) goto pernet;
+	ret = sock_register(&family6); if (ret) goto family4;
+	device.fops = ns3_registration_ops();
+	ret = misc_register(&device); if (!ret) return 0;
+	sock_unregister(AF_INET6);
+family4: sock_unregister(AF_INET);
+pernet: unregister_pernet_subsys(&pernet);
+proto: proto_unregister(&proto); return ret;
+}
+subsys_initcall(init);
+MODULE_LICENSE("GPL");

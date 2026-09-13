@@ -1,0 +1,412 @@
+Full Rust ABI5 acceptance, np, 2026-09-13
+Native Linux 7.3-rc2 / Rust 1.97.0 (matching library sources) / GCC 15.2.0.
+Build #7, native make -j4. No Nix build, host install or physical device use.
+CONFIG_RUST=y; CONFIG_NETSTACK3_RUST=y; CONFIG_INET=n; lifecycle frontend=n.
+PROVE_LOCKING, DEBUG_MUTEXES, DEBUG_ATOMIC_SLEEP, DEBUG_LIST enabled.
+Final build log contains no warnings. Final three KVM logs and SSH serial
+contain no FAIL, WARNING:, BUG:, Oops:, kernel panic or Go panic.
+
+Artifact SHA256:
+bzImage 8fd9a46543f24734bb19d93f700310ab709650c62505b7a41d46b4c600ce6ba5
+.config 83f58e85aef9faabed4172042eda145d865e3d0c7bb3d30e7fd3383c05ee7379
+endpoint-test f661d183c48cc8573a40f86400cd1cec77679dc6dce56e9a4c6de03e66a35b36
+
+Installed source SHA256 (verified equal to workspace):
+27370c1c2de5b51eb38c87144ed37507703864f71b903494760889084324af74 frontend.rs
+4353126616875622274aaaf649729740a6c24bb240e38de6362b709d0ec372f6 linux.rs
+e0707917473e2469c5d928f81aca02f461e48d5dfda25be6fcbc12a6318b8a07 rust_main.rs
+77537a0a4d14abcda213cccff9373a5d1aa11445f6c8b07f2744b40c07f02b78 glue.c
+eec9377573984f538f40125f7da75aa582394e02cdbbab74fc5860e75fe01547 endpoint_file.rs
+
+Production KVM acceptance-1:
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS ENDPOINT_CLAIM_COPY_ROLLBACK
+PASS ENDPOINT_ABI5_REJECTS_ABI4
+PASS ENDPOINT_SCOPING_SATURATION_CLOSE
+PASS ENDPOINT_CREDITS_AND_UNKNOWN_COMPLETION
+PASS ENDPOINT_QUERY_CANCEL_LATE_REPLY
+PASS ENDPOINT_CANCEL_AND_NONBLOCK
+PASS ENDPOINT_LIFETIME_QUOTA
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.120377 MBps=17.42
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.093036 MBps=22.54
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+BENCH TCP family=2 seconds=0.421927 MBps=318.11
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.393766 MBps=340.86
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH_IDLE sockets=128
+BENCH TCP family=2 seconds=0.661901 MBps=202.78
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.700792 MBps=191.52
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+PASS IDLE_SOCKET_TCP
+BENCH TCP family=2 seconds=3.131074 MBps=0.33
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.130543 MBps=0.33
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.135260 MBps=0.33
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.135132 MBps=0.33
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.135710 MBps=0.33
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.202972 MBps=0.33
+BENCH TCP family=2 seconds=3.202624 MBps=0.33
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.299625 MBps=0.32
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.322900 MBps=0.32
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.325750 MBps=0.32
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.346952 MBps=0.31
+BENCH TCP family=2 seconds=3.347446 MBps=0.31
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.348999 MBps=0.31
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.349755 MBps=0.31
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.374710 MBps=0.31
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.526995 MBps=0.30
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS PARALLEL_TCP_16
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.085101 MBps=24.65
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.093181 MBps=22.51
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_NSS_RUST_GLIBC_DNS_ABI_THREADS_FORK_TCP
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.080460 MBps=26.07
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.095975 MBps=21.85
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.100448 MBps=20.88
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.101122 MBps=20.74
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 2.37s
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_KVM_PRODUCTION_LOOPBACK
+
+Production KVM acceptance-2:
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS ENDPOINT_CLAIM_COPY_ROLLBACK
+PASS ENDPOINT_ABI5_REJECTS_ABI4
+PASS ENDPOINT_SCOPING_SATURATION_CLOSE
+PASS ENDPOINT_CREDITS_AND_UNKNOWN_COMPLETION
+PASS ENDPOINT_QUERY_CANCEL_LATE_REPLY
+PASS ENDPOINT_CANCEL_AND_NONBLOCK
+PASS ENDPOINT_LIFETIME_QUOTA
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.085061 MBps=24.66
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.092942 MBps=22.57
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+BENCH TCP family=2 seconds=0.502126 MBps=267.30
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.349502 MBps=384.03
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH_IDLE sockets=128
+BENCH TCP family=2 seconds=0.709564 MBps=189.16
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.778997 MBps=172.30
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+PASS IDLE_SOCKET_TCP
+BENCH TCP family=2 seconds=3.371474 MBps=0.31
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.495812 MBps=0.30
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.498634 MBps=0.30
+BENCH TCP family=10 seconds=3.498425 MBps=0.30
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.501106 MBps=0.30
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.607954 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.611098 MBps=0.29
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.613024 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.615251 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.616469 MBps=0.29
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.616976 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.621043 MBps=0.29
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.620328 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.621085 MBps=0.29
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.620973 MBps=0.29
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.795051 MBps=0.28
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS PARALLEL_TCP_16
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.104274 MBps=20.11
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.135859 MBps=15.44
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_NSS_RUST_GLIBC_DNS_ABI_THREADS_FORK_TCP
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.088367 MBps=23.74
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.092101 MBps=22.77
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.093156 MBps=22.52
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.131746 MBps=15.92
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 2.28s
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_KVM_PRODUCTION_LOOPBACK
+
+Production KVM acceptance-3:
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS ENDPOINT_CLAIM_COPY_ROLLBACK
+PASS ENDPOINT_ABI5_REJECTS_ABI4
+PASS ENDPOINT_SCOPING_SATURATION_CLOSE
+PASS ENDPOINT_CREDITS_AND_UNKNOWN_COMPLETION
+PASS ENDPOINT_QUERY_CANCEL_LATE_REPLY
+PASS ENDPOINT_CANCEL_AND_NONBLOCK
+PASS ENDPOINT_LIFETIME_QUOTA
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.120248 MBps=17.44
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.092698 MBps=22.63
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+BENCH TCP family=2 seconds=0.577257 MBps=232.51
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.381781 MBps=351.56
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH_IDLE sockets=128
+BENCH TCP family=2 seconds=0.665452 MBps=201.69
+PASS TCP family=2 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=0.710226 MBps=188.98
+PASS TCP family=10 bytes=67108864 bidirectional integrity epoll nonblock halfclose dup fork
+PASS IDLE_SOCKET_TCP
+BENCH TCP family=10 seconds=3.765526 MBps=0.28
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.766998 MBps=0.28
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.769844 MBps=0.28
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.832815 MBps=0.27
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.834816 MBps=0.27
+BENCH TCP family=10 seconds=3.836120 MBps=0.27
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.837719 MBps=0.27
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.837391 MBps=0.27
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.837990 MBps=0.27
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.843219 MBps=0.27
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.843700 MBps=0.27
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=3.854739 MBps=0.27
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=3.856679 MBps=0.27
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=10 seconds=4.051396 MBps=0.26
+BENCH TCP family=2 seconds=4.051566 MBps=0.26
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS TCP family=10 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+BENCH TCP family=2 seconds=4.179511 MBps=0.25
+PASS TCP family=2 bytes=524288 bidirectional integrity epoll nonblock halfclose dup fork
+PASS PARALLEL_TCP_16
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.119891 MBps=17.49
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.092733 MBps=22.62
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_NSS_RUST_GLIBC_DNS_ABI_THREADS_FORK_TCP
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.097173 MBps=21.58
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.095974 MBps=21.85
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST
+PASS SHUTDOWN_BACKPRESSURE_V4 bytes=835584
+PASS SHUTDOWN_BACKPRESSURE_V6 bytes=835584
+PASS SENDMMSG_UDP_V4
+PASS SENDMMSG_UDP_V6
+PASS REFUSED family=2 SO_ERROR clears
+PASS REFUSED family=10 SO_ERROR clears
+BENCH TCP family=2 seconds=0.076622 MBps=27.37
+PASS TCP family=2 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=2 zero-datagram source peek truncation nonblock
+BENCH TCP family=10 seconds=0.124917 MBps=16.79
+PASS TCP family=10 bytes=1048713 bidirectional integrity epoll nonblock halfclose dup fork
+PASS UDP family=10 zero-datagram source peek truncation nonblock
+PASS LOOPBACK_SUITE
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_NSS_OFFLINE_NO_FALLBACK
+PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 2.37s
+PASS PROVIDER_ABSENT_NO_NATIVE_FALLBACK
+PASS_KVM_PRODUCTION_LOOPBACK
+
+Real OpenSSH through private no-login Tailscale relay, final kernel:
+uid=0(root) gid=0(root) groups=0(root)
+7.3.0-rc2
+CONFIG_RUST=y
+# CONFIG_INET is not set
+CONFIG_NETSTACK3_RUST=y
+CONFIG_PROVE_LOCKING=y
+PASS_RUST_SSH_COMMAND
+/dev/pts/0
+PASS_RUST_SSH_PTY
+Connection to 100.64.0.2 closed.
+PASS_RUST_SSH_ROUNDTRIP 8388608 ad4b20d6ec5c4f54e71e7b351f1a28722725762e98a3ded088b415846bce28ec seconds 0.949
+PASS_RUST_SSH_ROUNDTRIP 8388608 ec7e34032f5eb67c0b1d0f34ada13b0ed3e38b22add94711a88c463d5521f252 seconds 0.976
+PASS_RUST_SSH_ROUNDTRIP 67108864 0fc8059e0274bb16a5c9b76f0084e102e79e186ea83f0117fd36b7f14fcb5dcb seconds 4.264
+
+Shared infrastructure lifecycle regression (separate kernel):
+PASS RUST_LIFECYCLE_V4_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_LIFECYCLE_V6_CREATE_POLL_DUP_FORK_DEATH_REPLACE
+PASS RUST_POLL_CANCELLATION
+PASS RUST_QUOTA_VALIDATION
+PASS RUST_NETNS_ISOLATION_RECLAMATION
+PASS RUST_WAKE_RACES_100
+PASS RUST_PROVIDER_SIGKILL
+PASS RUST_CONCURRENT_LIFETIMES_8x500
+PASS RUST_ENDPOINT_OWNERSHIP_AND_FD_ROLLBACK
+PASS RUST_LIFECYCLE_SUITE
+PASS_KVM_RUST_LIFECYCLE
+
+Failure retained: before read-only cancellation fix, Go SIGURG interrupted
+getsockname, restarted it against a revoked socket (ENETDOWN), then Tailscale
+panicked on nil UDP LocalAddr. Trace identified cancellation, not address
+encoding. New ENDPOINT_QUERY_CANCEL_LATE_REPLY verifies interruption, a late
+error interleaved with a new query, correct new result and unchanged SO_ERROR.
+Go preemption was not disabled. Mutating interrupted BIND still revokes.
+
+Retained np evidence root: /var/lib/poco-linux/redwood/work/socket-provider-kvm/rust-abi5/
+Earlier failing SSH logs: ssh-out/, ssh-trace/. Final logs: ssh-final/.
+Limitations: no KASAN, exhaustive fault injection, physical Wi-Fi, production
+network metadata or release-performance claim. Prior service/runtime unit
+suites were unchanged; real guest service integration reran in every full KVM.
+Private fixture daemons are explicitly stopped after acceptance.

@@ -89,7 +89,11 @@ user pointers/fields, namespace isolation/reclamation, 100 wake races and
 eight concurrent workers doing 500 lifetimes each. No SSH/data-path claim
 applies to this experimental kernel.
 
-## Result and next decision
+The next stage is now implemented and verified in
+[full Rust ABI5](../rust-abi5/README.md); the historical checkpoint below
+describes what this standalone lifecycle fixture establishes.
+
+## Historical result and next decision
 
 **Feasible, and latest Linux improves the boundary.** The complete 7.3-rc2
 suite passed four times with lockdep, debug mutexes and atomic-sleep checks:
