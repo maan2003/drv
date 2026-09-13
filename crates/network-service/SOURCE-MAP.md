@@ -6,6 +6,7 @@ This crate owns the sandboxed native network service described by
 | Responsibility | Source ownership | Disposition |
 | --- | --- | --- |
 | Netstack3 Ethernet, DHCP, DNS, TCP and socket provider | Pinned Fuchsia `netstack3-port-integration` and project `netstack3-port-spike` | Calls the pinned portable cores; native capability bindings are project-owned |
+| NSS resolver endpoint | Project-local safe `resolver.rs`, shared `drv-dns-wire`, and separate Rust `nss-drv` cdylib | Bounded local requests use existing Hickory/Netstack3 runtime; unsafe glibc pointer adapter is isolated in `nss-drv/src/ffi.rs` |
 | SOCKS5 application handoff | Project-local service formerly in `wlan-softmac-host/src/ethernet.rs` | Moved without protocol behavior changes |
 | Self-sandboxing READY/GO to NETWORK_READY/SERVE state machine | Project-local service formerly in `wlan-softmac-host/src/netstack_child.rs` | Moved without startup or sandbox behavior changes |
 | Process generation launcher | Project-local `NetworkServiceSupervisor` | Transfers only frame/listener/bootstrap capabilities and replaces the sandboxed child when the WLAN owner supplies a new Ethernet generation |

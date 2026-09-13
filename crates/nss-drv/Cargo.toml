@@ -1,0 +1,16 @@
+[package]
+name = "nss-drv"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[workspace]
+
+[lib]
+name = "nss_drv"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "=1.1.4", features = ["net", "event"] }
+drv-dns-wire = { path = "../dns-wire" }

@@ -13,8 +13,8 @@ plumbing; they do not replace or implement the production `ClientMlme`.
 |---|---|---|---|
 | `dhcp-protocol`: DHCP message, option, serialization and size-constrained types | `src/connectivity/network/dhcpv4/protocol/src/{lib,size_constrained,size_of_contents}.rs` | Cargo manifest only | Fuchsia BSD-2-Clause |
 | `dhcp_client_core`: complete client state machine, transitions, retransmission/jitter, lease phases, parsing and abstract dependencies | `src/connectivity/network/dhcpv4/client/core/src/{client,deps,inspect,lib,parse}.rs` | `dhcp-client-core-host.patch` gates only the `fuchsia_async::MonotonicInstant` convenience import/impl; traits and algorithms unchanged | Fuchsia BSD-2-Clause |
-| `trust-dns-proto`: DNS protocol and transport state | `third_party/rust_crates/forks/trust-dns-proto-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
-| `trust-dns-resolver`: resolver cache, retry, name-server ordering and lookup lifecycle | `third_party/rust_crates/forks/trust-dns-resolver-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
+| Retained Fuchsia `trust-dns-proto` source (not the native DNS runtime) | `third_party/rust_crates/forks/trust-dns-proto-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
+| Retained Fuchsia `trust-dns-resolver` source (not the native DNS runtime) | `third_party/rust_crates/forks/trust-dns-resolver-0.22.0/**` | `trust-dns-workspace.patch` adds only the enclosing Cargo workspace pointer | MIT OR Apache-2.0; original notices fetched with source |
 | `wlan-statemachine` and `wlan-statemachine-macro`: portable state transition DSL used by client SME/RSN | `src/connectivity/wlan/lib/statemachine/{src,macro/src}/**` | Cargo manifests only; upstream unit tests retained; Cargo doctests disabled because upstream illustrative fragments are intentionally non-standalone and GN does not compile them | Fuchsia BSD-2-Clause |
 | `wlan-bitfield` and `wlan-bitfield-wrapper`: 802.11/EAPOL bitfield generator and its upstream conformance tests | `src/connectivity/wlan/lib/bitfield/{src,wlan-bitfield-tests/src}/**` | Cargo manifests only; all 14 upstream tests retained; Cargo doctests disabled because GN does not compile the illustrative fragments | Fuchsia BSD-2-Clause |
 | `ieee80211`: SSID, MAC address, BSSID, parsing and formatting | `src/connectivity/wlan/lib/ieee80211/src/**` | Cargo manifest only; all 38 upstream unit tests unchanged; Cargo doctest disabled because GN does not compile the non-standalone illustrative fragment | Fuchsia BSD-2-Clause |
@@ -273,7 +273,7 @@ authority.
 
 ## Replacement rule
 
-The upstream DHCP state machine/protocol and Trust-DNS resolver are the sole
+The upstream DHCP state machine/protocol and Hickory 0.26.3 resolver are the sole
 production implementations. Native code may implement their socket, clock,
 RNG, spawning and configuration-effect traits, but must not retain a parallel
 codec, retry/cache, lease state machine, or service lifecycle.
@@ -284,14 +284,18 @@ The former custom control-plane module, its Edge-DHCP/Hickory dependencies, and 
 
 | Adapter symbol | Upstream contract reused unchanged |
 |---|---|
-| NativeDnsTime | trust-dns-proto Time |
-| NativeUdp | trust-dns-proto UdpSocket |
-| NativeTcp | trust-dns-proto DnsTcpStream and Connect |
-| NativeSpawn / NativeDnsRuntime | trust-dns-resolver Spawn and RuntimeProvider |
-| NativeDnsBridge configure / lookup_ip | trust-dns-resolver AsyncResolver and NameServerConfigGroup |
+| NativeDnsTime | hickory-net 0.26.3 runtime::Time |
+| NativeUdp | hickory-net runtime::DnsUdpSocket |
+| NativeTcp | hickory-net runtime::DnsTcpStream; RuntimeProvider::connect_tcp |
+| NativeSpawn / NativeDnsRuntime | hickory-net runtime::Spawn and RuntimeProvider |
+| NativeDnsBridge configure / lookup_ip | hickory-resolver Resolver::builder_with_config, NameServerConfig::udp_and_tcp |
 
-The bridge queue is bounded to 64 commands and each receive queue to 64
-datagrams. It owns no resolver algorithm: caching, retry, server ordering,
+The default bridge queue is bounded to 64 commands and each receive queue to
+eight datagrams (4 KiB maximum each). TCP writes acknowledge actual core
+consumption and retain full-buffer writes; UDP input preserves its actual
+source for resolver validation. Socket drops close the corresponding core
+handles during pumping. Host configuration and Tokio features are disabled;
+`ResolveHosts::Never` prevents runtime host-file access. It owns no resolver algorithm: caching, retry, server ordering,
 truncation detection, and TCP fallback execute in the pinned resolver.
 
 ### Remote application socket provider mapping

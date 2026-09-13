@@ -2,6 +2,8 @@
 fn main() {
     let result = (|| {
         let mut args: Vec<_> = std::env::args().skip(1).collect();
+        let resolver = args.iter().any(|arg| arg == "--resolver");
+        args.retain(|arg| arg != "--resolver");
         let bootstrap = args.last().is_some_and(|arg| arg == "--bootstrap");
         if bootstrap { args.pop(); }
         let mac = match args.as_slice() {
@@ -16,9 +18,9 @@ fn main() {
                 }
                 Some(mac)
             }
-            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] (frame capability on FD4, bootstrap on FD5)".into()),
+            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver] (frame capability on FD4, bootstrap on FD5)".into()),
         };
-        drv_network_service::run_provider(mac, bootstrap)
+        drv_network_service::run_provider(mac, bootstrap, resolver)
     })();
     if let Err(error) = result {
         eprintln!("netstack3-provider: {error}");

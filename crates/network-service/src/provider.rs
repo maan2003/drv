@@ -470,7 +470,7 @@ impl SocketWorker {
     }
 }
 
-pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<(), String> {
+pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool, resolver: bool) -> Result<(), String> {
     if bootstrap && ethernet_mac.is_none() {
         return Err("bootstrap requires an Ethernet capability".into());
     }
@@ -520,7 +520,30 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<()
         ));
         None
     };
-    crate::child::provider_setup(ethernet.is_some(), bootstrap)?;
+    // Bind before empty-root/no-open sandboxing, never from the DNS engine or NSS.
+    // Do not unlink an existing path: another provider may own it.
+    let resolver_listener = if resolver {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = std::os::unix::net::UnixListener::bind(drv_dns_wire::PATH)
+            .map_err(|e| format!("resolver listener: {e}"))?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))
+            .map_err(|e| e.to_string())?;
+        if listener.as_raw_fd() != 7 {
+            // SAFETY: before sandbox setup, reserve the documented listener capability
+            // slot. The listener owns its original FD; the duplicate gets one owner below.
+            if unsafe { libc::dup3(listener.as_raw_fd(), 7, libc::O_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) })
+        } else { Some(listener) }
+    } else { None };
+    crate::child::provider_setup(ethernet.is_some(), bootstrap, resolver)?;
+    // SAFETY: provider_setup created FD6; it lives for this entire service loop.
+    let poller = unsafe { std::os::fd::BorrowedFd::borrow_raw(6) };
+    let mut resolver_server = resolver_listener.map(|listener|
+        crate::resolver::ResolverServer::new(listener, poller)).transpose().map_err(|e| e.to_string())?;
+
     if bootstrap { crate::child::provider_bootstrap_ready()?; }
     eprintln!(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
@@ -561,7 +584,7 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<()
                 if let Some(frame) = &mut ethernet {
                     frame.notify_epoll(event.events);
                 }
-            } else if event.u64 != 0 {
+            } else if event.u64 != 0 && event.u64 != crate::resolver::TOKEN {
                 ready.push(event.u64);
             }
         }
@@ -761,10 +784,13 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<()
         for id in remove {
             workers.remove(&id);
         }
+        if let Some(resolver) = &mut resolver_server {
+            progress |= resolver.poll(&mut network, poller).map_err(|e| format!("resolver: {e}"))?;
+        }
         let now = start.elapsed();
         // Poll even while runnable: level-triggered IPC readiness provides fair
         // bounded batches without rescanning every idle endpoint.
-        let timeout = if progress || network.runtime().has_pending_work() {
+        let mut timeout = if progress || network.runtime().has_pending_work() {
             0
         } else {
             network
@@ -777,6 +803,10 @@ pub fn run_provider(ethernet_mac: Option<[u8; 6]>, bootstrap: bool) -> Result<()
                 })
                 .unwrap_or(-1)
         };
+        if let Some(deadline) = resolver_server.as_ref().and_then(|r| r.deadline()) {
+            let left = deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32 + 1;
+            timeout = if timeout < 0 { left } else { timeout.min(left) };
+        }
         let n = unsafe {
             libc::syscall(
                 libc::SYS_epoll_pwait,

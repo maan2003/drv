@@ -14,8 +14,8 @@ either.workspace = true
 futures.workspace = true
 futures-io.workspace = true
 libc.workspace = true
-trust-dns-proto.workspace = true
-trust-dns-resolver.workspace = true
+hickory-proto = { version = "=0.26.3", default-features = false, features = ["std"] }
+hickory-resolver = { version = "=0.26.3", default-features = false }
 netstack3-port-spike = { path = "../../../../../../../../crates/netstack3-port-spike" }
 netstack3_core = { path = "../../core" }
 net_types.workspace = true

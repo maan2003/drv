@@ -1,4 +1,5 @@
-//! Send command-channel adapters from pinned Trust-DNS to single-owner Netstack3.
+//! Send command-channel adapters from Hickory 0.26.3 to single-owner Netstack3.
+#![forbid(unsafe_code)]
 use crate::{Runtime, TcpSocketHandle, UdpSocketHandle};
 use async_trait::async_trait;
 use futures::{
@@ -7,6 +8,14 @@ use futures::{
     task::LocalSpawnExt as _,
 };
 use futures_io::{AsyncRead, AsyncWrite};
+use hickory_resolver::{
+    Resolver as HickoryResolver,
+    config::{NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
+    net::{
+        NetError,
+        runtime::{DnsTcpStream, DnsUdpSocket, RuntimeProvider, Spawn, Time},
+    },
+};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -18,21 +27,10 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Duration,
-};
-use trust_dns_proto::{
-    Time,
-    error::ProtoError,
-    tcp::{Connect, DnsTcpStream},
-    udp::UdpSocket,
-};
-use trust_dns_resolver::{
-    AsyncResolver,
-    config::{NameServerConfigGroup, ResolverConfig, ResolverOpts},
-    name_server::{GenericConnection, GenericConnectionProvider, RuntimeProvider, Spawn},
 };
 
 const DEFAULT_LIMIT: usize = 64;
@@ -47,23 +45,25 @@ fn native_resolver_options() -> ResolverOpts {
     // This resolver runs after the network service has entered its empty-root
     // sandbox. Host-file lookup would both be ineffective and violate the
     // runtime no-open capability boundary.
-    options.use_hosts_file = false;
+    options.use_hosts_file = ResolveHosts::Never;
     options
 }
 
-type Task = Pin<Box<dyn Future<Output = Result<(), ProtoError>> + Send>>;
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct End {
+    alive: AtomicBool,
+    write_result: Mutex<Option<io::Result<usize>>>,
     limit: usize,
-    peer: Mutex<Option<SocketAddr>>,
     open: Mutex<Option<io::Result<()>>>,
-    rx: Mutex<VecDeque<Vec<u8>>>,
+    rx: Mutex<VecDeque<(Vec<u8>, Option<SocketAddr>)>>,
     wake: Mutex<Option<Waker>>,
 }
 impl End {
     fn new(limit: usize) -> Self {
         Self {
+            alive: AtomicBool::new(true),
+            write_result: Mutex::new(None),
             limit,
-            peer: Mutex::new(None),
             open: Mutex::new(None),
             rx: Mutex::new(VecDeque::new()),
             wake: Mutex::new(None),
@@ -73,7 +73,7 @@ impl End {
         *self.open.lock().unwrap() = Some(r);
         self.wake()
     }
-    fn push(&self, b: Vec<u8>) {
+    fn push(&self, b: Vec<u8>, source: Option<SocketAddr>) {
         if b.len() > SOCKET_MESSAGE_BYTES_LIMIT {
             return;
         }
@@ -81,7 +81,7 @@ impl End {
         if q.len() == self.limit {
             q.pop_front();
         }
-        q.push_back(b);
+        q.push_back((b, source));
         drop(q);
         self.wake()
     }
@@ -194,26 +194,52 @@ impl Time for NativeDnsTime {
 #[derive(Clone)]
 pub struct NativeSpawn(Arc<Bus>);
 impl Spawn for NativeSpawn {
-    fn spawn_bg<F>(&mut self, f: F)
-    where
-        F: Future<Output = Result<(), ProtoError>> + Send + 'static,
-    {
+    fn spawn_bg(&mut self, f: impl Future<Output = ()> + Send + 'static) {
         self.0.tasks.lock().unwrap().push_back(Box::pin(f))
     }
 }
 #[derive(Clone)]
-pub struct NativeDnsRuntime;
+pub struct NativeDnsRuntime(Arc<Bus>);
 impl RuntimeProvider for NativeDnsRuntime {
     type Handle = NativeSpawn;
     type Timer = NativeDnsTime;
     type Udp = NativeUdp;
     type Tcp = NativeTcp;
+    fn create_handle(&self) -> NativeSpawn {
+        NativeSpawn(self.0.clone())
+    }
+    fn connect_tcp(
+        &self,
+        remote: SocketAddr,
+        bind: Option<SocketAddr>,
+        timeout: Option<Duration>,
+    ) -> Pin<Box<dyn Send + Future<Output = io::Result<NativeTcp>>>> {
+        Box::pin(async move {
+            if bind.is_some_and(|a| !a.ip().is_unspecified() || a.port() != 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "DNS TCP source bind",
+                ));
+            }
+            NativeDnsTime::timeout(
+                timeout.unwrap_or(Duration::from_secs(5)),
+                NativeTcp::connect(remote),
+            )
+            .await?
+        })
+    }
+    fn bind_udp(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Pin<Box<dyn Send + Future<Output = io::Result<NativeUdp>>>> {
+        Box::pin(NativeUdp::open(remote, Some(local)))
+    }
 }
 
 pub struct NativeUdp {
     b: Arc<Bus>,
     id: u64,
-    remote: SocketAddr,
     e: Arc<End>,
 }
 impl Unpin for NativeUdp {}
@@ -234,30 +260,21 @@ impl NativeUdp {
         let id = b.next.fetch_add(1, Ordering::Relaxed);
         let e = Arc::new(End::new(SOCKET_MESSAGE_LIMIT));
         b.send(Cmd::OU(id, remote, bind, e.clone()))?;
-        Ok(Self { b, id, remote, e })
+        Ok(Self { b, id, e })
     }
 }
 #[async_trait]
-impl UdpSocket for NativeUdp {
+impl DnsUdpSocket for NativeUdp {
     type Time = NativeDnsTime;
-    async fn connect(a: SocketAddr) -> io::Result<Self> {
-        Self::open(a, None).await
-    }
-    async fn connect_with_bind(a: SocketAddr, l: SocketAddr) -> io::Result<Self> {
-        Self::open(a, Some(l)).await
-    }
-    async fn bind(a: SocketAddr) -> io::Result<Self> {
-        Self::open(a, Some(a)).await
-    }
     fn poll_recv_from(
         &self,
         cx: &mut Context<'_>,
         out: &mut [u8],
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
-        if let Some(b) = self.e.rx.lock().unwrap().pop_front() {
+        if let Some((b, source)) = self.e.rx.lock().unwrap().pop_front() {
             let n = b.len().min(out.len());
             out[..n].copy_from_slice(&b[..n]);
-            Poll::Ready(Ok((n, self.e.peer.lock().unwrap().unwrap_or(self.remote))))
+            Poll::Ready(Ok((n, source.expect("UDP input has source"))))
         } else {
             *self.e.wake.lock().unwrap() = Some(cx.waker().clone());
             Poll::Pending
@@ -269,7 +286,6 @@ impl UdpSocket for NativeUdp {
         b: &[u8],
         a: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        *self.e.peer.lock().unwrap() = Some(a);
         Poll::Ready(
             self.b
                 .send(Cmd::SU(self.id, a, b.to_vec()))
@@ -282,25 +298,23 @@ pub struct NativeTcp {
     id: u64,
     e: Arc<End>,
     cur: Option<(Vec<u8>, usize)>,
+    writing: bool,
 }
 impl Unpin for NativeTcp {}
 impl DnsTcpStream for NativeTcp {
     type Time = NativeDnsTime;
 }
-#[async_trait]
-impl Connect for NativeTcp {
-    async fn connect_with_bind(a: SocketAddr, _: Option<SocketAddr>) -> io::Result<Self> {
+impl NativeTcp {
+    async fn connect(a: SocketAddr) -> io::Result<Self> {
         let b = bus()?;
         let id = b.next.fetch_add(1, Ordering::Relaxed);
         let e = Arc::new(End::new(SOCKET_MESSAGE_LIMIT));
         b.send(Cmd::OT(id, a, e.clone()))?;
-        wait(&e).await?;
-        Ok(Self {
-            b,
-            id,
-            e,
-            cur: None,
-        })
+        // Construct the lifetime owner before awaiting admission: cancellation
+        // must mark the queued/open core socket for cleanup too.
+        let socket = Self { b, id, e, cur: None, writing: false };
+        wait(&socket.e).await?;
+        Ok(socket)
     }
 }
 impl AsyncRead for NativeTcp {
@@ -311,7 +325,7 @@ impl AsyncRead for NativeTcp {
     ) -> Poll<io::Result<usize>> {
         if self.cur.is_none() {
             let next = self.e.rx.lock().unwrap().pop_front();
-            self.cur = next.map(|b| (b, 0));
+            self.cur = next.map(|(b, _)| (b, 0));
         }
         if let Some((b, p)) = self.cur.as_mut() {
             let n = (b.len() - *p).min(out.len());
@@ -328,8 +342,27 @@ impl AsyncRead for NativeTcp {
     }
 }
 impl AsyncWrite for NativeTcp {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
-        Poll::Ready(self.b.send(Cmd::WT(self.id, b.to_vec())).map(|_| b.len()))
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = self.e.write_result.lock().unwrap().take();
+        if let Some(result) = result {
+            self.writing = false;
+            return Poll::Ready(result);
+        }
+        *self.e.wake.lock().unwrap() = Some(cx.waker().clone());
+        if !self.writing {
+            if let Err(error) = self
+                .b
+                .send(Cmd::WT(self.id, bytes[..bytes.len().min(2048)].to_vec()))
+            {
+                return Poll::Ready(Err(error));
+            }
+            self.writing = true;
+        }
+        Poll::Pending
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
@@ -338,10 +371,20 @@ impl AsyncWrite for NativeTcp {
         Poll::Ready(self.b.send(Cmd::CT(self.id)))
     }
 }
-type Resolver = AsyncResolver<GenericConnection, GenericConnectionProvider<NativeDnsRuntime>>;
+impl Drop for NativeTcp {
+    fn drop(&mut self) {
+        self.e.alive.store(false, Ordering::Relaxed);
+    }
+}
+impl Drop for NativeUdp {
+    fn drop(&mut self) {
+        self.e.alive.store(false, Ordering::Relaxed);
+    }
+}
+type Resolver = HickoryResolver<NativeDnsRuntime>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DnsLookupHandle(u64);
-pub type DnsLookupResult = Result<Vec<IpAddr>, String>;
+pub type DnsLookupResult = Result<Vec<IpAddr>, NetError>;
 struct DnsLookupSlot {
     result: Option<DnsLookupResult>,
     abort: AbortHandle,
@@ -354,7 +397,7 @@ pub struct NativeDnsBridge {
     limit: usize,
     results: Rc<RefCell<HashMap<u64, DnsLookupSlot>>>,
     udp: HashMap<u64, (UdpSocketHandle, SocketAddr, NonZeroU16, Arc<End>)>,
-    tcp: HashMap<u64, (TcpSocketHandle, Arc<End>)>,
+    tcp: HashMap<u64, (TcpSocketHandle, Arc<End>, Option<Vec<u8>>)>,
 }
 impl NativeDnsBridge {
     pub fn new() -> Self {
@@ -372,20 +415,19 @@ impl NativeDnsBridge {
             tcp: HashMap::new(),
         }
     }
-    pub fn configure(
-        &mut self,
-        servers: &[IpAddr],
-    ) -> Result<(), trust_dns_resolver::error::ResolveError> {
+    pub fn configure(&mut self, servers: &[IpAddr]) -> Result<(), NetError> {
         let c = ResolverConfig::from_parts(
             None,
             vec![],
-            NameServerConfigGroup::from_ips_clear(servers, 53, true),
+            servers
+                .iter()
+                .copied()
+                .map(NameServerConfig::udp_and_tcp)
+                .collect::<Vec<_>>(),
         );
-        self.resolver = Some(AsyncResolver::new(
-            c,
-            native_resolver_options(),
-            NativeSpawn(self.b.clone()),
-        )?);
+        let mut builder = HickoryResolver::builder_with_config(c, NativeDnsRuntime(self.b.clone()));
+        *builder.options_mut() = native_resolver_options();
+        self.resolver = Some(builder.build()?);
         Ok(())
     }
     pub fn resolver(&self) -> Option<&Resolver> {
@@ -422,11 +464,7 @@ impl NativeDnsBridge {
         if let Err(error) = self.pool.spawner().spawn_local(async move {
             let result = Abortable::new(resolver.lookup_ip(name), registration).await;
             if let (Ok(result), Some(slot)) = (result, results.borrow_mut().get_mut(&id)) {
-                slot.result = Some(
-                    result
-                        .map(|addresses| addresses.iter().collect())
-                        .map_err(|error| error.to_string()),
-                );
+                slot.result = Some(result.map(|addresses| addresses.iter().collect()));
             }
         }) {
             self.results.borrow_mut().remove(&id);
@@ -503,19 +541,56 @@ impl NativeDnsBridge {
                 self.apply(rt, c)
             }
         }
+        self.udp.retain(|_, (h, _, _, e)| {
+            if e.alive.load(Ordering::Relaxed) {
+                true
+            } else {
+                let _ = rt.udp_close(*h);
+                false
+            }
+        });
+        self.tcp.retain(|_, (h, e, _)| {
+            if e.alive.load(Ordering::Relaxed) {
+                true
+            } else {
+                let _ = rt.tcp_close(*h);
+                false
+            }
+        });
         for (h, _, _, e) in self.udp.values().take(budget.saturating_sub(n)) {
-            if let Ok(Some(b)) = rt.udp_receive(*h) {
-                e.push(b);
-                n += 1
+            if let Ok(Some(packet)) = rt.udp_receive_msg(*h) {
+                let source = match packet.source.address {
+                    crate::NativeIpAddress::V4(ip) => IpAddr::from(ip),
+                    crate::NativeIpAddress::V6(ip) => IpAddr::from(ip),
+                };
+                e.push(
+                    packet.body,
+                    Some(SocketAddr::new(source, packet.source.port)),
+                );
+                n += 1;
             }
         }
-        for (h, e) in self.tcp.values().take(budget.saturating_sub(n)) {
-            let mut b = vec![0; 2048];
-            if let Ok(x) = rt.tcp_read(*h, &mut b) {
-                if x > 0 {
-                    b.truncate(x);
-                    e.push(b);
-                    n += 1
+        for (h, e, pending) in self.tcp.values_mut().take(budget.saturating_sub(n)) {
+            if let Some(bytes) = pending.as_ref() {
+                match rt.tcp_write(*h, bytes) {
+                    Ok(0) if !bytes.is_empty() => {}
+                    Err(crate::RuntimeError::WouldBlock) => {}
+                    result => {
+                        *e.write_result.lock().unwrap() = Some(result.map_err(err));
+                        *pending = None;
+                        e.wake();
+                        n += 1;
+                    }
+                }
+            }
+            if e.rx.lock().unwrap().len() < SOCKET_MESSAGE_LIMIT {
+                let mut b = vec![0; 2048];
+                if let Ok(x) = rt.tcp_read(*h, &mut b) {
+                    if x > 0 {
+                        b.truncate(x);
+                        e.push(b, None);
+                        n += 1;
+                    }
                 }
             }
         }
@@ -533,10 +608,13 @@ impl NativeDnsBridge {
                         SocketAddr::V4(v) if !v.ip().is_unspecified() => Some(v.ip().octets()),
                         _ => None,
                     });
-                    let port = bind
-                        .and_then(|a| NonZeroU16::new(a.port()))
-                        .unwrap_or(NonZeroU16::new(49152 + (id % 16383) as u16).unwrap());
-                    rt.udp_bind(h, local, port).map_err(err)?;
+                    let port = bind.and_then(|a| NonZeroU16::new(a.port()));
+                    if let Err(error) = rt.udp_bind(h, local, port) {
+                        let _ = rt.udp_close(h);
+                        return Err(err(error));
+                    }
+                    let port =
+                        NonZeroU16::new(rt.udp_socket_info(h).map_err(err)?.local.port).unwrap();
                     self.udp.insert(id, (h, remote, port, e.clone()));
                     Ok(())
                 })();
@@ -554,20 +632,22 @@ impl NativeDnsBridge {
                         return Err(io::Error::other("IPv6 DNS unsupported"));
                     };
                     let h = rt.tcp_socket().map_err(err)?;
-                    rt.tcp_connect(h, a.ip().octets(), NonZeroU16::new(a.port()).unwrap())
-                        .map_err(err)?;
-                    self.tcp.insert(id, (h, e.clone()));
+                    if let Err(error) = rt.tcp_connect(h, a.ip().octets(), NonZeroU16::new(a.port()).unwrap()) {
+                        let _ = rt.tcp_close(h);
+                        return Err(err(error));
+                    }
+                    self.tcp.insert(id, (h, e.clone(), None));
                     Ok(())
                 })();
                 e.opened(r)
             }
             Cmd::WT(id, b) => {
-                if let Some((h, _)) = self.tcp.get(&id) {
-                    let _ = rt.tcp_write(*h, &b);
+                if let Some((_, _, pending)) = self.tcp.get_mut(&id) {
+                    *pending = Some(b);
                 }
             }
             Cmd::CT(id) => {
-                if let Some((h, _)) = self.tcp.remove(&id) {
+                if let Some((h, _, _)) = self.tcp.remove(&id) {
                     let _ = rt.tcp_close(h);
                 }
             }
@@ -581,15 +661,16 @@ fn err(e: crate::RuntimeError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::Message;
+    use hickory_proto::rr::{Name, RData, Record};
     use std::num::{NonZeroU16, NonZeroU64};
-    use trust_dns_proto::op::Message;
-    use trust_dns_proto::rr::{Name, RData, Record};
 
     #[test]
     fn native_resolver_never_reads_the_host_filesystem() {
-        let mut expected = ResolverOpts::default();
-        expected.use_hosts_file = false;
-        assert_eq!(native_resolver_options(), expected);
+        assert!(matches!(
+            native_resolver_options().use_hosts_file,
+            ResolveHosts::Never
+        ));
     }
 
     #[test]
@@ -676,42 +757,59 @@ mod tests {
         let query = bridge.lookup_ip("native.test.").unwrap();
         assert!(bridge.take_result(query).is_none());
         assert!(bridge.take_result(query).is_none());
-        for _ in 0..8 {
+        for _ in 0..32 {
             bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
             exchange(&mut client, &mut server);
-        }
-        let request = server
-            .udp_receive(server_socket)
-            .unwrap()
-            .expect("Trust-DNS query");
-        let request = Message::from_vec(&request).unwrap();
-        let mut response = Message::new();
-        response
-            .set_id(request.id())
-            .set_message_type(trust_dns_proto::op::MessageType::Response);
-        response.add_query(request.queries()[0].clone());
-        response.add_answer(Record::from_rdata(
-            Name::from_ascii("native.test.").unwrap(),
-            60,
-            RData::A(std::net::Ipv4Addr::new(192, 0, 2, 99)),
-        ));
-        let client_port = bridge.udp.values().next().unwrap().2;
-        server
-            .udp_send_to(
-                server_socket,
-                [192, 0, 2, 2],
-                client_port,
-                &response.to_vec().unwrap(),
-            )
-            .unwrap();
-        for _ in 0..8 {
+            while let Some(packet) = server.udp_receive_msg(server_socket).unwrap() {
+                let request = Message::from_vec(&packet.body).unwrap();
+                let mut response = Message::new(
+                    request.id,
+                    hickory_proto::op::MessageType::Response,
+                    hickory_proto::op::OpCode::Query,
+                );
+                response.add_query(request.queries[0].clone());
+                if request.queries[0].query_type() == hickory_proto::rr::RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        Name::from_ascii("native.test.").unwrap(),
+                        60,
+                        RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
+                            192, 0, 2, 99,
+                        ))),
+                    ));
+                }
+                server
+                    .udp_send_to(
+                        server_socket,
+                        [192, 0, 2, 2],
+                        NonZeroU16::new(packet.source.port).unwrap(),
+                        &response.to_vec().unwrap(),
+                    )
+                    .unwrap();
+            }
             exchange(&mut client, &mut server);
-            bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
         }
         assert_eq!(
             bridge.take_result(query).unwrap().unwrap(),
             [IpAddr::from([192, 0, 2, 99])]
         );
+    }
+
+    #[test]
+    fn udp_reports_actual_reply_source() {
+        let end = Arc::new(End::new(SOCKET_MESSAGE_LIMIT));
+        let source: SocketAddr = "192.0.2.99:5300".parse().unwrap();
+        end.push(vec![1, 2, 3], Some(source));
+        let udp = NativeUdp {
+            b: Arc::new(Bus::new(8)),
+            id: 1,
+            e: end,
+        };
+        let mut out = [0; 8];
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            matches!(udp.poll_recv_from(&mut cx, &mut out), Poll::Ready(Ok((3, address))) if address == source)
+        );
+        assert_eq!(&out[..3], &[1, 2, 3]);
     }
 
     #[test]
@@ -733,7 +831,7 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         let end = End::new(SOCKET_MESSAGE_LIMIT);
-        end.push(vec![0; SOCKET_MESSAGE_BYTES_LIMIT + 1]);
+        end.push(vec![0; SOCKET_MESSAGE_BYTES_LIMIT + 1], None);
         assert!(end.rx.lock().unwrap().is_empty());
     }
 }

@@ -20,8 +20,11 @@ localhost after link loss. The reproducible harness and evidence live in
 The same provider has demonstrated WPA3, DHCP, application DNS and verified
 HTTPS through the userspace MT7921 driver in KVM. It is not yet the continuously
 integrated Wi-Fi service. Linux protocol options, notably the error queue required
-by the current glibc resolver, remain unsupported; the guest proof uses an
-application UDP DNS client. These tests do not establish broad socket
+by glibc’s direct UDP resolver, remain unsupported. A thin Rust NSS module now
+provides glibc forward hostname lookup over bounded local IPC to the existing
+DNS runtime; a no-INET KVM test exercises dynamic loading and UDP/TCP DNS.
+Applications bypassing NSS still need the broader socket compatibility work.
+These tests do not establish broad socket
 compatibility, hostile-provider robustness, or dependable physical throughput. Optimized localhost tests exceed
 100 MB/s; this is not evidence of Wi-Fi deployment throughput.
 
@@ -65,7 +68,10 @@ fragmentation, ICMP, UDP, TCP, and routing. It is not split by DNS domain,
 remote address, connection, or application frontend. SOCKS and the Linux
 socket frontend are bindings to this service, not separate network stacks.
 Wi-Fi selection and credentials belong to wlancfg. DNS currently shares
-the network process; the separate DNS service described in
+the network process and uses Hickory 0.26.3 with native Netstack3 transport;
+the optional NSS endpoint carries lookup requests, not DNS parsing or a second
+network stack. Its C ABI pointer adapter is isolated from safe Rust lookup,
+layout and I/O code; the separate DNS service described in
 [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) remains a later boundary.
 
 The production Linux frontend owns the existing `AF_INET` and `AF_INET6`

@@ -384,3 +384,41 @@ resolve the glibc compatibility gap above.
 A redundant delivery rebuild/KVM repeat after whitespace-only cleanup lost
 np SSH connectivity; its completion was not observed. The preceding final KVM
 run passed. No physical device was assigned during these runs.
+
+### Rust NSS and the Hickory upgrade
+
+The native DNS runtime now pins Hickory 0.26.3 rather than Fuchsia's retained
+Trust-DNS 0.22.0 fork. It still uses the custom Netstack3 runtime adapter,
+without Tokio, host resolver configuration or runtime host-file lookup.
+UDP replies now retain their actual source address; TCP writes acknowledge
+actual core consumption and retain writes when its buffer is full.
+
+`netstack3-provider --resolver` binds a local Unix listener before entering the
+existing empty-root sandbox. The filter gains only accept4 on that listener;
+DNS parsing/retries/caching remain in Hickory within the network process.
+[`nss-drv`](../../../nss-drv/README.md) is a separately loaded Rust cdylib, not
+a copy of the resolver/network stack in each application. One common FFI
+adapter handles glibc pointers; lookup, layout and I/O live in a separate module
+that forbids unsafe code. Server and wire modules also forbid unsafe code.
+
+To stage the maintained KVM image in addition to existing artifacts:
+- Build `crates/nss-drv` natively as a release cdylib; copy `libnss_drv.so` to
+  `ROOT/lib/libnss_drv.so.2`.
+- Compile `nss-test.c` with `-O2 -Wall -Wextra -Werror -ldl -pthread`; install it
+  as `ROOT/bin/nss-test`, with its ELF dependencies.
+- Create `ROOT/etc/nsswitch.conf` containing `hosts: files drv`.
+- Rebuild/stage the service and service-test executable with the upgraded
+  dependency lockfiles. `guest-init` supplies `/lib` in the fixture's loader
+  search path; the child process still enters its empty root.
+No host NSS files or host networking are changed.
+
+The simulated Ethernet fixture checks dynamic NSS loading, real glibc A/AAAA
+lookup, NXDOMAIN, UDP truncation → TCP fallback, short and misaligned buffers,
+full pointer terminators, threads/fork, and fail-closed lookup after link loss
+and provider death. This replaces `--resolve` only for the glibc/NSS path;
+it does not implement Linux extended-error queues or non-NSS resolvers.
+
+[Delivery evidence](evidence/dns-nss.txt): 43 service tests, 26 integration-crate
+unit tests plus nine integration tests, two NSS tests and one wire test passed;
+MT7921 adapter/passive-scan and ath11k-service downstream Cargo checks passed.
+The final complete no-INET KVM suite passed, including offline NSS checks.

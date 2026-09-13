@@ -20,8 +20,11 @@ unification cannot represent GN's mutually exclusive dependency targets.
 ## DHCP and DNS production reuse
 
 `SOURCE_MAP.md` records the file/function-level disposition for the pinned
-DHCP core/protocol and Fuchsia Trust-DNS forks. Their original source and
-license notices are fetched unchanged. Host changes are isolated as reviewable
+DHCP core/protocol and the retained Fuchsia Trust-DNS forks. Their original
+source and license notices are fetched unchanged. The native DNS runtime now
+uses crates.io Hickory resolver/protocol/network 0.26.3, pinned by the integration
+manifest and consumer lockfiles (MIT OR Apache-2.0), rather than the old 0.22.0
+forks. The Netstack3/Fuchsia revision is unchanged. Host changes are isolated as reviewable
 patch files; no algorithm, constant, state transition, cache, or retry policy is
 forked into the native adapter.
 

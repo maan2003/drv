@@ -9,7 +9,9 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+drv-dns-wire = { path = "../dns-wire" }
 libc = "0.2"
+rustix = { version = "=1.1.4", features = ["net", "event", "fs"] }
 netstack3-port-integration = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/cargo/port-integration" }
 netstack3-port-spike = { path = "../netstack3-port-spike" }
 rand = "=0.9.4"
@@ -23,7 +25,3 @@ netstack3_base = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea964693
 packet = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/network/packet" }
 packet_formats = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/packet-formats" }
 wlan-softmac-host = { path = "../wlan-softmac-host" }
-
-[patch.crates-io]
-trust-dns-proto = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
-trust-dns-resolver = { path = "../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }

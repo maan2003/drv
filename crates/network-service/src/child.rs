@@ -274,10 +274,10 @@ fn syscall_ok(result: i32, operation: &'static str) -> Result<(), String> {
     })
 }
 
-fn setup(expected_parent: i32) -> Result<(), String> {
+fn setup(expected_parent: i32, first_close: u32) -> Result<(), String> {
     unsafe {
-        if syscall(436, 6u32, u32::MAX, 0u32) != 0 {
-            for fd in 6..65536 {
+        if syscall(436, first_close, u32::MAX, 0u32) != 0 {
+            for fd in first_close as i32..65536 {
                 close(fd);
             }
         }
@@ -534,7 +534,7 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
         .transpose()?;
     let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
     let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
-    setup(expected_parent)?;
+    setup(expected_parent, 6)?;
     let poller = NetworkPoller::new().map_err(str::to_string)?;
     if poller.raw_fd() != EPOLL_FD {
         return Err(format!(
@@ -1441,19 +1441,25 @@ mod tests {
 // The provider endpoint is opened in the served network namespace before
 // setup creates the child's empty network namespace. Possession of fd 3,
 // not the child's namespace or privilege, authorizes this single session.
-pub(crate) fn provider_setup(ethernet: bool, bootstrap: bool) -> Result<(), String> {
+pub(crate) fn provider_setup(ethernet: bool, bootstrap: bool, resolver: bool) -> Result<(), String> {
     unsafe {
         if !ethernet { close(4); }
         if !bootstrap { close(5); }
     }
-    setup(unsafe { getppid() })?;
+    setup(unsafe { getppid() }, if resolver { 8 } else { 6 })?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
     if epoll != EPOLL_FD {
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
-    let filter = provider_filter(ethernet);
+    let mut filter = provider_filter(ethernet);
+    if resolver {
+        // Add the only new syscall authority: accept from the pre-bound resolver listener.
+        let mut accept = Vec::new();
+        append_accept4(&mut accept, 7);
+        filter.splice(4..4, accept);
+    }
     let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
     syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
 }

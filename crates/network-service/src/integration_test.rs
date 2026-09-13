@@ -304,6 +304,8 @@ const RENEWED_DNS_IP: [u8; 4] = [192, 0, 2, 53];
 struct AssociatedAp {
     server: Runtime,
     dns: netstack3_port_integration::UdpSocketHandle,
+    dns_tcp: netstack3_port_integration::TcpSocketHandle,
+    dns_connections: Vec<(netstack3_port_integration::TcpSocketHandle, Vec<u8>, Option<Vec<u8>>)>,
     advertised_dns: [u8; 4],
     renewal_requests: usize,
     pending: VecDeque<EthernetFrame>,
@@ -324,9 +326,14 @@ impl AssociatedAp {
         server
             .udp_bind(dns, Some(SERVER_IP), NonZeroU16::new(53).unwrap())
             .unwrap();
+        let dns_tcp = server.tcp_socket().unwrap();
+        server.tcp_bind(dns_tcp, Some(SERVER_IP), NonZeroU16::new(53).unwrap()).unwrap();
+        server.tcp_listen(dns_tcp, NonZeroUsize::new(8).unwrap()).unwrap();
         Self {
             server,
             dns,
+            dns_tcp,
+            dns_connections: Vec::new(),
             advertised_dns: SERVER_IP,
             renewal_requests: 0,
             pending: VecDeque::new(),
@@ -410,14 +417,7 @@ impl AssociatedAp {
             .push_back(EthernetFrame::try_from(bytes).unwrap());
     }
 
-    fn service_dns(&mut self) {
-        let Some(datagram) = self.server.udp_receive_msg(self.dns).unwrap() else {
-            return;
-        };
-        let NativeIpAddress::V4(source) = datagram.source.address else {
-            panic!("IPv6 query on IPv4 DNS socket")
-        };
-        let request = &datagram.body;
+    fn dns_response(request: &[u8], tcp: bool) -> Vec<u8> {
         assert!(request.len() >= 17 && request[4..6] == [0, 1]);
         let mut question_end = 12;
         loop {
@@ -429,28 +429,32 @@ impl AssociatedAp {
             question_end += label;
         }
         question_end += 4;
-        let mut response = Vec::with_capacity(question_end + 16);
+        let kind = u16::from_be_bytes(request[question_end - 4..question_end - 2].try_into().unwrap());
+        let missing = request.get(12..20) == Some(b"\x07missing");
+        let truncated = !tcp && request.get(12..16) == Some(b"\x03tcp");
+        let answer = !missing && !truncated && matches!(kind, 1 | 28);
+        let mut response = Vec::with_capacity(question_end + 28);
         response.extend_from_slice(&request[..2]);
-        response.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+        response.extend_from_slice(&[if truncated { 0x83 } else { 0x81 }, if missing { 0x83 } else { 0x80 }, 0, 1, 0, u8::from(answer), 0, 0, 0, 0]);
         response.extend_from_slice(&request[12..question_end]);
-        response.extend_from_slice(&[
-            0xc0,
-            0x0c,
-            0,
-            1,
-            0,
-            1,
-            0,
-            0,
-            0,
-            60,
-            0,
-            4,
-            SERVER_IP[0],
-            SERVER_IP[1],
-            SERVER_IP[2],
-            SERVER_IP[3],
-        ]);
+        if answer {
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&kind.to_be_bytes());
+            response.extend_from_slice(&[0, 1, 0, 0, 0, 60, 0, if kind == 1 { 4 } else { 16 }]);
+            if kind == 1 { response.extend_from_slice(&SERVER_IP); }
+            else { response.extend_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80]); }
+        }
+        response
+    }
+
+    fn service_dns(&mut self) {
+        let Some(datagram) = self.server.udp_receive_msg(self.dns).unwrap() else {
+            return;
+        };
+        let NativeIpAddress::V4(source) = datagram.source.address else {
+            panic!("IPv6 query on IPv4 DNS socket")
+        };
+        let response = Self::dns_response(&datagram.body, false);
         self.server
             .udp_send_to(
                 self.dns,
@@ -461,8 +465,33 @@ impl AssociatedAp {
             .unwrap();
     }
 
+    fn service_dns_tcp(&mut self) {
+        while let Ok(accepted) = self.server.tcp_accept(self.dns_tcp) {
+            self.dns_connections.push((accepted, Vec::new(), None));
+        }
+        for (handle, input, output) in &mut self.dns_connections {
+            let mut bytes = [0; 2048];
+            if let Ok(n) = self.server.tcp_read(*handle, &mut bytes) { input.extend_from_slice(&bytes[..n]); }
+            if output.is_none() && input.len() >= 2 {
+                let len = u16::from_be_bytes(input[..2].try_into().unwrap()) as usize;
+                if input.len() >= len + 2 {
+                    let response = Self::dns_response(&input[2..len + 2], true);
+                    let mut framed = (response.len() as u16).to_be_bytes().to_vec();
+                    framed.extend(response);
+                    *output = Some(framed);
+                    input.drain(..len + 2);
+                }
+            }
+            if let Some(bytes) = output {
+                if let Ok(n) = self.server.tcp_write(*handle, bytes) { bytes.drain(..n); }
+                if bytes.is_empty() { *output = None; }
+            }
+        }
+    }
+
     fn collect_server_frames(&mut self) {
         self.service_dns();
+        self.service_dns_tcp();
         while let Some(frame) = self.server.take_tx() {
             self.pending.push_back(frame);
         }
@@ -707,7 +736,9 @@ fn associated_link_renews_dns_without_destroying_tcp_then_revokes_on_loss() {
     for second in 16..48 {
         drive(&mut runner, &mut sink, &mut ap, Duration::from_secs(second));
         if let Some(result) = runner.stack_mut().take_lookup(lookup) {
-            assert_eq!(result.unwrap(), [IpAddr::V4(Ipv4Addr::from(SERVER_IP))]);
+            let mut addresses = result.unwrap();
+            addresses.sort();
+            assert_eq!(addresses, [IpAddr::V4(Ipv4Addr::from(SERVER_IP)), "2001:db8::50".parse().unwrap()]);
             break;
         }
         assert!(second != 47, "DNS lookup did not complete");
@@ -819,7 +850,7 @@ fn kernel_provider_ethernet_guest_fixture() {
     let bootstrap_pass = unsafe { libc::fcntl(bootstrap_child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     assert!(bootstrap_pass >= 10);
     let mut command = std::process::Command::new("/bin/netstack3-provider");
-    command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap"]);
+    command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap", "--resolver"]);
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0
@@ -913,6 +944,7 @@ fn kernel_provider_ethernet_guest_fixture() {
     assert_eq!(&response[..2], &[0x12, 0x34]);
     assert_ne!(response[2] & 0x80, 0);
     assert_eq!(&response[n - 4..n], &SERVER_IP);
+    assert!(std::process::Command::new("/bin/nss-test").status().unwrap().success());
     // A configured external address must not steal localhost's source route.
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
     println!("PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST");
@@ -923,7 +955,9 @@ fn kernel_provider_ethernet_guest_fixture() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(child.try_wait().unwrap().is_none());
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
+    assert!(std::process::Command::new("/bin/nss-test").arg("absent").status().unwrap().success());
     child.kill().unwrap();
     child.wait().unwrap();
+    assert!(std::process::Command::new("/bin/nss-test").arg("absent").status().unwrap().success());
     println!("PASS_KERNEL_PROVIDER_ETHERNET_DHCP_DNS_TCP");
 }
