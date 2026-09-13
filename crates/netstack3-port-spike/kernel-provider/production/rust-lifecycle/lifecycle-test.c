@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
@@ -264,6 +265,39 @@ static void concurrent_lifetimes(void)
 	check(stats(p).sockets == 0, "concurrent owner counters return to zero"); close(p);
 	puts("PASS RUST_CONCURRENT_LIFETIMES_8x500");
 }
+static void endpoint_ownership(void)
+{
+	int p = provider(), fd = app(AF_INET);
+	unsigned long long socket_id = id(fd);
+	struct rlimit old, limit;
+	check(getrlimit(RLIMIT_NOFILE, &old) == 0, "fd limit");
+	limit = old; limit.rlim_cur = 64;
+	check(setrlimit(RLIMIT_NOFILE, &limit) == 0, "set fd test limit");
+	int held[64], n = 0;
+	while (n < 64 && (held[n] = dup(p)) >= 0) ++n;
+	check(n < 64 && errno == EMFILE, "fd exhaustion reached");
+	check(ioctl(fd, NSRL_ENDPOINT) < 0 && errno == EMFILE, "endpoint reserve rolls back");
+	check(stats(p).sockets == 1, "failed endpoint does not lose owner");
+	for (int i = 0; i < n; ++i) close(held[i]);
+	check(setrlimit(RLIMIT_NOFILE, &old) == 0, "restore fd limit");
+	int endpoint = ioctl(fd, NSRL_ENDPOINT);
+	check(endpoint >= 0 && (fcntl(endpoint, F_GETFD) & FD_CLOEXEC), "typed endpoint CLOEXEC");
+	int ep = epoll(endpoint), copy = dup(endpoint);
+	check(copy >= 0, "endpoint dup");
+	close(fd); close(endpoint);
+	check(stats(p).sockets == 1, "endpoint retains closed application socket quota");
+	__u64 got;
+	check(read(copy, &got, sizeof(got)) == sizeof(got) && got == socket_id, "endpoint scoped read");
+	check(read(copy, &got, 1) < 0 && errno == EFAULT, "endpoint short user buffer");
+	events(ep, 0);
+	struct nsrl_ready update = { .id = socket_id, .ready = 1 };
+	check(ioctl(p, NSRL_READY, &update) == 0, "endpoint state update");
+	events(ep, EPOLLIN | EPOLLOUT);
+	close(p); events(ep, EPOLLERR | EPOLLHUP);
+	close(ep); close(copy);
+	p = provider(); check(stats(p).sockets == 0, "endpoint final release returns quota"); close(p);
+	puts("PASS RUST_ENDPOINT_OWNERSHIP_AND_FD_ROLLBACK");
+}
 int main(void)
 {
 	setbuf(stdout, NULL); alarm(40);
@@ -271,7 +305,7 @@ int main(void)
 	check(socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == ENETDOWN, "no native IPv6 fallback");
 	family(AF_INET); family(AF_INET6);
 	cancellation(); quota_and_validation(); namespace_isolation(); repeated_wakes();
-	provider_sigkill(); concurrent_lifetimes();
+	provider_sigkill(); concurrent_lifetimes(); endpoint_ownership();
 	puts("PASS RUST_LIFECYCLE_SUITE");
 	return 0;
 }

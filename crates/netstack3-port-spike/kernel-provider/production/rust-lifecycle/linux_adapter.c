@@ -7,6 +7,7 @@
  * This is intentionally not a mechanical Rust proto_ops port.
  */
 #include <linux/module.h>
+#include <linux/anon_inodes.h>
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/miscdevice.h>
@@ -29,8 +30,10 @@ extern int nsrl_set_ready(void *, u64, bool);
 extern int nsrl_socket_new(void *, void **);
 extern void nsrl_socket_drop(void *);
 extern u64 nsrl_socket_id(void *);
+extern int nsrl_socket_endpoint(void *);
 extern u32 nsrl_socket_poll(void *, const struct file *, poll_table *);
 extern size_t nsrl_live_sockets(void);
+struct file *nsrl_anon_file(const struct file_operations *ops, void *data);
 extern size_t nsrl_live_namespaces(void);
 
 struct nsrl_net {
@@ -84,6 +87,7 @@ static __poll_t nsrl_poll(struct file *file, struct socket *sock, poll_table *wa
 static int nsrl_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	u64 id;
+	if (cmd == NSRL_ENDPOINT) return nsrl_socket_endpoint(nsrl_sock(sock)->state);
 	if (cmd != NSRL_ID) return -ENOIOCTLCMD;
 	id = nsrl_socket_id(nsrl_sock(sock)->state);
 	return copy_to_user((void __user *)arg, &id, sizeof(id)) ? -EFAULT : 0;
@@ -220,3 +224,11 @@ proto:
 }
 subsys_initcall(nsrl_init);
 MODULE_LICENSE("GPL");
+
+
+/* Allocation glue only: typed callbacks/private ownership live in Rust.
+ * On failure anon_inode_getfile does not consume the foreign owner. */
+struct file *nsrl_anon_file(const struct file_operations *ops, void *data)
+{
+    return anon_inode_getfile("netstack3-endpoint", ops, data, O_RDWR | O_NONBLOCK);
+}

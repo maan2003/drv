@@ -102,3 +102,14 @@ owners, cancellation and quota retention in Rust. Do not replace the working
 ABI5 frontend until that slice and the real Netstack3 data path pass the
 existing KVM/SSH acceptance tests. This experiment is not evidence that all
 remaining C glue can disappear or that the complete rewrite is already safer.
+
+## Typed endpoint-file infrastructure
+
+`endpoint_file.rs` supplies read/write/poll/ioctl callbacks with typed `Arc<T>`
+private ownership. It reuses upstream `FileDescriptorReservation` and file
+references; a small C allocation helper calls `anon_inode_getfile`. Socket state
+can now outlive its application file through an endpoint owner. KVM additionally
+checks endpoint dup, quota retention, scoped reads, provider death and FD-limit
+rollback. This is the first infrastructure patch toward full ABI5, not its data
+path implementation. Earlier artifact hashes in evidence.txt describe the
+initial prototype; the endpoint patch is identified in its Git commit.

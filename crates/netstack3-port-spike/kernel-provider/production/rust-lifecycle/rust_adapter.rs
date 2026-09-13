@@ -2,6 +2,7 @@
 //! Foreign ownership boundary. Linux callback contracts are in linux_adapter.c.
 //! All state transitions and locking live in safe lifecycle.rs.
 
+mod endpoint_file;
 mod lifecycle;
 
 use core::{ffi::c_void, ptr};
@@ -72,12 +73,12 @@ unsafe extern "C" fn nsrl_socket_new(p: *mut c_void, out: *mut *mut c_void) -> i
 #[no_mangle]
 unsafe extern "C" fn nsrl_socket_drop(p: *mut c_void) {
     // SAFETY: final socket file release consumes its unique foreign owner.
-    drop(unsafe { KBox::<Socket>::from_foreign(p) });
+    drop(unsafe { Arc::<Socket>::from_foreign(p) });
 }
 #[no_mangle]
 unsafe extern "C" fn nsrl_socket_id(p: *mut c_void) -> u64 {
     // SAFETY: ioctl holds the socket file alive, excluding final release.
-    unsafe { KBox::<Socket>::borrow(p) }.id()
+    unsafe { Arc::<Socket>::borrow(p) }.id()
 }
 #[no_mangle]
 unsafe extern "C" fn nsrl_socket_poll(
@@ -88,7 +89,7 @@ unsafe extern "C" fn nsrl_socket_poll(
     // SAFETY: Linux poll holds file/socket alive and provides a valid or null
     // poll_table for this call. Socket files are positionless streams; this
     // callback does not run inside fdget_pos. The borrows never escape.
-    let socket = unsafe { KBox::<Socket>::borrow(p) };
+    let socket = unsafe { Arc::<Socket>::borrow(p) };
     let file = unsafe { File::from_raw_file(file) };
     let table = unsafe { PollTable::from_raw(table) };
     socket.poll(file, &table)
@@ -100,4 +101,29 @@ extern "C" fn nsrl_live_sockets() -> usize {
 #[no_mangle]
 extern "C" fn nsrl_live_namespaces() -> usize {
     lifecycle::live_namespaces()
+}
+
+// Endpoint consumer retains the socket independently of the application file.
+struct SocketEndpoint(Arc<Socket>);
+impl endpoint_file::Endpoint for SocketEndpoint {
+    fn read(&self, out: &mut kernel::uaccess::UserSliceWriter) -> Result<usize> {
+        out.write_slice(&self.0.id().to_le_bytes())?;
+        Ok(8)
+    }
+    fn poll(&self, file: &File, table: &PollTable<'_>) -> u32 {
+        match self.0.poll(file, table) {
+            0 => 0,
+            1 => bindings::POLLIN | bindings::POLLOUT,
+            _ => bindings::POLLERR | bindings::POLLHUP,
+        }
+    }
+}
+#[no_mangle]
+unsafe extern "C" fn nsrl_socket_endpoint(p: *mut c_void) -> i32 {
+    // SAFETY: socket ioctl retains the live Arc owner for this callback.
+    let socket: Arc<Socket> = unsafe { Arc::<Socket>::borrow(p) }.into();
+    Arc::new(SocketEndpoint(socket), GFP_KERNEL)
+        .map_err(Error::from)
+        .and_then(endpoint_file::install)
+        .unwrap_or_else(|e| e.to_errno())
 }

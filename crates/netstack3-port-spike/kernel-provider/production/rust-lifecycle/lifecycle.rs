@@ -124,14 +124,11 @@ pub(crate) struct Socket {
     identity: Option<(u64, u64)>,
 }
 impl Socket {
-    pub(crate) fn create(namespace: Arc<Namespace>) -> Result<KBox<Self>> {
-        let mut socket = KBox::new(
-            Self {
-                namespace,
-                identity: None,
-            },
-            GFP_KERNEL,
-        )?;
+    pub(crate) fn create(namespace: Arc<Namespace>) -> Result<Arc<Self>> {
+        let mut socket = Self {
+            namespace,
+            identity: None,
+        };
         let mut state = socket.namespace.state.lock();
         let generation = state.online.ok_or(ENETDOWN)?;
         if state.sockets.len() == SOCKETS {
@@ -150,7 +147,7 @@ impl Socket {
         drop(state);
         socket.identity = Some((id, generation));
         LIVE_SOCKETS.fetch_add(1, Ordering::Relaxed);
-        Ok(socket)
+        Arc::new(socket, GFP_KERNEL).map_err(Into::into)
     }
     pub(crate) fn id(&self) -> u64 {
         self.identity.unwrap().0
