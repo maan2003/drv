@@ -86,3 +86,38 @@ After post-gate services exited: no kernel warning-severity records and
 no remaining application/service workers in the guest. All primary recovery
 VMs, gateways and their owned timeout processes were stopped. Physical
 Wi-Fi testing and its control/watchdog processes were not touched.
+
+Host-capable candidate #22 repeat (2026-09-14 on np; KVM only):
+Linux 7.3.0-rc2-drv-np, native GCC 15.2.0/Rust 1.97.0 build;
+same #21 source patches, host-derived configuration with EFI, NVMe,
+Btrfs, DM_CRYPT, USB host/ACM, TPM, IOMMU/VFIO and watchdog support.
+CONFIG_INET, WLAN, CFG80211 and MAC80211 disabled; NETSTACK3_RUST=y.
+Kernel SHA256:
+9ae0a79a6284be187546e00b5d8361c615bc631e091c9ba04abd68f7f4a473d4
+Artifact: /var/lib/poco-linux/redwood/work/socket-provider-kvm/np-host/
+linux-7.3-rc2/arch/x86/boot/bzImage
+
+PASS_KVM_PRODUCTION_LOOPBACK with current production guest-init and
+existing compiled primary rust-abi5/root fixtures: parallel traffic,
+provider death/restart, absent/no-fallback, Ethernet integration fixture.
+Serial SHA256:
+11dcf8eef6fe335b432b5b94b32392793e0d324d5cb12e723e2480e111582f4b
+
+PASS RECOVERY_100_LOOPBACK_GENERATIONS using the frozen accepted
+applications/recovery-4/initrd.gz; 4GiB, 2 vCPU, no VFIO, null Ethernet.
+100 cycle passes, 100 DNS-only passes, 100 OLD_STILL_DEAD markers.
+199601ms from kmsg reader startup through final PASS; continuous kernel
+warning gate and final checkpoint completed before PASS.
+Warm cycle10 -> cycle100:
+  processes 24 -> 24; FDs 592 -> 597
+  RSS 1196376 -> 1246124 KiB; slab 52252 -> 54816 KiB
+Max: processes25, FDs606, RSS1247984 KiB, slab54816 KiB.
+Final provider FDs15, DNS FDs12.
+Serial SHA256:
+d2696dcf4496db06001364ed24831a592017fa1f974f58d3eae243c329422ca9
+Evidence: /var/lib/poco-linux/redwood/work/socket-provider-kvm/np-host/
+recovery-1/serial.log
+
+Owned KVM units stopped after acceptance. np remained on Linux6.18.43.
+No physical host reboot, EFI/TPM unlock, early watchdog rollback, or
+physical radio acceptance is established by these KVM results.
