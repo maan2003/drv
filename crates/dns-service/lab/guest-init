@@ -1,0 +1,58 @@
+#!/bin/busybox sh
+set -eu
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+export LD_LIBRARY_PATH=/lib
+mkdir -p /run
+/bin/sh -i 3<>/dev/vport0p2 0<&3 1>&3 2>&3 3<&- &
+zcat /proc/config.gz | grep '^# CONFIG_INET is not set$'
+/bin/netstack3-virtio-lab --external-dns >/run/provider.log 2>&1 &
+for i in $(seq 1 200); do
+ grep -q provider_network_status=Bound /run/provider.log && break
+ sleep .1
+done
+grep -q provider_network_status=Bound /run/provider.log
+start_dns() {
+ rm -f /run/drv-resolver.sock
+ /bin/drv-dns-service 3</etc/quad9.toml 4</etc/ssl/certs/ca-certificates.crt 2>&1 | tee /run/dns.log &
+ for i in $(seq 1 50); do
+  grep -q DNS_READY /run/dns.log && break
+  sleep .1
+ done
+ grep -q DNS_READY /run/dns.log
+}
+start_dns
+/bin/dns-check
+pid=$(pidof drv-dns-service)
+test "$(readlink /proc/1/ns/net)" = "$(readlink /proc/$pid/ns/net)"
+test "$(readlink /proc/1/ns/mnt)" != "$(readlink /proc/$pid/ns/mnt)"
+for task in /proc/$pid/task/*; do
+ grep -E '^(Uid|Gid|Cap|NoNewPrivs|Seccomp)' "$task/status"
+done
+ls -la /proc/$pid/root/
+ls -l /proc/$pid/fd
+provider=$(pidof netstack3-provider)
+kill "$pid"
+sleep 2
+start_dns
+/bin/dns-check
+test "$provider" = "$(pidof netstack3-provider)"
+echo PASS_DNS_INDEPENDENT_RESTART
+kill "$(pidof drv-dns-service)"
+sleep 2
+for op in raw netlink rights exec process exec-memory file-map remap-alias open; do
+ rm -f /run/drv-resolver.sock
+ # The probe's stdout/stderr must remain pipes; preserve its exit status in a file
+ # written by the trusted shell, not by the confined process.
+ (set +e; /bin/dns-deny "$op" 3</etc/quad9.toml 4</etc/ssl/certs/ca-certificates.crt;
+  echo $? >/run/deny-status) 2>&1 | cat
+ status=$(cat /run/deny-status)
+ if test "$op" = open; then test "$status" = 0; else test "$status" = 159; fi
+ echo "PASS_DNS_DENY_$op"
+ sleep 2
+done
+start_dns
+echo PASS_DNS_KVM_COMPLETE
+while true; do sleep 60; done

@@ -13,8 +13,13 @@ fn run() -> io::Result<()> {
     let (driver, service) = socketpair(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)?;
     let driver = Arc::new(driver);
     let receiver = driver.clone();
-    let mut child = Command::new("/bin/sh").args(["-c",
-        "exec /bin/netstack3-provider --ethernet-mac 02:00:00:00:00:01 --resolver 4<&0 0</dev/null 3<>/dev/netstack3"])
+    let external_dns = std::env::args().skip(1).collect::<Vec<_>>() == ["--external-dns"];
+    let launch = if external_dns {
+        "exec /bin/netstack3-provider --ethernet-mac 02:00:00:00:00:01 4<&0 0</dev/null 3<>/dev/netstack3"
+    } else {
+        "exec /bin/netstack3-provider --ethernet-mac 02:00:00:00:00:01 --resolver 4<&0 0</dev/null 3<>/dev/netstack3"
+    };
+    let mut child = Command::new("/bin/sh").args(["-c", launch])
         .stdin(Stdio::from(service)).spawn()?;
     let (failed, failures) = mpsc::channel();
     let incoming_failed = failed.clone();

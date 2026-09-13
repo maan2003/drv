@@ -1,0 +1,11 @@
+# Static bootstrap: no hostname lookup precedes TLS authentication.
+# Quad9's standard service enables threat blocking and DNSSEC validation.
+[[upstreams]]
+address = "9.9.9.9:443"
+server_name = "dns.quad9.net"
+path = "/dns-query"
+
+[[upstreams]]
+address = "149.112.112.112:443"
+server_name = "dns.quad9.net"
+path = "/dns-query"

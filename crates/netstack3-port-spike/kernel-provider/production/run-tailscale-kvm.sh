@@ -3,13 +3,13 @@
 # Uses an unprivileged QEMU/SLIRP gateway; never changes host interfaces or Tailscale.
 set -euo pipefail
 umask 077
-kernel=${1:?usage: run-tailscale-kvm.sh KERNEL ROOT NEW_OUTPUT_DIRECTORY}
+kernel=${1:?usage: run-tailscale-kvm.sh KERNEL ROOT NEW_OUTPUT_DIRECTORY [GUEST_INIT]}
 root=${2:?}
 out=${3:?}
 qemu=${QEMU:-qemu-system-x86_64}
 mkdir -m700 "$out"
 out=$(cd "$out"; pwd)
-cp "$(dirname "$0")/tailscale-guest-init" "$root/init"
+cp "${4:-$(dirname "$0")/tailscale-guest-init}" "$root/init"
 chmod +x "$root/init"
 (cd "$root"; find . -print0 | cpio --null -o -H newc) | gzip -1 >"$out/initrd.gz"
 "$qemu" -machine none -nodefaults -display none -monitor none -serial none \

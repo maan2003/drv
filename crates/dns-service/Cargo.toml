@@ -1,0 +1,28 @@
+[package]
+name = "drv-dns-service"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[workspace]
+
+[dependencies]
+hickory-proto = { version = "=0.26.1", features = ["dnssec-ring"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+h2 = "0.4"
+http = "1"
+bytes = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+drv-dns-wire = { path = "../dns-wire" }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+[profile.release]
+panic = "abort"
+strip = true
