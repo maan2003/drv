@@ -1,0 +1,45 @@
+2026-09-13 socket-binding checkpoint
+Pinned Fuchsia comparison: 1e1219e3fac944c9a906aea9646939746b6062b3,
+bindings/socket/worker.rs, stream.rs, stream/buffer.rs, queue.rs.
+Per-socket owner extracted to socket_worker.rs, forbid(unsafe_code), rustix IO.
+This preserves existing protocol/lifetime behavior; it is not a whole-stack rewrite.
+
+Native release build passed; network-service library tests: 43 passed.
+Full production-loopback KVM suite passed before and after MSG_BATCH fix.
+Kernel Linux6.18.40, CONFIG_INET=n, sandboxed Netstack3.
+
+Isolation:
+Unchanged plain SSH over QEMU/SLIRP -> Netstack3:
+64KiB,1MiB,8MiB random upload/download comparisons pass (<0.4s each).
+Unchanged private-tailnet path:
+64KiB passed; 1MiB download timeout45s after983040bytes.
+Adding local DERP did not resolve the failure.
+Guest strace: single-message sendmmsg succeeds; multi-message sendmmsg
+returns EOPNOTSUPP. Linux __sys_sendmmsg adds MSG_BATCH to non-final elements.
+Our ns3_sendmsg whitelist rejected that internal scheduling hint.
+
+Regression (same client binary):
+Old KVM kernel: FAIL sendmmsg batch accepted: Operation not supported.
+Fixed KVM kernel: PASS SENDMMSG_UDP_V4, PASS SENDMMSG_UDP_V6.
+Tests cover batch sizes1,2,4,8 with per-message length/boundary/byte checks.
+Fix accepts MSG_BATCH as a hint, without merging or deferring datagrams.
+
+Maintained tailscale-guest-init and run-tailscale-kvm.sh:
+OpenSSH10.4p1 key authentication, command execution and PTY PASS.
+uid=0(root) gid=0(root) groups=0(root)
+6.18.40
+# CONFIG_INET is not set
+/dev/pts/0
+DELIVERY_SSH_OK
+Private-tailnet byte-exact random SSH upload/download comparisons:
+8MiB: 0.85s
+8MiB: 0.63s
+64MiB: 2.65s
+
+Private controller/DERP reuse upstream Tailscale1.98.10 testcontrol/derpserver.
+No interactive login, production credentials, host tailnet policy or routes changed.
+Relay certificate pinned; controller host-loopback-only; relay source restricted.
+Observed direct peer transport; isolated DERP-only payload not proved.
+TS_ASSUME_NETWORK_UP_FOR_TEST still needed because Linux metadata is absent.
+This is virtual-gateway evidence, not MT7921/Redwood or hostile-provider proof.
+Kernel remains C; Rust socket-family abstraction feasibility is follow-up work.

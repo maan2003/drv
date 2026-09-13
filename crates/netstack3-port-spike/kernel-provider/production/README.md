@@ -483,3 +483,47 @@ successful bulk-transfer proof. A separate devbox connection also timed out.
 See the run evidence for scope, unsupported socket-option warnings, and a
 transient restart/rebind failure. These unresolved behaviors need isolation
 before treating this as dependable remote management.
+
+### Reproducible private-tailnet SSH test (no interactive login)
+
+`tailscale-control/` directly uses upstream Tailscale v1.98.10's testcontrol
+server and DERP server, not production accounts. Build with native Go 1.26.5:
+`cd tailscale-control && go build -o test-control .`.
+The helper's control listener is **127.0.0.1:18766 only**. Its TLS relay listens
+on an ephemeral port of the host's selected IPv4 address and rejects HTTP
+requests from other source addresses. The DERP map pins the certificate.
+No public control server, shared ACL, host route, or real host daemon is changed.
+The helper is intentionally an automatic-registration test fixture, never a
+production coordination service. Keep all test state in a mode-0700 lab directory.
+
+For the existing runner, stage:
+- Actual `tailscaled`/`tailscale`, provider and virtio frame adapter plus CA/ELF files.
+- Actual `/bin/sshd` and `/bin/ssh-keygen` plus OpenSSH's matching libexec helpers
+  and ELF dependencies (distro wrappers alone are insufficient).
+- `sshd-lab.conf` at `/etc/sshd-lab.conf`, and only the intended test public key
+  at `/root/.ssh/authorized_keys`.
+- `/etc/tailscale-lab-login-server` containing `http://10.0.2.2:18766`.
+- Optionally a private prior test identity at `/run/tailscaled.state`. Otherwise
+  the local test server automatically admits a fresh guest, with no browser login.
+
+Run `test-control`, then start a **separate userspace** host tailscaled with
+private `--state` and `--socket` paths, and `TS_LOGS_DIR` set to that private
+directory. Point its `tailscale up` to
+`http://127.0.0.1:18766` with `--accept-dns=false --accept-routes=false`.
+Do not use the real host daemon's socket/state. Run `run-tailscale-kvm.sh`
+normally; guest init starts key-only sshd and exposes tailnet TCP/22 through
+`tailscale serve`. Determine the guest's test-tailnet IP from the private
+daemon's status rather than assuming registration order.
+
+Use ordinary OpenSSH with a console-pinned host key and:
+`ProxyCommand=tailscale --socket=PRIVATE_PEER_SOCKET nc %h %p`.
+The guest remains `CONFIG_INET=n`; this checks both outer encrypted transport
+and the forwarded loopback TCP application path. Stop the private host peer
+and controller after tests; the QEMU runner bounds its guest/gateway to one hour.
+SSH transport cancellation alone may leave remote daemons alive: track their
+actual PIDs and validate command identity before cleanup.
+
+[Redesign checkpoint evidence](evidence/socket-worker-ssh.txt) records the
+old-kernel sendmmsg regression, the fixed-kernel test, and SSH bulk comparisons.
+Unsupported flags must be distinguished from Linux-internal scheduling hints:
+`MSG_BATCH` is added by `__sys_sendmmsg`, even when userspace supplies flags=0.

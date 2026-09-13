@@ -171,8 +171,45 @@ static void refused(int family) {
     close(fd);
     printf("PASS REFUSED family=%d SO_ERROR clears\n", family);
 }
+
+/* Linux adds MSG_BATCH internally for all but the last sendmmsg element.
+ * The frontend must accept that scheduling hint without changing datagrams. */
+static void udp_batch(int family) {
+    int rx = socket(family, SOCK_DGRAM, 0);
+    int tx = socket(family, SOCK_DGRAM, 0);
+    struct sockaddr_storage a = addr(family, 0);
+    socklen_t size = alen(family);
+    check(rx >= 0 && tx >= 0, "batch UDP sockets");
+    check(bind(rx, (void *)&a, size) == 0, "batch UDP bind");
+    check(getsockname(rx, (void *)&a, &size) == 0, "batch UDP name");
+    for (unsigned int count = 1; count <= 8; count *= 2) {
+        struct mmsghdr messages[8] = {};
+        struct iovec iov[8];
+        unsigned char payload[8][17];
+        for (unsigned int i = 0; i < count; ++i) {
+            memset(payload[i], i + count, sizeof(payload[i]));
+            iov[i] = (struct iovec){ .iov_base = payload[i], .iov_len = i + 1 };
+            messages[i].msg_hdr = (struct msghdr){
+                .msg_name = &a, .msg_namelen = size, .msg_iov = &iov[i], .msg_iovlen = 1
+            };
+        }
+        check(sendmmsg(tx, messages, count, MSG_NOSIGNAL) == (int)count,
+              "sendmmsg batch accepted");
+        for (unsigned int i = 0; i < count; ++i) {
+            unsigned char received[17];
+            check(messages[i].msg_len == i + 1, "sendmmsg per-message length");
+            check(recv(rx, received, sizeof(received), 0) == (ssize_t)i + 1,
+                  "batch datagram boundaries");
+            check(!memcmp(received, payload[i], i + 1), "batch datagram bytes");
+        }
+    }
+    close(tx); close(rx);
+    puts(family == AF_INET ? "PASS SENDMMSG_UDP_V4" : "PASS SENDMMSG_UDP_V6");
+}
+
 int main(int argc, char **argv) {
 	setbuf(stdout, NULL); alarm(90);
+    if (argc == 2 && !strcmp(argv[1], "batch")) { udp_batch(AF_INET); udp_batch(AF_INET6); return 0; }
     if (argc == 2 && !strcmp(argv[1], "parallel")) {
         enum { CLIENTS = 16 };
         pid_t children[CLIENTS];
@@ -232,6 +269,7 @@ int main(int argc, char **argv) {
         puts("PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION");
         return 0;
     }
+    udp_batch(AF_INET); udp_batch(AF_INET6);
     refused(AF_INET); refused(AF_INET6);
 	tcp(AF_INET, 23456); udp(AF_INET); tcp(AF_INET6, 23456); udp(AF_INET6);
 	puts("PASS LOOPBACK_SUITE"); return 0;

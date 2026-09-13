@@ -313,7 +313,9 @@ static int ns3_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	size_t count, done = 0;
 	long timeo = sock_sndtimeo(&s->sk, msg->msg_flags & MSG_DONTWAIT);
 	long ret = 0;
-	if (msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE))
+	/* __sys_sendmmsg adds MSG_BATCH to non-final messages. It is a
+	 * batching hint, not a request to merge or defer these datagrams. */
+	if (msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_BATCH))
 		return -EOPNOTSUPP;
 	if (sock->type == SOCK_DGRAM && len > NS3_PAYLOAD) return -EMSGSIZE;
 	mutex_lock(&s->transmit);

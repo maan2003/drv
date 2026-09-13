@@ -8,8 +8,8 @@ mount -t devtmpfs devtmpfs /dev
 zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
 export LD_LIBRARY_PATH=/lib
 mkdir -p /run /etc
-printf 'root:x:0:0:root:/root:/bin/sh\n' >/etc/passwd
-printf 'root:x:0:\n' >/etc/group
+printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/bin/false\n' >/etc/passwd
+printf 'root:x:0:\nsshd:x:74:\n' >/etc/group
 /bin/sh -i 3<>/dev/vport0p2 0<&3 1>&3 2>&3 3<&- &
 printf 'hosts: files drv\n' >/etc/nsswitch.conf
 for i in $(seq 1 50); do test ! -e /dev/vport0p1 || break; sleep .1; done
@@ -25,10 +25,35 @@ test -n "$dns"
 # Go may bypass NSS. Publish the actual DHCP result for this fixture only.
 printf 'nameserver %s\n' "$dns" >/etc/resolv.conf
 echo "TAILSCALE_LAB_DNS=$dns"
+# Optional real OpenSSH application fixture; no password or forwarding access.
+if test -x /bin/sshd; then
+    test -s /root/.ssh/authorized_keys
+    mkdir -p /run/ssh /var/empty /dev/pts
+    mount -t devpts devpts /dev/pts
+    chown -R 0:0 /root /var/empty /run/ssh
+    chmod 700 /root /root/.ssh /run/ssh
+    chmod 600 /root/.ssh/authorized_keys
+    chmod 755 /var/empty
+    if test ! -f /run/ssh/host_ed25519; then
+        /bin/ssh-keygen -q -t ed25519 -N '' -f /run/ssh/host_ed25519
+    fi
+    /bin/sshd -t -f /etc/sshd-lab.conf
+    /bin/sshd -D -e -f /etc/sshd-lab.conf >/run/ssh/sshd.log 2>&1 &
+    /bin/ssh-keygen -lf /run/ssh/host_ed25519.pub
+fi
 # Kernel interface/address publication is not implemented yet.
 TS_ASSUME_NETWORK_UP_FOR_TEST=true /bin/tailscaled --tun=userspace-networking --state=/run/tailscaled.state     --socket=/run/tailscaled.sock --socks5-server=127.0.0.1:1055     --outbound-http-proxy-listen=127.0.0.1:1056 >/run/tailscaled.log 2>&1 &
 for i in $(seq 1 100); do test ! -S /run/tailscaled.sock || break; sleep .1; done
-/bin/tailscale --socket=/run/tailscaled.sock up --hostname=drv-netstack3-kvm     --accept-dns=false --accept-routes=false --timeout=120s >/run/login.log 2>&1 &
+(
+    set -- --hostname=drv-netstack3-kvm --accept-dns=false --accept-routes=false --timeout=120s
+    if test -f /etc/tailscale-lab-login-server; then
+        set -- "$@" --login-server="$(cat /etc/tailscale-lab-login-server)"
+    fi
+    /bin/tailscale --socket=/run/tailscaled.sock up "$@"
+    if test -x /bin/sshd; then
+        /bin/tailscale --socket=/run/tailscaled.sock serve --bg --tcp=22 tcp://127.0.0.1:2222
+    fi
+) >/run/login.log 2>&1 &
 # Bounded diagnostic heartbeat; never dump the private state file.
 for i in $(seq 1 360); do
     echo "TAILSCALE_LAB_TICK=$i"
