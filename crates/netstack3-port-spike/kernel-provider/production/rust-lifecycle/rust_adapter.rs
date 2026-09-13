@@ -8,7 +8,7 @@ mod lifecycle;
 use core::{ffi::c_void, ptr};
 use kernel::{
     bindings,
-    fs::File,
+    fs::{file::FileDescriptorReservation, File},
     prelude::*,
     sync::{poll::PollTable, Arc},
     types::ForeignOwnable,
@@ -124,6 +124,12 @@ unsafe extern "C" fn nsrl_socket_endpoint(p: *mut c_void) -> i32 {
     let socket: Arc<Socket> = unsafe { Arc::<Socket>::borrow(p) }.into();
     Arc::new(SocketEndpoint(socket), GFP_KERNEL)
         .map_err(Error::from)
-        .and_then(endpoint_file::install)
+        .and_then(|endpoint| {
+            let reserved = FileDescriptorReservation::get_unused_fd_flags(bindings::O_CLOEXEC)?;
+            let file = endpoint_file::create(endpoint)?;
+            let fd = reserved.reserved_fd();
+            reserved.fd_install(file);
+            Ok(fd as i32)
+        })
         .unwrap_or_else(|e| e.to_errno())
 }

@@ -5,7 +5,7 @@ use kernel::ffi;
 use kernel::{
     bindings,
     error::from_err_ptr,
-    fs::{file::FileDescriptorReservation, File},
+    fs::File,
     prelude::*,
     sync::{aref::ARef, poll::PollTable, Arc},
     types::ForeignOwnable,
@@ -13,6 +13,7 @@ use kernel::{
 };
 
 pub(crate) trait Endpoint: Send + Sync + 'static {
+    fn release(&self) {}
     fn read(&self, _out: &mut UserSliceWriter) -> Result<usize> {
         Err(EOPNOTSUPP)
     }
@@ -27,15 +28,13 @@ pub(crate) trait Endpoint: Send + Sync + 'static {
     }
 }
 unsafe extern "C" {
-    fn nsrl_anon_file(
-        ops: *const bindings::file_operations,
-        data: *mut c_void,
-    ) -> *mut bindings::file;
+    fn nsrl_anon_file(ops: *const c_void, data: *mut c_void) -> *mut c_void;
 }
 pub(crate) fn create<T: Endpoint>(endpoint: Arc<T>) -> Result<ARef<File>> {
     let data = endpoint.into_foreign();
     // SAFETY: VTable matches Arc<T>; successful file creation owns data until release.
-    let raw = unsafe { nsrl_anon_file(&VTable::<T>::OPS, data) };
+    let ops: &'static bindings::file_operations = &const { operations::<T>() };
+    let raw = unsafe { nsrl_anon_file(core::ptr::from_ref(ops).cast(), data) };
     match from_err_ptr(raw) {
         Ok(raw) => {
             // SAFETY: anon_inode_getfile returned one live file reference.
@@ -48,12 +47,8 @@ pub(crate) fn create<T: Endpoint>(endpoint: Arc<T>) -> Result<ARef<File>> {
         }
     }
 }
-pub(crate) fn install<T: Endpoint>(endpoint: Arc<T>) -> Result<i32> {
-    let reserved = FileDescriptorReservation::get_unused_fd_flags(bindings::O_CLOEXEC)?;
-    let file = create(endpoint)?;
-    let fd = reserved.reserved_fd();
-    reserved.fd_install(file);
-    Ok(fd as i32)
+pub(crate) const fn operations<T: Endpoint>() -> bindings::file_operations {
+    VTable::<T>::OPS
 }
 
 struct VTable<T>(PhantomData<T>);
@@ -100,7 +95,9 @@ impl<T: Endpoint> VTable<T> {
     }
     unsafe extern "C" fn release(_inode: *mut bindings::inode, file: *mut bindings::file) -> i32 {
         // SAFETY: the final file release consumes its single foreign owner.
-        drop(unsafe { Arc::<T>::from_foreign((*file).private_data) });
+        let owner = unsafe { Arc::<T>::from_foreign((*file).private_data) };
+        owner.release();
+        drop(owner);
         0
     }
     const OPS: bindings::file_operations = bindings::file_operations {
