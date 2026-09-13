@@ -56,7 +56,7 @@ The current native x86-64 regression reproduces silent acceptance on kernel
 mixed controls, TCP rejection, sendmmsg partial success and datagram-preserving
 fallback. See [acceptance evidence](ancillary-evidence.txt). The full socket
 suite, Firefox/WebSocket and SSH/Git transfers also pass. End-to-end HTTP/3
-acceptance is separate from the ancillary contract.
+also passes on #19, with a captured EIO → two ordinary datagrams fallback trace.
 
 ## Waiting and the hostile-provider boundary
 

@@ -27,3 +27,22 @@ setsockopt socket 3 IP_TOS 0: Protocol not available
 setsockopt socket 3 IP_TOS 184: Protocol not available
 PASS_GIT_SSH_CLONE
 PASS_BROWSER_HTTP_WEBSOCKET
+
+WAN-restored HTTP/3 retest (includes failed browser-log ownership attempt):
+CURL_QUIC_VERSION=3
+547   sendmsg(5, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\310\0\0\0\1\24\264\310\314\330\226A\203\272.\31o=\313\301\325\261\352\2\303G\24g\nAT\242"..., iov_len=2400}], msg_iovlen=1, msg_control=[{cmsg_len=18, cmsg_level=SOL_UDP, cmsg_type=0x67, cmsg_data="\xb0\x04"}], msg_controllen=24, msg_flags=0}, 0) = -1 EIO (Input/output error)
+547   sendmsg(5, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\310\0\0\0\1\24\264\310\314\330\226A\203\272.\31o=\313\301\325\261\352\2\303G\24g\nAT\242"..., iov_len=1200}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 1200
+547   sendmsg(5, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\311\0\0\0\1\24\264\310\314\330\226A\203\272.\31o=\313\301\325\261\352\2\303G\24g\nAT\242"..., iov_len=1200}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 1200
+/etc/applications/check-browser.sh: line 14: can't create /run/applications/firefox-local.log: Permission denied
+sh: can't kill pid 562: No such process
+PASS_DNS server=127.0.0.1:53 tcp=false A_AAAA_MX_TXT_HTTPS_NXDOMAIN_SOA
+PASS_DNS server=127.0.0.1:53 tcp=true A_AAAA_MX_TXT_HTTPS_NXDOMAIN_SOA
+PASS_DNS server=[::1]:53 tcp=false A_AAAA_MX_TXT_HTTPS_NXDOMAIN_SOA
+PASS_DNS server=[::1]:53 tcp=true A_AAAA_MX_TXT_HTTPS_NXDOMAIN_SOA
+PASS_DNS_CONCURRENT_32
+PASS_DNS_NSS_AND_GLIBC
+
+Final browser retry after WAN restoration (reviewed image hash matches):
+*** You are running in headless mode.
+FIREFOX_RETRY_EXIT=0
+8d7433ec150c610a7918a8e394e1d16fdff6f7810eb6586b46b64b5746f2e2b6  /run/applications/firefox-external.png

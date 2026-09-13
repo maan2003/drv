@@ -39,17 +39,26 @@ The successful external screenshot run had no graphics error in its log.
 and separate QUIC probes, disposable Git SSH transfers, FFmpeg, private VPN
 recovery. Nix fetch/substitution only in isolated state/store, never Nix builds.
 
-## Preserved compatibility failures
+## Compatibility findings
 
 - Node 24.18.1 IPv6 listen: `node http-fixture.js ::1` requests
   `setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)` and receives ENOPROTOOPT before bind.
   Default IPv4 mode remains separately testable; IPv6 is not counted as passing.
-- curl HTTP/2 succeeded. HTTP/3-only to `cloudflare-quic.com` failed with exit55;
-  the same host curl reached HTTP/3. Guest traces show UDP_SEGMENT ancillary
-  data on 2400-byte sends and asynchronous EMSGSIZE errors. Ancillary-message
-  handling is under investigation; do not claim QUIC support from HTTP/2 success.
+- curl HTTP/2 succeeded. HTTP/3-only initially failed with exit55 on kernel #18.
+  The trace exposed silently ignored UDP_SEGMENT ancillary data. Kernel #19
+  rejects that request with EIO before admission; curl resends two ordinary
+  1200-byte datagrams and completes real HTTP/3. The regression and fallback trace
+  are recorded in `../rust-abi5/ancillary-evidence.txt`. GSO itself is not implemented.
+- `check-ssh.sh` passes an 8MiB byte-exact SSH roundtrip and Git clone through
+  localhost, using fresh fixture-only keys and pinned host-key verification.
+  Unsupported IP_TOS/VRF queries produce warnings but do not prevent this gate.
 
 For WebSocket tests, install the locked `ws` fixture dependency with
 `npm ci --ignore-scripts --no-audit --no-fund` in a disposable staging directory
 and copy its `node_modules` beside `http-fixture.js` in the guest.
 The fixture uses an upstream WebSocket implementation, not a hand-written codec.
+
+Tested Mozilla Linux x86-64 archive SHA256:
+`642ab731354a5ca790b894d4556dfb5028c61d0c24eb10d10e10a111a69c89bf`.
+No Nix builds were used. Existing FFmpeg store artifacts also proved ARM64;
+streaming/VPN recovery and isolated Nix fetches remain follow-up gates.
