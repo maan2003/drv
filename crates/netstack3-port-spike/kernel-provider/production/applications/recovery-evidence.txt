@@ -150,3 +150,26 @@ Evidence directory on np: socket-provider-kvm/np-host/zero-udp/
 original.log SHA43fd1b0f634d4128dbc8c4d118fd4c2e608922800c25ee493fb30b3b985b9a50
 fixed.log SHAd0c316dc5da205ccc033ce53e85a23b55145380202dd1331b66fdc2f646560eb
 fixed22.log SHAcc4d77e9e40a32408583b2baa6ad3ef563bc655838dd2c2eed1585ccd9e4a979
+
+QEMU launch-capability correction #23 (2026-09-14):
+#22 lacked CONFIG_FW_CFG_SYSFS; physical launch could not consume its inputs.
+New separate reflink build enables only FW_CFG_SYSFS=y; command-line device
+parameter parsing remains disabled. #22 source/image path preserved.
+#23 kernel SHA256:
+fcab8cd27d6e8e578118bba064d2816e1a39413904af58b29aa09160ff5b37f3
+Artifact: socket-provider-kvm/np-host/fwcfg/linux-7.3-rc2/arch/x86/boot/bzImage
+
+No-VFIO probe: exactly four named opt/drv-{credential,regulatory,watchdog,bssid}
+entries, three QEMU file inputs and one string input, all synthetic. Checked
+regular/readable paths, nonempty actual reads and byte-for-byte comparison.
+PASS_FW_CFG_EXACT_FOUR_SYNTHETIC_INPUTS.
+Initial probe incorrectly used test -s; qemu_fw_cfg raw bin_attribute has no
+stat size. Replaced that probe check with actual read length, not a kernel fix.
+Successful probe3.log SHA256:
+78165692f63ae5c1122ff27188eb4c0ce6d2d4bb4557fecd52c98fa166fa6e3b
+Separate unchanged full Ethernet/socket/NSS fixture on #23:
+PASS_CURRENT_EXACT_ROOT_NO_VFIO_NSS_FIXTURE; 1 passed, 49 filtered, 2.67s.
+sockets.log SHA256:
+445a87fa597324a05d3fd17a8a3f26989f4cfad55c69808709e2e64b152bb2bc
+Logs reside in socket-provider-kvm/np-host/fwcfg/. All probe VMs exited.
+No physical-radio or physical-host-boot acceptance from these checks.
