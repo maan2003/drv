@@ -1,0 +1,22 @@
+7.3.0-rc2
+# CONFIG_INET is not set
+PASS_CURL_LOOPBACK_DOWNLOAD_UPLOAD
+PASS_CURL_DNS_TLS
+PASS_GIT_HTTPS
+PASS_FIREFOX_JAVASCRIPT
+Terminated
+FIREFOX_EXTERNAL_SCREENSHOT_READY_FOR_VISUAL_REVIEW
+APP_HTTP_READY 127.0.0.1
+PASS_BROWSER_HTTP_WEBSOCKET
+PASS_BROWSER_HTTP_WEBSOCKET
+2598  socket(AF_INET6, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 21
+2598  setsockopt(21, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+2598  setsockopt(21, SOL_IPV6, IPV6_V6ONLY, [0], 4) = -1 ENOPROTOOPT (Protocol not available)
+2603  +++ exited with 0 +++
+2601  +++ exited with 0 +++
+2600  +++ exited with 0 +++
+2602  +++ exited with 0 +++
+2599  +++ exited with 0 +++
+2604  +++ exited with 1 +++
+2598  +++ exited with 1 +++
+curl: (55) Failed to connect to cloudflare-quic.com:443 after 10675 ms: Failed sending data to the peer

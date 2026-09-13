@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "description": "Guest-only application networking acceptance fixture",
+  "dependencies": { "ws": "8.18.3" }
+}

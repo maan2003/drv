@@ -19,7 +19,7 @@ chmod +x "$root/init"
     -netdev hubport,id=port,hubid=0,netdev=wire \
     -daemonize -pidfile "$out/gateway.pid" 2>"$out/gateway.log"
 trap 'kill "$(cat "$out/gateway.pid")" 2>/dev/null || true' ERR
-"$qemu" -enable-kvm -machine q35,kernel-irqchip=split -cpu host -smp 2 -m 1024 \
+"$qemu" -enable-kvm -machine q35,kernel-irqchip=split -cpu host -smp 2 -m "${QEMU_MEMORY_MIB:-1024}" \
     -nodefaults -no-reboot -display none -monitor none -serial file:"$out/serial.log" \
     -device intel-iommu,intremap=on,caching-mode=on -device virtio-serial-pci \
     -chardev socket,id=frames,path="$out/ethernet.sock" \
