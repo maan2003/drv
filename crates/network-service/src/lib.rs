@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 mod child;
 mod provider;
+mod socket_worker;
 mod resolver;
 pub use provider::run_provider;
 mod ethernet_device;
