@@ -366,8 +366,14 @@ Inside the lab-owned command, with native QEMU/cpio/gzip and core tools in PATH:
 
 ```sh
 export DRV_SAE_BSSID=... # current native scan, channel 149, SSID ajay
-./run-wifi-kvm.sh "$BZIMAGE" "$WIFI_ROOT" "$NEW_PRIVATE_OUTPUT_DIRECTORY"
+export DRV_SAE_CHANNEL=149
+./run-wifi-kvm-guarded.sh 0000:05:00.0 140 -- \
+  ./run-wifi-kvm.sh "$BZIMAGE" "$WIFI_ROOT" "$NEW_PRIVATE_OUTPUT_DIRECTORY"
 ```
+
+Do not invoke the guarded launcher on a host until both an independent recovery
+access path and a reset-before-native-bind reboot/power-cycle contract have been
+proved for that host. The current np incident does not satisfy those prerequisites.
 
 Keep the actual host reboot watchdog armed. The runner requires over 80 seconds
 of lease remaining and limits QEMU to 75 seconds. The lab's command deadline must

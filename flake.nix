@@ -1385,7 +1385,8 @@
                 --subst-var-by ip ${pkgs.iproute2}/bin/ip \
                 --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
                 --subst-var-by awk ${pkgs.gawk}/bin/awk \
-                --subst-var-by ping ${pkgs.iputils}/bin/ping
+                --subst-var-by ping ${pkgs.iputils}/bin/ping \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
               chmod 0755 "$out/bin/mt7921-full-firmware-validation-recovery-status"
             '';
             installCheckPhase = ''
@@ -1434,22 +1435,43 @@
                 --subst-var-by ip "$PWD/bin/ip" \
                 --subst-var-by grep ${pkgs.gnugrep}/bin/grep \
                 --subst-var-by awk ${pkgs.gawk}/bin/awk \
-                --subst-var-by ping "$PWD/bin/ping"
+                --subst-var-by ping "$PWD/bin/ping" \
+                --subst-var-by cat ${pkgs.coreutils}/bin/cat
               chmod +x status
               test "$(./status --version)" = mt7921-full-firmware-recovery-status-v1
               ./status --idle
               set +e
-              ./status --quarantined
+              quarantine_status=$(./status --quarantined)
               rc=$?
               set -e
               test "$rc" -eq 1
+              test "$quarantine_status" = clear
               ./status --native-ready 0000:05:00.0
               : > root/run/wifi-driver-lab/a.state
               ! ./status --idle
               echo UNSAFE > root/run/wifi-driver-lab/a.state.safety
               ./status --quarantined
               echo SAFE > root/run/wifi-driver-lab/a.state.safety
-              ! ./status --quarantined
+              set +e
+              quarantine_status=$(./status --quarantined)
+              rc=$?
+              set -e
+              test "$rc" -eq 1
+              test "$quarantine_status" = clear
+              ln -s missing root/run/wifi-driver-lab/unreadable.state.safety
+              set +e
+              ./status --quarantined
+              rc=$?
+              set -e
+              test "$rc" -eq 2
+              rm root/run/wifi-driver-lab/unreadable.state.safety
+              mv root/run/wifi-driver-lab root/run/wifi-driver-lab.saved
+              set +e
+              ./status --quarantined
+              rc=$?
+              set -e
+              test "$rc" -eq 2
+              mv root/run/wifi-driver-lab.saved root/run/wifi-driver-lab
               ! ./status --native-ready 0000:00:00.0
               set +e
               ./status arbitrary

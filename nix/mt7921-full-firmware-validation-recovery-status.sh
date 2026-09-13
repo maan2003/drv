@@ -19,10 +19,14 @@ case "$#:${1-}" in
     [ "${#states[@]}" -eq 0 ]
     ;;
   1:--quarantined)
+    [ -d "$run_dir" ] && [ -r "$run_dir" ] && [ -x "$run_dir" ] || exit 2
     shopt -s nullglob
     for safety in "$run_dir"/*.state.safety; do
-      [ "$(<"$safety")" = SAFE ] || exit 0
+      safety_state=$(@cat@ -- "$safety") || exit 2
+      [ "$safety_state" = SAFE ] || exit 0
     done
+    [ -d "$run_dir" ] && [ -r "$run_dir" ] && [ -x "$run_dir" ] || exit 2
+    printf 'clear\n'
     exit 1
     ;;
   2:--native-ready)
