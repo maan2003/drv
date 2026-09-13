@@ -330,3 +330,57 @@ not evidence that arbitrary glibc-resolving applications work unchanged.
 Durable DNS configuration publication and the owned userspace resolver boundary
 remain integration work; parsing the provider's DHCP diagnostic is test-fixture
 plumbing, not the production configuration API.
+
+### Core-owned names and per-socket workers
+
+The socket binding now queries core TCP/UDP `get_info` for local and peer names
+and delegates ephemeral port selection to core. It no longer maintains a
+second local-address cache or a sequential port allocator. Unbound
+`getsockname` opens the provider endpoint without binding it; regression tests
+cover unspecified names, routed localhost names, and UDP sendto-then-connect
+for IPv4 and IPv6.
+
+The kernel frontend's service uses one worker owning each endpoint FD, core
+socket, pending accepted child, send queue and close response. Dropping a worker
+closes its owned core sockets. Admitted sends still drain before normal close.
+This removes the separate FD/socket registries and the readiness-change
+linear handle lookup. Data/readiness still scan workers: this is **not** a
+complete event-driven Fuchsia binding port.
+
+Provenance: Fuchsia `1e1219e3fac944c9a906aea9646939746b6062b3`,
+`src/connectivity/network/netstack3/src/bindings/socket/worker.rs`
+(`SocketWorker::handle_stream`, `SocketWorkerHandler` request/close lifetime),
+`socket/stream.rs` and `socket/datagram.rs` (`get_sock_name`, `get_peer_name`).
+These are native Linux adaptations, not unchanged source imports: bounded epoll
+batches replace FIDL streams; Linux already combines dup/fork users into one
+endpoint; addresses use the embedding ABI without scoped IPv6. Upstream notices
+are retained with the [BSD license](../../upstream-cargo/LICENSE.fuchsia).
+Our regression tests exercise the adapted kernel contract; upstream FIDL tests
+were not ported.
+
+Three alternating full KVM suites compared the pre-worker core-name build
+against the worker build, using identical kernel, clients and guest init.
+With 128 idle bound UDP sockets, 64 MiB-per-direction TCP transfers improved
+from 210–217 MB/s to 230–234 MB/s (pooled IPv4/IPv6 median 214.79 → 230.95 MB/s,
+7.5%). These are payload bytes over wall time including setup and integrity
+checks, not physical Wi-Fi throughput. The maintained suite now includes this
+idle-socket workload without a hardware-dependent throughput threshold.
+[All six serial logs](evidence/worker-comparison.txt) retain results.
+All 43 service tests passed initially and on final recheck. One intervening
+run concurrent with KVM failed the existing resource-admission wait-count
+assertion (exit 125); the focused rerun passed with nine blocking waits.
+The failure is retained in the evidence; scheduling sensitivity is suspected,
+not established as the cause. Rust 1.97 incremental compilation hit an
+unstable-fingerprint compiler panic; the final release and tests passed with
+incremental compilation disabled.
+
+At the same Fuchsia pin, Starnix
+`src/starnix/kernel/core/vfs/socket/socket_backed_by_zxio.rs` stubs
+`SOL_IP/IP_RECVERR` with success, and its stream `MSG_ERRQUEUE` path returns
+`EAGAIN`. That is not a complete extended-error queue to port. This change
+deliberately does not copy fake option success, implement NSS, or claim to
+resolve the glibc compatibility gap above.
+
+A redundant delivery rebuild/KVM repeat after whitespace-only cleanup lost
+np SSH connectivity; its completion was not observed. The preceding final KVM
+run passed. No physical device was assigned during these runs.

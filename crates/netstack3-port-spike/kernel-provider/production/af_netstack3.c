@@ -448,7 +448,8 @@ static int ns3_getname(struct socket *sock, struct sockaddr *addr, int peer)
 	__le32 which = cpu_to_le32(peer);
 	int ret;
 	mutex_lock(&s->control);
-	ret = s->opened ? ns3_call(s, NS3_GETNAME, &which, sizeof(which), &a, sizeof(a)) : -ENOTCONN;
+	ret = peer && !s->opened ? -ENOTCONN : ns3_open_remote(s);
+	if (!ret) ret = ns3_call(s, NS3_GETNAME, &which, sizeof(which), &a, sizeof(a));
 	mutex_unlock(&s->control);
 	if (ret < 0) return ret;
 	if (ret != sizeof(a)) return -EPROTO;

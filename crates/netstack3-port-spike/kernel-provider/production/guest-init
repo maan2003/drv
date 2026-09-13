@@ -31,6 +31,7 @@ echo SANDBOX_EMPTY_ROOT_VERIFIED
 /bin/loopback-test
 # Large enough to exhaust TCP quick ACKs; catches timer-paced bulk regressions.
 /bin/loopback-test bench-long
+/bin/loopback-test bench-idle
 /bin/loopback-test parallel
 /bin/loopback-test death > /run/death.log 2>&1 &
 death=$!

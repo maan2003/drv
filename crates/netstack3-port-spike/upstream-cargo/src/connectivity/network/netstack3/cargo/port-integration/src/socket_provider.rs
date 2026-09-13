@@ -51,7 +51,6 @@ enum Socket {
 
 #[derive(Default)]
 struct SocketV2 {
-    local: Option<ProviderSocketAddressV2>,
     peer: Option<ProviderSocketAddressV2>,
     read_closed: bool,
     write_closed: bool,
@@ -72,7 +71,6 @@ struct Client {
 struct State {
     next_client: u64,
     next_socket: u64,
-    next_ephemeral_port: u16,
     clients: HashMap<SocketClientId, Client>,
     revoked_clients: HashSet<SocketClientId>,
     sockets: HashMap<RemoteSocketHandle, Socket>,
@@ -91,7 +89,6 @@ impl NativeSocketProvider {
             state: Rc::new(RefCell::new(State {
                 next_client: 0,
                 next_socket: 0,
-                next_ephemeral_port: 49152,
                 clients: HashMap::new(),
                 revoked_clients: HashSet::new(),
                 sockets: HashMap::new(),
@@ -225,40 +222,31 @@ impl NativeSocketProvider {
         .map_err(|_| RemoteSocketError::StaleHandle)
     }
 
-    fn next_ephemeral_port(&self) -> u16 {
-        let mut state = self.state.borrow_mut();
-        let port = state.next_ephemeral_port;
-        state.next_ephemeral_port = if port == u16::MAX { 49152 } else { port + 1 };
-        port
-    }
-
-    fn unspecified(
+    fn socket_info(
         &self,
         handle: RemoteSocketHandle,
-        port: u16,
-    ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
-        Ok(ProviderSocketAddressV2 {
-            address: match self.state.borrow().sockets.get(&handle) {
+    ) -> Result<crate::NativeSocketInfo, RemoteSocketError> {
+        let mut runtime = self.runtime.borrow_mut();
+        match self.state.borrow().sockets.get(&handle) {
+            Some(Socket::Tcp {
+                raw: VersionedTcp::V4(raw),
+                ..
+            }) => runtime.tcp_socket_info(*raw),
+            Some(Socket::Tcp {
+                raw: VersionedTcp::V6(raw),
+                ..
+            }) => runtime.tcp_socket_info_ipv6(*raw),
                 Some(Socket::Udp {
-                    raw: VersionedUdp::V4(_),
+                raw: VersionedUdp::V4(raw),
                     ..
-                })
-                | Some(Socket::Tcp {
-                    raw: VersionedTcp::V4(_),
+            }) => runtime.udp_socket_info(*raw),
+            Some(Socket::Udp {
+                raw: VersionedUdp::V6(raw),
                     ..
-                }) => RemoteIpAddress::V4([0; 4]),
-                Some(Socket::Udp {
-                    raw: VersionedUdp::V6(_),
-                    ..
-                })
-                | Some(Socket::Tcp {
-                    raw: VersionedTcp::V6(_),
-                    ..
-                }) => RemoteIpAddress::V6([0; 16]),
+            }) => runtime.udp_socket_info_ipv6(*raw),
                 None => return Err(RemoteSocketError::StaleHandle),
-            },
-            port,
-        })
+        }
+        .map_err(map_error)
     }
 
     fn refresh_tcp_connection(&self, handle: RemoteSocketHandle) -> Result<(), RemoteSocketError> {
@@ -818,30 +806,72 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         local: Option<RemoteIpAddress>,
         port: u16,
     ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
-        let port = if port == 0 {
-            self.next_ephemeral_port()
-        } else {
-            port
-        };
-        let nonzero = NonZeroU16::new(port).unwrap();
-        let udp = match self.state.borrow().sockets.get(&handle) {
-            Some(Socket::Udp { .. }) => true,
-            Some(Socket::Tcp { .. }) => false,
-            None => return Err(RemoteSocketError::StaleHandle),
-        };
-        if udp {
-            self.udp_bind(handle, local, nonzero)?;
-        } else {
-            self.tcp_bind(handle, local, nonzero)?;
+        let port = NonZeroU16::new(port);
+        {
+            let mut runtime = self.runtime.borrow_mut();
+            match (self.state.borrow().sockets.get(&handle), local) {
+                (
+                    Some(Socket::Tcp {
+                        raw: VersionedTcp::V4(raw),
+                        ..
+                    }),
+                    None | Some(RemoteIpAddress::V4(_)),
+                ) => runtime.tcp_bind(
+                    *raw,
+                    local.map(|ip| match ip {
+                        RemoteIpAddress::V4(ip) => ip,
+                        _ => unreachable!(),
+                    }),
+                    port,
+                ),
+                (
+                    Some(Socket::Tcp {
+                        raw: VersionedTcp::V6(raw),
+                        ..
+                    }),
+                    None | Some(RemoteIpAddress::V6(_)),
+                ) => runtime.tcp_bind_ipv6(
+                    *raw,
+                    local.map(|ip| match ip {
+                        RemoteIpAddress::V6(ip) => ip,
+                        _ => unreachable!(),
+                    }),
+                    port,
+                ),
+                (
+                    Some(Socket::Udp {
+                        raw: VersionedUdp::V4(raw),
+                        ..
+                    }),
+                    None | Some(RemoteIpAddress::V4(_)),
+                ) => runtime.udp_bind(
+                    *raw,
+                    local.map(|ip| match ip {
+                        RemoteIpAddress::V4(ip) => ip,
+                        _ => unreachable!(),
+                    }),
+                    port,
+                ),
+                (
+                    Some(Socket::Udp {
+                        raw: VersionedUdp::V6(raw),
+                        ..
+                    }),
+                    None | Some(RemoteIpAddress::V6(_)),
+                ) => runtime.udp_bind_ipv6(
+                    *raw,
+                    local.map(|ip| match ip {
+                        RemoteIpAddress::V6(ip) => ip,
+                        _ => unreachable!(),
+                    }),
+                    port,
+                ),
+                (Some(_), _) => return Err(RemoteSocketError::AddressFamilyMismatch),
+                (None, _) => return Err(RemoteSocketError::StaleHandle),
         }
-        let address = match local {
-            Some(address) => ProviderSocketAddressV2 { address, port },
-            None => self.unspecified(handle, port)?,
-        };
-        match self.state.borrow_mut().sockets.get_mut(&handle).unwrap() {
-            Socket::Udp { v2, .. } | Socket::Tcp { v2, .. } => v2.local = Some(address.clone()),
+            .map_err(map_error)?;
         }
-        Ok(address)
+        Ok(provider_address(self.socket_info(handle)?.local))
     }
 
     fn connect(
@@ -850,7 +880,7 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         peer: ProviderSocketAddressV2,
     ) -> Result<(), RemoteSocketError> {
         let port = NonZeroU16::new(peer.port).ok_or(RemoteSocketError::InvalidState)?;
-        if self.v2(handle)?.local.is_none() {
+        if self.socket_info(handle)?.local.port == 0 {
             // Let core select the source from the destination route. A configured
             // Ethernet address must not become the source of a localhost flow.
             self.bind(handle, None, 0)?;
@@ -950,7 +980,8 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
             unreachable!()
         };
         v2.peer = None;
-        Ok(v2.local.clone().expect("connected socket is bound"))
+        drop(state);
+        Ok(provider_address(self.socket_info(handle)?.local))
     }
 
     fn listen(
@@ -958,7 +989,7 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         handle: RemoteSocketHandle,
         backlog: u32,
     ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
-        if self.v2(handle)?.local.is_none() {
+        if self.socket_info(handle)?.local.port == 0 {
             self.bind(handle, None, 0)?;
         }
         let backlog =
@@ -973,7 +1004,8 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
             return Err(RemoteSocketError::WrongSocketKind);
         };
         v2.listening = true;
-        Ok(v2.local.clone().unwrap())
+        drop(state);
+        Ok(provider_address(self.socket_info(handle)?.local))
     }
 
     fn accept(
@@ -1007,7 +1039,6 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
                     client,
                     raw,
                     v2: SocketV2 {
-                        local: Some(local.clone()),
                         peer: Some(peer.clone()),
                         ..SocketV2::default()
                     },
@@ -1056,11 +1087,6 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
                 return Err(RemoteSocketError::InvalidState);
             }
             return self.tcp_write(handle, bytes);
-        }
-        // Keep the binding's local-name state in sync with implicit UDP binds.
-        // Otherwise a later connect tries to bind the already-bound core socket.
-        if self.v2(handle)?.local.is_none() {
-            self.bind(handle, None, 0)?;
         }
         match self.state.borrow().sockets.get(&handle) {
             Some(Socket::Udp {
@@ -1263,14 +1289,13 @@ impl netstack3_port_spike::provider_dispatch_v2::RemoteSocketProviderV2 for Nati
         handle: RemoteSocketHandle,
         which: ProviderNameV2,
     ) -> Result<ProviderSocketAddressV2, RemoteSocketError> {
-        let v2 = self.v2(handle)?;
+        let info = self.socket_info(handle)?;
         match which {
-            ProviderNameV2::Local => v2
-                .local
-                .clone()
-                .or_else(|| self.unspecified(handle, 0).ok())
+            ProviderNameV2::Local => Ok(provider_address(info.local)),
+            ProviderNameV2::Peer => info
+                .peer
+                .map(provider_address)
                 .ok_or(RemoteSocketError::InvalidState),
-            ProviderNameV2::Peer => v2.peer.clone().ok_or(RemoteSocketError::InvalidState),
         }
     }
 

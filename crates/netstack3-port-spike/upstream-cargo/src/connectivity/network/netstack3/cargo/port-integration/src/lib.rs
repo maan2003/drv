@@ -231,6 +231,82 @@ pub struct NativeSocketAddress {
     pub port: u16,
 }
 
+/// Core-owned socket names; an unbound socket has an unspecified local address and port zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSocketInfo {
+    pub local: NativeSocketAddress,
+    pub peer: Option<NativeSocketAddress>,
+}
+
+// Adapted from Fuchsia 1e1219e3fac944c9a906aea9646939746b6062b3:
+// src/connectivity/network/netstack3/src/bindings/socket/stream.rs,
+// get_sock_name/get_peer_name; socket/datagram.rs, get_sock_name/get_peer_name.
+// Copyright 2019 The Fuchsia Authors. BSD-2-Clause license; see upstream-cargo/LICENSE.fuchsia.
+// Difference: return host-neutral addresses, not FIDL objects. Scoped IPv6 is
+// still outside this embedding's address ABI.
+fn tcp_socket_info<A: net_types::ip::IpAddress, D>(
+    info: netstack3_tcp::SocketInfo<A, D>,
+    convert: impl Fn(Option<A>) -> NativeIpAddress,
+) -> NativeSocketInfo {
+    let address = |ip, port| NativeSocketAddress {
+        address: convert(ip),
+        port,
+    };
+    match info {
+        netstack3_tcp::SocketInfo::Unbound(_) => NativeSocketInfo {
+            local: address(None, 0),
+            peer: None,
+        },
+        netstack3_tcp::SocketInfo::Bound(info) => NativeSocketInfo {
+            local: address(info.addr.map(|ip| ip.addr().get()), info.port.get()),
+            peer: None,
+        },
+        netstack3_tcp::SocketInfo::Connection(info) => NativeSocketInfo {
+            local: address(
+                Some(info.local_addr.ip.addr().get()),
+                info.local_addr.port.get(),
+            ),
+            peer: Some(address(
+                Some(info.remote_addr.ip.addr().get()),
+                info.remote_addr.port.get(),
+            )),
+        },
+    }
+}
+
+fn udp_socket_info<A: net_types::ip::IpAddress, D>(
+    info: netstack3_datagram::SocketInfo<A, D>,
+    convert: impl Fn(Option<A>) -> NativeIpAddress,
+) -> NativeSocketInfo {
+    let address = |ip, port| NativeSocketAddress {
+        address: convert(ip),
+        port,
+    };
+    match info {
+        netstack3_datagram::SocketInfo::Unbound => NativeSocketInfo {
+            local: address(None, 0),
+            peer: None,
+        },
+        netstack3_datagram::SocketInfo::Listener(info) => NativeSocketInfo {
+            local: address(
+                info.local_ip.map(|ip| ip.addr().get()),
+                info.local_identifier.get(),
+            ),
+            peer: None,
+        },
+        netstack3_datagram::SocketInfo::Connected(info) => NativeSocketInfo {
+            local: address(
+                Some(info.local_ip.addr().get()),
+                info.local_identifier.get(),
+            ),
+            peer: Some(address(
+                Some(info.remote_ip.addr().get()),
+                info.remote_identifier,
+            )),
+        },
+    }
+}
+
 #[derive(Debug, Default)]
 struct Queues {
     tx: VecDeque<TxFrame>,
@@ -1685,11 +1761,26 @@ impl Runtime {
         Ok(handle)
     }
 
+    pub fn udp_socket_info(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<NativeSocketInfo, RuntimeError> {
+        let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
+        let info = self
+            .stack
+            .api(&mut self.bindings)
+            .udp::<Ipv4>()
+            .get_info(id);
+        Ok(udp_socket_info(info, |ip| {
+            NativeIpAddress::V4(ip.map(|ip| ip.ipv4_bytes()).unwrap_or([0; 4]))
+        }))
+    }
+
     pub fn udp_bind(
         &mut self,
         handle: UdpSocketHandle,
         address: Option<[u8; 4]>,
-        port: NonZeroU16,
+        port: impl Into<Option<NonZeroU16>>,
     ) -> Result<(), RuntimeError> {
         let id = self.udp.get(&handle).ok_or(RuntimeError::UnknownSocket)?;
         let address = address
@@ -1699,7 +1790,7 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .udp::<Ipv4>()
-            .listen(id, address, Some(port))
+            .listen(id, address, port.into())
             .map_err(|_| RuntimeError::AddressInUse)
     }
 
@@ -1830,11 +1921,29 @@ impl Runtime {
         Ok(handle)
     }
 
+    pub fn udp_socket_info_ipv6(
+        &mut self,
+        handle: UdpSocketHandle,
+    ) -> Result<NativeSocketInfo, RuntimeError> {
+        let id = self
+            .udp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?;
+        let info = self
+            .stack
+            .api(&mut self.bindings)
+            .udp::<Ipv6>()
+            .get_info(id);
+        Ok(udp_socket_info(info, |ip| {
+            NativeIpAddress::V6(ip.map(|ip| ip.ipv6_bytes()).unwrap_or([0; 16]))
+        }))
+    }
+
     pub fn udp_bind_ipv6(
         &mut self,
         handle: UdpSocketHandle,
         address: Option<[u8; 16]>,
-        port: NonZeroU16,
+        port: impl Into<Option<NonZeroU16>>,
     ) -> Result<(), RuntimeError> {
         let id = self
             .udp_v6
@@ -1849,7 +1958,7 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .udp::<Ipv6>()
-            .listen(id, address, Some(port))
+            .listen(id, address, port.into())
             .map_err(|_| RuntimeError::AddressInUse)
     }
 
@@ -2023,11 +2132,26 @@ impl Runtime {
         Ok(handle)
     }
 
+    pub fn tcp_socket_info(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<NativeSocketInfo, RuntimeError> {
+        let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
+        let info = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv4>()
+            .get_info(id);
+        Ok(tcp_socket_info(info, |ip| {
+            NativeIpAddress::V4(ip.map(|ip| ip.ipv4_bytes()).unwrap_or([0; 4]))
+        }))
+    }
+
     pub fn tcp_bind(
         &mut self,
         handle: TcpSocketHandle,
         address: Option<[u8; 4]>,
-        port: NonZeroU16,
+        port: impl Into<Option<NonZeroU16>>,
     ) -> Result<(), RuntimeError> {
         let id = &self.tcp.get(&handle).ok_or(RuntimeError::UnknownSocket)?.id;
         let address = address
@@ -2037,7 +2161,7 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .tcp::<Ipv4>()
-            .bind(id, address, Some(port))
+            .bind(id, address, port.into())
             .map_err(map_tcp_bind_error)
     }
 
@@ -2337,11 +2461,30 @@ impl Runtime {
         Ok(handle)
     }
 
+    pub fn tcp_socket_info_ipv6(
+        &mut self,
+        handle: TcpSocketHandle,
+    ) -> Result<NativeSocketInfo, RuntimeError> {
+        let id = &self
+            .tcp_v6
+            .get(&handle)
+            .ok_or(RuntimeError::UnknownSocket)?
+            .id;
+        let info = self
+            .stack
+            .api(&mut self.bindings)
+            .tcp::<Ipv6>()
+            .get_info(id);
+        Ok(tcp_socket_info(info, |ip| {
+            NativeIpAddress::V6(ip.map(|ip| ip.ipv6_bytes()).unwrap_or([0; 16]))
+        }))
+    }
+
     pub fn tcp_bind_ipv6(
         &mut self,
         handle: TcpSocketHandle,
         address: Option<[u8; 16]>,
-        port: NonZeroU16,
+        port: impl Into<Option<NonZeroU16>>,
     ) -> Result<(), RuntimeError> {
         let id = &self
             .tcp_v6
@@ -2357,7 +2500,7 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .tcp::<Ipv6>()
-            .bind(id, address, Some(port))
+            .bind(id, address, port.into())
             .map_err(map_tcp_bind_error)
     }
 

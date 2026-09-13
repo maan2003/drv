@@ -30,6 +30,27 @@ static struct sockaddr_storage addr(int family, unsigned short port) {
 	return a;
 }
 static socklen_t alen(int family) { return family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6); }
+static void check_name(int fd, int family, int peer, unsigned short expected_port, int wildcard) {
+    struct sockaddr_storage got;
+    socklen_t n = sizeof(got);
+    check((peer ? getpeername(fd, (void *)&got, &n) : getsockname(fd, (void *)&got, &n)) == 0,
+          peer ? "getpeername" : "getsockname");
+    struct sockaddr_storage expected = addr(family, expected_port);
+    if (wildcard) {
+        if (family == AF_INET) ((struct sockaddr_in *)&expected)->sin_addr.s_addr = 0;
+        else memset(&((struct sockaddr_in6 *)&expected)->sin6_addr, 0, 16);
+    }
+    check(n == alen(family) && got.ss_family == family, "socket name family");
+    if (family == AF_INET) {
+        struct sockaddr_in *g = (void *)&got, *e = (void *)&expected;
+        check(g->sin_addr.s_addr == e->sin_addr.s_addr, "core-selected IPv4 socket name");
+        check(expected_port ? g->sin_port == e->sin_port : (wildcard ? !g->sin_port : !!g->sin_port), "IPv4 socket name port");
+    } else {
+        struct sockaddr_in6 *g = (void *)&got, *e = (void *)&expected;
+        check(!memcmp(&g->sin6_addr, &e->sin6_addr, 16), "core-selected IPv6 socket name");
+        check(expected_port ? g->sin6_port == e->sin6_port : (wildcard ? !g->sin6_port : !!g->sin6_port), "IPv6 socket name port");
+    }
+}
 static void wait_event(int fd, unsigned int mask) {
 	int ep = epoll_create1(EPOLL_CLOEXEC);
 	struct epoll_event e = { .events = mask }, got;
@@ -58,6 +79,7 @@ static void tcp(int family, unsigned short port) {
 	struct sockaddr_storage a = addr(family, port);
 	int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	check(listener >= 0, "tcp socket");
+    check_name(listener, family, 0, 0, 1);
 	check(bind(listener, (void *)&a, alen(family)) == 0, "tcp bind");
 	check(listen(listener, 8) == 0, "tcp listen");
     check(fcntl(listener, F_SETFL, O_NONBLOCK) == 0, "listener nonblock");
@@ -74,6 +96,8 @@ static void tcp(int family, unsigned short port) {
 		wait_event(fd, EPOLLOUT);
 		int error = -1; socklen_t n = sizeof(error);
 		check(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &n) == 0 && error == 0, "connect SO_ERROR");
+        check_name(fd, family, 0, 0, 0);
+        check_name(fd, family, 1, port, 0);
 		unsigned char *buf = malloc(length);
 		check(buf != NULL, "client malloc");
 		for (size_t i = 0; i < length; ++i) buf[i] = (i * 29 + i / 251) & 255;
@@ -126,6 +150,8 @@ static void udp(int family) {
 		family == AF_INET ? IP_RECVERR : IPV6_RECVERR, &enabled, sizeof(enabled)) < 0 &&
 		errno == ENOPROTOOPT, "unsupported optional protocol option");
 	check(connect(client, (void *)&a, alen(family)) == 0, "nonblocking UDP connect is immediate");
+    check_name(client, family, 0, 0, 0);
+    check_name(client, family, 1, 23457, 0);
 	check(send(client, "peer", 4, 0) == 4, "connected UDP send");
 	wait_event(server, EPOLLIN);
 	check(recv(server, b, sizeof(b), 0) == 4 && !memcmp(b, "peer", 4), "connected UDP receive");
@@ -165,6 +191,22 @@ int main(int argc, char **argv) {
                 WIFEXITED(status) && WEXITSTATUS(status) == 0, "parallel client");
         }
         puts("PASS PARALLEL_TCP_16");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "bench-idle")) {
+        enum { IDLE = 128 };
+        int idle[IDLE];
+        for (int i = 0; i < IDLE; ++i) {
+            idle[i] = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            struct sockaddr_storage a = addr(AF_INET, 0);
+            check(idle[i] >= 0 && bind(idle[i], (void *)&a, alen(AF_INET)) == 0,
+                  "idle UDP ephemeral bind");
+        }
+        payload_length = 64 * 1024 * 1024;
+        puts("BENCH_IDLE sockets=128");
+        tcp(AF_INET, 23456); tcp(AF_INET6, 23456);
+        for (int i = 0; i < IDLE; ++i) close(idle[i]);
+        puts("PASS IDLE_SOCKET_TCP");
         return 0;
     }
 	if (argc == 2 && (!strcmp(argv[1], "bench") || !strcmp(argv[1], "bench-long"))) {
