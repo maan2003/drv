@@ -112,9 +112,9 @@ use mt7921_softmac_adapter::production_effects::{
 };
 #[cfg(feature = "fuchsia-passive")]
 use mt7921_softmac_adapter::{
-    LinuxChannelShape, Mt7921ProductionClient, Mt7921SoftmacAdapter, PassiveMechanicsEvent,
-    PassivePrerequisites, SourceExactPassiveMechanics, SourceExactPassiveTransport,
-    query_from_capabilities, set_channel_request,
+    LinuxChannelShape, Mt7921SoftmacAdapter, PassiveMechanicsEvent, PassivePrerequisites,
+    SourceExactPassiveMechanics, SourceExactPassiveTransport, query_from_capabilities,
+    set_channel_request,
 };
 #[cfg(feature = "fuchsia-passive")]
 use sha2::{Digest as _, Sha256};
@@ -142,9 +142,7 @@ use std::{
 };
 use userspace_vfio::{Ioas, RegionInfo, VfioIrq};
 #[cfg(feature = "fuchsia-passive")]
-use wifi_control_service::{
-    PreparedServerEndpoints, RuntimeError as WifiRuntimeError, WifiRuntime,
-};
+use wifi_control_service::PreparedServerEndpoints;
 
 const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
@@ -548,107 +546,6 @@ fn poll_network_ready_handshake(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
             Err(error) => Err(format!("netstack bootstrap close acknowledgment: {error}")),
         };
-    }
-}
-
-#[cfg(feature = "fuchsia-passive")]
-struct MtWifiRuntime<'hardware>(Mt7921ProductionClient<'hardware>);
-
-#[cfg(feature = "fuchsia-passive")]
-fn wifi_runtime_error(error: PinnedConnectError) -> WifiRuntimeError {
-    match error {
-        PinnedConnectError::Failed(result) => WifiRuntimeError::Failed(result),
-        PinnedConnectError::Timeout => WifiRuntimeError::Timeout,
-        PinnedConnectError::Driver(PinnedDriverError::RoamUnsupported) => {
-            WifiRuntimeError::Unsupported
-        }
-        PinnedConnectError::Driver(_) => WifiRuntimeError::DriverFault,
-        PinnedConnectError::Containment => WifiRuntimeError::ContainmentFault,
-    }
-}
-
-#[cfg(feature = "fuchsia-passive")]
-impl WifiRuntime for MtWifiRuntime<'_> {
-    fn public_mac(&self) -> [u8; 6] {
-        self.0.public_mac()
-    }
-
-    fn take_ethernet_device(&mut self) -> Option<OwnedFd> {
-        self.0
-            .take_ethernet_device()
-            .map(|device| device.into_frame_fd())
-    }
-
-    fn begin_connect(
-        &mut self,
-        request: fidl_sme::ConnectRequest,
-        deadline: Instant,
-    ) -> Result<(), WifiRuntimeError> {
-        self.0
-            .begin_connect(request, deadline)
-            .map_err(wifi_runtime_error)
-    }
-
-    async fn drive_connect_once(
-        &mut self,
-    ) -> Result<Option<fidl_sme::ConnectResult>, WifiRuntimeError> {
-        self.0
-            .drive_connect_once()
-            .await
-            .map_err(wifi_runtime_error)
-    }
-
-    async fn cancel_connect(
-        &mut self,
-        reason: fidl_sme::UserDisconnectReason,
-        deadline: Instant,
-    ) -> Result<fidl_sme::ConnectResult, WifiRuntimeError> {
-        self.0
-            .cancel_connect(reason, deadline)
-            .await
-            .map_err(wifi_runtime_error)
-    }
-
-    fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), WifiRuntimeError> {
-        self.0.roam(request).map_err(wifi_runtime_error)
-    }
-
-    fn begin_scan(
-        &mut self,
-        request: fidl_sme::ScanRequest,
-        deadline: Instant,
-    ) -> Result<(), WifiRuntimeError> {
-        self.0
-            .begin_scan(request, deadline)
-            .map_err(wifi_runtime_error)
-    }
-
-    async fn drive_scan_once(
-        &mut self,
-    ) -> Result<Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>, WifiRuntimeError>
-    {
-        self.0.drive_scan_once().await.map_err(wifi_runtime_error)
-    }
-
-    async fn drive_once(&mut self) -> Result<bool, WifiRuntimeError> {
-        self.0.drive_once().await.map_err(wifi_runtime_error)
-    }
-
-    fn next_connection_event(
-        &mut self,
-    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, WifiRuntimeError> {
-        self.0.next_connection_event().map_err(wifi_runtime_error)
-    }
-
-    async fn disconnect(
-        &mut self,
-        reason: fidl_sme::UserDisconnectReason,
-        deadline: Instant,
-    ) -> Result<(), WifiRuntimeError> {
-        self.0
-            .disconnect(reason, deadline)
-            .await
-            .map_err(wifi_runtime_error)
     }
 }
 
@@ -7570,8 +7467,7 @@ fn run() -> Result<(), String> {
                                     )?;
                                     drop(runner);
                                     let mut client =
-                                        futures::executor::block_on(Mt7921ProductionClient::new(
-                                            device,
+                                        futures::executor::block_on(device.into_runtime(
                                             device_info,
                                             security_support,
                                             spectrum_support,
@@ -7584,7 +7480,7 @@ fn run() -> Result<(), String> {
                                             .take()
                                             .ok_or("Wi-Fi service endpoints were not retained")?;
                                         let mut server = endpoints
-                                            .bind_runtime(MtWifiRuntime(client))
+                                            .bind_runtime(client)
                                             .post_lockdown_open_complete()
                                             .map_err(|error| {
                                                 format!("open MT7921 control generation: {error}")
@@ -7594,7 +7490,7 @@ fn run() -> Result<(), String> {
                                             format!("MT7921 control service: {error}")
                                         });
                                         let mut runtime = server.into_runtime();
-                                        let stop = runtime.0.stop().map_err(|error| {
+                                        let stop = runtime.stop().map_err(|error| {
                                             format!("stop MT7921 client runtime: {error}")
                                         });
                                         result?;
@@ -7700,7 +7596,7 @@ fn run() -> Result<(), String> {
                                         }
                                         netstack.poll_network_ready()?;
                                         let progressed = match futures::executor::block_on(
-                                            client.drive_once(),
+                                            client.drive_service_once(),
                                         ) {
                                             Ok(progressed) => progressed,
                                             Err(PinnedConnectError::Driver(
@@ -20873,7 +20769,7 @@ mod tests {
     #[test]
     fn live_wpa3_path_keeps_driver_owner_while_netstack_runs_out_of_process() {
         let source = include_str!("vfio_read.rs");
-        let runtime_constructor = source.find("Mt7921ProductionClient::new").unwrap();
+        let runtime_constructor = source.find("device.into_runtime(").unwrap();
         let start = source[..runtime_constructor]
             .rfind("let (mut device, runner) =")
             .unwrap();
@@ -20884,20 +20780,20 @@ mod tests {
         let exchange = &source[start..end];
         for required in [
             "Mt7921ClientDevice::new",
-            "Mt7921ProductionClient::new",
+            "device.into_runtime(",
             ".take_ethernet_device()",
             "fidl_internal::Protocol::Wpa3Personal",
             ".into_passphrase()",
             "client.connect(request, deadline)",
             "spawn_netstack_child",
-            "client.drive_once()",
+            "client.drive_service_once()",
         ] {
             assert!(exchange.contains(required), "{required}");
         }
         let connect = exchange.find("client.connect(request, deadline)").unwrap();
         let take = exchange.find(".take_ethernet_device()").unwrap();
         let spawn = exchange.find("spawn_netstack_child").unwrap();
-        let pump = exchange.find("client.drive_once()").unwrap();
+        let pump = exchange.find("client.drive_service_once()").unwrap();
         assert!(connect < take && take < spawn && spawn < pump);
         let launcher = include_str!("vfio_read.rs");
         let process = launcher
@@ -21598,7 +21494,7 @@ mod tests {
             .split("let passphrase = sae_credential")
             .next()
             .unwrap();
-        assert!(service.contains("bind_runtime(MtWifiRuntime(client))"));
+        assert!(service.contains("bind_runtime(client)"));
         assert!(service.contains("run_to_terminal()"));
         assert!(service.contains("wifi_control_terminal=true callbacks_revoked=true"));
         assert!(!service.contains("hardware_stopped=true"));
@@ -21689,7 +21585,7 @@ mod tests {
             .next()
             .unwrap();
         let acquire = sae.find("acquire_sae_tx_resources").unwrap();
-        let runtime = sae.find("Mt7921ProductionClient::new").unwrap();
+        let runtime = sae.find("device.into_runtime(").unwrap();
         let connect = sae.find("client.connect(request, deadline)").unwrap();
         assert!(acquire < runtime && runtime < connect);
         assert!(!sae.contains("program_live_rate_power"));

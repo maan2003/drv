@@ -11,7 +11,6 @@ use fdf::ArenaStaticBox;
 use fidl_fuchsia_wlan_common as fidl_common;
 use fidl_fuchsia_wlan_driver as fidl_driver;
 use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
-#[cfg(test)]
 use fidl_fuchsia_wlan_mlme as fidl_mlme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 #[cfg(test)]
@@ -1189,6 +1188,36 @@ impl<E> Mt7921ClientDevice<E, NoClientScan> {
 impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     Mt7921ClientDevice<E, Mt7921SoftmacAdapter<T>>
 {
+    /// Consume the sole device owner into the protocol runtime. Service
+    /// composition receives the runtime directly, without retaining a second
+    /// effects/transport handle or a chip-specific forwarding façade.
+    pub async fn into_runtime(
+        self,
+        device_info: fidl_mlme::DeviceInfo,
+        security: fidl_common::SecuritySupport,
+        spectrum: fidl_common::SpectrumManagementSupport,
+        inspector: fuchsia_inspect::Inspector,
+        ethernet_queue_capacity: usize,
+    ) -> Result<PinnedClientRuntime<E, T>, anyhow::Error> {
+        let device = self.into_production_owner().map_err(|status| {
+            anyhow::anyhow!("MT7921 effects/transport owner is still shared: {status}")
+        })?;
+        PinnedClientRuntime::new_with_ethernet_capacity(
+            device,
+            {
+                let mut config = wlan_sme::client::ClientConfig::default();
+                config.wpa3_supported = true;
+                config
+            },
+            device_info,
+            security,
+            spectrum,
+            inspector,
+            ethernet_queue_capacity,
+        )
+        .await
+    }
+
     /// Construct the usable production boundary. TX authorization is checked
     /// by `effects` at every submission; construction grants no authority.
     pub fn new(

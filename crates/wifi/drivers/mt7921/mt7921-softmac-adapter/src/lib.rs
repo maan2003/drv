@@ -7,10 +7,7 @@
 
 pub mod client_device;
 pub mod ethernet;
-mod production_client;
 pub mod production_effects;
-
-pub use production_client::Mt7921ProductionClient;
 
 use fidl_fuchsia_wlan_ieee80211::{HtCapabilities, VhtCapabilities};
 use fuchsia_softmac_port::{
