@@ -105,6 +105,33 @@ pub(super) struct ActiveMcuViews<'a, B: Backend> {
     pub start: Instant,
 }
 
+impl<B: Backend> crate::OwnedHardwareResources<B> {
+    pub(super) fn active_mcu_views<'a>(
+        &'a mut self,
+        receive: &'a mut crate::receive::RxRouting,
+        start: Instant,
+    ) -> Result<ActiveMcuViews<'a, B>, drv_hardware::Error> {
+        let dma = &mut self.dma;
+        Ok(ActiveMcuViews {
+            wfdma: self.bar0.slice(0xd4000, 4096)?,
+            tx_ring: &mut dma.mcu_tx_ring,
+            payloads: &mut dma.command_payloads,
+            fwdl_ring: &mut dma.fwdl_ring,
+            fwdl_payload: &mut dma.fwdl_payload,
+            wm_ring: &mut dma.mcu_rx_ring,
+            wm_buffers: &mut dma.mcu_rx_buffers,
+            wm2_ring: &mut dma.wa_rx_ring,
+            wm2_buffers: &mut dma.wa_rx_buffers,
+            interrupt: self
+                .interrupt
+                .as_ref()
+                .ok_or(drv_hardware::Error::Invalid)?,
+            receive,
+            start,
+        })
+    }
+}
+
 impl<B: Backend> ActiveMcuViews<'_, B> {
     fn ring_number(ring: McuRxIrqRing) -> usize {
         if ring == McuRxIrqRing::Wm { 0 } else { 4 }

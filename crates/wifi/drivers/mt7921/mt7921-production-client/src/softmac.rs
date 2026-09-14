@@ -29,18 +29,18 @@ impl ClientRuntimeDriver for Mt7921Driver {
         if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
             return Err(zx::Status::BAD_STATE);
         }
-        if self.mac_preparation.complete() {
-            return Ok(false);
-        }
         let resources = self
             .session
             .resources
-            .as_ref()
+            .as_mut()
             .ok_or(zx::Status::BAD_STATE)?;
-        match self
-            .mac_preparation
-            .drive(&resources.bar0, std::time::Instant::now())
-        {
+        match self.mac_initialization.drive(
+            resources,
+            &mut self.session.mcu.0,
+            &mut self.session.receive,
+            self.session.start,
+            std::time::Instant::now(),
+        ) {
             Ok(progress) => Ok(progress),
             Err(status) => {
                 // Block all further operational turns. The owner retains DMA

@@ -4720,12 +4720,11 @@ fn expect_loader_completion<E>(
     }
 }
 
-fn run_firmware_loader<T: FirmwareLoaderTransport>(
+fn run_firmware_prefix<T: FirmwareLoaderTransport>(
     transport: &mut T,
     patch: Patch<'_>,
     firmware: Firmware<'_>,
     state: &mut FirmwareLoaderState,
-    configure_channel_domain: bool,
     stop_after_patch: bool,
     stop_after_capability: bool,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
@@ -4981,33 +4980,9 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
                 completion,
                 FirmwareCommandCompletion::NoResponse,
             )?;
-            for command in [
-                DownloadCommand::EepromBufferMode,
-                DownloadCommand::ProtectControl,
-            ] {
-                let completion = loader_command(transport, command)?;
-                expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
-            }
-            for command in &commands {
-                if let Some(response) = loader_set_clc(transport, command)? {
-                    report.special_unii_mask = response.special_unii_mask;
-                }
-                report.clc_rules_applied = report
-                    .clc_rules_applied
-                    .checked_add(1)
-                    .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
-            }
-            if configure_channel_domain {
-                let command = conservative_channel_domain(
-                    report.nic_capability,
-                    *b"00",
-                    true,
-                    report.special_unii_mask,
-                )
-                .map_err(FirmwareLoaderFailure::ChannelDomain)?;
-                loader_set_channel_domain(transport, &command)?;
-                *state = FirmwareLoaderState::ChannelDomainConfigured;
-            }
+            let command = DownloadCommand::EepromBufferMode;
+            let completion = loader_command(transport, command)?;
+            expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
             *state = FirmwareLoaderState::Ready;
             Ok(report)
         }
@@ -5016,6 +4991,67 @@ fn run_firmware_loader<T: FirmwareLoaderTransport>(
             completion,
         }),
     }
+}
+
+// Diagnostic compatibility suffix. Its historic MCU-only ordering is not
+// Linux MAC initialization: the production owner must insert MAC MMIO before
+// ProtectControl and perform regulatory configuration at its proper boundary.
+fn run_firmware_loader<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+    state: &mut FirmwareLoaderState,
+    configure_channel_domain: bool,
+    stop_after_patch: bool,
+    stop_after_capability: bool,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderFailure<T::Error>> {
+    let mut report = run_firmware_prefix(
+        transport,
+        patch,
+        firmware,
+        state,
+        stop_after_patch,
+        stop_after_capability,
+    )?;
+    if stop_after_patch || stop_after_capability {
+        return Ok(report);
+    }
+    *state = FirmwareLoaderState::ClcConfigured;
+    let command = DownloadCommand::ProtectControl;
+    let completion = loader_command(transport, command)?;
+    expect_loader_completion(command, completion, FirmwareCommandCompletion::Ack)?;
+    let commands = world_clc_commands(
+        firmware,
+        report
+            .eeprom_hardware
+            .hardware_info()
+            .expect("the fixed EEPROM hardware block was validated"),
+        report.nic_capability.chip_capability.unwrap_or(0),
+        transport.acpi_configuration(),
+    )
+    .map_err(FirmwareLoaderFailure::Clc)?;
+    for command in &commands {
+        if let Some(response) = loader_set_clc(transport, command)? {
+            report.special_unii_mask = response.special_unii_mask;
+        }
+        report.clc_rules_applied = report
+            .clc_rules_applied
+            .checked_add(1)
+            .ok_or(FirmwareLoaderFailure::Clc(ClcDiscoveryError::CountOverflow))?;
+    }
+    if configure_channel_domain {
+        let command = conservative_channel_domain(
+            report.nic_capability,
+            *b"00",
+            true,
+            report.special_unii_mask,
+        )
+        .map_err(FirmwareLoaderFailure::ChannelDomain)?;
+        loader_set_channel_domain(transport, &command)?;
+        *state = FirmwareLoaderState::ChannelDomainConfigured;
+    }
+    *state = FirmwareLoaderState::Ready;
+    Ok(report)
 }
 
 /// Execute the bounded Linux MT7921 patch + RAM loading sequence. Cleanup is
@@ -5043,20 +5079,19 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
     finish_firmware_loader(transport, state, result)
 }
 
-/// Initialize the complete firmware/control-plane sequence through channel
-/// domain setup and leave a successful transport live for the owning driver.
+/// Initialize firmware, initial CLC and EEPROM mode, leaving the transport live
+/// at Linux's pre-MAC boundary. The owning driver must next initialize MAC MMIO,
+/// then publish and complete ProtectControl before regulatory/PHY setup.
 ///
-/// Initialization commands and patch-semaphore handling are identical to the
-/// bounded loader. Failure always attempts transport quiescence and retains
-/// both the primary and cleanup errors. The driver remains responsible for
-/// full hardware containment after failure and at the end of its lifetime.
+/// Failure always attempts transport quiescence and retains both primary and
+/// cleanup errors. The driver remains responsible for full hardware containment.
 pub fn initialize_mt7921_firmware<T: FirmwareLoaderTransport>(
     transport: &mut T,
     patch: Patch<'_>,
     firmware: Firmware<'_>,
 ) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
     let mut state = FirmwareLoaderState::Powering;
-    match run_firmware_loader(transport, patch, firmware, &mut state, true, false, false) {
+    match run_firmware_prefix(transport, patch, firmware, &mut state, false, false) {
         Ok(report) => Ok(report),
         Err(failure) => finish_firmware_loader(transport, state, Err(failure)),
     }
@@ -15998,21 +16033,28 @@ mod tests {
     }
 
     #[test]
-    fn live_firmware_initialization_preserves_sequence_without_quiescing_success() {
+    fn live_firmware_initialization_stops_before_mac_and_preserves_sequence() {
         let (patch_bytes, ram_bytes) = loader_images();
-        let patch = Patch::parse(&patch_bytes).unwrap();
-        let ram = Firmware::parse(&ram_bytes).unwrap();
         let mut bounded = FakeFirmwareLoader {
             clc_mask: 0,
             ..Default::default()
         };
-        let expected =
-            load_mt7921_firmware_through_channel_domain(&mut bounded, patch, ram).unwrap();
-        assert_eq!(
-            bounded.trace.pop(),
-            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
-        );
-
+        load_mt7921_firmware_through_channel_domain(
+            &mut bounded,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        let boundary = bounded
+            .trace
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    LoaderTrace::Command(DownloadCommand::ProtectControl, _)
+                )
+            })
+            .unwrap();
         let mut live = FakeFirmwareLoader {
             clc_mask: 0,
             ..Default::default()
@@ -16023,10 +16065,12 @@ mod tests {
             Firmware::parse(&ram_bytes).unwrap(),
         )
         .unwrap();
-        assert_eq!(report, expected);
-        assert_eq!(live.trace, bounded.trace);
-        assert_eq!(live.sequence, bounded.sequence);
-        assert_eq!(live.now_ms, bounded.now_ms);
+        assert_eq!(live.trace, bounded.trace[..boundary]);
+        assert_eq!(report.clc_rules_applied, 1);
+        assert!(matches!(
+            live.trace.last(),
+            Some(LoaderTrace::Command(DownloadCommand::EepromBufferMode, _))
+        ));
         let next_sequence = live.sequence % 15 + 1;
         loader_command(&mut live, DownloadCommand::GetNicCapability).unwrap();
         assert_eq!(

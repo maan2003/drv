@@ -32,28 +32,10 @@ impl<B: Backend, P: ActivationPci> ProductionFirmwareLoader<'_, B, P> {
             &mut ActiveMcuViews<'_, B>,
         ) -> Result<R, LoaderMechanicsError<drv_hardware::Error>>,
     ) -> Result<R, String> {
-        let resources = &mut *self.resources;
-        let dma = &mut resources.dma;
-        let mut views = ActiveMcuViews {
-            wfdma: resources
-                .bar0
-                .slice(0xd4000, 4096)
-                .map_err(|error| format!("slice WFDMA: {error:?}"))?,
-            tx_ring: &mut dma.mcu_tx_ring,
-            payloads: &mut dma.command_payloads,
-            fwdl_ring: &mut dma.fwdl_ring,
-            fwdl_payload: &mut dma.fwdl_payload,
-            wm_ring: &mut dma.mcu_rx_ring,
-            wm_buffers: &mut dma.mcu_rx_buffers,
-            wm2_ring: &mut dma.wa_rx_ring,
-            wm2_buffers: &mut dma.wa_rx_buffers,
-            interrupt: resources
-                .interrupt
-                .as_ref()
-                .ok_or("loader interrupt already released")?,
-            receive: self.receive,
-            start: self.start,
-        };
+        let mut views = self
+            .resources
+            .active_mcu_views(self.receive, self.start)
+            .map_err(|error| format!("construct MCU views: {error:?}"))?;
         operation(self.mechanics, &mut views)
             .map_err(|error| format!("shared loader mechanics: {error:?}"))
     }

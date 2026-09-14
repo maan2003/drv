@@ -72,6 +72,7 @@ pub struct DeviceResponseInput {
 pub struct DeviceModel(Rc<RefCell<DeviceModelState>>);
 
 struct DeviceModelState {
+    dma_writes: VecDeque<(u64, Vec<u8>)>,
     register_reads: VecDeque<u32>,
     response_bytes: Vec<u8>,
     completions_per_poll: VecDeque<usize>,
@@ -82,6 +83,7 @@ struct DeviceModelState {
 impl DeviceModel {
     fn new(input: DeviceResponseInput) -> Self {
         Self(Rc::new(RefCell::new(DeviceModelState {
+            dma_writes: VecDeque::new(),
             register_reads: input.register_reads.into(),
             response_bytes: input.response_bytes,
             completions_per_poll: input.completions_per_poll.into(),
@@ -90,10 +92,16 @@ impl DeviceModel {
         })))
     }
 
+    /// Queue a device-side DMA write, applied before the next CPU DMA read.
+    /// Mapping, direction and streaming ownership are checked by the backend.
+    pub fn write_dma(&self, address: u64, bytes: Vec<u8>) {
+        self.0.borrow_mut().dma_writes.push_back((address, bytes));
+    }
+
     /// Number of response decisions not yet consumed by the driver.
     pub fn remaining_decisions(&self) -> usize {
         let state = self.0.borrow();
-        state.register_reads.len() + state.completions_per_poll.len()
+        state.register_reads.len() + state.completions_per_poll.len() + state.dma_writes.len()
     }
 }
 
@@ -316,6 +324,20 @@ impl DeterministicBackend {
         };
         (Device::from_backend(backend), operations)
     }
+    pub fn recording_mt7921_device_with_model(
+        input: DeviceResponseInput,
+    ) -> (Device<Self>, OperationLog, DeviceModel) {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let model = DeviceModel::new(input);
+        let backend = Self {
+            operations: Some(operations.clone()),
+            device_model: Some(model.clone()),
+            mt7921_activation_model: true,
+            ..Self::default()
+        };
+        (Device::from_backend(backend), operations, model)
+    }
+
     pub fn recording_mt7921_activation_device_with_failures()
     -> (Device<Self>, OperationLog, FailureInjection) {
         let operations = Rc::new(RefCell::new(Vec::new()));
@@ -394,6 +416,30 @@ impl DeterministicBackend {
         }
         Ok(())
     }
+    fn apply_device_writes(&mut self) -> Result<()> {
+        let Some(model) = self.device_model.clone() else {
+            return Ok(());
+        };
+        while let Some((address, bytes)) = model.0.borrow_mut().dma_writes.pop_front() {
+            let (id, range) = self
+                .dmas
+                .iter()
+                .find_map(|(id, dma)| {
+                    let offset = usize::try_from(address.checked_sub(dma.iova)?).ok()?;
+                    let end = offset.checked_add(bytes.len())?;
+                    (end <= dma.bytes.len()).then_some((*id, offset..end))
+                })
+                .ok_or(Error::OutOfBounds)?;
+            self.device_accessible(id, range.clone())?;
+            let dma = self.dma_mut(&id)?;
+            if matches!(dma.direction, DmaDirection::ToDevice) {
+                return Err(Error::Invalid);
+            }
+            dma.bytes[range].copy_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
     fn device_accessible(&self, dma: u64, range: Range<usize>) -> Result<()> {
         let dma = self.dmas.get(&dma).ok_or(Error::StaleHandle)?;
         if self.cache_coherent
@@ -682,6 +728,7 @@ impl Backend for DeterministicBackend {
         self.alloc_dma(size, constraints.alignment, direction, coherent)
     }
     fn dma_read(&mut self, dma: &u64, r: Range<usize>, out: &mut [u8]) -> Result<()> {
+        self.apply_device_writes()?;
         let d = self.dma(dma)?;
         if matches!(d.direction, DmaDirection::ToDevice) {
             return Err(Error::Invalid);
@@ -728,6 +775,7 @@ impl Backend for DeterministicBackend {
         Ok(())
     }
     fn dma_read_once_u32(&mut self, dma: &u64, offset: usize) -> Result<u32> {
+        self.apply_device_writes()?;
         let bytes: [u8; 4] = self.dma(dma)?.bytes[offset..offset + 4]
             .try_into()
             .map_err(|_| Error::OutOfBounds)?;
@@ -942,6 +990,29 @@ pub fn run_edu_sequence<B: Backend>(device: &Device<B>) -> Result<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn modeled_device_dma_checks_mapping_direction_and_streaming_ownership() {
+        use drv_hardware::{FromDevice, ToDevice};
+        let (device, _, model) =
+            DeterministicBackend::recording_noncoherent_device_with_model(Default::default());
+        let mut rx = device.alloc_coherent::<FromDevice>(4096, 4096).unwrap();
+        let address = rx.device_address(0).unwrap().bits();
+        model.write_dma(address + 3, vec![7, 8]);
+        let mut bytes = [0; 2];
+        rx.read(3, &mut bytes).unwrap();
+        assert_eq!(bytes, [7, 8]);
+        assert_eq!(model.remaining_decisions(), 0);
+        model.write_dma(address + 4095, vec![1, 2]);
+        assert_eq!(rx.read(0, &mut bytes), Err(Error::OutOfBounds));
+        let tx = device.alloc_coherent::<ToDevice>(4096, 4096).unwrap();
+        model.write_dma(tx.device_address(0).unwrap().bits(), vec![1]);
+        assert_eq!(rx.read(0, &mut bytes), Err(Error::Invalid));
+        let mut stream = device.alloc_streaming::<FromDevice>(4096, 4096).unwrap();
+        stream.sync_for_cpu(0, 4096).unwrap();
+        model.write_dma(stream.device_address(0).unwrap().bits(), vec![1]);
+        assert_eq!(rx.read(0, &mut bytes), Err(Error::DeviceFault));
+    }
+
     #[test]
     fn safe_sequence_covers_dma_mmio_irq_reset_and_bounds() {
         let dev = DeterministicBackend::device();

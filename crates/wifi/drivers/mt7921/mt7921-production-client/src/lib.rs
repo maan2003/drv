@@ -900,7 +900,8 @@ pub fn run_firmware_bootstrap(
 }
 
 /// An exclusively owned, initialized MT7921 device. Construction completes
-/// firmware loading, EEPROM/CLC and channel-domain setup; it is not an unchecked
+/// firmware loading and initial EEPROM/CLC setup, before MAC initialization;
+/// channel-domain and radio setup remain pending. It is not an unchecked
 /// wrapper around a resource graph. Protocol and driver remain in one process.
 ///
 /// Operational ownership cannot be forged:
@@ -911,7 +912,7 @@ pub fn run_firmware_bootstrap(
 pub struct Mt7921Driver {
     session: Mt7921HardwareSession,
     firmware: FirmwareLoaderReport,
-    mac_preparation: radio::MacPreparation,
+    mac_initialization: radio::MacInitialization,
 }
 
 impl Mt7921Driver {
@@ -932,7 +933,7 @@ impl Mt7921Driver {
                 Ok(Self {
                     session,
                     firmware,
-                    mac_preparation: radio::MacPreparation::new(),
+                    mac_initialization: radio::MacInitialization::new(),
                 })
             }
             Err(source) => {
