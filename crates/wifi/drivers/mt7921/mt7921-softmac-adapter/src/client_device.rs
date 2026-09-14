@@ -1198,7 +1198,11 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
         spectrum: fidl_common::SpectrumManagementSupport,
         inspector: fuchsia_inspect::Inspector,
         ethernet_queue_capacity: usize,
-    ) -> Result<PinnedClientRuntime<E, T>, anyhow::Error> {
+    ) -> Result<PinnedClientRuntime<E, T>, anyhow::Error>
+    where
+        E: 'static,
+        T: 'static,
+    {
         let device = self.into_production_owner().map_err(|status| {
             anyhow::anyhow!("MT7921 effects/transport owner is still shared: {status}")
         })?;

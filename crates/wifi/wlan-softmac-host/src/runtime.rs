@@ -438,6 +438,170 @@ pub enum DriverError {
     UpcallOverflow,
 }
 
+enum MlmeInput {
+    Request(wlan_sme::MlmeRequest),
+    Upcall(Upcall),
+    Timeout(wlan_mlme::client::TimedEvent),
+    Ethernet(Vec<u8>),
+}
+
+/// Owns MLME across awaited device operations; it never borrows ClientRuntime.
+/// A single poll handles at most one input, even when every completion is ready.
+struct MlmeTask {
+    sender: mpsc::Sender<MlmeInput>,
+    future: futures::future::LocalBoxFuture<'static, Result<(), ConnectError>>,
+    pending: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl MlmeTask {
+    fn new<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver + 'static>(
+        mut mlme: wlan_mlme::client::ClientMlme<HostMlmeDevice<D>>,
+        io: Arc<Mutex<HostIo>>,
+    ) -> Self {
+        let (sender, mut receiver) = mpsc::channel(UPCALL_QUEUE_CAPACITY);
+        let pending = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let work = pending.clone();
+        let future = async move {
+            while let Some(input) = receiver.next().await {
+                match input {
+                    MlmeInput::Request(request) => {
+                    let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
+                    let eapol_tx = matches!(&request, wlan_sme::MlmeRequest::Eapol(_));
+                    if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
+                        println!(
+                            "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
+                            frame.seq_num,
+                            frame.status_code.into_primitive(),
+                            sae_group(frame)
+                        );
+                    }
+                    if eapol_tx {
+                        println!("client_eapol_stage=sme_tx_request");
+                    }
+                    match &request {
+                        wlan_sme::MlmeRequest::SaeHandshakeResp(response) => {
+                            eprintln!("client_sae_handshake response={response:?}");
+                        }
+                        wlan_sme::MlmeRequest::Deauthenticate(request) => {
+                            eprintln!("client_deauthenticate request={request:?}");
+                        }
+                        _ => {}
+                    }
+                    let name = request.name();
+                    // Diagnostic: surface every MLME request the SME issues so the
+                    // post-4-way sequence (SetKeys GTK/IGTK, SetCtrlPort, Deauth) is
+                    // visible when the connect fails after PTK.
+                    println!("client_mlme_request name={name}");
+                    wlan_mlme::MlmeImpl::handle_mlme_request(&mut mlme, request)
+                        .await
+                        .map_err(|error| {
+                            ConnectError::Driver(DriverError::MlmeRequest {
+                                name,
+                                // Pinned MLME errors contain status/contract names,
+                                // never request frame or credential bytes.
+                                detail: error.to_string(),
+                            })
+                        })?;
+                    println!("client_mlme_request_complete name={name}");
+                    if sae_frame_tx {
+                        println!(
+                            "client_sae_stage=mlme_request_complete state={}",
+                            mlme.sae_state_name()
+                        );
+                    }
+                    if eapol_tx {
+                        println!("client_eapol_stage=mlme_tx_request_complete");
+                    }
+                    }
+                    MlmeInput::Upcall(upcall) => {
+            match upcall {
+                Upcall::ScanComplete { status, scan_id } => {
+                    MlmeImpl::handle_scan_complete(&mut mlme, status, scan_id).await;
+                }
+                Upcall::TxResult(result) => {
+                    if let Some(minstrel) = io.lock().unwrap().minstrel.clone() {
+                        minstrel.lock().handle_tx_result_report(&result);
+                    }
+                }
+                Upcall::Recv { bytes, info } => {
+                    let auth = safe_auth_stage(&bytes);
+                    let eapol = bytes
+                        .windows(8)
+                        .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+                    MlmeImpl::handle_mac_frame_rx(
+                        &mut mlme,
+                        &bytes,
+                        info,
+                        fuchsia_trace::Id::new(),
+                    )
+                    .await;
+                    if let Some((algorithm, transaction, status, rejected_group)) = auth {
+                        println!(
+                            "client_mlme_rx stage=handle_complete algorithm={algorithm} transaction={transaction} status={status} rejected_group={rejected_group:?}"
+                        );
+                    }
+                    if eapol {
+                        println!("client_eapol_stage=mlme_handle_complete");
+                    }
+                }
+            }
+                    }
+                    MlmeInput::Timeout(event) => {
+                        MlmeImpl::handle_timeout(&mut mlme, event).await;
+                    }
+                    MlmeInput::Ethernet(bytes) => {
+                        if let Err(error) = MlmeImpl::handle_eth_frame_tx(
+                            &mut mlme, &bytes, fuchsia_trace::Id::new(),
+                        ) {
+                            println!("client_data_tx_error stage=ethernet_pump kind=target_rejected error={error}");
+                        }
+                    }
+                }
+                work.set(work.get() - 1);
+                let mut yielded = false;
+                futures::future::poll_fn(move |cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }).await;
+            }
+            Err(ConnectError::Driver(DriverError::RequestStreamClosed))
+        }.boxed_local();
+        Self {
+            sender,
+            future,
+            pending,
+        }
+    }
+
+    fn enqueue(&mut self, input: MlmeInput) -> Result<(), ConnectError> {
+        if self.pending.get() == UPCALL_QUEUE_CAPACITY {
+            return Err(ConnectError::Driver(DriverError::ControlBudgetExhausted));
+        }
+        self.sender
+            .try_send(input)
+            .map_err(|_| ConnectError::Driver(DriverError::RequestStreamClosed))?;
+        self.pending.set(self.pending.get() + 1);
+        Ok(())
+    }
+
+    fn poll_once(&mut self) -> Result<bool, ConnectError> {
+        let before = self.pending.get();
+        if let Some(result) = self.future.as_mut().now_or_never() {
+            result?;
+        }
+        Ok(self.pending.get() < before)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.get() == 0
+    }
+}
+
 struct ConnectAttempt {
     transaction: wlan_sme::client::ConnectTransactionStream,
     deadline: std::time::Instant,
@@ -456,7 +620,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     upcalls: Arc<Mutex<UpcallQueue>>,
     io: Arc<Mutex<HostIo>>,
     sme: wlan_sme::client::ClientSme,
-    mlme: wlan_mlme::client::ClientMlme<HostMlmeDevice<D>>,
+    mlme: MlmeTask,
     requests: wlan_sme::MlmeStream,
     events: mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>,
     sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
@@ -553,7 +717,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         security: fidl_common::SecuritySupport,
         spectrum: fidl_common::SpectrumManagementSupport,
         inspector: fuchsia_inspect::Inspector,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, anyhow::Error>
+    where
+        D: 'static,
+    {
         Self::new_with_ethernet_capacity(
             device,
             sme_config,
@@ -575,7 +742,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         spectrum: fidl_common::SpectrumManagementSupport,
         inspector: fuchsia_inspect::Inspector,
         ethernet_queue_capacity: usize,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, anyhow::Error>
+    where
+        D: 'static,
+    {
         let resources = PreparedRuntimeResources::with_ethernet_capacity(
             device_info.sta_addr,
             ethernet_queue_capacity,
@@ -601,7 +771,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         spectrum: fidl_common::SpectrumManagementSupport,
         inspector: fuchsia_inspect::Inspector,
         resources: PreparedRuntimeResources,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, anyhow::Error>
+    where
+        D: 'static,
+    {
         if device_info.sta_addr != resources.mac_address {
             return Err(anyhow::anyhow!(
                 "prepared Ethernet MAC differs from queried SoftMAC MAC"
@@ -671,9 +844,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         Ok(Self {
             device,
             upcalls,
-            io,
+            io: io.clone(),
             sme,
-            mlme,
+            mlme: MlmeTask::new(mlme, io.clone()),
             requests,
             events,
             sme_timers,
@@ -731,38 +904,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 }
                 upcall
             };
-            match upcall {
-                Some(Upcall::ScanComplete { status, scan_id }) => {
-                    MlmeImpl::handle_scan_complete(&mut self.mlme, status, scan_id).await;
-                }
-                Some(Upcall::TxResult(result)) => {
-                    if let Some(minstrel) = self.io.lock().unwrap().minstrel.clone() {
-                        minstrel.lock().handle_tx_result_report(&result);
-                    }
-                }
-                Some(Upcall::Recv { bytes, info }) => {
-                    let auth = safe_auth_stage(&bytes);
-                    let eapol = bytes
-                        .windows(8)
-                        .any(|window| window == [0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-                    MlmeImpl::handle_mac_frame_rx(
-                        &mut self.mlme,
-                        &bytes,
-                        info,
-                        fuchsia_trace::Id::new(),
-                    )
-                    .await;
-                    if let Some((algorithm, transaction, status, rejected_group)) = auth {
-                        println!(
-                            "client_mlme_rx stage=handle_complete algorithm={algorithm} transaction={transaction} status={status} rejected_group={rejected_group:?}"
-                        );
-                    }
-                    if eapol {
-                        println!("client_eapol_stage=mlme_handle_complete");
-                    }
-                }
-                None => break,
-            }
+            let Some(upcall) = upcall else { break };
+            self.mlme.enqueue(MlmeInput::Upcall(upcall))?;
+            self.mlme.poll_once()?;
             progressed = true;
         }
         Ok(progressed)
@@ -774,53 +918,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             let mut cycle_progressed = false;
             match self.requests.try_recv() {
                 Ok(request) => {
-                    let sae_frame_tx = matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
-                    let eapol_tx = matches!(&request, wlan_sme::MlmeRequest::Eapol(_));
-                    if let wlan_sme::MlmeRequest::SaeFrameTx(frame) = &request {
-                        println!(
-                            "client_sae_stage=sme_sae_frame_tx transaction={} status={} group={:?}",
-                            frame.seq_num,
-                            frame.status_code.into_primitive(),
-                            sae_group(frame)
-                        );
-                    }
-                    if eapol_tx {
-                        println!("client_eapol_stage=sme_tx_request");
-                    }
-                    match &request {
-                        wlan_sme::MlmeRequest::SaeHandshakeResp(response) => {
-                            eprintln!("client_sae_handshake response={response:?}");
-                        }
-                        wlan_sme::MlmeRequest::Deauthenticate(request) => {
-                            eprintln!("client_deauthenticate request={request:?}");
-                        }
-                        _ => {}
-                    }
-                    let name = request.name();
-                    // Diagnostic: surface every MLME request the SME issues so the
-                    // post-4-way sequence (SetKeys GTK/IGTK, SetCtrlPort, Deauth) is
-                    // visible when the connect fails after PTK.
-                    println!("client_mlme_request name={name}");
-                    wlan_mlme::MlmeImpl::handle_mlme_request(&mut self.mlme, request)
-                        .await
-                        .map_err(|error| {
-                            ConnectError::Driver(DriverError::MlmeRequest {
-                                name,
-                                // Pinned MLME errors contain status/contract names,
-                                // never request frame or credential bytes.
-                                detail: error.to_string(),
-                            })
-                        })?;
-                    println!("client_mlme_request_complete name={name}");
-                    if sae_frame_tx {
-                        println!(
-                            "client_sae_stage=mlme_request_complete state={}",
-                            self.mlme.sae_state_name()
-                        );
-                    }
-                    if eapol_tx {
-                        println!("client_eapol_stage=mlme_tx_request_complete");
-                    }
+                    self.mlme.enqueue(MlmeInput::Request(request))?;
+                    self.mlme.poll_once()?;
                     progressed = true;
                     cycle_progressed = true;
                 }
@@ -883,7 +982,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             let _ = self.stop();
             return Err(ConnectError::Driver(DriverError::UpcallOverflow));
         }
+        let resumed = self.mlme.poll_once()?;
         let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
+        progressed |= resumed;
         if let Some(action) = self.timer_runtime.block_on(async {
             tokio::task::yield_now().await;
             self.sme_timers.as_mut().next().now_or_never().flatten()
@@ -900,7 +1001,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 "client_mlme_timer stage=stream_dequeued timer_id={} event={:?}",
                 event.id, event.event
             );
-            wlan_mlme::MlmeImpl::handle_timeout(&mut self.mlme, event.event).await;
+            self.mlme.enqueue(MlmeInput::Timeout(event.event))?;
+            self.mlme.poll_once()?;
             progressed = true;
             control_quiescent = false;
         }
@@ -968,15 +1070,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             })?
         };
         if let Some(frame) = frame {
-            if let Err(error) = wlan_mlme::MlmeImpl::handle_eth_frame_tx(
-                &mut self.mlme,
-                frame.as_bytes(),
-                fuchsia_trace::Id::new(),
-            ) {
-                println!(
-                    "client_data_tx_error stage=ethernet_pump kind=target_rejected error={error}"
-                );
-            }
+            self.mlme
+                .enqueue(MlmeInput::Ethernet(frame.as_bytes().to_vec()))?;
+            self.mlme.poll_once()?;
             progressed = true;
         }
         Ok(progressed)
@@ -1151,7 +1247,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 Ok(progressed) => progressed,
                 Err(error) => break Err(error),
             };
-            if sme_is_retry_quiescent(&self.sme.status()) {
+            if sme_is_retry_quiescent(&self.sme.status()) && self.mlme.is_idle() {
                 break Ok(());
             }
             if !progressed {
@@ -1221,6 +1317,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
             if (terminal.is_some() || transaction_closed)
                 && sme_is_retry_quiescent(&self.sme.status())
+                && self.mlme.is_idle()
             {
                 break Ok(());
             }
@@ -1322,13 +1419,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     }
 
     fn finish_failed_attempt_cleanup(&mut self) -> bool {
-        // A completed SME failure is retryable only when both owners can
+        // A completed SME failure is retryable only when all owners can
         // prove quiescence. Keep the data plane closed before asking the
         // device to revoke and drain its attempt, then discard callbacks
         // that raced with that device-side drain.
         self.io.lock().unwrap().ethernet.set_link(false);
         let sme_quiescent = sme_is_retry_quiescent(&self.sme.status());
         let device_quiescent = sme_quiescent
+            && self.mlme.is_idle()
             && self
                 .device
                 .lock()
@@ -2455,6 +2553,28 @@ mod tests {
         assert!(!effects.calls.contains(&"passive"));
         assert!(!effects.calls.contains(&"active"));
         assert!(effects.calls.contains(&"stop"));
+    }
+
+    #[test]
+    fn queued_mlme_work_cannot_be_certified_retry_quiescent() {
+        let (fake, effects) = Fake::new(0);
+        effects.lock().unwrap().retry_cleanup = true;
+        let mut runtime = runtime(fake);
+        runtime
+            .mlme
+            .enqueue(MlmeInput::Upcall(Upcall::ScanComplete {
+                status: zx::Status::OK,
+                scan_id: 1,
+            }))
+            .unwrap();
+        assert!(!runtime.finish_failed_attempt_cleanup());
+        assert!(
+            !effects
+                .lock()
+                .unwrap()
+                .calls
+                .contains(&"finish_failed_connect_attempt")
+        );
     }
 
     #[test]
