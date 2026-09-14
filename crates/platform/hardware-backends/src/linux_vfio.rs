@@ -687,7 +687,7 @@ impl LinuxVfio {
         hash_state: RandomState,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
-        pci.verify_dma_disabled()
+        pci.verify_bus_master_disabled()
             .map_err(LinuxVfioError::PciControl)?;
         let backend = Self::initialize_pci_coherent(device, iommu, irq_event, hash_state, setup)?;
         let config = pci
@@ -2106,6 +2106,66 @@ mod tests {
         assert!(!records.contains(&Record::QueryRegion(6)));
         assert!(records.contains(&Record::InstallIrqAt { index: 2, start: 3 }));
         assert!(records.contains(&Record::DisableIrqAt { index: 2, start: 3 }));
+    }
+
+    #[test]
+    fn idle_d3_is_allowed_only_until_kernel_bind_resumes_the_device() {
+        for resumed in [false, true] {
+            let (device, device_path) = fake_device();
+            let iommu = Arc::new(File::open("/dev/null").unwrap());
+            let (pci, mut config, config_path) = fake_pci_control(0, 3);
+            with_fake_pci_io(
+                FakeIrq {
+                    count: 1,
+                    eventfd: true,
+                },
+                FakeIrq {
+                    count: 0,
+                    eventfd: true,
+                },
+                || {
+                    let result = LinuxVfio::initialize_pci_controlled(
+                        pci,
+                        device,
+                        iommu,
+                        InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap()),
+                        RandomState::new(),
+                        |device, iommu| {
+                            userspace_vfio::bind_iommufd(device, iommu)?;
+                            if resumed {
+                                config.seek(SeekFrom::Start(4)).map_err(|e| e.to_string())?;
+                                config
+                                    .write_all(&2u16.to_le_bytes())
+                                    .map_err(|e| e.to_string())?;
+                                config
+                                    .seek(SeekFrom::Start(0x44))
+                                    .map_err(|e| e.to_string())?;
+                                config
+                                    .write_all(&0u16.to_le_bytes())
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                            userspace_vfio::attach_ioas(device, ioas.id())?;
+                            Ok(ioas)
+                        },
+                    );
+                    if resumed {
+                        let opened = result.unwrap();
+                        assert_eq!(opened.config.power_state(), 0);
+                        assert_eq!(opened.config.command(), 2);
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(LinuxVfioError::PciControl(
+                                PciControlError::UnsafeDmaState { .. }
+                            ))
+                        ));
+                    }
+                },
+            );
+            std::fs::remove_file(device_path).unwrap();
+            std::fs::remove_file(config_path).unwrap();
+        }
     }
 
     #[test]

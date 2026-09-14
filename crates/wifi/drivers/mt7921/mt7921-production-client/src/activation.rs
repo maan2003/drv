@@ -844,6 +844,7 @@ mod tests {
             irq_installed: false,
             bus_master_enabled: false,
             bme_disabled_command: None,
+            transport_quiesced: false,
             reset_generation: None,
             post_reset_registers: None,
             post_reset_pci: None,
@@ -983,6 +984,9 @@ mod tests {
         assert!(!containment.irq_installed);
         assert!(!containment.bus_master_enabled);
         assert_eq!(pci.calls.last(), Some(&"verify-bme-off"));
+        assert_eq!(resources.bar0.read_u32(0xd4208).unwrap() & 0xf, 0);
+        assert_eq!(resources.bar0.read_u32(0xd4204).unwrap(), 0);
+        assert_eq!(resources.bar0.read_u32(0x10188).unwrap(), 0);
     }
 
     #[test]

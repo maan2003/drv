@@ -269,6 +269,7 @@ mod tests {
             irq_installed: true,
             bus_master_enabled: true,
             bme_disabled_command: None,
+            transport_quiesced: false,
             reset_generation: None,
             post_reset_registers: None,
             post_reset_pci: None,

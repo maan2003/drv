@@ -78,7 +78,7 @@ pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
-pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write,readiness-fd-F_GETFD; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl-except-service-readiness-F_GETFD,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write,regulatory-database-read,readiness-fd-F_GETFD; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,prctl-GET_AUXV-max512-reserved-zero,exit,exit_group; denied=fcntl-except-owned-fd-F_GETFD,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
 
 #[derive(Debug)]
 pub enum Error {
@@ -677,6 +677,14 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
             persistence_dir_fd,
             application_listener_fd,
         } => {
+            // OwnedFd debug-drop checks include dynamically accepted clients
+            // and directory-relative persistence files. This query cannot
+            // create, duplicate or modify a descriptor.
+            allow(
+                &mut rules,
+                libc::SYS_fcntl,
+                vec![eq(1, libc::F_GETFD as u64)],
+            );
             let fd = *persistence_dir_fd as u32;
             // The sealed filesystem, not seccomp, confines pointed-to names.
             allow(
@@ -771,6 +779,19 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
             irq_eventfd,
             service,
         } => {
+            // Rust's lazy CPU/runtime discovery reads the process's own
+            // startup auxiliary vector. All mutating prctl operations remain
+            // forbidden; the kernel bounds writes by the caller's buffer.
+            allow(
+                &mut rules,
+                libc::SYS_prctl,
+                vec![
+                    eq(0, 0x41555856),
+                    condition(2, Qword, Le, 512),
+                    eq(3, 0),
+                    eq(4, 0),
+                ],
+            );
             allow_ioctl(
                 &mut rules,
                 *vfio_fd,
@@ -781,6 +802,13 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
                 *iommufd,
                 userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS,
             );
+            for fd in [*pci_config_fd, *vfio_fd, *iommufd, *irq_eventfd] {
+                allow(
+                    &mut rules,
+                    libc::SYS_fcntl,
+                    vec![eq(0, fd as u64), eq(1, libc::F_GETFD as u64)],
+                );
+            }
             allow_fds(&mut rules, libc::SYS_lseek, &[*pci_config_fd]);
             allow(
                 &mut rules,
@@ -1527,6 +1555,57 @@ mod filter_tests {
             .status()
             .unwrap();
         assert!(status.success(), "Tokio under MT7921 filter: {status}");
+    }
+
+    #[test]
+    fn mt7921_auxv_query_does_not_allow_prctl_mutation() {
+        const TEST: &str = "filter_tests::mt7921_auxv_query_does_not_allow_prctl_mutation";
+        if let Ok(mode) = std::env::var("DRV_MT7921_AUXV_PROBE") {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            assert!(fd >= 0);
+            enable_filter(Profile::Mt7921Vfio {
+                pci_config_fd: fd,
+                vfio_fd: fd,
+                iommufd: fd,
+                irq_eventfd: fd,
+                service: None,
+            });
+            let mut auxv = [0u8; 512];
+            let operation = if mode != "mutation" {
+                0x41555856
+            } else {
+                libc::PR_SET_DUMPABLE as u64
+            };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    operation,
+                    auxv.as_mut_ptr(),
+                    if mode == "oversized" { 513 } else { auxv.len() },
+                    if mode == "reserved" { 1 } else { 0 },
+                    0,
+                )
+            };
+            // Older kernels lack PR_GET_AUXV; ENOSYS/EINVAL is not SIGSYS.
+            assert!(
+                result >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+            );
+            unsafe { libc::_exit(0) }
+        }
+        for mode in ["query", "mutation", "oversized", "reserved"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .env("DRV_MT7921_AUXV_PROBE", mode)
+                .status()
+                .unwrap();
+            if mode == "query" {
+                assert!(status.success());
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGSYS));
+            }
+        }
     }
 
     #[test]
@@ -2443,7 +2522,7 @@ mod filter_tests {
                     libc::ioctl(fds[0], userspace_vfio::mt7921_seccomp::VFIO_REQUESTS[2], 0);
                 }
                 "fcntl" => {
-                    libc::fcntl(fds[0], libc::F_GETFD);
+                    libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 "dup" => {
                     libc::dup(fds[0]);

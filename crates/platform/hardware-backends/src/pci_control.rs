@@ -141,6 +141,20 @@ impl PciControl {
         Ok(read_command(&mut self.config)? & PCI_COMMAND_MASTER != 0)
     }
 
+    /// Before BIND_IOMMUFD, an idle VFIO cdev may still be in D3.
+    /// Binding calls the kernel's open_device, which resumes to D0 and enables
+    /// memory decoding. Bus mastering must already be off before that call.
+    pub(crate) fn verify_bus_master_disabled(&mut self) -> Result<(), PciControlError> {
+        let state = snapshot(&mut self.config)?;
+        if state.command & PCI_COMMAND_MASTER != 0 {
+            return Err(PciControlError::UnsafeDmaState {
+                command: state.command,
+                power_state: state.power_state,
+            });
+        }
+        Ok(())
+    }
+
     pub fn verify_dma_disabled(&mut self) -> Result<PciConfigSnapshot, PciControlError> {
         verify_dma_disabled(&mut self.config)
     }

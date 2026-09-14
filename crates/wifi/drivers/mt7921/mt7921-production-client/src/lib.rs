@@ -240,6 +240,7 @@ pub struct ContainmentLedger {
     irq_installed: bool,
     bus_master_enabled: bool,
     bme_disabled_command: Option<u16>,
+    transport_quiesced: bool,
     reset_generation: Option<u64>,
     post_reset_registers: Option<PostResetRegisters>,
     post_reset_pci: Option<PostResetPciSnapshot>,
@@ -321,6 +322,7 @@ fn ensure_operational(lifecycle: SessionLifecycle) -> Result<(), drv_hardware::E
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContainmentStage {
+    QuiesceTransport,
     DisableBusMaster,
     Reset,
     PostResetRegisters,
@@ -722,6 +724,7 @@ impl Mt7921HardwareSession {
                 irq_installed: false,
                 bus_master_enabled: false,
                 bme_disabled_command: None,
+                transport_quiesced: false,
                 reset_generation: None,
                 post_reset_registers: None,
                 post_reset_pci: None,
@@ -816,6 +819,26 @@ impl Mt7921HardwareSession {
     /// can retry. Once contained, repeated calls are idempotent.
     fn contain(&mut self) -> Result<ContainmentLedger, Mt7921ContainmentError> {
         self.receive.abort();
+        if !self.containment.transport_quiesced {
+            self.lifecycle = SessionLifecycle::Closing;
+            let errors = activation::quiesce(
+                self.resources.as_mut().expect("live session resources"),
+                self.pci.as_mut().expect("live PCI authority"),
+                &mut self.acquisition,
+                &mut self.containment,
+                &mut self.activation_state,
+            );
+            if !errors.is_empty() {
+                return Err(Mt7921ContainmentError {
+                    stage: ContainmentStage::QuiesceTransport,
+                    detail: format!("{errors:?}"),
+                    ledger: self.containment,
+                });
+            }
+            // Once reset has begun, old BAR handles may be stale even when it
+            // fails. A retry must resume reset, never revisit these handles.
+            self.containment.transport_quiesced = true;
+        }
         advance_containment(
             self.resources.as_mut().expect("live session resources"),
             self.pci.as_mut().expect("live PCI authority"),
@@ -1236,6 +1259,7 @@ mod tests {
             irq_installed: true,
             bus_master_enabled: false,
             bme_disabled_command: None,
+            transport_quiesced: false,
             reset_generation: None,
             post_reset_registers: None,
             post_reset_pci: None,
