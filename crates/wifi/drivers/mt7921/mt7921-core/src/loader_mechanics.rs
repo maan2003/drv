@@ -178,6 +178,7 @@ pub enum LoaderMechanicsError<E> {
     Route(McuRxRouteError),
     DuplicateResponse,
     Timeout,
+    CommandPending { slot: u16 },
     ScatterPending,
     NoScatterPending,
     ScatterMismatch,
@@ -192,6 +193,7 @@ impl<E> LoaderMechanicsError<E> {
             self,
             Self::ContainmentRequired(_)
                 | Self::Timeout
+                | Self::CommandPending { .. }
                 | Self::RxDescriptorNotDone { .. }
                 | Self::TxDescriptorNotDone { .. }
                 | Self::ScatterDescriptorNotDone { .. }
@@ -215,6 +217,7 @@ struct PendingScatter {
 pub struct LoaderMechanics {
     sequence: u8,
     command_producer: u16,
+    pending_command: Option<u16>,
     rx_head: [u16; 2],
     fwdl_producer: u16,
     pending_scatter: Option<PendingScatter>,
@@ -231,6 +234,7 @@ impl LoaderMechanics {
         Self {
             sequence,
             command_producer: 0,
+            pending_command: None,
             rx_head: [0; 2],
             fwdl_producer: 0,
             pending_scatter: None,
@@ -259,6 +263,9 @@ impl LoaderMechanics {
         &mut self,
         sequence: u8,
     ) -> Result<(u16, u16), LoaderMechanicsError<core::convert::Infallible>> {
+        if let Some(slot) = self.pending_command {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
         let expected = self.sequence % 15 + 1;
         if sequence != expected {
             return Err(LoaderMechanicsError::InvalidReservedSequence {
@@ -312,6 +319,9 @@ impl LoaderMechanics {
         completion: LoaderCommandCompletion,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
+        if let Some(slot) = self.pending_command {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
         if template.len() < 48 || template.len() > MT7921_LOADER_COMMAND_MAX_BYTES {
             return Err(LoaderMechanicsError::InvalidCommandLength);
         }
@@ -335,6 +345,9 @@ impl LoaderMechanics {
         completion: LoaderCommandCompletion,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
+        if let Some(slot) = self.pending_command {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
         if sequence == 0 || sequence != self.sequence {
             return Err(LoaderMechanicsError::InvalidReservedSequence {
                 reserved: sequence,
@@ -377,6 +390,9 @@ impl LoaderMechanics {
         let producer = next(slot, MT7921_MCU_TX_RING_COUNT as u16);
         self.command_producer = producer;
         fence(Ordering::Release);
+        // A failed MMIO publication may still have reached the device. Keep
+        // exclusive payload ownership until exact consumption and reclaim.
+        self.pending_command = Some(slot);
         t.publish_command_producer(producer)
             .map_err(LoaderMechanicsError::ContainmentRequired)?;
         o.observe_loader_mechanics(LoaderMechanicsEvent::CommandPublished {
@@ -401,6 +417,7 @@ impl LoaderMechanics {
                     .map_err(LoaderMechanicsError::ContainmentRequired)
             });
         if reclaimed.is_ok() {
+            self.pending_command = None;
             o.observe_loader_mechanics(LoaderMechanicsEvent::CommandReclaimed { slot });
         }
         match (result, reclaimed) {
@@ -1297,6 +1314,90 @@ mod tests {
             .unwrap();
         assert_eq!(next, 1);
         assert_eq!(engine.fwdl_producer(), 2);
+    }
+
+    #[test]
+    fn ambiguous_command_ownership_prevents_shared_payload_overwrite() {
+        for failure in 0..3 {
+            let mut engine = LoaderMechanics::default();
+            let mut io = Fake::default();
+            match failure {
+                0 => io.fail_publish_command = true,
+                1 => {
+                    io.command_didx = VecDeque::from([0, 0]);
+                    io.waits = VecDeque::from([false]);
+                }
+                _ => io.command_descriptor.ctrl = 0,
+            }
+            let template = vec![0x5a; 48];
+            assert!(
+                engine
+                    .execute_template(
+                        &mut io,
+                        &mut (),
+                        &template,
+                        LoaderCommandCompletion::NoResponse,
+                        1,
+                    )
+                    .is_err()
+            );
+            let before = io.ops.clone();
+            assert_eq!(
+                engine.execute_template(
+                    &mut io,
+                    &mut (),
+                    &template,
+                    LoaderCommandCompletion::NoResponse,
+                    2,
+                ),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(io.ops, before, "retry must not touch DMA or MMIO");
+            assert!(matches!(
+                engine.commit_candidate_command(3),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            ));
+        }
+    }
+
+    #[test]
+    fn successful_reclaim_allows_next_shared_payload_publication_after_move() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake::default();
+        let template = vec![0x5a; 48];
+        engine
+            .execute_template(
+                &mut io,
+                &mut (),
+                &template,
+                LoaderCommandCompletion::NoResponse,
+                1,
+            )
+            .unwrap();
+        let mut moved = engine;
+        io.command_didx.push_back(2);
+        moved
+            .execute_template(
+                &mut io,
+                &mut (),
+                &template,
+                LoaderCommandCompletion::NoResponse,
+                2,
+            )
+            .unwrap();
+        let reclaimed = io
+            .ops
+            .iter()
+            .position(|op| *op == Op::ReclaimCommand(0))
+            .unwrap();
+        let next_payload = io
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::CommandPayload(1, _)))
+            .unwrap();
+        assert!(reclaimed < next_payload);
+        assert_eq!(moved.sequence(), 2);
+        assert_eq!(moved.command_producer(), 2);
     }
 
     #[test]

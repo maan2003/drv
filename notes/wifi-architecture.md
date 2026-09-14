@@ -39,6 +39,23 @@ owner must retain the authority needed after driver death; process exit or a
 successful kill is never evidence of hardware containment. Restart requires
 verified containment, otherwise quarantine/escalation.
 
+## Types establish ownership boundaries
+
+Constructors must establish the invariant represented by their return type.
+Use a consuming transition from prepared device authority to an initialized
+driver, and produce contained authority only after the actual containment
+checks succeed. Diagnostic reports and copied status values are not authority.
+
+Likewise, distinguish device generations, connection epochs and operation IDs.
+A committed RX occurrence is created only after descriptor repost/publication,
+and cannot be reconstructed from public ring/slot integers. A failed transition
+retains the authority needed for cleanup or quarantine rather than returning
+an apparently usable owner. Keep constructors and raw representations private
+where fabrication would bypass the boundary.
+
+These types replace unchecked flags and duplicated state; do not add a type
+for every phase or retain redundant wrappers merely to increase type count.
+
 ## Small APIs with explicit lifetimes
 
 Application → policy:

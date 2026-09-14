@@ -19,7 +19,8 @@ pub(super) struct ProductionFirmwareLoader<'a, B: Backend, P> {
     pub acquisition: &'a mut AcquisitionLedger,
     pub containment: &'a mut ContainmentLedger,
     pub activation_state: &'a mut ActivationState,
-    pub mechanics: LoaderMechanics,
+    pub mechanics: &'a mut LoaderMechanics,
+    pub receive: &'a mut crate::receive::RxRouting,
     pub start: Instant,
 }
 
@@ -50,9 +51,10 @@ impl<B: Backend, P: ActivationPci> ProductionFirmwareLoader<'_, B, P> {
                 .interrupt
                 .as_ref()
                 .ok_or("loader interrupt already released")?,
+            receive: self.receive,
             start: self.start,
         };
-        operation(&mut self.mechanics, &mut views)
+        operation(self.mechanics, &mut views)
             .map_err(|error| format!("shared loader mechanics: {error:?}"))
     }
 }
@@ -294,13 +296,16 @@ mod tests {
             bus_master: BusMasterState::Enabled,
         };
         let mut pci = FakePci(0x406);
+        let mut mechanics = LoaderMechanics::default();
+        let mut receive = crate::receive::RxRouting::default();
         let mut loader = ProductionFirmwareLoader {
             resources: &mut resources,
             pci: &mut pci,
             acquisition: &mut acquisition,
             containment: &mut containment,
             activation_state: &mut activation_state,
-            mechanics: LoaderMechanics::default(),
+            mechanics: &mut mechanics,
+            receive: &mut receive,
             start: Instant::now(),
         };
         let sequence = loader.next_sequence();

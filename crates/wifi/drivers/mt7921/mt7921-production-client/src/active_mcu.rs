@@ -101,6 +101,7 @@ pub(super) struct ActiveMcuViews<'a, B: Backend> {
     pub wm2_ring: &'a mut CoherentDma<B, Bidirectional>,
     pub wm2_buffers: &'a mut CoherentDma<B, FromDevice>,
     pub interrupt: &'a Interrupt<B>,
+    pub receive: &'a mut crate::receive::RxRouting,
     pub start: Instant,
 }
 
@@ -237,36 +238,47 @@ impl<B: Backend> LoaderMechanicsTransport for ActiveMcuViews<'_, B> {
         slot: u16,
         descriptor: DmaDescriptor,
     ) -> Result<(), Self::Error> {
-        self.ring_dma(ring).write(
-            usize::from(slot) * DMA_DESCRIPTOR_LEN,
-            &descriptor.to_le_bytes(),
-        )
+        let dma = match ring {
+            McuRxIrqRing::Wm => &mut self.wm_ring,
+            McuRxIrqRing::Wm2 => &mut self.wm2_ring,
+        };
+        self.receive.repost(ring, slot, || {
+            dma.write(
+                usize::from(slot) * DMA_DESCRIPTOR_LEN,
+                &descriptor.to_le_bytes(),
+            )
+        })
     }
     fn publish_rx_producer(
         &mut self,
         ring: McuRxIrqRing,
         producer: u16,
     ) -> Result<(), Self::Error> {
-        self.wfdma.write_u32(
-            RX_RING_BASE + Self::ring_number(ring) * RING_STRIDE + RING_CIDX,
-            u32::from(producer),
-        )
+        let wfdma = &self.wfdma;
+        self.receive.publish(ring, producer, || {
+            wfdma.write_u32(
+                RX_RING_BASE + Self::ring_number(ring) * RING_STRIDE + RING_CIDX,
+                u32::from(producer),
+            )
+        })
     }
     fn prepare_rx_result(
         &mut self,
-        _: McuRxIrqRing,
-        _: u16,
-        _: u16,
+        ring: McuRxIrqRing,
+        consumed: u16,
+        posted: u16,
         _: &[u8],
-        _: Result<&mt7921_core::McuRxRoute, &mt7921_core::McuRxRouteError>,
-        _: Option<mt7921_core::FirmwareRxDisposition>,
+        routed: Result<&mt7921_core::McuRxRoute, &mt7921_core::McuRxRouteError>,
+        disposition: Option<mt7921_core::FirmwareRxDisposition>,
     ) -> Result<(), Self::Error> {
-        Ok(())
+        self.receive
+            .prepare(ring, consumed, posted, routed, disposition)
     }
-    fn complete_rx_result(&mut self, _: McuRxIrqRing, _: u16) -> Result<(), Self::Error> {
-        Ok(())
+    fn complete_rx_result(&mut self, ring: McuRxIrqRing, consumed: u16) -> Result<(), Self::Error> {
+        self.receive.complete(ring, consumed)
     }
     fn abort_rx(&mut self) -> Result<(), Self::Error> {
+        self.receive.abort();
         Ok(())
     }
     fn scatter_payload_address(&self) -> Result<u64, Self::Error> {
