@@ -51,6 +51,15 @@ The reduced cutover now implements the same-process typed ownership boundary
 below. Radio operations are deliberately unavailable until ported to that owner;
 this is not a claim of Wi-Fi connectivity or physical recovery qualification.
 
+## Advisor cadence
+
+The owner requires autonomous engineering decisions during implementation.
+Do not consult or update an advisor for each fix, small design choice, or test
+result. Request final review after a substantial subsystem is implemented,
+aiming for roughly one advisor message per hour. Advisors should push back on
+unnecessary check-ins. This does not replace user approval for shared or
+irreversible actions.
+
 ## One Wi-Fi process, separate policy and IP services
 
 **The Wi-Fi protocol engine and hardware driver run in the same process.**
