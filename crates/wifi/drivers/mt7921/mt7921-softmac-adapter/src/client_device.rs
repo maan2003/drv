@@ -1517,8 +1517,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn join_bss(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: fidl_driver::JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready(self.backend.lock().unwrap().effects.join_bss(&request))
     }
     fn install_key(

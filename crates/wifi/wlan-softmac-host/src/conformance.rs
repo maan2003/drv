@@ -249,6 +249,7 @@ mod tests {
         }
         fn join_bss(
             &mut self,
+            _context: crate::OperationContext,
             _: JoinBssRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))

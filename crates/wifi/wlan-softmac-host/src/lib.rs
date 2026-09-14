@@ -165,6 +165,7 @@ pub trait WlanSoftmac {
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn join_bss(
         &mut self,
+        context: OperationContext,
         request: JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn install_key(
@@ -302,6 +303,7 @@ mod tests {
         }
         fn join_bss(
             &mut self,
+            _context: crate::OperationContext,
             _: JoinBssRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready({
@@ -396,7 +398,7 @@ mod tests {
         device
             .set_channel(context.clone(), Default::default())
             .await?;
-        device.join_bss(Default::default()).await?;
+        device.join_bss(context.clone(), Default::default()).await?;
         device.install_key(Default::default()).await?;
         device
             .notify_association_complete(Default::default())

@@ -408,7 +408,8 @@ impl DeviceOps for HostMlmeDevice {
     }
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        self.request(|reply| Command::Join(request.clone(), reply))
+        let context = self.execution.operation.borrow().clone();
+        self.request(|reply| Command::Join(context, request.clone(), reply))
             .await
     }
     async fn enable_beaconing(
@@ -1942,6 +1943,7 @@ mod tests {
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
         channel_contexts: Vec<OperationContext>,
+        join_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
         suppress_auth_response: bool,
@@ -2127,8 +2129,10 @@ mod tests {
         }
         fn join_bss(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_driver::JoinBssRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            self.0.lock().unwrap().join_contexts.push(context);
             std::future::ready(record!(self, "join", ()))
         }
         fn install_key(
@@ -3540,7 +3544,12 @@ mod tests {
             let state = effects.lock().unwrap();
             assert_eq!(state.channels.len(), 1);
             assert_eq!(state.channel_contexts[0].deadline(), deadline);
+            assert_eq!(state.join_contexts[0].deadline(), deadline);
             runtime.mlme.epoch.revoke();
+            assert_eq!(
+                state.join_contexts[0].check(std::time::Instant::now()),
+                Err(zx::Status::CANCELED)
+            );
             assert_eq!(
                 state.channel_contexts[0].check(std::time::Instant::now()),
                 Err(zx::Status::CANCELED)

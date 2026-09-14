@@ -110,6 +110,7 @@ impl WlanSoftmac for FakeSoftmac {
     }
     fn join_bss(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: driver::JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))

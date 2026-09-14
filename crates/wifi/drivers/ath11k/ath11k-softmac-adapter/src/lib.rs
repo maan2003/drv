@@ -894,9 +894,11 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn join_bss(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
+            context.check(std::time::Instant::now())?;
             self.pending_association_security = None;
             self.igtk = None;
             let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
@@ -1513,6 +1515,13 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
 #[cfg(test)]
 mod tests {
+    fn operation_context() -> wlan_softmac_host::OperationContext {
+        wlan_softmac_host::conformance::operation_context(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .0
+    }
+
     use super::*;
     use ath11k_core::Operation;
     use std::sync::{Arc, Mutex};
@@ -2010,7 +2019,7 @@ mod tests {
     #[test]
     fn join_and_clear_bind_and_delete_exactly_one_peer() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         let vdev = adapter.vdev.unwrap();
         assert_eq!(
             adapter.device.backend().operations(),
@@ -2046,13 +2055,13 @@ mod tests {
                 address: PEER,
             },
         ]));
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
     }
 
     #[test]
     fn failed_peer_deletion_still_revokes_adapter_peer_authority() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         let vdev = adapter.vdev.unwrap();
         adapter.device.backend_mut().clear();
         adapter
@@ -2110,7 +2119,7 @@ mod tests {
             });
 
         assert_eq!(
-            futures::executor::block_on(adapter.join_bss(join_request())),
+            futures::executor::block_on(adapter.join_bss(operation_context(), join_request())),
             Err(zx::Status::IO)
         );
         assert_eq!(adapter.peer, None);
@@ -2130,7 +2139,7 @@ mod tests {
     #[test]
     fn open_association_and_symmetric_link_preserve_operation_order() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         adapter.device.backend_mut().clear();
         let vdev = adapter.vdev.unwrap();
 
@@ -2215,7 +2224,7 @@ mod tests {
     #[test]
     fn group_and_integrity_keys_decode_sme_wire_order_counters() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         futures::executor::block_on(adapter.notify_association_complete(open_association()))
             .unwrap();
         let mut key = WlanKeyConfiguration {
@@ -2255,7 +2264,8 @@ mod tests {
     fn ap_uapsd_capability_does_not_require_station_uapsd() {
         for apsd in [false, true] {
             let mut adapter = ready_adapter();
-            futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+            futures::executor::block_on(adapter.join_bss(operation_context(), join_request()))
+                .unwrap();
             let ac = || fidl_fuchsia_wlan_driver::WlanWmmAccessCategoryParameters {
                 ecw_min: 4,
                 ecw_max: 10,
@@ -2280,7 +2290,7 @@ mod tests {
     #[test]
     fn secure_association_requires_transmitted_rsn_evidence() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         adapter.device.backend_mut().clear();
         let mut association = open_association();
         association.capability_info = Some(0x0431);
@@ -2294,7 +2304,7 @@ mod tests {
     #[test]
     fn secure_association_stays_unauthorized_until_controlled_port_up() {
         let mut adapter = ready_adapter();
-        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
         adapter.device.backend_mut().clear();
 
         let mut request = vec![0; 28];

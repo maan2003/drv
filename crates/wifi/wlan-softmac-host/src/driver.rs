@@ -34,7 +34,11 @@ pub(crate) enum Command {
         WlanSoftmacBaseSetChannelRequest,
         oneshot::Sender<Result<(), zx::Status>>,
     ),
-    Join(JoinBssRequest, oneshot::Sender<Result<(), zx::Status>>),
+    Join(
+        OperationContext,
+        JoinBssRequest,
+        oneshot::Sender<Result<(), zx::Status>>,
+    ),
     Key(
         WlanKeyConfiguration,
         oneshot::Sender<Result<(), zx::Status>>,
@@ -73,6 +77,7 @@ impl Command {
     fn operation_context(&self) -> Option<&OperationContext> {
         match self {
             Self::Channel(context, ..)
+            | Self::Join(context, ..)
             | Self::PassiveScan(context, ..)
             | Self::ActiveScan(context, ..) => Some(context),
             _ => None,
@@ -99,7 +104,7 @@ impl Command {
             Self::Channel(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::Join(_, reply) => {
+            Self::Join(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
             Self::Key(_, reply) => {
@@ -322,8 +327,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::Join(request, reply) => {
-                let completion = self.device.join_bss(request);
+            Command::Join(context, request, reply) => {
+                let completion = self.device.join_bss(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));
