@@ -48,8 +48,8 @@ perform no host deployment or reboot as an implicit part of guest testing.
 
 
 The reduced cutover now implements the same-process typed ownership boundary
-below. Radio operations are deliberately unavailable until ported to that owner;
-this is not a claim of Wi-Fi connectivity or physical recovery qualification.
+below. Passive scanning/RX now run in that owner; association and TX remain pending.
+This is not a claim of Internet connectivity or complete recovery qualification.
 
 ## Advisor cadence
 

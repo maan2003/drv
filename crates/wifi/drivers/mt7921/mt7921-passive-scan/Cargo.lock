@@ -587,11 +587,13 @@ name = "mt7921-passive-scan"
 version = "0.1.0"
 dependencies = [
  "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-mlme",
  "fuchsia-inspect",
  "futures",
  "libc",
  "linux-self-sandbox",
+ "mt7921-core",
  "mt7921-production-client",
  "tokio",
  "wifi-control-service",
@@ -607,6 +609,7 @@ dependencies = [
  "drv-hardware-backends",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-softmac",
+ "futures-channel",
  "linux-self-sandbox",
  "mt7921-core",
  "sha2",

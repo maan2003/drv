@@ -9,6 +9,8 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+mt7921-core = { path = "../mt7921-core" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
 libc = "=0.2.189"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }

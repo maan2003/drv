@@ -90,7 +90,7 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args == ["--describe"] {
         println!(
-            "mt7921-service owner=typed-driver protocol=mlme+sme process=single radio_operations=unavailable old_owner=removed"
+            "mt7921-service owner=typed-driver protocol=mlme+sme process=single radio_operations=passive-scan-only old_owner=removed"
         );
         return Ok(());
     }
@@ -207,6 +207,33 @@ fn run() -> Result<(), String> {
                 "configured MAC differs from firmware identity; MAC override is unavailable".into(),
             );
         }
+        let channels = driver.passive_channels();
+        let bands = [
+            fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
+            fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz,
+        ]
+        .into_iter()
+        .filter_map(|band| {
+            let primary_channels: Vec<_> = channels
+                .iter()
+                .filter(|channel| {
+                    (channel.band == mt7921_core::PhysicalBand::Ghz2)
+                        == (band == fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz)
+                })
+                .map(|channel| fidl_fuchsia_wlan_ieee80211::ChannelNumber {
+                    band,
+                    number: channel.number as u8,
+                })
+                .collect();
+            (!primary_channels.is_empty()).then_some(fidl_fuchsia_wlan_mlme::BandCapability {
+                band,
+                basic_rates: vec![0x8c, 0x98, 0xb0],
+                ht_cap: None,
+                vht_cap: None,
+                primary_channels,
+            })
+        })
+        .collect();
         let runtime = ClientRuntime::new_with_prepared_resources(
             driver,
             wlan_sme::client::ClientConfig::default(),
@@ -214,7 +241,7 @@ fn run() -> Result<(), String> {
                 sta_addr: mac,
                 factory_addr: mac,
                 role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
-                bands: Vec::new(),
+                bands,
                 softmac_hardware_capability: 0,
                 qos_capable: false,
             },
@@ -229,7 +256,7 @@ fn run() -> Result<(), String> {
             .bind_runtime(runtime)
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
-        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=unavailable");
+        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=passive-scan-only");
         let result = server.run_to_terminal().await;
         let mut runtime = server.into_runtime();
         let stopped = runtime.shutdown().await;

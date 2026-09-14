@@ -4016,8 +4016,9 @@ pub fn encode_passive_mcu_command(
             payload[8] = 1;
             payload[12..16].copy_from_slice(&0x0001_0001u32.to_le_bytes());
             payload[16] = 1;
-            payload[24..26].copy_from_slice(&19u16.to_le_bytes());
-            payload[30..32].copy_from_slice(&19u16.to_le_bytes());
+            // mt7921_add_interface calls uni_add_dev before assigning the
+            // newly allocated vif's reserved WCID19. Initial BMC/STA indices
+            // are therefore zero; association supplies the later peer indices.
             encode_uni_mcu(2, &payload, sequence)
         }
         // add_interface -> mt7921_mcu_set_tx before mac80211 has supplied

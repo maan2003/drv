@@ -859,6 +859,11 @@ pub struct Mt7921FirmwareRunReport {
 
 #[derive(Debug)]
 pub enum Mt7921FirmwareRunError {
+    Radio {
+        source: zx::Status,
+        acquisition: AcquisitionLedger,
+        containment: Box<Result<ContainmentLedger, Mt7921ContainmentError>>,
+    },
     Regulatory {
         source: mt7921_core::RateTxPowerError,
         acquisition: AcquisitionLedger,
@@ -885,6 +890,7 @@ pub enum Mt7921FirmwareRunError {
 impl fmt::Display for Mt7921FirmwareRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Radio { source, .. } => write!(f, "prepare MT7921 passive radio: {source:?}"),
             Self::Regulatory { source, .. } => {
                 write!(f, "derive MT7921 regulatory policy: {source:?}")
             }
@@ -946,7 +952,10 @@ pub struct Mt7921Driver {
     firmware: FirmwareLoaderReport,
     regulatory: mt7921_core::RegulatoryRatePowerSnapshot,
     mac_initialization: radio::MacInitialization,
+    radio_preparation: radio::RadioPreparation,
     data_rx: receive::DataRx,
+    scan: Option<radio::PassiveScan>,
+    next_scan_id: u64,
     upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
 
@@ -978,13 +987,30 @@ impl Mt7921Driver {
                         });
                     }
                 };
+                let radio_preparation =
+                    match radio::RadioPreparation::new(verified.ram, &firmware, &regulatory) {
+                        Ok(preparation) => preparation,
+                        Err(source) => {
+                            session.lifecycle = SessionLifecycle::Closing;
+                            let acquisition = session.acquisition.clone();
+                            let containment = session.contain();
+                            return Err(Mt7921FirmwareRunError::Radio {
+                                source,
+                                acquisition,
+                                containment: Box::new(containment),
+                            });
+                        }
+                    };
                 session.lifecycle = SessionLifecycle::FirmwareInitialized;
                 Ok(Self {
                     session,
                     firmware,
                     regulatory,
                     mac_initialization: radio::MacInitialization::new(),
+                    radio_preparation,
                     data_rx: receive::DataRx::default(),
+                    scan: None,
+                    next_scan_id: 1,
                     upcalls: None,
                 })
             }
@@ -1001,6 +1027,23 @@ impl Mt7921Driver {
                 })
             }
         }
+    }
+
+    /// World-domain receive-only channels. This is not transmit authorization.
+    pub fn passive_channels(&self) -> Vec<mt7921_core::CandidateChannel> {
+        mt7921_core::candidate_channels(self.firmware.nic_capability)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.band != mt7921_core::PhysicalBand::Ghz6
+                    && self.regulatory.channels().iter().any(|rule| {
+                        rule.band == candidate.band
+                            && rule.channel == candidate.number
+                            && rule.present
+                            && !rule.disabled
+                            && rule.max_reg_power_dbm.is_some()
+                    })
+            })
+            .collect()
     }
 
     /// Diagnostic facts, not a capability for creating another driver.

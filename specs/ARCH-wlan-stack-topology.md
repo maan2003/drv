@@ -4,11 +4,15 @@
 
 MT7921 now uses one typed hardware/DMA owner consumed by the same-process
 Fuchsia MLME/SME runtime. The binary-local `vfio_read` owner and its executable
-are removed, not retained as a compatibility path. Firmware initialization
-and containment are implemented; scan, channel/peer/key configuration,
-association, radio TX/RX and MAC override are intentionally unavailable until
-ported into this owner. Earlier Internet demonstrations used the retired
-implementation and are not acceptance of this replacement.
+are removed, not retained as a compatibility path. Firmware initialization,
+bounded passive-scan/RX progression and containment are implemented and have
+been exercised with the assigned MT7921 inside KVM through the production CLI.
+Regulatory input is a hash-verified inherited database; the chip owner retains
+its immutable world-domain policy. Passive scan does not grant transmit
+authority. Active scan, scan cancellation, channel/peer/key configuration,
+association, TX and MAC override remain unavailable. Earlier Internet
+demonstrations used the retired implementation and are not acceptance of this
+replacement.
 
 The policy daemon owns persistence and network intent, and drives the pinned
 Fuchsia selector/state machine over bounded, fd-free control IPC. Application

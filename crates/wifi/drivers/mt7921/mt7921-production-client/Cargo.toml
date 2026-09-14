@@ -9,6 +9,7 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+futures-channel = "=0.3.34"
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-softmac = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
 wlan-softmac-host = { path = "../../../wlan-softmac-host" }
@@ -21,6 +22,7 @@ zeroize = "=1.8.2"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }
 
 [dev-dependencies]
+wlan-softmac-host = { path = "../../../wlan-softmac-host", features = ["conformance"] }
 drv-hardware-backends = { path = "../../../../platform/hardware-backends" }
 [patch.crates-io]
 trust-dns-proto = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
