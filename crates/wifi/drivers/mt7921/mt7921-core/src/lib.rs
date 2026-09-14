@@ -5036,6 +5036,25 @@ pub fn load_mt7921_firmware_through_channel_domain<T: FirmwareLoaderTransport>(
     finish_firmware_loader(transport, state, result)
 }
 
+/// Initialize the complete firmware/control-plane sequence through channel
+/// domain setup and leave a successful transport live for the owning driver.
+///
+/// Initialization commands and patch-semaphore handling are identical to the
+/// bounded loader. Failure always attempts transport quiescence and retains
+/// both the primary and cleanup errors. The driver remains responsible for
+/// full hardware containment after failure and at the end of its lifetime.
+pub fn initialize_mt7921_firmware<T: FirmwareLoaderTransport>(
+    transport: &mut T,
+    patch: Patch<'_>,
+    firmware: Firmware<'_>,
+) -> Result<FirmwareLoaderReport, FirmwareLoaderError<T::Error>> {
+    let mut state = FirmwareLoaderState::Powering;
+    match run_firmware_loader(transport, patch, firmware, &mut state, true, false, false) {
+        Ok(report) => Ok(report),
+        Err(failure) => finish_firmware_loader(transport, state, Err(failure)),
+    }
+}
+
 /// Execute channel-domain setup, then one caller-owned bounded passive hook
 /// before the same mandatory cleanup transaction. The hook cannot bypass or
 /// replace cleanup and its failure is preserved as a typed transport error.
@@ -15542,6 +15561,7 @@ mod tests {
         fail_release: bool,
         fail_patch_publish: bool,
         fail_patch_completion: bool,
+        fail_cleanup: bool,
         clc_mask: u8,
     }
 
@@ -15562,6 +15582,7 @@ mod tests {
                 fail_release: false,
                 fail_patch_publish: false,
                 fail_patch_completion: false,
+                fail_cleanup: false,
                 clc_mask: 0x1f,
             }
         }
@@ -15756,7 +15777,12 @@ mod tests {
 
         fn fail_closed_cleanup(&mut self, state: FirmwareLoaderState) -> Result<(), Self::Error> {
             self.trace.push(LoaderTrace::Cleanup(state));
-            self.step()
+            self.step()?;
+            if self.fail_cleanup {
+                Err("injected cleanup failure")
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -15957,6 +15983,118 @@ mod tests {
             event,
             LoaderTrace::Command(DownloadCommand::TargetAddressLength { .. }, _)
         )));
+    }
+
+    #[test]
+    fn live_firmware_initialization_preserves_sequence_without_quiescing_success() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let patch = Patch::parse(&patch_bytes).unwrap();
+        let ram = Firmware::parse(&ram_bytes).unwrap();
+        let mut bounded = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let expected =
+            load_mt7921_firmware_through_channel_domain(&mut bounded, patch, ram).unwrap();
+        assert_eq!(
+            bounded.trace.pop(),
+            Some(LoaderTrace::Cleanup(FirmwareLoaderState::Ready))
+        );
+
+        let mut live = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        let report = initialize_mt7921_firmware(
+            &mut live,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report, expected);
+        assert_eq!(live.trace, bounded.trace);
+        assert_eq!(live.sequence, bounded.sequence);
+        assert_eq!(live.now_ms, bounded.now_ms);
+        let next_sequence = live.sequence % 15 + 1;
+        loader_command(&mut live, DownloadCommand::GetNicCapability).unwrap();
+        assert_eq!(
+            live.trace.last(),
+            Some(&LoaderTrace::Command(
+                DownloadCommand::GetNicCapability,
+                next_sequence,
+            ))
+        );
+        assert!(
+            !live
+                .trace
+                .iter()
+                .any(|event| matches!(event, LoaderTrace::Cleanup(_)))
+        );
+    }
+
+    #[test]
+    fn live_firmware_initialization_failure_always_quiesces_and_preserves_both_errors() {
+        let (patch_bytes, ram_bytes) = loader_images();
+        let mut baseline = FakeFirmwareLoader {
+            clc_mask: 0,
+            ..Default::default()
+        };
+        initialize_mt7921_firmware(
+            &mut baseline,
+            Patch::parse(&patch_bytes).unwrap(),
+            Firmware::parse(&ram_bytes).unwrap(),
+        )
+        .unwrap();
+        for fail_at in 1..=baseline.calls {
+            for fail_cleanup in [false, true] {
+                let mut transport = FakeFirmwareLoader {
+                    clc_mask: 0,
+                    fail_at: Some(fail_at),
+                    fail_cleanup,
+                    ..Default::default()
+                };
+                let failure = initialize_mt7921_firmware(
+                    &mut transport,
+                    Patch::parse(&patch_bytes).unwrap(),
+                    Firmware::parse(&ram_bytes).unwrap(),
+                )
+                .unwrap_err();
+                if fail_cleanup {
+                    assert!(matches!(
+                        failure,
+                        FirmwareLoaderError::Cleanup {
+                            failure: Some(_),
+                            source: "injected cleanup failure",
+                        }
+                    ));
+                } else {
+                    assert!(matches!(failure, FirmwareLoaderError::Failed(_)));
+                }
+                assert!(matches!(
+                    transport.trace.last(),
+                    Some(LoaderTrace::Cleanup(_))
+                ));
+                assert_eq!(
+                    transport
+                        .trace
+                        .iter()
+                        .filter(|event| matches!(event, LoaderTrace::Cleanup(_)))
+                        .count(),
+                    1
+                );
+                if transport.trace.iter().any(|event| {
+                    matches!(
+                        event,
+                        LoaderTrace::Command(DownloadCommand::PatchStart { .. }, _)
+                    )
+                }) {
+                    assert!(transport.trace.iter().any(|event| matches!(
+                        event,
+                        LoaderTrace::Command(DownloadCommand::PatchSemaphoreRelease, _)
+                    )));
+                }
+            }
+        }
     }
 
     #[test]
