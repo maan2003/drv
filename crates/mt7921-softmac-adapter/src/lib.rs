@@ -1862,8 +1862,16 @@ mod tests {
             .iter()
             .map(|(_, encoded, _)| encoded[39])
             .collect::<Vec<_>>();
-        assert_eq!(&command_sequences[..5], &[15, 1, 2, 3, 12]);
-        assert_eq!(mechanics.rate_power_sequences, [4, 5, 6, 7, 8, 9, 10, 11]);
+        // Loader-owned EEPROM/protection commands are not replayed. The first
+        // eight-page SKU batch wraps 14 -> 15 -> 1 before runtime commands;
+        // the second batch follows SetRxPath and shares that same sequence.
+        assert_eq!(mechanics.prepare_after_commands, Some(0));
+        assert_eq!(mechanics.rate_power_after_commands, Some(4));
+        assert_eq!(command_sequences, [8, 9, 10, 11, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            mechanics.rate_power_sequences,
+            [15, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -2193,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_passive_dependencies_fail_after_only_source_ordered_eeprom() {
+    fn mandatory_passive_dependencies_fail_before_runtime_commands() {
         let capability = nic();
         let mechanics = ScriptedMechanics {
             prerequisites: Some(PassivePrerequisites {
@@ -2221,11 +2229,9 @@ mod tests {
                 SourceExactTransportError::MandatoryDependency(_)
             ))
         ));
-        assert_eq!(adapter.transport.mechanics.commands.len(), 1);
-        assert!(matches!(
-            adapter.transport.mechanics.commands[0].0,
-            PassiveMcuCommand::EepromBufferMode
-        ));
+        assert_eq!(adapter.transport.mechanics.prepare_after_commands, Some(0));
+        assert!(adapter.transport.mechanics.commands.is_empty());
+        assert_eq!(adapter.transport.mechanics.rate_power_after_commands, None);
         assert_eq!(adapter.start_active_scan(), Err(AdapterError::Poisoned));
     }
 
