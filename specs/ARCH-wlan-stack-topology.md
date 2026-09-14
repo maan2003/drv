@@ -74,9 +74,10 @@ The internal structure copies Fuchsia's WLAN component contracts (`WlanSoftmac`,
 scaffolding (`WlanSoftmacBridge`, raw-pointer FFI frame protocols) exist only to
 work around a Fuchsia toolchain gap and are dropped; the method *semantics* are
 kept. The seam is a project-owned portable contract per
-[REQ-host-portability](REQ-host-portability.md). The current SoftMAC seam uses
-in-process synchronous Rust traits and callbacks with generated FIDL schema
-value types. Unix `SOCK_SEQPACKET` carries the separate Ethernet process seam,
+[REQ-host-portability](REQ-host-portability.md). The SoftMAC seam uses
+in-process Rust traits and callbacks with generated FIDL schema value types.
+Mutations admit work synchronously and return owned, executor-neutral completion
+futures; the host releases the driver lock before awaiting them. Unix `SOCK_SEQPACKET` carries the separate Ethernet process seam,
 not these SoftMAC control/raw-frame calls.
 
 - **Control + raw-frame seam (WlanSoftmac).** driver <-> MLME. Methods to copy:
@@ -149,8 +150,10 @@ or receive general filesystem, host-network, or unrelated device access.
 The selected Linux execution model is one Tokio current-thread runtime with a
 LocalSet and readiness-driven descriptor integration. Portable driver contracts
 remain executor-neutral. Entrypoints own that executor; protocol state does not own a nested runtime.
-Manual driver-turn polling and synchronous downcalls remain transitional,
-not the completed async lifecycle.
+SoftMAC mutations return owned futures without borrowing the driver. Existing
+legacy adapters still perform synchronous work before returning ready futures;
+that behavior and manual driver-turn polling remain transitional, not the
+completed async lifecycle.
 
 The driver owns submitted operations and their hardware-visible resources
 independently of waiting futures. Dropping a waiter or reaching its deadline

@@ -97,50 +97,60 @@ impl WlanSoftmac for FakeSoftmac {
     fn set_channel(
         &mut self,
         _: softmac::WlanSoftmacBaseSetChannelRequest,
-    ) -> Result<(), zx::Status> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
-    fn join_bss(&mut self, _: driver::JoinBssRequest) -> Result<(), zx::Status> {
-        Ok(())
+    fn join_bss(
+        &mut self,
+        _: driver::JoinBssRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
-    fn install_key(&mut self, _: softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
-        Ok(())
+    fn install_key(
+        &mut self,
+        _: softmac::WlanKeyConfiguration,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
     fn notify_association_complete(
         &mut self,
         _: softmac::WlanAssociationConfig,
-    ) -> Result<(), zx::Status> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
     fn clear_association(
         &mut self,
         _: softmac::WlanSoftmacBaseClearAssociationRequest,
-    ) -> Result<(), zx::Status> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
     fn start_passive_scan(
         &mut self,
         _: softmac::WlanSoftmacBaseStartPassiveScanRequest,
-    ) -> Result<softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<
+        Output = Result<softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn start_active_scan(
         &mut self,
         _: softmac::WlanSoftmacStartActiveScanRequest,
-    ) -> Result<softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<
+        Output = Result<softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn cancel_scan(
         &mut self,
         _: softmac::WlanSoftmacBaseCancelScanRequest,
-    ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn update_wmm_parameters(
         &mut self,
         _: softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
-    ) -> Result<(), zx::Status> {
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Ok(()))
     }
     fn queue_tx(&mut self, bytes: &[u8], _: softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
         let response = match bytes.first().copied() {
@@ -365,7 +375,7 @@ async fn drive_until<R: wifi_control_service::WifiRuntime>(
 ) {
     for _ in 0..2_000 {
         (server.drive_once()).await.unwrap();
-            tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
         if done() {
             return;
         }

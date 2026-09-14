@@ -80,46 +80,69 @@ impl WlanSoftmac for Mt7921Driver {
     ) -> Result<SpectrumManagementSupport, zx::Status> {
         Ok(Default::default())
     }
-    fn set_channel(&mut self, _: WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn set_channel(
+        &mut self,
+        _: WlanSoftmacBaseSetChannelRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn join_bss(&mut self, _: JoinBssRequest) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn join_bss(
+        &mut self,
+        _: JoinBssRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn install_key(&mut self, _: WlanKeyConfiguration) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn install_key(
+        &mut self,
+        _: WlanKeyConfiguration,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn notify_association_complete(&mut self, _: WlanAssociationConfig) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    fn notify_association_complete(
+        &mut self,
+        _: WlanAssociationConfig,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn clear_association(
         &mut self,
         _: WlanSoftmacBaseClearAssociationRequest,
-    ) -> Result<(), zx::Status> {
-        // No join/key/TX operation can currently create association state.
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready({
+            // No join/key/TX operation can currently create association state.
+            Ok(())
+        })
     }
     fn start_passive_scan(
         &mut self,
         _: WlanSoftmacBaseStartPassiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn start_active_scan(
         &mut self,
         _: WlanSoftmacStartActiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn cancel_scan(&mut self, _: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
-        // Neither scan entrypoint admits work.
-        Ok(())
+    fn cancel_scan(
+        &mut self,
+        _: WlanSoftmacBaseCancelScanRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready({
+            // Neither scan entrypoint admits work.
+            Ok(())
+        })
     }
     fn update_wmm_parameters(
         &mut self,
         _: WlanSoftmacBaseUpdateWmmParametersRequest,
-    ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn queue_tx(&mut self, _: &[u8], _: WlanTxInfoFlags) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)

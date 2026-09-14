@@ -865,503 +865,537 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
         Ok(Default::default())
     }
 
-    fn set_channel(&mut self, request: WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status> {
-        let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
-        if request.bandwidth != Some(ChannelBandwidth::Cbw20)
-            || request.vht_secondary_80_channel.is_none()
-        {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let vdev = self.ready_vdev()?;
-        let frequency = channel_frequency(primary)?;
-        let channel = self
-            .regulatory_domain
-            .as_ref()
-            .into_iter()
-            .flat_map(|domain| &domain.channels)
-            .find(|channel| channel.frequency_mhz == frequency)
-            .copied()
-            .ok_or(zx::Status::NOT_FOUND)?;
-        self.device.start_vdev(vdev, channel).map_err(status)
-    }
-
-    fn join_bss(&mut self, request: JoinBssRequest) -> Result<(), zx::Status> {
-        self.pending_association_security = None;
-        self.igtk = None;
-        let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
-        if request.beacon_period.is_none() {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        if request.bss_type != Some(BssType::Infrastructure) || request.remote != Some(true) {
-            return Err(zx::Status::NOT_SUPPORTED);
-        }
-        if self.peer.is_some() {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let vdev = self.ready_vdev()?;
-        if let Err(error) = self.device.create_peer(vdev, peer) {
-            if self.runtime_trace.is_some() {
-                eprintln!("ath11k_softmac_peer_create error={error:?}");
-            }
-            // A failed completion can leave peer creation ambiguous. Only a
-            // terminal firmware stop is representable at the current seam.
-            let _ = self.stop();
-            return Err(status(error));
-        }
-        self.peer = Some(peer);
-        Ok(())
-    }
-    fn install_key(&mut self, configuration: WlanKeyConfiguration) -> Result<(), zx::Status> {
-        if self.runtime_trace.is_some() {
-            eprintln!(
-                "ath11k_key_request type={:?} cipher={:?} index={:?} peer={:?} protection={:?} rsc={:?}",
-                configuration.key_type,
-                configuration.cipher_type,
-                configuration.key_idx,
-                configuration.peer_addr,
-                configuration.protection,
-                configuration.rsc
-            );
-        }
-        let vdev = self.ready_vdev()?;
-        let associated_peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
-        if !self.associated {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let protection = match configuration.protection.ok_or(zx::Status::INVALID_ARGS)? {
-            fidl_fuchsia_wlan_softmac::WlanProtection::None => {
+    fn set_channel(
+        &mut self,
+        request: WlanSoftmacBaseSetChannelRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
+            if request.bandwidth != Some(ChannelBandwidth::Cbw20)
+                || request.vht_secondary_80_channel.is_none()
+            {
                 return Err(zx::Status::INVALID_ARGS);
             }
-            fidl_fuchsia_wlan_softmac::WlanProtection::RxTx => KeyProtection::RxTx,
-            fidl_fuchsia_wlan_softmac::WlanProtection::Rx => KeyProtection::Rx,
-            fidl_fuchsia_wlan_softmac::WlanProtection::Tx => KeyProtection::Tx,
-        };
-        if configuration.cipher_oui != Some([0x00, 0x0f, 0xac]) {
-            return Err(zx::Status::NOT_SUPPORTED);
-        }
-        let (kind, peer) = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
-            fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise => {
-                if configuration.peer_addr != Some(associated_peer) {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                (KeyKind::Pairwise, associated_peer)
+            let vdev = self.ready_vdev()?;
+            let frequency = channel_frequency(primary)?;
+            let channel = self
+                .regulatory_domain
+                .as_ref()
+                .into_iter()
+                .flat_map(|domain| &domain.channels)
+                .find(|channel| channel.frequency_mhz == frequency)
+                .copied()
+                .ok_or(zx::Status::NOT_FOUND)?;
+            self.device.start_vdev(vdev, channel).map_err(status)
+        })())
+    }
+
+    fn join_bss(
+        &mut self,
+        request: JoinBssRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            self.pending_association_security = None;
+            self.igtk = None;
+            let peer = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+            if request.beacon_period.is_none() {
+                return Err(zx::Status::INVALID_ARGS);
             }
-            fidl_fuchsia_wlan_ieee80211::KeyType::Group => {
-                if configuration.peer_addr != Some([0xff; 6]) {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                // Linux resolves a station GTK's broadcast host identity to
-                // the associated BSSID before WMI and peer-state publication.
-                (KeyKind::Group, associated_peer)
+            if request.bss_type != Some(BssType::Infrastructure) || request.remote != Some(true) {
+                return Err(zx::Status::NOT_SUPPORTED);
             }
-            fidl_fuchsia_wlan_ieee80211::KeyType::Igtk => {
-                if configuration.peer_addr != Some([0xff; 6])
-                    || configuration.cipher_type != Some(6)
-                    || !matches!(configuration.key_idx, Some(4) | Some(5))
-                    || protection != KeyProtection::RxTx
-                {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                let key: [u8; 16] = configuration
-                    .key
-                    .ok_or(zx::Status::INVALID_ARGS)?
-                    .try_into()
-                    .map_err(|_| zx::Status::INVALID_ARGS)?;
-                // SME packs the six wire-order IPN octets into the low
-                // six bytes of a big-endian u64. BIP compares a little-endian
-                // 48-bit packet number.
-                let rsc = configuration
-                    .rsc
-                    .ok_or(zx::Status::INVALID_ARGS)?
-                    .to_be_bytes();
-                if rsc[..2] != [0, 0] {
-                    return Err(zx::Status::INVALID_ARGS);
-                }
-                let mut ipn = [0; 8];
-                ipn[..6].copy_from_slice(&rsc[2..]);
-                let receive_ipn = u64::from_le_bytes(ipn);
-                self.igtk = Some(Igtk {
-                    key_id: u16::from(configuration.key_idx.unwrap()),
-                    key,
-                    receive_ipn,
-                    transmit_ipn: 0,
-                });
-                return Ok(());
+            if self.peer.is_some() {
+                return Err(zx::Status::BAD_STATE);
             }
-            _ => return Err(zx::Status::NOT_SUPPORTED),
-        };
-        let cipher = match configuration.cipher_type.ok_or(zx::Status::INVALID_ARGS)? {
-            2 => Cipher::Tkip,
-            4 => Cipher::Ccmp128,
-            8 => Cipher::Gcmp128,
-            9 => Cipher::Gcmp256,
-            10 => Cipher::Ccmp256,
-            _ => return Err(zx::Status::NOT_SUPPORTED),
-        };
-        let rsc = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
-        // EAPOL's parser exposes the RSC octets as a big-endian u64;
-        // CCMP/GCMP's wire PN is little-endian. Preserve the packet number,
-        // rather than rejecting a valid nonzero GTK RSC as wider than 48 bits.
-        let receive_sequence_counter = if kind == KeyKind::Group {
-            u64::from_le_bytes(rsc.to_be_bytes())
-        } else {
-            rsc
-        };
-        if receive_sequence_counter > 0x0000_ffff_ffff_ffff {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let key = KeyConfig {
-            vdev,
-            peer,
-            index: configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?,
-            cipher,
-            kind,
-            protection,
-            receive_sequence_counter,
-            bytes: configuration.key.ok_or(zx::Status::INVALID_ARGS)?,
-        };
-        if let Err(error) = self.device.install_key(key) {
+            let vdev = self.ready_vdev()?;
+            if let Err(error) = self.device.create_peer(vdev, peer) {
+                if self.runtime_trace.is_some() {
+                    eprintln!("ath11k_softmac_peer_create error={error:?}");
+                }
+                // A failed completion can leave peer creation ambiguous. Only a
+                // terminal firmware stop is representable at the current seam.
+                let _ = self.stop();
+                return Err(status(error));
+            }
+            self.peer = Some(peer);
+            Ok(())
+        })())
+    }
+    fn install_key(
+        &mut self,
+        configuration: WlanKeyConfiguration,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
             if self.runtime_trace.is_some() {
-                // Core errors can own the key-install operation: never Debug
-                // the whole error, since that would include key bytes.
-                let phase = match &error {
-                    ath11k_core::CoreError::ProtocolAt(operation)
-                    | ath11k_core::CoreError::DeviceFaultAt(operation) => Some(operation.target()),
-                    _ => None,
-                };
                 eprintln!(
-                    "ath11k_key_install_failed kind={kind:?} status={:?} phase={phase:?}",
-                    status(error.clone())
+                    "ath11k_key_request type={:?} cipher={:?} index={:?} peer={:?} protection={:?} rsc={:?}",
+                    configuration.key_type,
+                    configuration.cipher_type,
+                    configuration.key_idx,
+                    configuration.peer_addr,
+                    configuration.protection,
+                    configuration.rsc
                 );
             }
-            // WMI completion may have succeeded before a DP publication
-            // failed. Only terminal device teardown makes that state safe.
-            let _ = self.stop();
-            return Err(status(error));
-        }
-        Ok(())
+            let vdev = self.ready_vdev()?;
+            let associated_peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+            if !self.associated {
+                return Err(zx::Status::BAD_STATE);
+            }
+            let protection = match configuration.protection.ok_or(zx::Status::INVALID_ARGS)? {
+                fidl_fuchsia_wlan_softmac::WlanProtection::None => {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                fidl_fuchsia_wlan_softmac::WlanProtection::RxTx => KeyProtection::RxTx,
+                fidl_fuchsia_wlan_softmac::WlanProtection::Rx => KeyProtection::Rx,
+                fidl_fuchsia_wlan_softmac::WlanProtection::Tx => KeyProtection::Tx,
+            };
+            if configuration.cipher_oui != Some([0x00, 0x0f, 0xac]) {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let (kind, peer) = match configuration.key_type.ok_or(zx::Status::INVALID_ARGS)? {
+                fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise => {
+                    if configuration.peer_addr != Some(associated_peer) {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    (KeyKind::Pairwise, associated_peer)
+                }
+                fidl_fuchsia_wlan_ieee80211::KeyType::Group => {
+                    if configuration.peer_addr != Some([0xff; 6]) {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    // Linux resolves a station GTK's broadcast host identity to
+                    // the associated BSSID before WMI and peer-state publication.
+                    (KeyKind::Group, associated_peer)
+                }
+                fidl_fuchsia_wlan_ieee80211::KeyType::Igtk => {
+                    if configuration.peer_addr != Some([0xff; 6])
+                        || configuration.cipher_type != Some(6)
+                        || !matches!(configuration.key_idx, Some(4) | Some(5))
+                        || protection != KeyProtection::RxTx
+                    {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    let key: [u8; 16] = configuration
+                        .key
+                        .ok_or(zx::Status::INVALID_ARGS)?
+                        .try_into()
+                        .map_err(|_| zx::Status::INVALID_ARGS)?;
+                    // SME packs the six wire-order IPN octets into the low
+                    // six bytes of a big-endian u64. BIP compares a little-endian
+                    // 48-bit packet number.
+                    let rsc = configuration
+                        .rsc
+                        .ok_or(zx::Status::INVALID_ARGS)?
+                        .to_be_bytes();
+                    if rsc[..2] != [0, 0] {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    let mut ipn = [0; 8];
+                    ipn[..6].copy_from_slice(&rsc[2..]);
+                    let receive_ipn = u64::from_le_bytes(ipn);
+                    self.igtk = Some(Igtk {
+                        key_id: u16::from(configuration.key_idx.unwrap()),
+                        key,
+                        receive_ipn,
+                        transmit_ipn: 0,
+                    });
+                    return Ok(());
+                }
+                _ => return Err(zx::Status::NOT_SUPPORTED),
+            };
+            let cipher = match configuration.cipher_type.ok_or(zx::Status::INVALID_ARGS)? {
+                2 => Cipher::Tkip,
+                4 => Cipher::Ccmp128,
+                8 => Cipher::Gcmp128,
+                9 => Cipher::Gcmp256,
+                10 => Cipher::Ccmp256,
+                _ => return Err(zx::Status::NOT_SUPPORTED),
+            };
+            let rsc = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
+            // EAPOL's parser exposes the RSC octets as a big-endian u64;
+            // CCMP/GCMP's wire PN is little-endian. Preserve the packet number,
+            // rather than rejecting a valid nonzero GTK RSC as wider than 48 bits.
+            let receive_sequence_counter = if kind == KeyKind::Group {
+                u64::from_le_bytes(rsc.to_be_bytes())
+            } else {
+                rsc
+            };
+            if receive_sequence_counter > 0x0000_ffff_ffff_ffff {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let key = KeyConfig {
+                vdev,
+                peer,
+                index: configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?,
+                cipher,
+                kind,
+                protection,
+                receive_sequence_counter,
+                bytes: configuration.key.ok_or(zx::Status::INVALID_ARGS)?,
+            };
+            if let Err(error) = self.device.install_key(key) {
+                if self.runtime_trace.is_some() {
+                    // Core errors can own the key-install operation: never Debug
+                    // the whole error, since that would include key bytes.
+                    let phase = match &error {
+                        ath11k_core::CoreError::ProtocolAt(operation)
+                        | ath11k_core::CoreError::DeviceFaultAt(operation) => {
+                            Some(operation.target())
+                        }
+                        _ => None,
+                    };
+                    eprintln!(
+                        "ath11k_key_install_failed kind={kind:?} status={:?} phase={phase:?}",
+                        status(error.clone())
+                    );
+                }
+                // WMI completion may have succeeded before a DP publication
+                // failed. Only terminal device teardown makes that state safe.
+                let _ = self.stop();
+                return Err(status(error));
+            }
+            Ok(())
+        })())
     }
     fn notify_association_complete(
         &mut self,
         configuration: WlanAssociationConfig,
-    ) -> Result<(), zx::Status> {
-        if self.associated {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
-        if self.peer != Some(peer) {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let aid = configuration.aid.ok_or(zx::Status::INVALID_ARGS)?;
-        if !(1..=2007).contains(&aid) {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let listen_interval = configuration
-            .listen_interval
-            .ok_or(zx::Status::INVALID_ARGS)?;
-        let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
-        let qos = configuration.qos.ok_or(zx::Status::INVALID_ARGS)?;
-        let capability_info = configuration
-            .capability_info
-            .ok_or(zx::Status::INVALID_ARGS)?;
-        let evidence = self.pending_association_security.take();
-        // MLME's negotiated CapabilityInfo clears Privacy. The transmitted
-        // RSNE is authoritative security provenance, not that summary bit.
-        let security = if evidence.is_some_and(|security| security.need_ptk_4_way)
-            || capability_info & 0x0010 != 0
-        {
-            evidence
-                .filter(|security| security.peer == peer && security.need_ptk_4_way)
-                .ok_or(zx::Status::BAD_STATE)?
-        } else {
-            PendingAssociationSecurity {
-                peer,
-                need_ptk_4_way: false,
-                need_gtk_2_way: false,
-                pmf: false,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            if self.associated {
+                return Err(zx::Status::BAD_STATE);
             }
-        };
-        if configuration.bandwidth != Some(ChannelBandwidth::Cbw20) {
-            // The current vdev-start seam configures only 20 MHz.
-            return Err(zx::Status::NOT_SUPPORTED);
-        }
-        let secondary = configuration
-            .vht_secondary_80_channel
-            .ok_or(zx::Status::INVALID_ARGS)?;
-        if secondary.band != primary.band || secondary.number != 0 {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        if configuration.ht_cap.is_some() != configuration.ht_op.is_some()
-            || configuration.vht_cap.is_some() != configuration.vht_op.is_some()
-            || (configuration.vht_cap.is_some() && configuration.ht_cap.is_none())
-            || (!qos && (configuration.ht_cap.is_some() || configuration.vht_cap.is_some()))
-        {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let rates = configuration.rates.ok_or(zx::Status::INVALID_ARGS)?;
-        if rates.is_empty() {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let allowed: &[u8] = match primary.band {
-            WlanBand::TwoGhz => TWO_GHZ_RATES,
-            WlanBand::FiveGhz => FIVE_GHZ_RATES,
-            _ => return Err(zx::Status::NOT_SUPPORTED),
-        };
-        if rates.iter().any(|rate| !allowed.contains(&(rate & 0x7f))) {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let legacy_rates = allowed
-            .iter()
-            .copied()
-            .filter(|allowed| rates.iter().any(|rate| rate & 0x7f == *allowed))
-            .collect();
-        let wmm = configuration
-            .wmm_params
-            .map(|wmm| {
-                // This is the AP's U-APSD capability, not a requirement to
-                // enable it for our station. Our WMM setup keeps U-APSD off.
-                if !qos {
-                    return Err(zx::Status::INVALID_ARGS);
+            let peer = configuration.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+            if self.peer != Some(peer) {
+                return Err(zx::Status::BAD_STATE);
+            }
+            let aid = configuration.aid.ok_or(zx::Status::INVALID_ARGS)?;
+            if !(1..=2007).contains(&aid) {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let listen_interval = configuration
+                .listen_interval
+                .ok_or(zx::Status::INVALID_ARGS)?;
+            let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+            let qos = configuration.qos.ok_or(zx::Status::INVALID_ARGS)?;
+            let capability_info = configuration
+                .capability_info
+                .ok_or(zx::Status::INVALID_ARGS)?;
+            let evidence = self.pending_association_security.take();
+            // MLME's negotiated CapabilityInfo clears Privacy. The transmitted
+            // RSNE is authoritative security provenance, not that summary bit.
+            let security = if evidence.is_some_and(|security| security.need_ptk_4_way)
+                || capability_info & 0x0010 != 0
+            {
+                evidence
+                    .filter(|security| security.peer == peer && security.need_ptk_4_way)
+                    .ok_or(zx::Status::BAD_STATE)?
+            } else {
+                PendingAssociationSecurity {
+                    peer,
+                    need_ptk_4_way: false,
+                    need_gtk_2_way: false,
+                    pmf: false,
                 }
-                macro_rules! convert {
-                    ($ac:expr) => {{
-                        let ac = $ac;
-                        if ac.ecw_min > 15
-                            || ac.ecw_max > 15
-                            || ac.ecw_min > ac.ecw_max
-                            || ac.aifsn > 15
-                        {
-                            return Err(zx::Status::INVALID_ARGS);
-                        }
-                        WmmAccessCategory {
-                            ecw_min: ac.ecw_min,
-                            ecw_max: ac.ecw_max,
-                            aifsn: ac.aifsn,
-                            txop_limit: ac.txop_limit,
-                            admission_control_mandatory: ac.acm,
-                        }
-                    }};
-                }
-                Ok(WmmConfig {
-                    access_categories: [
-                        convert!(wmm.ac_be_params),
-                        convert!(wmm.ac_bk_params),
-                        convert!(wmm.ac_vi_params),
-                        convert!(wmm.ac_vo_params),
-                    ],
+            };
+            if configuration.bandwidth != Some(ChannelBandwidth::Cbw20) {
+                // The current vdev-start seam configures only 20 MHz.
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let secondary = configuration
+                .vht_secondary_80_channel
+                .ok_or(zx::Status::INVALID_ARGS)?;
+            if secondary.band != primary.band || secondary.number != 0 {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            if configuration.ht_cap.is_some() != configuration.ht_op.is_some()
+                || configuration.vht_cap.is_some() != configuration.vht_op.is_some()
+                || (configuration.vht_cap.is_some() && configuration.ht_cap.is_none())
+                || (!qos && (configuration.ht_cap.is_some() || configuration.vht_cap.is_some()))
+            {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let rates = configuration.rates.ok_or(zx::Status::INVALID_ARGS)?;
+            if rates.is_empty() {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let allowed: &[u8] = match primary.band {
+                WlanBand::TwoGhz => TWO_GHZ_RATES,
+                WlanBand::FiveGhz => FIVE_GHZ_RATES,
+                _ => return Err(zx::Status::NOT_SUPPORTED),
+            };
+            if rates.iter().any(|rate| !allowed.contains(&(rate & 0x7f))) {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let legacy_rates = allowed
+                .iter()
+                .copied()
+                .filter(|allowed| rates.iter().any(|rate| rate & 0x7f == *allowed))
+                .collect();
+            let wmm = configuration
+                .wmm_params
+                .map(|wmm| {
+                    // This is the AP's U-APSD capability, not a requirement to
+                    // enable it for our station. Our WMM setup keeps U-APSD off.
+                    if !qos {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    macro_rules! convert {
+                        ($ac:expr) => {{
+                            let ac = $ac;
+                            if ac.ecw_min > 15
+                                || ac.ecw_max > 15
+                                || ac.ecw_min > ac.ecw_max
+                                || ac.aifsn > 15
+                            {
+                                return Err(zx::Status::INVALID_ARGS);
+                            }
+                            WmmAccessCategory {
+                                ecw_min: ac.ecw_min,
+                                ecw_max: ac.ecw_max,
+                                aifsn: ac.aifsn,
+                                txop_limit: ac.txop_limit,
+                                admission_control_mandatory: ac.acm,
+                            }
+                        }};
+                    }
+                    Ok(WmmConfig {
+                        access_categories: [
+                            convert!(wmm.ac_be_params),
+                            convert!(wmm.ac_bk_params),
+                            convert!(wmm.ac_vi_params),
+                            convert!(wmm.ac_vo_params),
+                        ],
+                    })
                 })
-            })
-            .transpose()?;
-        let vdev = self.ready_vdev()?;
-        let association = PeerAssociation {
-            vdev,
-            peer,
-            aid,
-            listen_interval,
-            primary_mhz: channel_frequency(primary)?,
-            bandwidth: AssociationBandwidth::Bw20,
-            capability_info,
-            legacy_rates,
-            qos,
-            ht_capabilities: configuration.ht_cap.map(|cap| cap.bytes),
-            vht_capabilities: configuration.vht_cap.map(|cap| cap.bytes),
-            wmm,
-            need_ptk_4_way: security.need_ptk_4_way,
-            need_gtk_2_way: security.need_gtk_2_way,
-            pmf: security.pmf,
-        };
-        if let Err(error) = self.device.associate_peer(association) {
-            if self.runtime_trace.is_some() {
-                eprintln!("ath11k_softmac_associate error={error:?}");
+                .transpose()?;
+            let vdev = self.ready_vdev()?;
+            let association = PeerAssociation {
+                vdev,
+                peer,
+                aid,
+                listen_interval,
+                primary_mhz: channel_frequency(primary)?,
+                bandwidth: AssociationBandwidth::Bw20,
+                capability_info,
+                legacy_rates,
+                qos,
+                ht_capabilities: configuration.ht_cap.map(|cap| cap.bytes),
+                vht_capabilities: configuration.vht_cap.map(|cap| cap.bytes),
+                wmm,
+                need_ptk_4_way: security.need_ptk_4_way,
+                need_gtk_2_way: security.need_gtk_2_way,
+                pmf: security.pmf,
+            };
+            if let Err(error) = self.device.associate_peer(association) {
+                if self.runtime_trace.is_some() {
+                    eprintln!("ath11k_softmac_associate error={error:?}");
+                }
+                self.peer = None;
+                if self.device.delete_peer(vdev, peer).is_err() {
+                    let _ = self.stop();
+                }
+                return Err(status(error));
             }
-            self.peer = None;
-            if self.device.delete_peer(vdev, peer).is_err() {
-                let _ = self.stop();
+            if let Err(error) = self.device.up_vdev(vdev, peer, aid) {
+                self.peer = None;
+                let down = self.device.down_vdev(vdev);
+                let deleted = self.device.delete_peer(vdev, peer);
+                if down.is_err() || deleted.is_err() {
+                    let _ = self.stop();
+                }
+                return Err(status(error));
             }
-            return Err(status(error));
-        }
-        if let Err(error) = self.device.up_vdev(vdev, peer, aid) {
-            self.peer = None;
-            let down = self.device.down_vdev(vdev);
-            let deleted = self.device.delete_peer(vdev, peer);
-            if down.is_err() || deleted.is_err() {
-                let _ = self.stop();
-            }
-            return Err(status(error));
-        }
-        self.associated = true;
-        // A protected peer remains unauthorized until the SME completes key
-        // installation and opens the controlled port. Open associations are
-        // emitted with ath11k's source-derived AUTH peer flag.
-        self.link_up = !security.need_ptk_4_way;
-        Ok(())
+            self.associated = true;
+            // A protected peer remains unauthorized until the SME completes key
+            // installation and opens the controlled port. Open associations are
+            // emitted with ath11k's source-derived AUTH peer flag.
+            self.link_up = !security.need_ptk_4_way;
+            Ok(())
+        })())
     }
     fn clear_association(
         &mut self,
         request: WlanSoftmacBaseClearAssociationRequest,
-    ) -> Result<(), zx::Status> {
-        self.pending_association_security = None;
-        self.igtk = None;
-        let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
-        if request.peer_addr != Some(peer) {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let vdev = self.ready_vdev()?;
-        let was_associated = self.associated;
-        let was_link_up = self.link_up;
-        // Revoke adapter-side authority before the first fallible operation.
-        self.peer = None;
-        self.associated = false;
-        self.link_up = false;
-        let mut first_error = None;
-        if was_link_up && let Err(error) = self.device.set_peer_authorized(vdev, peer, false) {
-            first_error = Some(error);
-        }
-        if was_associated
-            && let Err(error) = self.device.down_vdev(vdev)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        if let Err(error) = self.device.delete_peer(vdev, peer)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        if let Some(error) = first_error {
-            let _ = self.stop();
-            return Err(status(error));
-        }
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            self.pending_association_security = None;
+            self.igtk = None;
+            let peer = self.peer.ok_or(zx::Status::BAD_STATE)?;
+            if request.peer_addr != Some(peer) {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let vdev = self.ready_vdev()?;
+            let was_associated = self.associated;
+            let was_link_up = self.link_up;
+            // Revoke adapter-side authority before the first fallible operation.
+            self.peer = None;
+            self.associated = false;
+            self.link_up = false;
+            let mut first_error = None;
+            if was_link_up && let Err(error) = self.device.set_peer_authorized(vdev, peer, false) {
+                first_error = Some(error);
+            }
+            if was_associated
+                && let Err(error) = self.device.down_vdev(vdev)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if let Err(error) = self.device.delete_peer(vdev, peer)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if let Some(error) = first_error {
+                let _ = self.stop();
+                return Err(status(error));
+            }
+            Ok(())
+        })())
     }
 
     fn start_passive_scan(
         &mut self,
         request: WlanSoftmacBaseStartPassiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        eprintln!("ath11k_softmac_scan=PASSIVE_ENTRY");
-        self.trace_runtime("passive_scan_enter", 0);
-        if self.active_scan.is_some() {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let channels = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
-        if channels.is_empty() {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let channels_mhz = channels
-            .into_iter()
-            .map(channel_frequency)
-            .collect::<Result<Vec<_>, _>>()?;
-        eprintln!(
-            "ath11k_softmac_scan=PASSIVE_CHANNELS_READY count={}",
-            channels_mhz.len()
-        );
-        let scan_id = self.next_scan_id;
-        self.next_scan_id = self
-            .next_scan_id
-            .checked_add(1)
-            .filter(|next| *next <= HOST_SCAN_ID_END + 1)
-            .ok_or(zx::Status::NO_RESOURCES)?;
-        eprintln!("ath11k_softmac_scan=PASSIVE_START_ENTER");
-        self.trace_runtime("passive_scan_send_enter", scan_id as usize);
-        self.device
-            .start_scan(ScanConfig {
-                vdev: self.ready_vdev()?,
-                id: ScanId(scan_id),
-                active: false,
-                channels_mhz,
-                ssids: Vec::new(),
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready((|| {
+            eprintln!("ath11k_softmac_scan=PASSIVE_ENTRY");
+            self.trace_runtime("passive_scan_enter", 0);
+            if self.active_scan.is_some() {
+                return Err(zx::Status::BAD_STATE);
+            }
+            let channels = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
+            if channels.is_empty() {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let channels_mhz = channels
+                .into_iter()
+                .map(channel_frequency)
+                .collect::<Result<Vec<_>, _>>()?;
+            eprintln!(
+                "ath11k_softmac_scan=PASSIVE_CHANNELS_READY count={}",
+                channels_mhz.len()
+            );
+            let scan_id = self.next_scan_id;
+            self.next_scan_id = self
+                .next_scan_id
+                .checked_add(1)
+                .filter(|next| *next <= HOST_SCAN_ID_END + 1)
+                .ok_or(zx::Status::NO_RESOURCES)?;
+            eprintln!("ath11k_softmac_scan=PASSIVE_START_ENTER");
+            self.trace_runtime("passive_scan_send_enter", scan_id as usize);
+            self.device
+                .start_scan(ScanConfig {
+                    vdev: self.ready_vdev()?,
+                    id: ScanId(scan_id),
+                    active: false,
+                    channels_mhz,
+                    ssids: Vec::new(),
+                })
+                .map_err(status)?;
+            self.trace_runtime("passive_scan_send_complete", scan_id as usize);
+            eprintln!("ath11k_softmac_scan=PASSIVE_START_READY");
+            self.active_scan = Some(scan_id);
+            Ok(WlanSoftmacBaseStartPassiveScanResponse {
+                scan_id: Some(u64::from(scan_id)),
             })
-            .map_err(status)?;
-        self.trace_runtime("passive_scan_send_complete", scan_id as usize);
-        eprintln!("ath11k_softmac_scan=PASSIVE_START_READY");
-        self.active_scan = Some(scan_id);
-        Ok(WlanSoftmacBaseStartPassiveScanResponse {
-            scan_id: Some(u64::from(scan_id)),
-        })
+        })())
     }
     fn start_active_scan(
         &mut self,
         request: WlanSoftmacStartActiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        if self.active_scan.is_some() {
-            return Err(zx::Status::BAD_STATE);
-        }
-        let channels = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
-        let ssids = request.ssids.ok_or(zx::Status::INVALID_ARGS)?;
-        if channels.is_empty()
-            || channels.len() > ACTIVE_SCAN_CHANNEL_MAX
-            || ssids.is_empty()
-            || ssids.len() > ACTIVE_SCAN_SSID_MAX
-        {
-            return Err(zx::Status::INVALID_ARGS);
-        }
-        let installed_channels = &self
-            .regulatory_domain
-            .as_ref()
-            .ok_or(zx::Status::BAD_STATE)?
-            .channels;
-        let mut channels_mhz = Vec::with_capacity(channels.len());
-        for channel in channels {
-            let frequency = channel_frequency(channel)?;
-            let Some(installed) = installed_channels
-                .iter()
-                .find(|installed| installed.frequency_mhz == frequency)
-            else {
-                return Err(zx::Status::INVALID_ARGS);
-            };
-            if installed.passive || channels_mhz.contains(&frequency) {
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready((|| {
+            if self.active_scan.is_some() {
+                return Err(zx::Status::BAD_STATE);
+            }
+            let channels = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
+            let ssids = request.ssids.ok_or(zx::Status::INVALID_ARGS)?;
+            if channels.is_empty()
+                || channels.len() > ACTIVE_SCAN_CHANNEL_MAX
+                || ssids.is_empty()
+                || ssids.len() > ACTIVE_SCAN_SSID_MAX
+            {
                 return Err(zx::Status::INVALID_ARGS);
             }
-            channels_mhz.push(frequency);
-        }
-        let ssids = ssids
-            .into_iter()
-            .map(|ssid| {
-                let len = usize::from(ssid.len);
-                if len == 0 || len > SSID_BYTE_MAX {
+            let installed_channels = &self
+                .regulatory_domain
+                .as_ref()
+                .ok_or(zx::Status::BAD_STATE)?
+                .channels;
+            let mut channels_mhz = Vec::with_capacity(channels.len());
+            for channel in channels {
+                let frequency = channel_frequency(channel)?;
+                let Some(installed) = installed_channels
+                    .iter()
+                    .find(|installed| installed.frequency_mhz == frequency)
+                else {
+                    return Err(zx::Status::INVALID_ARGS);
+                };
+                if installed.passive || channels_mhz.contains(&frequency) {
                     return Err(zx::Status::INVALID_ARGS);
                 }
-                Ok(ssid.data[..len].to_vec())
+                channels_mhz.push(frequency);
+            }
+            let ssids = ssids
+                .into_iter()
+                .map(|ssid| {
+                    let len = usize::from(ssid.len);
+                    if len == 0 || len > SSID_BYTE_MAX {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    Ok(ssid.data[..len].to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let scan_id = self.next_scan_id;
+            self.next_scan_id = self
+                .next_scan_id
+                .checked_add(1)
+                .filter(|next| *next <= HOST_SCAN_ID_END + 1)
+                .ok_or(zx::Status::NO_RESOURCES)?;
+            self.device
+                .start_scan(ScanConfig {
+                    vdev: self.ready_vdev()?,
+                    id: ScanId(scan_id),
+                    active: true,
+                    channels_mhz,
+                    ssids,
+                })
+                .map_err(status)?;
+            self.active_scan = Some(scan_id);
+            Ok(WlanSoftmacBaseStartActiveScanResponse {
+                scan_id: Some(u64::from(scan_id)),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let scan_id = self.next_scan_id;
-        self.next_scan_id = self
-            .next_scan_id
-            .checked_add(1)
-            .filter(|next| *next <= HOST_SCAN_ID_END + 1)
-            .ok_or(zx::Status::NO_RESOURCES)?;
-        self.device
-            .start_scan(ScanConfig {
-                vdev: self.ready_vdev()?,
-                id: ScanId(scan_id),
-                active: true,
-                channels_mhz,
-                ssids,
-            })
-            .map_err(status)?;
-        self.active_scan = Some(scan_id);
-        Ok(WlanSoftmacBaseStartActiveScanResponse {
-            scan_id: Some(u64::from(scan_id)),
-        })
+        })())
     }
-    fn cancel_scan(&mut self, request: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
-        let scan_id = u32::try_from(request.scan_id.ok_or(zx::Status::INVALID_ARGS)?)
-            .map_err(|_| zx::Status::INVALID_ARGS)?;
-        if self.active_scan != Some(scan_id) {
-            return Err(zx::Status::NOT_FOUND);
-        }
-        self.device
-            .stop_scan(self.ready_vdev()?, ScanId(scan_id))
-            .map_err(status)?;
-        self.active_scan = None;
-        Ok(())
+    fn cancel_scan(
+        &mut self,
+        request: WlanSoftmacBaseCancelScanRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            let scan_id = u32::try_from(request.scan_id.ok_or(zx::Status::INVALID_ARGS)?)
+                .map_err(|_| zx::Status::INVALID_ARGS)?;
+            if self.active_scan != Some(scan_id) {
+                return Err(zx::Status::NOT_FOUND);
+            }
+            self.device
+                .stop_scan(self.ready_vdev()?, ScanId(scan_id))
+                .map_err(status)?;
+            self.active_scan = None;
+            Ok(())
+        })())
     }
     fn update_wmm_parameters(
         &mut self,
         _request: WlanSoftmacBaseUpdateWmmParametersRequest,
-    ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status> {
         if bytes.len() < 24 {
@@ -1734,19 +1768,18 @@ mod tests {
     fn ready_adapter() -> Ath11kClientDevice<ModelSubsystems> {
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(NoopUpcalls)).unwrap();
-        adapter
-            .set_channel(WlanSoftmacBaseSetChannelRequest {
-                primary: Some(ChannelNumber {
-                    band: WlanBand::TwoGhz,
-                    number: 6,
-                }),
-                bandwidth: Some(ChannelBandwidth::Cbw20),
-                vht_secondary_80_channel: Some(ChannelNumber {
-                    band: WlanBand::TwoGhz,
-                    number: 0,
-                }),
-            })
-            .unwrap();
+        futures::executor::block_on(adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
+            primary: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 6,
+            }),
+            bandwidth: Some(ChannelBandwidth::Cbw20),
+            vht_secondary_80_channel: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 0,
+            }),
+        }))
+        .unwrap();
         adapter.device.backend_mut().clear();
         adapter
     }
@@ -1781,9 +1814,10 @@ mod tests {
         adapter.device.backend_mut().clear();
         let vdev = adapter.vdev.unwrap();
 
-        let response = adapter
-            .start_active_scan(active_scan_request(&[b"redwood", b"lab"]))
-            .unwrap();
+        let response = futures::executor::block_on(
+            adapter.start_active_scan(active_scan_request(&[b"redwood", b"lab"])),
+        )
+        .unwrap();
 
         assert_eq!(response.scan_id, Some(u64::from(HOST_SCAN_ID_START)));
         assert_eq!(adapter.active_scan, Some(HOST_SCAN_ID_START));
@@ -1804,18 +1838,17 @@ mod tests {
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(NoopUpcalls)).unwrap();
         adapter.next_scan_id = HOST_SCAN_ID_END;
-        let scan = adapter
-            .start_active_scan(active_scan_request(&[b"lab"]))
-            .unwrap();
+        let scan =
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
+                .unwrap();
         assert_eq!(scan.scan_id, Some(u64::from(HOST_SCAN_ID_END)));
-        adapter
-            .cancel_scan(WlanSoftmacBaseCancelScanRequest {
-                scan_id: scan.scan_id,
-            })
-            .unwrap();
+        futures::executor::block_on(adapter.cancel_scan(WlanSoftmacBaseCancelScanRequest {
+            scan_id: scan.scan_id,
+        }))
+        .unwrap();
         adapter.device.backend_mut().clear();
         assert_eq!(
-            adapter.start_active_scan(active_scan_request(&[b"lab"])),
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"]))),
             Err(zx::Status::NO_RESOURCES)
         );
         assert!(adapter.device.backend().operations().is_empty());
@@ -1830,49 +1863,52 @@ mod tests {
         let mut missing_channels = active_scan_request(&[b"lab"]);
         missing_channels.channels = None;
         assert_eq!(
-            adapter.start_active_scan(missing_channels),
+            futures::executor::block_on(adapter.start_active_scan(missing_channels)),
             Err(zx::Status::INVALID_ARGS)
         );
         assert_eq!(
-            adapter.start_active_scan(active_scan_request(&[])),
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[]))),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut empty_ssid = active_scan_request(&[b"lab"]);
         empty_ssid.ssids.as_mut().unwrap()[0].len = 0;
         assert_eq!(
-            adapter.start_active_scan(empty_ssid),
+            futures::executor::block_on(adapter.start_active_scan(empty_ssid)),
             Err(zx::Status::INVALID_ARGS)
         );
         let too_many_ssids = vec![b"lab".as_slice(); ACTIVE_SCAN_SSID_MAX + 1];
         assert_eq!(
-            adapter.start_active_scan(active_scan_request(&too_many_ssids)),
+            futures::executor::block_on(
+                adapter.start_active_scan(active_scan_request(&too_many_ssids))
+            ),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut oversized_ssid = active_scan_request(&[b"lab"]);
         oversized_ssid.ssids.as_mut().unwrap()[0].len = (SSID_BYTE_MAX + 1) as u8;
         assert_eq!(
-            adapter.start_active_scan(oversized_ssid),
+            futures::executor::block_on(adapter.start_active_scan(oversized_ssid)),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut out_of_domain = active_scan_request(&[b"lab"]);
         out_of_domain.channels.as_mut().unwrap()[0].number = 11;
         assert_eq!(
-            adapter.start_active_scan(out_of_domain),
+            futures::executor::block_on(adapter.start_active_scan(out_of_domain)),
             Err(zx::Status::INVALID_ARGS)
         );
         adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = true;
         assert_eq!(
-            adapter.start_active_scan(active_scan_request(&[b"lab"])),
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"]))),
             Err(zx::Status::INVALID_ARGS)
         );
         adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = false;
         assert!(adapter.device.backend().operations().is_empty());
 
-        adapter
-            .start_active_scan(active_scan_request(&[b"lab"]))
+        futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
             .unwrap();
         assert_eq!(
-            adapter.start_active_scan(active_scan_request(&[b"other"])),
+            futures::executor::block_on(
+                adapter.start_active_scan(active_scan_request(&[b"other"]))
+            ),
             Err(zx::Status::BAD_STATE)
         );
         assert_eq!(adapter.device.backend().operations().len(), 1);
@@ -1885,25 +1921,24 @@ mod tests {
         adapter.start(Box::new(Recorder(records.clone()))).unwrap();
         adapter.device.backend_mut().clear();
 
-        let first = adapter
-            .start_active_scan(active_scan_request(&[b"lab"]))
-            .unwrap()
-            .scan_id
-            .unwrap();
+        let first =
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
+                .unwrap()
+                .scan_id
+                .unwrap();
         assert!(adapter.drive().unwrap());
         assert_eq!(records.lock().unwrap().scans, vec![(zx::Status::OK, first)]);
         assert_eq!(adapter.active_scan, None);
 
-        let second = adapter
-            .start_active_scan(active_scan_request(&[b"lab"]))
-            .unwrap()
-            .scan_id
-            .unwrap();
-        adapter
-            .cancel_scan(WlanSoftmacBaseCancelScanRequest {
-                scan_id: Some(second),
-            })
-            .unwrap();
+        let second =
+            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
+                .unwrap()
+                .scan_id
+                .unwrap();
+        futures::executor::block_on(adapter.cancel_scan(WlanSoftmacBaseCancelScanRequest {
+            scan_id: Some(second),
+        }))
+        .unwrap();
         assert_eq!(second, first + 1);
         assert_eq!(adapter.active_scan, None);
         assert!(matches!(
@@ -1937,7 +1972,7 @@ mod tests {
     #[test]
     fn join_and_clear_bind_and_delete_exactly_one_peer() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
         let vdev = adapter.vdev.unwrap();
         assert_eq!(
             adapter.device.backend().operations(),
@@ -1956,11 +1991,12 @@ mod tests {
                 },
             ]
         );
-        adapter
-            .clear_association(WlanSoftmacBaseClearAssociationRequest {
+        futures::executor::block_on(adapter.clear_association(
+            WlanSoftmacBaseClearAssociationRequest {
                 peer_addr: Some(PEER),
-            })
-            .unwrap();
+            },
+        ))
+        .unwrap();
         assert_eq!(adapter.peer, None);
         assert!(adapter.device.backend().operations().ends_with(&[
             Operation::WmiPeerDelete {
@@ -1972,13 +2008,13 @@ mod tests {
                 address: PEER,
             },
         ]));
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
     }
 
     #[test]
     fn failed_peer_deletion_still_revokes_adapter_peer_authority() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
         let vdev = adapter.vdev.unwrap();
         adapter.device.backend_mut().clear();
         adapter
@@ -1990,9 +2026,11 @@ mod tests {
             });
 
         assert_eq!(
-            adapter.clear_association(WlanSoftmacBaseClearAssociationRequest {
-                peer_addr: Some(PEER),
-            }),
+            futures::executor::block_on(adapter.clear_association(
+                WlanSoftmacBaseClearAssociationRequest {
+                    peer_addr: Some(PEER),
+                }
+            )),
             Err(zx::Status::IO)
         );
         assert_eq!(adapter.peer, None);
@@ -2012,9 +2050,11 @@ mod tests {
                 .contains(&Operation::QmiFirmwareStop)
         );
         assert_eq!(
-            adapter.clear_association(WlanSoftmacBaseClearAssociationRequest {
-                peer_addr: Some(PEER),
-            }),
+            futures::executor::block_on(adapter.clear_association(
+                WlanSoftmacBaseClearAssociationRequest {
+                    peer_addr: Some(PEER),
+                }
+            )),
             Err(zx::Status::BAD_STATE)
         );
     }
@@ -2031,7 +2071,10 @@ mod tests {
                 address: PEER,
             });
 
-        assert_eq!(adapter.join_bss(join_request()), Err(zx::Status::IO));
+        assert_eq!(
+            futures::executor::block_on(adapter.join_bss(join_request())),
+            Err(zx::Status::IO)
+        );
         assert_eq!(adapter.peer, None);
         assert_eq!(adapter.device.state(), DeviceState::Stopped);
         assert!(adapter.device.backend().operations().starts_with(&[
@@ -2049,17 +2092,16 @@ mod tests {
     #[test]
     fn open_association_and_symmetric_link_preserve_operation_order() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
         adapter.device.backend_mut().clear();
         let vdev = adapter.vdev.unwrap();
 
-        adapter
-            .notify_association_complete(open_association())
+        futures::executor::block_on(adapter.notify_association_complete(open_association()))
             .unwrap();
         adapter.set_link_up(true).unwrap();
         adapter.set_link_up(false).unwrap();
         assert_eq!(
-            adapter.install_key(WlanKeyConfiguration {
+            futures::executor::block_on(adapter.install_key(WlanKeyConfiguration {
                 protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
                 cipher_oui: Some([0x00, 0x0f, 0xac]),
                 cipher_type: Some(4),
@@ -2068,7 +2110,7 @@ mod tests {
                 key_idx: Some(0),
                 key: Some(vec![0x55; 16]),
                 rsc: Some(0),
-            }),
+            })),
             Ok(())
         );
         assert_eq!(
@@ -2135,9 +2177,8 @@ mod tests {
     #[test]
     fn group_and_integrity_keys_decode_sme_wire_order_counters() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
-        adapter
-            .notify_association_complete(open_association())
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
+        futures::executor::block_on(adapter.notify_association_complete(open_association()))
             .unwrap();
         let mut key = WlanKeyConfiguration {
             protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
@@ -2150,7 +2191,7 @@ mod tests {
             rsc: Some(u64::from_be_bytes([2, 1, 0, 0, 0, 0, 0, 0])),
             ..Default::default()
         };
-        adapter.install_key(key.clone()).unwrap();
+        futures::executor::block_on(adapter.install_key(key.clone())).unwrap();
         assert!(matches!(
             adapter.device.backend().operations().last(),
             Some(Operation::DpInstallPeerKey(KeyConfig {
@@ -2161,14 +2202,14 @@ mod tests {
         ));
         key.rsc = Some(u64::from_be_bytes([0, 0, 0, 0, 0, 0, 1, 0]));
         assert_eq!(
-            adapter.install_key(key.clone()),
+            futures::executor::block_on(adapter.install_key(key.clone())),
             Err(zx::Status::INVALID_ARGS)
         );
         key.key_type = Some(fidl_fuchsia_wlan_ieee80211::KeyType::Igtk);
         key.cipher_type = Some(6);
         key.key_idx = Some(4);
         key.rsc = Some(u64::from_be_bytes([0, 0, 6, 5, 4, 3, 2, 1]));
-        adapter.install_key(key).unwrap();
+        futures::executor::block_on(adapter.install_key(key)).unwrap();
         assert_eq!(adapter.igtk.as_ref().unwrap().receive_ipn, 0x0102_0304_0506);
     }
 
@@ -2176,7 +2217,7 @@ mod tests {
     fn ap_uapsd_capability_does_not_require_station_uapsd() {
         for apsd in [false, true] {
             let mut adapter = ready_adapter();
-            adapter.join_bss(join_request()).unwrap();
+            futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
             let ac = || fidl_fuchsia_wlan_driver::WlanWmmAccessCategoryParameters {
                 ecw_min: 4,
                 ecw_max: 10,
@@ -2193,7 +2234,7 @@ mod tests {
                 ac_vi_params: ac(),
                 ac_vo_params: ac(),
             });
-            adapter.notify_association_complete(association).unwrap();
+            futures::executor::block_on(adapter.notify_association_complete(association)).unwrap();
             assert!(adapter.associated);
         }
     }
@@ -2201,12 +2242,12 @@ mod tests {
     #[test]
     fn secure_association_requires_transmitted_rsn_evidence() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
         adapter.device.backend_mut().clear();
         let mut association = open_association();
         association.capability_info = Some(0x0431);
         assert_eq!(
-            adapter.notify_association_complete(association),
+            futures::executor::block_on(adapter.notify_association_complete(association)),
             Err(zx::Status::BAD_STATE)
         );
         assert!(adapter.device.backend().operations().is_empty());
@@ -2215,7 +2256,7 @@ mod tests {
     #[test]
     fn secure_association_stays_unauthorized_until_controlled_port_up() {
         let mut adapter = ready_adapter();
-        adapter.join_bss(join_request()).unwrap();
+        futures::executor::block_on(adapter.join_bss(join_request())).unwrap();
         adapter.device.backend_mut().clear();
 
         let mut request = vec![0; 28];
@@ -2234,7 +2275,7 @@ mod tests {
 
         let mut association = open_association();
         association.capability_info = Some(0x0421);
-        adapter.notify_association_complete(association).unwrap();
+        futures::executor::block_on(adapter.notify_association_complete(association)).unwrap();
         assert!(adapter.associated);
         assert!(!adapter.link_up);
         assert!(
@@ -2309,19 +2350,18 @@ mod tests {
         let records = Arc::new(Mutex::new(RecordedUpcalls::default()));
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(Recorder(records.clone()))).unwrap();
-        adapter
-            .set_channel(WlanSoftmacBaseSetChannelRequest {
-                primary: Some(ChannelNumber {
-                    band: WlanBand::TwoGhz,
-                    number: 6,
-                }),
-                bandwidth: Some(ChannelBandwidth::Cbw20),
-                vht_secondary_80_channel: Some(ChannelNumber {
-                    band: WlanBand::TwoGhz,
-                    number: 0,
-                }),
-            })
-            .unwrap();
+        futures::executor::block_on(adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
+            primary: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 6,
+            }),
+            bandwidth: Some(ChannelBandwidth::Cbw20),
+            vht_secondary_80_channel: Some(ChannelNumber {
+                band: WlanBand::TwoGhz,
+                number: 0,
+            }),
+        }))
+        .unwrap();
         let mut frame = vec![0; 24];
         frame[0] = 0xb0;
         frame[4..10].copy_from_slice(&[2, 0, 0, 0, 0, 2]);

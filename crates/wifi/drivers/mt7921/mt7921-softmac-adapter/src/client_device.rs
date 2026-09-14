@@ -1292,7 +1292,7 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     pub fn set_runtime_channel(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
-    ) -> Result<(), zx::Status> {
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         wlan_softmac_host::WlanSoftmac::set_channel(self, request)
     }
 }
@@ -1491,123 +1491,146 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     fn set_channel(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
-    ) -> Result<(), zx::Status> {
-        let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
-        let bandwidth = request.bandwidth.ok_or(zx::Status::INVALID_ARGS)?;
-        let secondary = request
-            .vht_secondary_80_channel
-            .ok_or(zx::Status::INVALID_ARGS)?;
-        let mut backend = self.backend.lock().unwrap();
-        let current = backend
-            .effects
-            .ensure_channel(primary, bandwidth, secondary)?
-            == ClientChannelEnsure::Current;
-        if !current {
-            match backend.scan.set_channel(primary, bandwidth, secondary) {
-                Err(zx::Status::NOT_SUPPORTED) | Ok(()) => {}
-                Err(status) => return Err(status),
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
+            let bandwidth = request.bandwidth.ok_or(zx::Status::INVALID_ARGS)?;
+            let secondary = request
+                .vht_secondary_80_channel
+                .ok_or(zx::Status::INVALID_ARGS)?;
+            let mut backend = self.backend.lock().unwrap();
+            let current = backend
+                .effects
+                .ensure_channel(primary, bandwidth, secondary)?
+                == ClientChannelEnsure::Current;
+            if !current {
+                match backend.scan.set_channel(primary, bandwidth, secondary) {
+                    Err(zx::Status::NOT_SUPPORTED) | Ok(()) => {}
+                    Err(status) => return Err(status),
+                }
             }
-        }
-        backend.effects.set_channel(primary, bandwidth, secondary)
+            backend.effects.set_channel(primary, bandwidth, secondary)
+        })())
     }
-    fn join_bss(&mut self, request: fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
-        self.backend.lock().unwrap().effects.join_bss(&request)
+    fn join_bss(
+        &mut self,
+        request: fidl_driver::JoinBssRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(self.backend.lock().unwrap().effects.join_bss(&request))
     }
     fn install_key(
         &mut self,
         configuration: fidl_softmac::WlanKeyConfiguration,
-    ) -> Result<(), zx::Status> {
-        let mut backend = self.backend.lock().unwrap();
-        let ComposedBackend { effects, scan, .. } = &mut *backend;
-        effects.install_key(&configuration, scan)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready({
+            let mut backend = self.backend.lock().unwrap();
+            let ComposedBackend { effects, scan, .. } = &mut *backend;
+            effects.install_key(&configuration, scan)
+        })
     }
     fn notify_association_complete(
         &mut self,
         configuration: fidl_softmac::WlanAssociationConfig,
-    ) -> Result<(), zx::Status> {
-        let mut configuration = configuration;
-        if let Some(profile) = self.support.association.as_ref() {
-            configuration.ht_cap = Some(fidl_ieee80211::HtCapabilities {
-                bytes: profile.ht_capabilities.ok_or(zx::Status::BAD_STATE)?,
-            });
-            configuration.vht_cap = Some(fidl_ieee80211::VhtCapabilities {
-                bytes: profile.vht_capabilities.ok_or(zx::Status::BAD_STATE)?,
-            });
-        }
-        let mut backend = self.backend.lock().unwrap();
-        let result = {
-            let ComposedBackend { effects, scan, .. } = &mut *backend;
-            effects.notify_association_complete(&configuration, scan)
-        };
-        if let Err(status) = result {
-            backend.association_activation_failure = Some(status);
-            println!(
-                "client_runtime_control stage=association_activation_failed status={status} rx_dequeued=false"
-            );
-        }
-        result
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            let mut configuration = configuration;
+            if let Some(profile) = self.support.association.as_ref() {
+                configuration.ht_cap = Some(fidl_ieee80211::HtCapabilities {
+                    bytes: profile.ht_capabilities.ok_or(zx::Status::BAD_STATE)?,
+                });
+                configuration.vht_cap = Some(fidl_ieee80211::VhtCapabilities {
+                    bytes: profile.vht_capabilities.ok_or(zx::Status::BAD_STATE)?,
+                });
+            }
+            let mut backend = self.backend.lock().unwrap();
+            let result = {
+                let ComposedBackend { effects, scan, .. } = &mut *backend;
+                effects.notify_association_complete(&configuration, scan)
+            };
+            if let Err(status) = result {
+                backend.association_activation_failure = Some(status);
+                println!(
+                    "client_runtime_control stage=association_activation_failed status={status} rx_dequeued=false"
+                );
+            }
+            result
+        })())
     }
     fn clear_association(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
-    ) -> Result<(), zx::Status> {
-        let mut backend = self.backend.lock().unwrap();
-        let ComposedBackend { effects, scan, .. } = &mut *backend;
-        effects.clear_association(&request, scan)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready({
+            let mut backend = self.backend.lock().unwrap();
+            let ComposedBackend { effects, scan, .. } = &mut *backend;
+            effects.clear_association(&request, scan)
+        })
     }
     fn start_passive_scan(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
-    ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-        let mut backend = self.backend.lock().unwrap();
-        backend.authorization.invalidate_scan();
-        backend.effects.revoke_scan();
-        backend.cancelled_scan_id = None;
-        let response = backend.scan.start_passive_scan(request.clone())?;
-        let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
-        backend.active_scan_id = Some(scan_id);
-        if let Err(status) = backend
-            .effects
-            .begin_passive_scan(scan_id, request.channels.as_deref().unwrap_or_default())
-        {
+    ) -> impl std::future::Future<
+        Output = Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready((|| {
+            let mut backend = self.backend.lock().unwrap();
             backend.authorization.invalidate_scan();
-            let _ = backend
-                .scan
-                .cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest {
-                    scan_id: Some(scan_id),
-                });
             backend.effects.revoke_scan();
-            backend.active_scan_id = None;
             backend.cancelled_scan_id = None;
-            return Err(status);
-        }
-        Ok(response)
+            let response = backend.scan.start_passive_scan(request.clone())?;
+            let scan_id = response.scan_id.ok_or(zx::Status::IO_INVALID)?;
+            backend.active_scan_id = Some(scan_id);
+            if let Err(status) = backend
+                .effects
+                .begin_passive_scan(scan_id, request.channels.as_deref().unwrap_or_default())
+            {
+                backend.authorization.invalidate_scan();
+                let _ = backend
+                    .scan
+                    .cancel_scan(fidl_softmac::WlanSoftmacBaseCancelScanRequest {
+                        scan_id: Some(scan_id),
+                    });
+                backend.effects.revoke_scan();
+                backend.active_scan_id = None;
+                backend.cancelled_scan_id = None;
+                return Err(status);
+            }
+            Ok(response)
+        })())
     }
     fn start_active_scan(
         &mut self,
         request: fidl_softmac::WlanSoftmacStartActiveScanRequest,
-    ) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        let _ = request;
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<
+        Output = Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+    > + 'static {
+        std::future::ready({
+            let _ = request;
+            Err(zx::Status::NOT_SUPPORTED)
+        })
     }
     fn cancel_scan(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
-    ) -> Result<(), zx::Status> {
-        let scan_id = request.scan_id;
-        let mut backend = self.backend.lock().unwrap();
-        backend.scan.cancel_scan(request)?;
-        if backend.active_scan_id == scan_id {
-            backend.cancelled_scan_id = scan_id;
-        }
-        Ok(())
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready((|| {
+            let scan_id = request.scan_id;
+            let mut backend = self.backend.lock().unwrap();
+            backend.scan.cancel_scan(request)?;
+            if backend.active_scan_id == scan_id {
+                backend.cancelled_scan_id = scan_id;
+            }
+            Ok(())
+        })())
     }
     fn update_wmm_parameters(
         &mut self,
         request: fidl_softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
-    ) -> Result<(), zx::Status> {
-        let _ = request;
-        Err(zx::Status::NOT_SUPPORTED)
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready({
+            let _ = request;
+            Err(zx::Status::NOT_SUPPORTED)
+        })
     }
     fn queue_tx(
         &mut self,

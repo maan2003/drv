@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Chip-generic owner and synchronous contracts for a client SoftMAC device.
+//! Chip-generic owner and owned-operation contracts for a client SoftMAC device.
 //!
 //! The request and response values are the host bindings generated from the
 //! project's pinned Fuchsia FIDL schemas. The lifecycle and callback traits
@@ -32,7 +32,7 @@ pub trait WlanSoftmacUpcalls: Send {
     fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64);
 }
 
-/// Run-scoped ownership paired with the synchronous SoftMAC downcalls.
+/// Run-scoped ownership paired with the SoftMAC operation contract.
 pub trait WlanSoftmacLifecycle {
     fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status>;
     fn stop(&mut self) -> Result<(), zx::Status>;
@@ -56,10 +56,18 @@ pub trait ClientRuntimeDriver {
     fn reset(&mut self) -> Result<(), zx::Status>;
 }
 
-/// Synchronous client-only calls from the host MLME into a SoftMAC device.
+/// Client-only calls from the host MLME into a SoftMAC device.
 ///
-/// Implementations complete each operation before returning. Policy,
-/// transport, lifecycle, and callbacks remain outside this contract.
+/// Mutations validate and admit work during the call, then return an owned
+/// completion future that does not borrow the device. Await it only after
+/// releasing the driver lock. Completion means the defined effect is complete,
+/// not merely queued; scan-start completion is distinct from scan-end upcalls.
+///
+/// The driver retains all in-flight resources. Dropping a completion future
+/// abandons its result without cancelling published work or releasing DMA.
+/// Futures need not be Send: the Linux host uses its owning LocalSet.
+/// Queries return installed facts; queue_tx reports bounded queue admission.
+/// Policy, transport, lifecycle, and callbacks remain outside this contract.
 pub trait WlanSoftmac {
     fn query(&mut self) -> Result<WlanSoftmacQueryResponse, zx::Status>;
     fn query_discovery_support(&mut self) -> Result<DiscoverySupport, zx::Status>;
@@ -69,31 +77,47 @@ pub trait WlanSoftmac {
         &mut self,
     ) -> Result<SpectrumManagementSupport, zx::Status>;
 
-    fn set_channel(&mut self, request: WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status>;
-    fn join_bss(&mut self, request: JoinBssRequest) -> Result<(), zx::Status>;
-    fn install_key(&mut self, configuration: WlanKeyConfiguration) -> Result<(), zx::Status>;
+    fn set_channel(
+        &mut self,
+        request: WlanSoftmacBaseSetChannelRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
+    fn join_bss(
+        &mut self,
+        request: JoinBssRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
+    fn install_key(
+        &mut self,
+        configuration: WlanKeyConfiguration,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn notify_association_complete(
         &mut self,
         configuration: WlanAssociationConfig,
-    ) -> Result<(), zx::Status>;
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn clear_association(
         &mut self,
         request: WlanSoftmacBaseClearAssociationRequest,
-    ) -> Result<(), zx::Status>;
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
 
     fn start_passive_scan(
         &mut self,
         request: WlanSoftmacBaseStartPassiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>;
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+    > + 'static;
     fn start_active_scan(
         &mut self,
         request: WlanSoftmacStartActiveScanRequest,
-    ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>;
-    fn cancel_scan(&mut self, request: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status>;
+    ) -> impl std::future::Future<
+        Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+    > + 'static;
+    fn cancel_scan(
+        &mut self,
+        request: WlanSoftmacBaseCancelScanRequest,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn update_wmm_parameters(
         &mut self,
         request: WlanSoftmacBaseUpdateWmmParametersRequest,
-    ) -> Result<(), zx::Status>;
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status>;
 }
 
@@ -145,56 +169,90 @@ mod tests {
             self.calls.push("spectrum_management");
             Ok(Default::default())
         }
-        fn set_channel(&mut self, _: WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status> {
-            self.calls.push("set_channel");
-            Ok(())
+        fn set_channel(
+            &mut self,
+            _: WlanSoftmacBaseSetChannelRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("set_channel");
+                Ok(())
+            })
         }
-        fn join_bss(&mut self, _: JoinBssRequest) -> Result<(), zx::Status> {
-            self.calls.push("join_bss");
-            Ok(())
+        fn join_bss(
+            &mut self,
+            _: JoinBssRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("join_bss");
+                Ok(())
+            })
         }
-        fn install_key(&mut self, _: WlanKeyConfiguration) -> Result<(), zx::Status> {
-            self.calls.push("install_key");
-            Ok(())
+        fn install_key(
+            &mut self,
+            _: WlanKeyConfiguration,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("install_key");
+                Ok(())
+            })
         }
         fn notify_association_complete(
             &mut self,
             _: WlanAssociationConfig,
-        ) -> Result<(), zx::Status> {
-            self.calls.push("association_complete");
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("association_complete");
+                Ok(())
+            })
         }
         fn clear_association(
             &mut self,
             _: WlanSoftmacBaseClearAssociationRequest,
-        ) -> Result<(), zx::Status> {
-            self.calls.push("clear_association");
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("clear_association");
+                Ok(())
+            })
         }
         fn start_passive_scan(
             &mut self,
             _: WlanSoftmacBaseStartPassiveScanRequest,
-        ) -> Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-            self.calls.push("passive_scan");
-            Ok(Default::default())
+        ) -> impl std::future::Future<
+            Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready({
+                self.calls.push("passive_scan");
+                Ok(Default::default())
+            })
         }
         fn start_active_scan(
             &mut self,
             _: WlanSoftmacStartActiveScanRequest,
-        ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-            self.calls.push("active_scan");
-            Ok(Default::default())
+        ) -> impl std::future::Future<
+            Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready({
+                self.calls.push("active_scan");
+                Ok(Default::default())
+            })
         }
-        fn cancel_scan(&mut self, _: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
-            self.calls.push("cancel_scan");
-            Ok(())
+        fn cancel_scan(
+            &mut self,
+            _: WlanSoftmacBaseCancelScanRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("cancel_scan");
+                Ok(())
+            })
         }
         fn update_wmm_parameters(
             &mut self,
             _: WlanSoftmacBaseUpdateWmmParametersRequest,
-        ) -> Result<(), zx::Status> {
-            self.calls.push("update_wmm");
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready({
+                self.calls.push("update_wmm");
+                Ok(())
+            })
         }
         fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status> {
             self.calls.push("queue_tx");
@@ -203,28 +261,30 @@ mod tests {
         }
     }
 
-    fn forward_every_downcall(device: &mut dyn WlanSoftmac) -> Result<(), zx::Status> {
+    async fn forward_every_downcall<D: WlanSoftmac>(device: &mut D) -> Result<(), zx::Status> {
         device.query()?;
         device.query_discovery_support()?;
         device.query_mac_sublayer_support()?;
         device.query_security_support()?;
         device.query_spectrum_management_support()?;
-        device.set_channel(Default::default())?;
-        device.join_bss(Default::default())?;
-        device.install_key(Default::default())?;
-        device.notify_association_complete(Default::default())?;
-        device.clear_association(Default::default())?;
-        device.start_passive_scan(Default::default())?;
-        device.start_active_scan(Default::default())?;
-        device.cancel_scan(Default::default())?;
-        device.update_wmm_parameters(Default::default())?;
+        device.set_channel(Default::default()).await?;
+        device.join_bss(Default::default()).await?;
+        device.install_key(Default::default()).await?;
+        device
+            .notify_association_complete(Default::default())
+            .await?;
+        device.clear_association(Default::default()).await?;
+        device.start_passive_scan(Default::default()).await?;
+        device.start_active_scan(Default::default()).await?;
+        device.cancel_scan(Default::default()).await?;
+        device.update_wmm_parameters(Default::default()).await?;
         device.queue_tx(&[1, 2, 3], WlanTxInfoFlags::PROTECTED)
     }
 
     #[test]
     fn fake_compiles_and_forwards_the_complete_downcall_surface() {
         let mut fake = Fake::default();
-        forward_every_downcall(&mut fake).unwrap();
+        futures::executor::block_on(forward_every_downcall(&mut fake)).unwrap();
 
         assert_eq!(
             fake.calls,

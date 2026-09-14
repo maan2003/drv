@@ -8,6 +8,7 @@ use fidl_fuchsia_wlan_softmac::{
     WlanRxInfo, WlanSoftmacBaseSetChannelRequest, WlanSoftmacBaseStartPassiveScanRequest,
     WlanTxResult,
 };
+use futures::FutureExt;
 use std::sync::{Arc, Mutex};
 
 const DRIVE_BUDGET: usize = 8;
@@ -35,6 +36,23 @@ impl WlanSoftmacUpcalls for Recorder {
             .unwrap()
             .push(ConformanceEvent::ScanComplete { status, scan_id });
     }
+}
+
+fn drive_operation<D: ClientRuntimeDriver, T>(
+    device: &mut D,
+    completion: impl std::future::Future<Output = Result<T, zx::Status>>,
+) -> Result<T, zx::Status> {
+    let mut completion = std::pin::pin!(completion);
+    for _ in 0..DRIVE_BUDGET {
+        if let Some(result) = completion.as_mut().now_or_never() {
+            return result;
+        }
+        device.drive()?;
+    }
+    completion
+        .as_mut()
+        .now_or_never()
+        .unwrap_or(Err(zx::Status::TIMED_OUT))
 }
 
 /// Exercise one deterministic lifecycle/query/channel/passive-scan run.
@@ -67,23 +85,24 @@ where
         .unwrap()
         .push(ConformanceEvent::SupportQueried);
 
-    device.set_channel(WlanSoftmacBaseSetChannelRequest {
+    let completion = device.set_channel(WlanSoftmacBaseSetChannelRequest {
         primary: Some(channel),
         bandwidth: Some(ChannelBandwidth::Cbw20),
         vht_secondary_80_channel: Some(ChannelNumber {
             number: 0,
             ..channel
         }),
-    })?;
+    });
+    drive_operation(&mut device, completion)?;
     events.lock().unwrap().push(ConformanceEvent::ChannelSet);
 
-    let scan_id = device
-        .start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
-            channels: Some(vec![channel]),
-            min_channel_time: Some(10),
-            max_channel_time: Some(20),
-            min_home_time: Some(0),
-        })?
+    let completion = device.start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
+        channels: Some(vec![channel]),
+        min_channel_time: Some(10),
+        max_channel_time: Some(20),
+        min_home_time: Some(0),
+    });
+    let scan_id = drive_operation(&mut device, completion)?
         .scan_id
         .ok_or(zx::Status::BAD_STATE)?;
     events
@@ -206,48 +225,66 @@ mod tests {
         ) -> Result<SpectrumManagementSupport, zx::Status> {
             Ok(Default::default())
         }
-        fn set_channel(&mut self, _: WlanSoftmacBaseSetChannelRequest) -> Result<(), zx::Status> {
-            Ok(())
+        fn set_channel(
+            &mut self,
+            _: WlanSoftmacBaseSetChannelRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
-        fn join_bss(&mut self, _: JoinBssRequest) -> Result<(), zx::Status> {
-            Ok(())
+        fn join_bss(
+            &mut self,
+            _: JoinBssRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
-        fn install_key(&mut self, _: WlanKeyConfiguration) -> Result<(), zx::Status> {
-            Ok(())
+        fn install_key(
+            &mut self,
+            _: WlanKeyConfiguration,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
         fn notify_association_complete(
             &mut self,
             _: WlanAssociationConfig,
-        ) -> Result<(), zx::Status> {
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
         fn clear_association(
             &mut self,
             _: WlanSoftmacBaseClearAssociationRequest,
-        ) -> Result<(), zx::Status> {
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
         fn start_passive_scan(
             &mut self,
             _: WlanSoftmacBaseStartPassiveScanRequest,
-        ) -> Result<crate::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-            self.scan_id = Some(1);
-            Ok(crate::WlanSoftmacBaseStartPassiveScanResponse { scan_id: Some(1) })
+        ) -> impl std::future::Future<
+            Output = Result<crate::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready({
+                self.scan_id = Some(1);
+                Ok(crate::WlanSoftmacBaseStartPassiveScanResponse { scan_id: Some(1) })
+            })
         }
         fn start_active_scan(
             &mut self,
             _: WlanSoftmacStartActiveScanRequest,
-        ) -> Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-            Err(zx::Status::NOT_SUPPORTED)
+        ) -> impl std::future::Future<
+            Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready(Err(zx::Status::NOT_SUPPORTED))
         }
-        fn cancel_scan(&mut self, _: WlanSoftmacBaseCancelScanRequest) -> Result<(), zx::Status> {
-            Ok(())
+        fn cancel_scan(
+            &mut self,
+            _: WlanSoftmacBaseCancelScanRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
         fn update_wmm_parameters(
             &mut self,
             _: WlanSoftmacBaseUpdateWmmParametersRequest,
-        ) -> Result<(), zx::Status> {
-            Ok(())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(Ok(()))
         }
         fn queue_tx(&mut self, _: &[u8], _: WlanTxInfoFlags) -> Result<(), zx::Status> {
             Ok(())

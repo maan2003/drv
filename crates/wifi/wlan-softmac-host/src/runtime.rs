@@ -270,13 +270,18 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         eprintln!(
             "client_softmac_channel stage=bridge_enter primary={primary:?} bandwidth={bandwidth:?} secondary={secondary:?}"
         );
-        let result = self.device.lock().unwrap().device.set_channel(
-            fidl_softmac::WlanSoftmacBaseSetChannelRequest {
-                primary: Some(primary),
-                bandwidth: Some(bandwidth),
-                vht_secondary_80_channel: Some(secondary),
-            },
-        );
+        let result = {
+            let completion = {
+                self.device.lock().unwrap().device.set_channel(
+                    fidl_softmac::WlanSoftmacBaseSetChannelRequest {
+                        primary: Some(primary),
+                        bandwidth: Some(bandwidth),
+                        vht_secondary_80_channel: Some(secondary),
+                    },
+                )
+            };
+            completion.await
+        };
         eprintln!("client_softmac_channel stage=bridge_complete result={result:?}");
         result
     }
@@ -294,12 +299,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
             request.max_channel_time,
             request.min_home_time,
         );
-        let response = self
-            .device
-            .lock()
-            .unwrap()
-            .device
-            .start_passive_scan(request.clone());
+        let response = {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .start_passive_scan(request.clone())
+            };
+            completion.await
+        };
         eprintln!(
             "client_softmac_scan stage=bridge_complete kind=passive status={}",
             if response.is_ok() { "ok" } else { "error" }
@@ -310,24 +319,37 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         &mut self,
         request: &fidl_softmac::WlanSoftmacStartActiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .start_active_scan(request.clone())
+        {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .start_active_scan(request.clone())
+            };
+            completion.await
+        }
     }
     async fn cancel_scan(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .cancel_scan(request.clone())
+        {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .cancel_scan(request.clone())
+            };
+            completion.await
+        }
     }
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
-        self.device.lock().unwrap().device.join_bss(request.clone())
+        {
+            let completion = { self.device.lock().unwrap().device.join_bss(request.clone()) };
+            completion.await
+        }
     }
     async fn enable_beaconing(
         &mut self,
@@ -342,19 +364,26 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         &mut self,
         key: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
-        self.device.lock().unwrap().device.install_key(key.clone())
+        {
+            let completion = { self.device.lock().unwrap().device.install_key(key.clone()) };
+            completion.await
+        }
     }
     async fn notify_association_complete(
         &mut self,
         config: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
         eprintln!("client_association stage=configure_enter config={config:?}");
-        let result = self
-            .device
-            .lock()
-            .unwrap()
-            .device
-            .notify_association_complete(config);
+        let result = {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .notify_association_complete(config)
+            };
+            completion.await
+        };
         eprintln!("client_association stage=configure_complete result={result:?}");
         result
     }
@@ -362,21 +391,31 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .clear_association(request.clone())
+        {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .clear_association(request.clone())
+            };
+            completion.await
+        }
     }
     async fn update_wmm_parameters(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
     ) -> Result<(), zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .update_wmm_parameters(request.clone())
+        {
+            let completion = {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .device
+                    .update_wmm_parameters(request.clone())
+            };
+            completion.await
+        }
     }
     fn take_mlme_event_stream(&mut self) -> Option<mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>> {
         self.event_stream.take()
@@ -1537,6 +1576,7 @@ mod tests {
         scan_id: u64,
         scan_offload: bool,
         empty_bands: bool,
+        channel_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
     }
 
     #[derive(Clone)]
@@ -1686,56 +1726,78 @@ mod tests {
         fn set_channel(
             &mut self,
             request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
-        ) -> Result<(), zx::Status> {
-            self.0.lock().unwrap().channels.push(request);
-            record!(self, "channel", ())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            let completion = {
+                let mut effects = self.0.lock().unwrap();
+                effects.channels.push(request);
+                effects.calls.push("channel");
+                effects.channel_completion.take()
+            };
+            async move {
+                match completion {
+                    Some(completion) => completion.await.unwrap_or(Err(zx::Status::CANCELED)),
+                    None => Ok(()),
+                }
+            }
         }
-        fn join_bss(&mut self, _: fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
-            record!(self, "join", ())
+        fn join_bss(
+            &mut self,
+            _: fidl_driver::JoinBssRequest,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "join", ()))
         }
-        fn install_key(&mut self, _: fidl_softmac::WlanKeyConfiguration) -> Result<(), zx::Status> {
-            record!(self, "key", ())
+        fn install_key(
+            &mut self,
+            _: fidl_softmac::WlanKeyConfiguration,
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "key", ()))
         }
         fn notify_association_complete(
             &mut self,
             _: fidl_softmac::WlanAssociationConfig,
-        ) -> Result<(), zx::Status> {
-            record!(self, "assoc", ())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "assoc", ()))
         }
         fn clear_association(
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
-        ) -> Result<(), zx::Status> {
-            record!(self, "clear", ())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "clear", ()))
         }
         fn start_passive_scan(
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
-        ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
-            let mut effects = self.0.lock().unwrap();
-            effects.calls.push("passive");
-            effects.scan_id = effects.scan_id.checked_add(1).unwrap();
-            Ok(fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse {
-                scan_id: Some(effects.scan_id),
+        ) -> impl std::future::Future<
+            Output = Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready({
+                let mut effects = self.0.lock().unwrap();
+                effects.calls.push("passive");
+                effects.scan_id = effects.scan_id.checked_add(1).unwrap();
+                Ok(fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse {
+                    scan_id: Some(effects.scan_id),
+                })
             })
         }
         fn start_active_scan(
             &mut self,
             _: fidl_softmac::WlanSoftmacStartActiveScanRequest,
-        ) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
-            record!(self, "active", Default::default())
+        ) -> impl std::future::Future<
+            Output = Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
+        > + 'static {
+            std::future::ready(record!(self, "active", Default::default()))
         }
         fn cancel_scan(
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseCancelScanRequest,
-        ) -> Result<(), zx::Status> {
-            record!(self, "cancel", ())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "cancel", ()))
         }
         fn update_wmm_parameters(
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
-        ) -> Result<(), zx::Status> {
-            record!(self, "wmm", ())
+        ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            std::future::ready(record!(self, "wmm", ()))
         }
         fn queue_tx(
             &mut self,
@@ -1850,6 +1912,54 @@ mod tests {
             peer_addr: [0; 6],
             result_code: fidl_softmac::WlanTxResultCode::Success,
         }
+    }
+
+    #[test]
+    fn deferred_downcall_releases_driver_lock_and_reports_completion_error() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (reply, completion) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(completion);
+            let (mut bridge, _) = parts(fake);
+            let device = bridge.device.clone();
+            let mut operation = std::pin::pin!(bridge.set_channel(
+                wlan_channel(),
+                fidl_ieee80211::ChannelBandwidth::Cbw20,
+                wlan_channel(),
+            ));
+            assert!(operation.as_mut().now_or_never().is_none());
+            assert!(
+                device.try_lock().is_ok(),
+                "downcall must release the driver before Pending"
+            );
+            assert_eq!(effects.lock().unwrap().calls, ["channel"]);
+            reply.send(Err(zx::Status::IO)).unwrap();
+            assert_eq!(operation.await, Err(zx::Status::IO));
+        });
+    }
+
+    #[test]
+    fn dropping_completion_does_not_stop_or_revoke_driver_work() {
+        run_local_test(async {
+            let (mut fake, effects) = Fake::new(0);
+            let (reply, completion) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(completion);
+            let completion = fake.set_channel(Default::default());
+            assert_eq!(
+                effects.lock().unwrap().channels.len(),
+                1,
+                "admitted during call"
+            );
+            drop(completion);
+            assert!(
+                reply.send(Ok(())).is_err(),
+                "only the result waiter was abandoned"
+            );
+            assert_eq!(effects.lock().unwrap().calls, ["channel"]);
+            assert_eq!(effects.lock().unwrap().channels.len(), 1);
+            fake.stop().unwrap();
+            assert_eq!(effects.lock().unwrap().calls, ["channel", "stop"]);
+        });
     }
 
     #[test]
@@ -2016,6 +2126,40 @@ mod tests {
             }
             assert!((runtime.pump_upcalls()).await.unwrap());
             assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+        });
+    }
+
+    #[test]
+    fn owner_can_drive_and_join_shutdown_while_mlme_awaits_driver_completion() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (reply, completion) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(completion);
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .begin_connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(runtime.drive_connect_once().await.unwrap(), None);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !effects.lock().unwrap().calls.contains(&"channel") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!runtime.mlme.is_idle());
+            assert_eq!(runtime.drive_connect_once().await.unwrap(), None);
+            runtime.shutdown().await.unwrap();
+            assert!(runtime.mlme.task.is_none());
+            assert!(reply.send(Ok(())).is_err());
+            let effects = effects.lock().unwrap();
+            assert_eq!(
+                effects.calls.iter().filter(|call| **call == "stop").count(),
+                1
+            );
         });
     }
 
