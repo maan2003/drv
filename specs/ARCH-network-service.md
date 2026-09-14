@@ -16,7 +16,7 @@ IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
 the same binding now accepts a frame-only Ethernet capability and passes
 DHCP, application TCP/HTTP and UDP/DNS against a simulated AP, retaining
 localhost after link loss. The reproducible harness and evidence live in
-[`kernel-provider/production`](../crates/netstack3-port-spike/kernel-provider/production/README.md).
+[`kernel-provider/production`](../crates/net/netstack3-port-spike/kernel-provider/production/README.md).
 The same provider has demonstrated WPA3, DHCP, application DNS and verified
 HTTPS through the userspace MT7921 driver in KVM. It is not yet the continuously
 integrated Wi-Fi service. Linux protocol options, notably the error queue required

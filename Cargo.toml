@@ -1,7 +1,47 @@
 [workspace]
-members = ["crates/directory-capability", "crates/ath11k-oracle", "crates/mt7921-oracle", "crates/qrtr-socket", "crates/ath11k-qmi-qrtr", "crates/ath11k-bringup", "crates/ath11k-dp", "crates/ath11k-wmi", "crates/ath11k-qmi", "crates/ath11k-ce", "crates/ath11k-hal", "crates/ath11k-platform-backend", "crates/ath11k-core", "crates/amd-hda-spike", "crates/audio-pipewire-spike", "crates/bluetooth-hci-broker", "crates/bluetooth-sapphire-wasm", "crates/driver-runtime", "crates/dma-pool", "crates/fuchsia-audio-processing", "crates/fuchsia-audio-timeline", "crates/hardware-api", "crates/hardware-backends", "crates/harness", "crates/mt76-core", "crates/mt7921-core", "crates/mt7921-port-spike", "crates/netstack3-port-spike", "crates/probe", "crates/userspace-vfio"]
+members = [
+  "crates/platform/directory-capability",
+  "lab/ath11k/ath11k-oracle",
+  "lab/mt7921/mt7921-oracle",
+  "crates/qualcomm/qrtr-socket",
+  "crates/wifi/drivers/ath11k/ath11k-qmi-qrtr",
+  "lab/ath11k/ath11k-bringup",
+  "crates/wifi/drivers/ath11k/ath11k-dp",
+  "crates/wifi/drivers/ath11k/ath11k-wmi",
+  "crates/wifi/drivers/ath11k/ath11k-qmi",
+  "crates/wifi/drivers/ath11k/ath11k-ce",
+  "crates/wifi/drivers/ath11k/ath11k-hal",
+  "crates/wifi/drivers/ath11k/ath11k-platform-backend",
+  "crates/wifi/drivers/ath11k/ath11k-core",
+  "lab/audio/amd-hda-spike",
+  "lab/audio/audio-pipewire-spike",
+  "crates/bluetooth/bluetooth-hci-broker",
+  "crates/bluetooth/bluetooth-sapphire-wasm",
+  "crates/platform/driver-runtime",
+  "crates/platform/dma-pool",
+  "crates/audio/fuchsia-audio-processing",
+  "crates/audio/fuchsia-audio-timeline",
+  "crates/platform/hardware-api",
+  "crates/platform/hardware-backends",
+  "lab/harness",
+  "crates/wifi/drivers/mt76/mt76-core",
+  "crates/wifi/drivers/mt7921/mt7921-core",
+  "crates/wifi/drivers/mt7921/mt7921-port-spike",
+  "crates/net/netstack3-port-spike",
+  "lab/probe",
+  "crates/platform/userspace-vfio",
+]
 resolver = "3"
-exclude = ["crates/ath11k-softmac-adapter", "crates/linux-self-sandbox", "crates/mt7921-softmac-adapter", "crates/mt7921-passive-scan", "crates/mt7921-production-client", "crates/wlan-softmac-class-support", "crates/wlan-softmac-host", "crates/wifi-supervisor-wire"]
+exclude = [
+  "crates/wifi/drivers/ath11k/ath11k-softmac-adapter",
+  "crates/platform/linux-self-sandbox",
+  "crates/wifi/drivers/mt7921/mt7921-softmac-adapter",
+  "crates/wifi/drivers/mt7921/mt7921-passive-scan",
+  "crates/wifi/drivers/mt7921/mt7921-production-client",
+  "crates/wifi/wlan-softmac-class-support",
+  "crates/wifi/wlan-softmac-host",
+  "crates/wifi/wifi-supervisor-wire",
+]
 
 [workspace.package]
 edition = "2024"

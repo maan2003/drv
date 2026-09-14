@@ -1,0 +1,36 @@
+[package]
+name = "wifi-control-service"
+description = "Bounded Wi-Fi runtime control service over Unix seqpacket"
+edition = "2024"
+license = "GPL-2.0-only"
+version = "0.1.0"
+
+[features]
+test-fixture = []
+
+[[bin]]
+name = "wifi-control-unsandboxed-test-fixture"
+path = "src/bin/wifi-control-unsandboxed-test-fixture.rs"
+required-features = ["test-fixture"]
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+fidl-fuchsia-wlan-sme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
+futures = "=0.3.32"
+libc = "=0.2.189"
+linux-self-sandbox = { path = "../../platform/linux-self-sandbox" }
+wlan-control-wire = { path = "../wlan-control-wire" }
+wifi-supervisor-wire = { path = "../wifi-supervisor-wire" }
+wlan-softmac-host = { path = "../wlan-softmac-host" }
+
+[dev-dependencies]
+fidl-fuchsia-wlan-common = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-driver = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.driver" }
+fidl-fuchsia-wlan-internal = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
+fidl-fuchsia-wlan-mlme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.mlme" }
+fidl-fuchsia-wlan-softmac = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
+fuchsia-inspect = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
+zx = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }

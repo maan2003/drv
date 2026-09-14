@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-(cd crates/probe && cargo component bindings)
+(cd lab/probe && cargo component bindings)
 cargo fmt --all
 cargo build -p drv-probe --target wasm32-unknown-unknown
 wasm-tools component new \

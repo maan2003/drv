@@ -1,0 +1,16 @@
+[package]
+name = "ath11k-bringup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Staged Linux host bring-up runner for Redwood WCN6750"
+
+[dependencies]
+ath11k-core = { path = "../../../crates/wifi/drivers/ath11k/ath11k-core" }
+ath11k-dp = { path = "../../../crates/wifi/drivers/ath11k/ath11k-dp" }
+ath11k-qmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-qmi" }
+ath11k-qmi-qrtr = { path = "../../../crates/wifi/drivers/ath11k/ath11k-qmi-qrtr" }
+ath11k-wmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-wmi" }
+drv-hardware = { path = "../../../crates/platform/hardware-api" }
+drv-hardware-backends = { path = "../../../crates/platform/hardware-backends" }
+userspace-vfio = { path = "../../../crates/platform/userspace-vfio" }

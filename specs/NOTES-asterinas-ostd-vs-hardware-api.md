@@ -26,7 +26,7 @@ have been validated by a working virtio/net stack in safe Rust.
 | Access only via `VmReader/VmWriter` + `read_val::<T: Pod>` / `write_val`; **no `&T` into DMA memory ever** | Both DMA types provide byte access and alignment-checked `read_pod`/`write_pod`; they do not expose references into device memory. | Same discipline. |
 | `VmIoOnce::read_once/write_once` = single non-tearing load/store, alignment-checked | Both DMA types provide alignment-checked `read_once`/`write_once` for sealed 32-bit `PodOnce` values. | Same single-access shape for device-shared words. |
 | Explicit `fence(SeqCst)` in the virtqueue between descriptor write and avail-index publish | The backend contract makes MMIO writes release-ordered after coherent DMA writes and completed streaming handoffs, and MMIO reads acquire-order later coherent DMA reads. The deterministic backend can reject a declared descriptor-before-doorbell violation. | Equivalent ordering is explicit at the publication boundary. |
-| `DmaPool<D>` (safe crate): fixed-size sub-page streaming segments, refcounted pages, returned on drop, `deny(unsafe_code)` | `crates/dma-pool` is a safe crate generic over `Backend`; it splits streaming pages into direction-typed segments, bounds retained free segments, and is used by ath11k DP RX/REO paths. | Borrowed. MT7921 adoption remains a driver-local decision. |
+| `DmaPool<D>` (safe crate): fixed-size sub-page streaming segments, refcounted pages, returned on drop, `deny(unsafe_code)` | `crates/platform/dma-pool` is a safe crate generic over `Backend`; it splits streaming pages into direction-typed segments, bounds retained free segments, and is used by ath11k DP RX/REO paths. | Borrowed. MT7921 adoption remains a driver-local decision. |
 | `SafePtr<T, M: VmIo, Rights>` typed pointer into a `VmIo` object with static rights (`Dup`, `Write`), `field_ptr!` macro | typed descriptor codecs in ath11k-hal | Do **not** borrow the rights machinery (heavy). Borrow `field_ptr!`-style offset projection only if HAL codecs get painful. |
 | Constructors require IRQs enabled (documented), drop allowed in IRQ context | n/a (userspace) | n/a. |
 | CVM/TDX shared-page handling | n/a | n/a. |
@@ -61,7 +61,7 @@ there beyond confirming the design.
 The safe API now includes bounded `MmioRegion` slices, owned coherent and
 streaming DMA splits, typed POD and single-access operations, explicit
 DMA/MMIO publication ordering, backend coherency reporting with deterministic
-coherent/non-coherent coverage, and the safe generic `crates/dma-pool`. The
+coherent/non-coherent coverage, and the safe generic `crates/platform/dma-pool`. The
 pool is integrated into ath11k DP; this note does not require every driver to
 adopt it.
 

@@ -1,0 +1,18 @@
+[package]
+name = "amd-hda-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drv-audio-pipewire-spike = { path = "../audio-pipewire-spike" }
+drv-fuchsia-audio-processing = { path = "../../../crates/audio/fuchsia-audio-processing" }
+drv-fuchsia-audio-timeline = { path = "../../../crates/audio/fuchsia-audio-timeline" }
+
+[[bin]]
+name = "amd-hda-enumerate"
+path = "src/main.rs"
+
+[[bin]]
+name = "amd-hda-rt-daemon"
+path = "src/bin/rt_daemon.rs"

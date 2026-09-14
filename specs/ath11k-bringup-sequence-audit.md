@@ -2,7 +2,7 @@
 
 Source authority is Linux commit
 `509ce3d952d550f93b544c8d94c99e798f09a9b4`. The decomposition and exact
-public port seams are in `crates/ath11k-core/INTERFACES.md`.
+public port seams are in `crates/wifi/drivers/ath11k/ath11k-core/INTERFACES.md`.
 
 | phase | minimum Linux ownership path | completion evidence |
 |---|---|---|

@@ -12,7 +12,7 @@
       ];
     in
     {
-      nixosModules.netstack3-kernel-provider = import ./crates/netstack3-port-spike/kernel-provider/module.nix;
+      nixosModules.netstack3-kernel-provider = import ./crates/net/netstack3-port-spike/kernel-provider/module.nix;
 
       checks.x86_64-linux.vfio-edu =
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/vfio-edu-test.nix
@@ -20,25 +20,25 @@
 
       checks.x86_64-linux.netstack3-kernel-provider =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
-          ./crates/netstack3-port-spike/kernel-provider/check.nix
+          ./crates/net/netstack3-port-spike/kernel-provider/check.nix
           { };
 
       checks.x86_64-linux.audio-pipewire-daemon =
-        nixpkgs.legacyPackages.x86_64-linux.callPackage ./crates/audio-pipewire-spike/package.nix
+        nixpkgs.legacyPackages.x86_64-linux.callPackage ./lab/audio/audio-pipewire-spike/package.nix
           { };
 
       checks.x86_64-linux.netstack3-provider-daemon =
-        nixpkgs.legacyPackages.x86_64-linux.callPackage ./crates/netstack3-port-spike/provider-package.nix
+        nixpkgs.legacyPackages.x86_64-linux.callPackage ./crates/net/netstack3-port-spike/provider-package.nix
           { };
 
       checks.x86_64-linux.netstack3-provider-service =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
-          ./crates/netstack3-port-spike/kernel-provider/service-test.nix
+          ./crates/net/netstack3-port-spike/kernel-provider/service-test.nix
           { };
 
       checks.x86_64-linux.netstack3-kernel-provider-boot =
         nixpkgs.legacyPackages.x86_64-linux.callPackage
-          ./crates/netstack3-port-spike/kernel-provider/boot-test.nix
+          ./crates/net/netstack3-port-spike/kernel-provider/boot-test.nix
           { };
 
       checks.x86_64-linux.wlan-softmac-host =
@@ -50,15 +50,15 @@
           pname = "wlan-softmac-host-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/wlan-softmac-host";
-          buildAndTestSubdir = "crates/wlan-softmac-host";
-          cargoLock.lockFile = ./crates/wlan-softmac-host/Cargo.lock;
+          cargoRoot = "crates/wifi/wlan-softmac-host";
+          buildAndTestSubdir = "crates/wifi/wlan-softmac-host";
+          cargoLock.lockFile = ./crates/wifi/wlan-softmac-host/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/wlan-softmac-host
+            cd crates/wifi/wlan-softmac-host
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
@@ -77,15 +77,15 @@
           pname = "wlan-control-wire-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/wlan-control-wire";
-          buildAndTestSubdir = "crates/wlan-control-wire";
-          cargoLock.lockFile = ./crates/wlan-control-wire/Cargo.lock;
+          cargoRoot = "crates/wifi/wlan-control-wire";
+          buildAndTestSubdir = "crates/wifi/wlan-control-wire";
+          cargoLock.lockFile = ./crates/wifi/wlan-control-wire/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/wlan-control-wire
+            cd crates/wifi/wlan-control-wire
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
@@ -104,15 +104,15 @@
           pname = "linux-self-sandbox-check";
           version = "0.1.0";
           src = ./.;
-          cargoRoot = "crates/linux-self-sandbox";
-          buildAndTestSubdir = "crates/linux-self-sandbox";
-          cargoLock.lockFile = ./crates/linux-self-sandbox/Cargo.lock;
+          cargoRoot = "crates/platform/linux-self-sandbox";
+          buildAndTestSubdir = "crates/platform/linux-self-sandbox";
+          cargoLock.lockFile = ./crates/platform/linux-self-sandbox/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/linux-self-sandbox
+            cd crates/platform/linux-self-sandbox
             cargo test --locked --offline -- --nocapture
             cargo test --locked --offline --features filter-integration-test \
               --test mt_hashmap_filter -- --nocapture
@@ -133,15 +133,15 @@
           pname = "wifi-control-service-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/wifi-control-service";
-          buildAndTestSubdir = "crates/wifi-control-service";
-          cargoLock.lockFile = ./crates/wifi-control-service/Cargo.lock;
+          cargoRoot = "crates/wifi/wifi-control-service";
+          buildAndTestSubdir = "crates/wifi/wifi-control-service";
+          cargoLock.lockFile = ./crates/wifi/wifi-control-service/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/wifi-control-service
+            cd crates/wifi/wifi-control-service
             cargo test --locked --offline --features test-fixture
             cargo clippy --locked --offline --all-targets --features test-fixture -- -D warnings
             runHook postCheck
@@ -160,15 +160,15 @@
           pname = "ath11k-wifi-service-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/ath11k-wifi-service";
-          buildAndTestSubdir = "crates/ath11k-wifi-service";
-          cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+          cargoRoot = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+          buildAndTestSubdir = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+          cargoLock.lockFile = ./crates/wifi/drivers/ath11k/ath11k-wifi-service/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/ath11k-wifi-service
+            cd crates/wifi/drivers/ath11k/ath11k-wifi-service
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
@@ -187,15 +187,15 @@
           pname = "wlancfg-service-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/wlancfg-service";
-          buildAndTestSubdir = "crates/wlancfg-service";
-          cargoLock.lockFile = ./crates/wlancfg-service/Cargo.lock;
+          cargoRoot = "crates/wifi/wlancfg-service";
+          buildAndTestSubdir = "crates/wifi/wlancfg-service";
+          cargoLock.lockFile = ./crates/wifi/wlancfg-service/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/wlancfg-service
+            cd crates/wifi/wlancfg-service
             cargo test --locked --offline
             # This filtered lifecycle must match deployment. Rust's debug-only
             # I/O-safety assertions use fcntl, which the runtime policy
@@ -219,15 +219,15 @@
           pname = "network-service-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/network-service";
-          buildAndTestSubdir = "crates/network-service";
-          cargoLock.lockFile = ./crates/network-service/Cargo.lock;
+          cargoRoot = "crates/net/network-service";
+          buildAndTestSubdir = "crates/net/network-service";
+          cargoLock.lockFile = ./crates/net/network-service/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/network-service
+            cd crates/net/network-service
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
@@ -246,15 +246,15 @@
           pname = "ath11k-softmac-adapter-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/ath11k-softmac-adapter";
-          buildAndTestSubdir = "crates/ath11k-softmac-adapter";
-          cargoLock.lockFile = ./crates/ath11k-softmac-adapter/Cargo.lock;
+          cargoRoot = "crates/wifi/drivers/ath11k/ath11k-softmac-adapter";
+          buildAndTestSubdir = "crates/wifi/drivers/ath11k/ath11k-softmac-adapter";
+          cargoLock.lockFile = ./crates/wifi/drivers/ath11k/ath11k-softmac-adapter/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/ath11k-softmac-adapter
+            cd crates/wifi/drivers/ath11k/ath11k-softmac-adapter
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets -- -D warnings
             runHook postCheck
@@ -273,15 +273,15 @@
           pname = "mt7921-production-client-check";
           version = "0.1.0";
           src = mt7921FuchsiaSource;
-          cargoRoot = "crates/mt7921-production-client";
-          buildAndTestSubdir = "crates/mt7921-production-client";
-          cargoLock.lockFile = ./crates/mt7921-production-client/Cargo.lock;
+          cargoRoot = "crates/wifi/drivers/mt7921/mt7921-production-client";
+          buildAndTestSubdir = "crates/wifi/drivers/mt7921/mt7921-production-client";
+          cargoLock.lockFile = ./crates/wifi/drivers/mt7921/mt7921-production-client/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             runHook preCheck
-            cd crates/mt7921-production-client
+            cd crates/wifi/drivers/mt7921/mt7921-production-client
             cargo test --locked --offline
             cargo clippy --locked --offline --all-targets --no-deps -- -D warnings
             runHook postCheck
@@ -303,7 +303,7 @@
           src = mt7921FuchsiaSource;
           cargoRoot = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
           buildAndTestSubdir = "reference/fuchsia-${commit}/src/connectivity/network/netstack3";
-          cargoLock.lockFile = ./crates/netstack3-port-spike/upstream-cargo/src/connectivity/network/netstack3/Cargo.lock;
+          cargoLock.lockFile = ./crates/net/netstack3-port-spike/upstream-cargo/src/connectivity/network/netstack3/Cargo.lock;
           nativeBuildInputs = [ pkgs.clippy pkgs.cmake pkgs.pkg-config pkgs.perl ];
           dontBuild = true;
           doCheck = true;
@@ -371,9 +371,9 @@
               ! bash "$verify" "$source" "$base" reordered "$set_hash" "$closure" derivation-owned
 
               association_verify=${./nix/verify-mt7921-production-association-path.sh}
-              adapter_source=${./crates/mt7921-softmac-adapter/src/client_device.rs}
-              binary_source=${./crates/mt7921-port-spike/src/bin/vfio_read.rs}
-              fixture_source=${./crates/netstack3-port-spike/upstream-cargo/src/connectivity/wlan/lib/mlme/rust/src/host_fixture.rs}
+              adapter_source=${./crates/wifi/drivers/mt7921/mt7921-softmac-adapter/src/client_device.rs}
+              binary_source=${./crates/wifi/drivers/mt7921/mt7921-port-spike/src/bin/vfio_read.rs}
+              fixture_source=${./crates/net/netstack3-port-spike/upstream-cargo/src/connectivity/wlan/lib/mlme/rust/src/host_fixture.rs}
               bash "$association_verify" "$adapter_source" "$binary_source" "$fixture_source"
               cp "$adapter_source" stale-adapter.rs
               cp "$fixture_source" swapped-oracle-fixture.rs
@@ -410,24 +410,24 @@
               pname = "wlan-control-wire";
               version = "0.1.0";
               src = mt7921FuchsiaSource;
-              cargoRoot = "crates/wlan-control-wire";
-              buildAndTestSubdir = "crates/wlan-control-wire";
-              cargoLock.lockFile = ./crates/wlan-control-wire/Cargo.lock;
+              cargoRoot = "crates/wifi/wlan-control-wire";
+              buildAndTestSubdir = "crates/wifi/wlan-control-wire";
+              cargoLock.lockFile = ./crates/wifi/wlan-control-wire/Cargo.lock;
               doCheck = false;
               installPhase = ''
                 mkdir -p "$out/share/wlan-control-wire"
-                cp crates/wlan-control-wire/Cargo.toml crates/wlan-control-wire/Cargo.lock \
+                cp crates/wifi/wlan-control-wire/Cargo.toml crates/wifi/wlan-control-wire/Cargo.lock \
                   "$out/share/wlan-control-wire/"
-                cp -R crates/wlan-control-wire/src "$out/share/wlan-control-wire/"
+                cp -R crates/wifi/wlan-control-wire/src "$out/share/wlan-control-wire/"
               '';
             };
           wlancfg-service = pkgs.rustPlatform.buildRustPackage {
             pname = "wlancfg-service";
             version = "0.1.0";
             src = mt7921FuchsiaSource;
-            cargoRoot = "crates/wlancfg-service";
-            buildAndTestSubdir = "crates/wlancfg-service";
-            cargoLock.lockFile = ./crates/wlancfg-service/Cargo.lock;
+            cargoRoot = "crates/wifi/wlancfg-service";
+            buildAndTestSubdir = "crates/wifi/wlancfg-service";
+            cargoLock.lockFile = ./crates/wifi/wlancfg-service/Cargo.lock;
             nativeBuildInputs = [ pkgs.cmake pkgs.perl ];
             doCheck = false;
           };
@@ -436,17 +436,17 @@
             pname = "ath11k-wifi-service";
             version = "0.1.0";
             src = mt7921FuchsiaSource;
-            cargoRoot = "crates/ath11k-wifi-service";
-            buildAndTestSubdir = "crates/ath11k-wifi-service";
-            cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+            cargoRoot = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+            buildAndTestSubdir = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+            cargoLock.lockFile = ./crates/wifi/drivers/ath11k/ath11k-wifi-service/Cargo.lock;
             nativeBuildInputs = [ pkgs.cmake pkgs.perl ];
             doCheck = false;
             meta.mainProgram = "ath11k-wifi-service";
           };
 
-          audio-pipewire-daemon = pkgs.callPackage ./crates/audio-pipewire-spike/package.nix { };
+          audio-pipewire-daemon = pkgs.callPackage ./lab/audio/audio-pipewire-spike/package.nix { };
 
-          netstack3-provider-daemon = pkgs.callPackage ./crates/netstack3-port-spike/provider-package.nix { };
+          netstack3-provider-daemon = pkgs.callPackage ./crates/net/netstack3-port-spike/provider-package.nix { };
 
           hardware-backends = pkgs.rustPlatform.buildRustPackage {
             pname = "drv-hardware-backends";
@@ -506,9 +506,9 @@
               pname = "ath11k-wifi-service-aarch64";
               version = "0.1.0";
               src = mt7921FuchsiaSource;
-              cargoRoot = "crates/ath11k-wifi-service";
-              buildAndTestSubdir = "crates/ath11k-wifi-service";
-              cargoLock.lockFile = ./crates/ath11k-wifi-service/Cargo.lock;
+              cargoRoot = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+              buildAndTestSubdir = "crates/wifi/drivers/ath11k/ath11k-wifi-service";
+              cargoLock.lockFile = ./crates/wifi/drivers/ath11k/ath11k-wifi-service/Cargo.lock;
               cargoBuildFlags = [ "--bins" ];
               cargoInstallFlags = [ "--bins" ];
               nativeBuildInputs = [ pkgs.cmake pkgs.perl pkgs.gnugrep ];
@@ -688,9 +688,9 @@
             pname = "mt7921-full-firmware-validation";
             version = "0.1.0";
             src = mt7921FuchsiaSource;
-            cargoRoot = "crates/mt7921-passive-scan";
-            buildAndTestSubdir = "crates/mt7921-passive-scan";
-            cargoLock.lockFile = ./crates/mt7921-passive-scan/Cargo.lock;
+            cargoRoot = "crates/wifi/drivers/mt7921/mt7921-passive-scan";
+            buildAndTestSubdir = "crates/wifi/drivers/mt7921/mt7921-passive-scan";
+            cargoLock.lockFile = ./crates/wifi/drivers/mt7921/mt7921-passive-scan/Cargo.lock;
             cargoBuildFlags = [
               "--no-default-features"
               "--features"
@@ -708,7 +708,7 @@
               export MT7921_GENERATED_CRATE_SOURCE_SHA256=$(cat "$ref/.drv-generated-crate-source-sha256")
               export MT7921_SOURCE_IDENTITY_SHA256=$(cat "$ref/.drv-source-identity-sha256")
               export MT7921_PROJECT_CORE_SOURCE_SHA256=$(
-                find crates/mt7921-core -type f -print0 | sort -z \
+                find crates/wifi/drivers/mt7921/mt7921-core -type f -print0 | sort -z \
                   | while IFS= read -r -d $'\0' file; do printf '%s\0' "$file"; sha256sum "$file"; done \
                   | sha256sum | cut -d ' ' -f1
               )
@@ -1140,7 +1140,7 @@
             { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p "$out/bin"
-              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+              substitute ${./lab/mt7921/scripts/selector-write-recovery-supervisor.sh} \
                 "$out/bin/mt7921-fresh-laa-diagnostic-supervisor" \
                 --subst-var-by runtime_path /run/current-system/sw/bin \
                 --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
@@ -1232,7 +1232,7 @@
             { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.util-linux ]; }
             ''
               mkdir -p "$out/bin"
-              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} \
+              substitute ${./lab/mt7921/scripts/selector-write-recovery-supervisor.sh} \
                 "$out/bin/mt7921-full-firmware-validation-supervisor" \
                 --subst-var-by runtime_path /run/current-system/sw/bin \
                 --subst-var-by wifi_driver_lab /run/current-system/sw/bin/wifi-driver-lab \
@@ -1307,7 +1307,7 @@
               esac
               EOF
               chmod 0755 work/{launcher,id,watchdog,wifi-driver-lab}
-              substitute ${./crates/mt7921-port-spike/lab/selector-write-recovery-supervisor.sh} work/supervisor \
+              substitute ${./lab/mt7921/scripts/selector-write-recovery-supervisor.sh} work/supervisor \
                 --subst-var-by runtime_path ${pkgs.bash}/bin:${pkgs.coreutils}/bin \
                 --subst-var-by wifi_driver_lab "$PWD/work/wifi-driver-lab" \
                 --subst-var-by wifi_lab_watchdog "$PWD/work/watchdog" \

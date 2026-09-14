@@ -27,7 +27,7 @@ let
     stripRoot = false;
   };
   patchFiles = map (name:
-    ../crates/netstack3-port-spike/upstream-cargo/patches/${name}
+    ../crates/net/netstack3-port-spike/upstream-cargo/patches/${name}
   ) [
     "dhcp-client-core-host.patch"
     "trust-dns-workspace.patch"
@@ -102,11 +102,11 @@ runCommand "mt7921-source-fuchsia-${commit}-${builtins.substring 0 12 orderedPat
   printf '%s\n' '${closure}' > "$refroot/.drv-source-closure"
 
   chmod -R u+w "$refroot"
-  cp -R ${../crates/netstack3-port-spike/upstream-cargo}/src/. "$refroot/src/"
-  cp -R ${../crates/directory-capability} "$refroot/src/lib/directory-capability"
-  cp -R ${../crates/netstack3-port-spike/upstream-cargo}/sdk/. "$refroot/sdk/"
-  cp -R ${../crates/netstack3-port-spike/upstream-cargo}/third_party/. "$refroot/third_party/"
-  cp ${../crates/netstack3-port-spike/upstream-cargo}/LICENSE.fuchsia "$refroot/LICENSE"
+  cp -R ${../crates/net/netstack3-port-spike/upstream-cargo}/src/. "$refroot/src/"
+  cp -R ${../crates/platform/directory-capability} "$refroot/src/lib/directory-capability"
+  cp -R ${../crates/net/netstack3-port-spike/upstream-cargo}/sdk/. "$refroot/sdk/"
+  cp -R ${../crates/net/netstack3-port-spike/upstream-cargo}/third_party/. "$refroot/third_party/"
+  cp ${../crates/net/netstack3-port-spike/upstream-cargo}/LICENSE.fuchsia "$refroot/LICENSE"
   chmod -R u+w "$refroot"
   sed -i '/\[package\]/a workspace = "../../connectivity/network/netstack3"' "$refroot/src/lib/directory-capability/Cargo.toml"
 

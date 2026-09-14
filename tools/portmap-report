@@ -131,7 +131,7 @@ def fmt_ratio(a, b): return (f"{a / b:.2f}:1" if b else ("∞" if a else "—"))
 def main():
     crates = sorted(
         p.parent
-        for p in (ROOT / "crates").glob("ath11k-*/PORT-MAP.md")
+        for p in (ROOT / "crates" / "wifi" / "drivers" / "ath11k").glob("ath11k-*/PORT-MAP.md")
         if p.parent.name != "ath11k-qmi-qrtr"
     )
     if len(crates) != 7:

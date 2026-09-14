@@ -157,9 +157,9 @@ if marker not in text:
 sapphire.write_text(text.replace(marker, replacement, 1))
 PY
 
-cp "$repo/crates/bluetooth-sapphire-wasm/upstream/wasi_test_stubs.c" "$source/"
-cp "$repo/crates/bluetooth-sapphire-wasm/upstream/physical_discovery.cc" "$source/"
-cp "$repo/crates/bluetooth-sapphire-wasm/upstream/physical_wasi_stubs.c" "$source/"
+cp "$repo/crates/bluetooth/bluetooth-sapphire-wasm/upstream/wasi_test_stubs.c" "$source/"
+cp "$repo/crates/bluetooth/bluetooth-sapphire-wasm/upstream/physical_discovery.cc" "$source/"
+cp "$repo/crates/bluetooth/bluetooth-sapphire-wasm/upstream/physical_wasi_stubs.c" "$source/"
 cat >>"$source/BUILD.bazel" <<'EOF'
 
 cc_library(

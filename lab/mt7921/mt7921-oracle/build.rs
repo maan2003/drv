@@ -1,0 +1,685 @@
+use std::env;
+use std::path::{Path, PathBuf};
+
+const TAG: &str = "v7.1.5";
+const COMMIT: &str = "155b42bec9cbb6b8cdc47dd9bd09503a81fbe493";
+
+fn main() {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let root = env::var_os("MT76_REFERENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("../../../result-mt76/reference/linux-v7.1.5"));
+    if !root.join("COMMIT").is_file() {
+        panic!(
+            "pinned mt76 source is missing at {}; run `nix build .#mt76-reference-source --out-link result-mt76` or set MT76_REFERENCE_DIR",
+            root.display()
+        );
+    }
+    assert_identity(&root);
+    let generated = generate_oracle(&root, &manifest);
+    cc::Build::new()
+        .file(generated)
+        .warnings(true)
+        .flag_if_supported("-std=gnu11")
+        .compile("mt76_c_oracle");
+    println!("cargo:rerun-if-env-changed=MT76_REFERENCE_DIR");
+    println!("cargo:rerun-if-changed=c/oracle.c");
+    println!("cargo:rerun-if-changed={}", root.join("COMMIT").display());
+    println!("cargo:rerun-if-changed={}", root.join("TAG").display());
+}
+
+fn generate_oracle(root: &Path, manifest: &Path) -> PathBuf {
+    let mt76 = root.join("drivers/net/wireless/mediatek/mt76");
+    let mcu = std::fs::read_to_string(mt76.join("mt76_connac_mcu.c")).expect("read MCU C");
+    let mt7921_mcu = std::fs::read_to_string(mt76.join("mt7921/mcu.c")).expect("read MT7921 MCU C");
+    let dma = std::fs::read_to_string(mt76.join("dma.c")).expect("read DMA C");
+    let connac_mac =
+        std::fs::read_to_string(mt76.join("mt76_connac_mac.c")).expect("read Connac2 MAC C");
+    let mt7921_mac = std::fs::read_to_string(mt76.join("mt7921/mac.c")).expect("read MT7921 MAC C");
+    let mt792x_core =
+        std::fs::read_to_string(mt76.join("mt792x_core.c")).expect("read MT792x core C");
+    let mt792x_dma = std::fs::read_to_string(mt76.join("mt792x_dma.c")).expect("read MT792x DMA C");
+    let mt7921_pci_mac =
+        std::fs::read_to_string(mt76.join("mt7921/pci_mac.c")).expect("read MT7921 PCI MAC C");
+    let mt7921_main =
+        std::fs::read_to_string(mt76.join("mt7921/main.c")).expect("read MT7921 main C");
+    let util = std::fs::read_to_string(mt76.join("util.c")).expect("read mt76 util C");
+    let poll_function = item(
+        &util,
+        "bool ____mt76_poll_msec(",
+        "EXPORT_SYMBOL_GPL(____mt76_poll_msec);",
+    );
+    let driver_pm_function = item(
+        &mt792x_core,
+        "int __mt792xe_mcu_drv_pmctrl(",
+        "EXPORT_SYMBOL_GPL(__mt792xe_mcu_drv_pmctrl);",
+    );
+    let firmware_pm_function = item(
+        &mt792x_core,
+        "int mt792xe_mcu_fw_pmctrl(",
+        "EXPORT_SYMBOL_GPL(mt792xe_mcu_fw_pmctrl);",
+    );
+    let start_firmware_function = item(
+        &mcu,
+        "int mt76_connac_mcu_start_firmware(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_start_firmware);",
+    );
+    let patch_sem_function = item(
+        &mcu,
+        "int mt76_connac_mcu_patch_sem_ctrl(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_patch_sem_ctrl);",
+    );
+    let start_patch_function = item(
+        &mcu,
+        "int mt76_connac_mcu_start_patch(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_start_patch);",
+    );
+    let init_download_function = item(
+        &mcu,
+        "int mt76_connac_mcu_init_download(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_init_download);",
+    );
+    let mcu_function = item(
+        &mcu,
+        "int mt76_connac2_mcu_fill_message(",
+        "EXPORT_SYMBOL_GPL(mt76_connac2_mcu_fill_message);",
+    );
+    let dma_function = item(
+        &dma,
+        "static int\nmt76_dma_add_buf(",
+        "static void\nmt76_dma_tx_cleanup_idx",
+    );
+    let dma_rx_function = item(
+        &dma,
+        "static int\nmt76_dma_add_rx_buf(",
+        "static int\nmt76_dma_add_buf(",
+    );
+    let dma_get_buf_function = item(
+        &dma,
+        "static void *\nmt76_dma_get_buf(",
+        "static void *\nmt76_dma_dequeue(",
+    );
+    let dma_dequeue_function = item(
+        &dma,
+        "static void *\nmt76_dma_dequeue(",
+        "static int\nmt76_dma_tx_queue_skb_raw(",
+    );
+    let dma_rx_cleanup_function = item(
+        &dma,
+        "static void\nmt76_dma_rx_cleanup(",
+        "static void\nmt76_dma_rx_reset(",
+    );
+    let response_function = item(
+        &mt7921_mcu,
+        "int mt7921_mcu_parse_response(",
+        "EXPORT_SYMBOL_GPL(mt7921_mcu_parse_response);",
+    );
+    let channel_domain_function = item(
+        &mcu,
+        "int mt76_connac_mcu_set_channel_domain(",
+        "EXPORT_SYMBOL_GPL(mt76_connac_mcu_set_channel_domain);",
+    );
+    let channel_info_function = item(
+        &mt7921_mcu,
+        "int mt7921_mcu_set_chan_info(",
+        "int mt7921_mcu_set_eeprom(",
+    );
+    let clc_function = item(
+        &mt7921_mcu,
+        "int __mt7921_mcu_set_clc(",
+        "int mt7921_mcu_set_clc(",
+    );
+    let fill_txs_function = item(
+        &connac_mac,
+        "bool mt76_connac2_mac_fill_txs(",
+        "EXPORT_SYMBOL_GPL(mt76_connac2_mac_fill_txs);",
+    );
+    let add_txs_skb_function = item(
+        &connac_mac,
+        "bool mt76_connac2_mac_add_txs_skb(",
+        "EXPORT_SYMBOL_GPL(mt76_connac2_mac_add_txs_skb);",
+    );
+    let add_txs_function = item(
+        &mt7921_mac,
+        "void mt7921_mac_add_txs(",
+        "static void mt7921_mac_tx_free(",
+    );
+    // Checkpoint-six wrappers execute the exact request assignments below in
+    // a deliberately smaller type universe. Pin every normalized assignment
+    // and the monitor ordering to the immutable source before compiling them.
+    require_ordered(
+        item(
+            &mcu,
+            "void mt76_connac_mcu_sta_ba_tlv(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_ba_tlv);",
+        ),
+        &[
+            "ba->ba_type = tx ? MT_BA_TYPE_ORIGINATOR : MT_BA_TYPE_RECIPIENT;",
+            "ba->winsize = cpu_to_le16(params->buf_size);",
+            "ba->ssn = cpu_to_le16(params->ssn);",
+            "ba->ba_en = enable << params->tid;",
+            "ba->amsdu = params->amsdu;",
+            "ba->tid = params->tid;",
+        ],
+    );
+    require_ordered(
+        item(
+            &mcu,
+            "void mt76_connac_mcu_wtbl_ba_tlv(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_wtbl_ba_tlv);",
+        ),
+        &[
+            "ba->tid = params->tid;",
+            "ba->ba_type = MT_BA_TYPE_ORIGINATOR;",
+            "ba->sn = enable ? cpu_to_le16(params->ssn) : 0;",
+            "ba->ba_winsize = enable ? cpu_to_le16(params->buf_size) : 0;",
+            "ba->ba_en = enable;",
+            "memcpy(ba->peer_addr, params->sta->addr, ETH_ALEN);",
+            "ba->ba_type = MT_BA_TYPE_RECIPIENT;",
+            "ba->rst_ba_tid = params->tid;",
+            "ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;",
+            "ba->rst_ba_sb = 1;",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_uni_bss_ps(",
+            "static int\nmt7921_mcu_uni_bss_bcnft(",
+        ),
+        &[
+            ".ps_state = vif->cfg.ps ? 2 : 0,",
+            "MCU_UNI_CMD(BSS_INFO_UPDATE)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_set_beacon_filter(",
+            "int mt7921_get_txpwr_info(",
+        ),
+        &[
+            "mt7921_mcu_uni_bss_bcnft(dev, vif, true);",
+            "MT7921_FIF_BIT_SET",
+            "MT_WF_RFCR_DROP_OTHER_BEACON",
+            "mt7921_mcu_set_bss_pm(dev, vif, false);",
+            "MT7921_FIF_BIT_CLR",
+            "MT_WF_RFCR_DROP_OTHER_BEACON",
+        ],
+    );
+    require_ordered(
+        item(
+            &mcu,
+            "int mt76_connac_mcu_set_deep_sleep(",
+            "EXPORT_SYMBOL_GPL(mt76_connac_mcu_set_deep_sleep);",
+        ),
+        &[
+            "snprintf(req.data, sizeof(req.data), \"KeepFullPwr %d\", !enable);",
+            "MCU_CE_CMD(CHIP_CONFIG)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_mcu,
+            "int mt7921_mcu_set_sniffer(",
+            "int mt7921_mcu_config_sniffer(",
+        ),
+        &[
+            ".tag = cpu_to_le16(0),",
+            ".enable = enable,",
+            "MCU_UNI_CMD(SNIFFER)",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt7921_main,
+            "mt7921_sniffer_interface_iter(",
+            "void mt7921_set_runtime_pm(",
+        ),
+        &[
+            "mt7921_mcu_set_sniffer(dev, vif, monitor);",
+            "pm->enable = pm->enable_user && !monitor;",
+            "pm->ds_enable = pm->ds_enable_user && !monitor;",
+            "mt76_connac_mcu_set_deep_sleep(&dev->mt76, pm->ds_enable);",
+            "if (monitor)",
+            "mt7921_mcu_set_beacon_filter(dev, vif, false);",
+        ],
+    );
+    // The reset oracle below spells out only register and branch observations.
+    // Pin that normalization to the ordered source operations it represents so
+    // a source-tag change cannot silently leave a plausible handwritten trace.
+    require_ordered(
+        &mt7921_pci_mac,
+        &[
+            "mt792xe_mcu_drv_pmctrl(dev);",
+            "mt76_wr(dev, dev->irq_map->host_irq_enable, 0);",
+            "mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0x0);",
+            "mt792x_wpdma_reset(dev, true);",
+            "mt76_wr(dev, dev->irq_map->host_irq_enable,",
+            "mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);",
+            "err = mt7921e_driver_own(dev);",
+            "err = mt7921_run_firmware(dev);",
+        ],
+    );
+    require_ordered(
+        &mt792x_dma,
+        &[
+            "err = mt792x_dma_disable(dev, force);",
+            "mt76_queue_reset(dev, dev->mphy.q_tx[i], true);",
+            "mt76_queue_reset(dev, dev->mt76.q_mcu[i], true);",
+            "mt76_queue_reset(dev, &dev->mt76.q_rx[i], true);",
+            "return mt792x_dma_enable(dev);",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt792x_dma,
+            "int mt792x_dma_disable(",
+            "EXPORT_SYMBOL_GPL(mt792x_dma_disable);",
+        ),
+        &[
+            "mt76_clear(dev, MT_WFDMA0_GLO_CFG,",
+            "mt76_poll_msec_tick(dev, MT_WFDMA0_GLO_CFG,",
+            "mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,",
+            "mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);",
+            "if (force)",
+            "mt76_clear(dev, MT_WFDMA0_RST,",
+            "mt76_set(dev, MT_WFDMA0_RST,",
+        ],
+    );
+    require_ordered(
+        item(
+            &mt792x_dma,
+            "int mt792x_dma_enable(",
+            "EXPORT_SYMBOL_GPL(mt792x_dma_enable);",
+        ),
+        &[
+            "mt792x_dma_prefetch(dev);",
+            "mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);",
+            "mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);",
+            "mt76_set(dev, MT_WFDMA0_GLO_CFG,",
+            "MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN",
+            "mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);",
+            "mt76_connac_irq_enable(&dev->mt76,",
+            "mt76_set(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);",
+        ],
+    );
+    let wrapper = std::fs::read_to_string(manifest.join("c/oracle.c")).expect("read wrapper");
+    let generated = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("mt76_oracle.c");
+    std::fs::write(
+        &generated,
+        format!(
+            "{}\n{poll_function}\n{driver_pm_function}\n{firmware_pm_function}\n{start_firmware_function}\n{patch_sem_function}\n{start_patch_function}\n{init_download_function}\n{mcu_function}\n{channel_domain_function}\n{channel_info_function}\n{clc_function}\n{dma_rx_function}\n{dma_function}\n{response_function}\n{dma_get_buf_function}\n{dma_dequeue_function}\n{dma_rx_cleanup_function}\n{fill_txs_function}\n{add_txs_skb_function}\n{add_txs_function}\n{wrapper}",
+            prelude()
+        ),
+    )
+    .expect("write generated oracle");
+    generated
+}
+
+fn require_ordered(text: &str, needles: &[&str]) {
+    let mut rest = text;
+    for needle in needles {
+        let offset = rest
+            .find(needle)
+            .unwrap_or_else(|| panic!("pinned source lost ordered reset operation {needle}"));
+        rest = &rest[offset + needle.len()..];
+    }
+}
+
+fn item<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let start = text
+        .find(start)
+        .unwrap_or_else(|| panic!("pinned source lost {start}"));
+    let end = text[start..]
+        .find(end)
+        .map(|n| start + n)
+        .unwrap_or_else(|| panic!("pinned source lost {end}"));
+    &text[start..end]
+}
+
+fn assert_identity(root: &Path) {
+    let commit = std::fs::read_to_string(root.join("COMMIT")).expect("read COMMIT");
+    let tag = std::fs::read_to_string(root.join("TAG")).expect("read TAG");
+    assert_eq!(commit.trim(), COMMIT, "wrong mt76 reference commit");
+    assert_eq!(tag.trim(), TAG, "wrong mt76 reference tag");
+}
+
+fn prelude() -> &'static str {
+    r#"#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint16_t __le16; typedef uint32_t __le32; typedef uint64_t dma_addr_t;
+#define __packed __attribute__((packed))
+#define __aligned(x) __attribute__((aligned(x)))
+#define BIT(n) (1U << (n))
+#define GENMASK(h, l) (((~0U) << (l)) & (~0U >> (31 - (h))))
+#define __bf_shf(x) (__builtin_ffs((unsigned int)(x)) - 1)
+#define FIELD_PREP(mask, val) (((u32)(val) << __bf_shf(mask)) & (mask))
+#define FIELD_GET(mask, val) (((u32)(val) & (mask)) >> __bf_shf(mask))
+#define cpu_to_le16(x) ((u16)(x))
+#define cpu_to_le32(x) ((u32)(x))
+#define WRITE_ONCE(x, val) ((x) = (val))
+#define HZ 1000
+#define CONFIG_ARCH_DMA_ADDR_T_64BIT 1
+#define __MCU_CMD_FIELD_ID GENMASK(7, 0)
+#define __MCU_CMD_FIELD_EXT_ID GENMASK(15, 8)
+#define __MCU_CMD_FIELD_QUERY BIT(16)
+#define __MCU_CMD_FIELD_UNI BIT(17)
+#define __MCU_CMD_FIELD_CE BIT(18)
+#define __MCU_CMD_FIELD_WA BIT(19)
+#define MCU_CMD_FW_SCATTER 0xee
+#define MCU_CMD(x) MCU_CMD_##x
+#define MT_TXD0_Q_IDX GENMASK(31, 25)
+#define MT_TXD0_PKT_FMT GENMASK(24, 23)
+#define MT_TXD0_TX_BYTES GENMASK(15, 0)
+#define MT_TXD1_LONG_FORMAT BIT(31)
+#define MT_TXD1_HDR_FORMAT GENMASK(17, 16)
+#define MT_TX_TYPE_CMD 2
+#define MT_TX_MCU_PORT_RX_Q0 0x20
+#define MT_HDR_FORMAT_CMD 1
+#define MT_TX_PORT_IDX_MCU 1
+#define MCU_PQ_ID(p, q) (((p) << 15) | ((q) << 10))
+#define MCU_PKT_ID 0xa0
+#define MCU_CMD_UNI_EXT_ACK 7
+enum { MCU_Q_QUERY, MCU_Q_SET, MCU_Q_RESERVED, MCU_Q_NA };
+enum { MCU_S2D_H2N, MCU_S2D_C2N, MCU_S2D_H2C, MCU_S2D_H2N_AND_H2C };
+struct mt76_connac2_mcu_txd { __le32 txd[8]; __le16 len; __le16 pq_id; u8 cid; u8 pkt_type; u8 set_query; u8 seq; u8 uc_d2b0_rev; u8 ext_cid; u8 s2d_index; u8 ext_cid_ack; u32 rsv[5]; } __packed __aligned(4);
+struct mt76_connac2_mcu_uni_txd { __le32 txd[8]; __le16 len; __le16 cid; u8 rsv; u8 pkt_type; u8 frag_n; u8 seq; __le16 checksum; u8 s2d_index; u8 option; u8 rsv1[4]; } __packed __aligned(4);
+struct ieee80211_tx_rate { int idx; };
+struct ieee80211_tx_info { u32 flags; struct { u8 ampdu_len, ampdu_ack_len; struct ieee80211_tx_rate rates[1]; } status; };
+struct sk_buff { u8 *data; unsigned int len; u8 cb[64]; };
+static inline void *skb_push(struct sk_buff *skb, unsigned int len) { skb->data -= len; skb->len += len; memset(skb->data, 0, len); return skb->data; }
+static inline void *skb_pull(struct sk_buff *skb, unsigned int len) { skb->data += len; skb->len -= len; return skb->data; }
+static inline void skb_reserve(struct sk_buff *skb, unsigned int len) { skb->data += len; }
+static inline void skb_put_data(struct sk_buff *skb, const void *data, unsigned int len) { memcpy(skb->data + skb->len, data, len); skb->len += len; }
+#define __skb_push skb_push
+struct mt76_queue;
+struct mt76_dev;
+struct rate_info { u8 mcs, nss, flags, bw, he_gi, he_dcm; u16 legacy; };
+struct mt76_sta_stats { uint64_t tx_mode[16], tx_bw[5], tx_nss[4], tx_mcs[16], tx_bytes; u32 tx_packets, tx_retries, tx_failed; };
+struct mt76_wcid { struct rate_info rate; struct mt76_sta_stats stats; void *sta; u8 phy_idx; };
+struct ieee80211_sta { struct mt76_wcid drv_priv; };
+struct ieee80211_rate { u16 bitrate; };
+struct ieee80211_supported_band { struct ieee80211_rate bitrates[64]; struct ieee80211_channel *channels; int n_channels; };
+struct mt76_sband { struct ieee80211_supported_band sband; };
+struct ieee80211_channel { int band; int center_freq; u16 hw_value; u32 flags; };
+struct cfg80211_chan_def { struct ieee80211_channel *chan; int center_freq1, center_freq2, width; };
+struct mt76_phy { struct mt76_dev *dev; struct cfg80211_chan_def chandef; struct mt76_sband sband_2g, sband_5g, sband_6g; u64 state; u8 antenna_mask; bool offchannel; };
+struct ieee80211_conf { u32 flags; };
+struct ieee80211_hw { struct ieee80211_conf conf; void *wiphy; };
+struct mt76_driver_ops { int (*rx_rro_add_msdu_page)(struct mt76_dev *, struct mt76_queue *, dma_addr_t, void *); };
+struct mt76_dev { void *dev, *dma_dev; struct { unsigned int timeout; u8 msg_seq; } mcu; struct { struct { int unused; } wed; } mmio; struct mt76_queue *q_rx; struct mt76_driver_ops *drv; struct mt76_phy phy; struct mt76_phy *phys[2]; struct ieee80211_hw *hw; u8 alpha2[2]; };
+struct mt76_connac2_mcu_rxd { __le32 rxd[6]; __le16 len; __le16 pkt_type_id; u8 eid; u8 seq; u8 option; u8 rsv; u8 ext_eid; u8 rsv1[2]; u8 s2d_index; u8 tlv[]; } __packed __aligned(4);
+struct mt76_desc { __le32 buf0; __le32 ctrl; __le32 buf1; __le32 info; } __packed __aligned(4);
+struct mt76_wed_rro_desc { __le32 buf0; __le32 buf1; };
+struct mt76_txwi_cache { int qid; dma_addr_t dma_addr; void *ptr; };
+struct mt76_queue_buf { dma_addr_t addr; u16 len; bool skip_unmap; };
+struct mt76_queue_entry { bool skip_buf0, skip_buf1; dma_addr_t dma_addr[2]; u16 dma_len[2]; void *txwi; void *skb; void *buf; u16 wcid; };
+struct mt76_queue { int head, tail, ndesc, queued; u32 flags, magic_cnt; unsigned int buf_size; void *page_pool, *rx_head; int lock; struct mt76_desc *desc; struct mt76_queue_entry *entry; };
+static inline bool mt76_queue_is_wed_rro_ind(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_rxdmad_c(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rx(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_data(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro_msdu_pg(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_wed_rro(struct mt76_queue *q) { (void)q; return false; }
+static inline bool mt76_queue_is_npu(struct mt76_queue *q) { (void)q; return false; }
+static inline struct mt76_txwi_cache *mt76_get_rxwi(struct mt76_dev *d) { (void)d; return NULL; }
+static inline struct mt76_txwi_cache *mt76_rx_token_release(struct mt76_dev *d, u32 token) { (void)d; (void)token; return NULL; }
+static inline int mt76_rx_token_consume(struct mt76_dev *d, void *a, void *b, dma_addr_t c) { (void)d; (void)a; (void)b; (void)c; return -1; }
+static inline void mt76_put_rxwi(struct mt76_dev *d, void *p) { (void)d; (void)p; }
+#define ENOMEM 12
+#define ENOENT 2
+#define EAGAIN 11
+#define EIO 5
+#define ETIMEDOUT 110
+#define le16_to_cpu(x) ((u16)(x))
+#define le32_to_cpu(x) ((u32)(x))
+#define dev_err(...) ((void)0)
+static inline void mt792x_reset(struct mt76_dev *dev) { (void)dev; }
+#define MCU_CMD_PATCH_SEM_CONTROL 0x10
+#define MCU_CMD_PATCH_FINISH_REQ 0x07
+#define MCU_CMD_FW_START_REQ 0x02
+#define MCU_CMD_PATCH_START_REQ 0x05
+#define MCU_CMD_TARGET_ADDRESS_LEN_REQ 0x01
+#define MCU_CMD_THERMAL_CTRL 0x2c
+#define MCU_CMD_DEV_INFO_UPDATE 0x01
+#define MCU_CMD_BSS_INFO_UPDATE 0x02
+#define MCU_CMD_STA_REC_UPDATE 0x03
+#define MCU_CMD_SUSPEND 0x05
+#define MCU_CMD_OFFLOAD 0x06
+#define MCU_CMD_HIF_CTRL 0x07
+#define MCU_CMD_REG_READ 0xc0
+#define MCU_CMD_WF_RF_PIN_CTRL 0xbd
+#define MCU_CMD_SET_CHAN_DOMAIN 0x0f
+#define MCU_CMD_SET_CLC 0x5c
+#define MCU_CMD_SET_RX_PATH 0x4e
+#define MCU_CMD_CHANNEL_SWITCH 0x08
+#define MCU_EXT_CMD(x) (FIELD_PREP(__MCU_CMD_FIELD_ID, 0xed) | FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, MCU_CMD_##x))
+#define MCU_CE_CMD(x) (FIELD_PREP(__MCU_CMD_FIELD_ID, MCU_CMD_##x) | __MCU_CMD_FIELD_CE)
+#define MCU_UNI_CMD(x) (MCU_CMD_##x | __MCU_CMD_FIELD_UNI)
+#define MCU_CE_QUERY(x) (MCU_CMD_##x | __MCU_CMD_FIELD_CE | __MCU_CMD_FIELD_QUERY)
+struct mt76_connac_mcu_uni_event { u8 cid; u8 pad[3]; __le32 status; } __packed;
+struct mt76_connac_mcu_reg_event { __le32 reg; __le32 val; } __packed;
+struct mt7921_wf_rf_pin_ctrl_event { u8 result; } __packed;
+#define MT_QFLAG_WED_RRO_EN BIT(0)
+#define MT_DMA_CTL_TOKEN GENMASK(31, 16)
+#define MT_DMA_CTL_TO_HOST BIT(8)
+#define MT_DMA_CTL_WO_DROP BIT(9)
+#define MT_DMA_CTL_DMA_DONE BIT(31)
+#define MT_DMA_MAGIC_MASK GENMASK(3, 0)
+#define MT_DMA_MAGIC_CNT 16
+#define DMA_DUMMY_DATA ((void *)1)
+#define MT_DMA_CTL_SD_LEN0 GENMASK(29, 16)
+#define MT_DMA_CTL_LAST_SEC0 BIT(30)
+#define MT_DMA_CTL_SD_LEN1 GENMASK(13, 0)
+#define MT_DMA_CTL_LAST_SEC1 BIT(14)
+#define MT_DMA_CTL_SDP0_H GENMASK(3, 0)
+#define MT_DMA_CTL_SDP1_H GENMASK(19, 16)
+#define MT_TXD_LEN_LAST BIT(15)
+#define MT_MSDU_ID_VALID BIT(15)
+#define MT_HDR_FORMAT_802_3 0
+#define MT_HDR_FORMAT_802_11 2
+#define MT_TX_TYPE_CT 0
+#define MT_LMAC_ALTX0 0x10
+#define MT_TXD1_WLAN_IDX GENMASK(9, 0)
+#define MT_TXD1_HDR_INFO GENMASK(15, 11)
+#define MT_TXD1_ETH_802_3 BIT(15)
+#define MT_TXD1_HDR_FORMAT GENMASK(17, 16)
+#define MT_TXD1_TID GENMASK(22, 20)
+#define MT_TXD2_SUB_TYPE GENMASK(3, 0)
+#define MT_TXD2_FRAME_TYPE GENMASK(5, 4)
+#define MT_TXD2_HTC_VLD BIT(13)
+#define MT_TXD2_FIX_RATE BIT(31)
+#define MT_TXD3_PROTECT_FRAME BIT(1)
+#define MT_TXD3_REM_TX_COUNT GENMASK(15, 11)
+#define MT_TXD3_BA_DISABLE BIT(28)
+#define MT_TXD5_PID GENMASK(7, 0)
+#define MT_TXD5_TX_STATUS_HOST BIT(10)
+#define MT_TXD6_FIXED_BW BIT(2)
+#define MT_TXD6_TX_RATE GENMASK(29, 16)
+#define MT_TXD7_SUB_TYPE GENMASK(19, 16)
+#define MT_TXD7_TYPE GENMASK(21, 20)
+#define MT_RXD0_PKT_FLAG GENMASK(19, 16)
+#define MT_RXD0_PKT_TYPE GENMASK(31, 27)
+#define MT_RXD1_NORMAL_GROUP_1 BIT(11)
+#define MT_RXD1_NORMAL_GROUP_2 BIT(12)
+#define MT_RXD1_NORMAL_GROUP_3 BIT(13)
+#define MT_RXD1_NORMAL_GROUP_4 BIT(14)
+#define MT_RXD1_NORMAL_GROUP_5 BIT(15)
+#define MT_RXD2_NORMAL_HDR_OFFSET GENMASK(15, 14)
+#define MT_RXD3_NORMAL_CH_FREQ GENMASK(15, 8)
+#define MT_PRXV_RCPI0 GENMASK(7, 0)
+#define MT_PRXV_RCPI1 GENMASK(15, 8)
+#define le32_get_bits(v, mask) FIELD_GET(mask, le32_to_cpu(v))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BUILD_BUG_ON(c) _Static_assert(!(c), "build bug")
+#define fallthrough __attribute__((fallthrough))
+#define MT_TX_RATE_STBC BIT(13)
+#define MT_TX_RATE_NSS GENMASK(12, 10)
+#define MT_TX_RATE_MODE GENMASK(9, 6)
+#define MT_TX_RATE_DCM BIT(4)
+#define MT_TX_RATE_IDX GENMASK(5, 0)
+#define MT_TXS0_BW GENMASK(30, 29)
+#define MT_TXS0_TID GENMASK(28, 26)
+#define MT_TXS0_TXS_FORMAT GENMASK(24, 23)
+#define MT_TXS0_ACK_ERROR_MASK GENMASK(18, 16)
+#define MT_TXS0_TX_RATE GENMASK(13, 0)
+#define MT_TXS2_WCID GENMASK(25, 16)
+#define MT_TXS3_PID GENMASK(31, 24)
+#define MT_TXS5_MPDU_TX_BYTE GENMASK(22, 0)
+#define MT_TXS6_MPDU_FAIL_CNT GENMASK(31, 23)
+#define MT_TXS7_MPDU_RETRY_BYTE GENMASK(22, 0)
+#define MT_TXS7_MPDU_RETRY_CNT GENMASK(31, 23)
+#define MT_TXS_PPDU_FMT 2
+#define MT_PACKET_ID_FIRST 3
+#define MT792x_WTBL_SIZE 20
+#define MT_BAND1 1
+#define NL80211_BAND_5GHZ 1
+#define NL80211_BAND_6GHZ 2
+#define IEEE80211_CHAN_DISABLED BIT(0)
+#define IEEE80211_CONF_MONITOR BIT(0)
+#define NL80211_IFTYPE_AP 3
+#define NL80211_CHAN_WIDTH_80P80 3
+#define CH_SWITCH_NORMAL 0
+#define CH_SWITCH_DFS 5
+#define CH_SWITCH_SCAN_BYPASS_DPD 9
+#define MT_PHY_TYPE_CCK 0
+#define MT_PHY_TYPE_OFDM 1
+#define MT_PHY_TYPE_HT 2
+#define MT_PHY_TYPE_HT_GF 3
+#define MT_PHY_TYPE_VHT 4
+#define MT_PHY_TYPE_HE_SU 8
+#define MT_PHY_TYPE_HE_EXT_SU 9
+#define MT_PHY_TYPE_HE_TB 10
+#define MT_PHY_TYPE_HE_MU 11
+#define RATE_INFO_FLAGS_MCS BIT(0)
+#define RATE_INFO_FLAGS_VHT_MCS BIT(1)
+#define RATE_INFO_FLAGS_SHORT_GI BIT(2)
+#define RATE_INFO_FLAGS_HE_MCS BIT(3)
+#define RATE_INFO_BW_20 0
+#define RATE_INFO_BW_40 1
+#define RATE_INFO_BW_80 2
+#define RATE_INFO_BW_160 3
+#define IEEE80211_STA_RX_BW_40 1
+#define IEEE80211_STA_RX_BW_80 2
+#define IEEE80211_STA_RX_BW_160 3
+#define IEEE80211_TX_STAT_ACK BIT(0)
+#define IEEE80211_SKB_CB(skb) ((struct ieee80211_tx_info *)(skb)->cb)
+struct sk_buff_head { int unused; };
+struct mt792x_link_sta { struct mt76_wcid wcid; };
+struct mt792x_dev;
+struct mt792x_phy { struct mt76_phy *mt76; struct mt792x_dev *dev; u8 power_type; u64 chip_cap; u8 clc_chan_conf; };
+struct mt76_connac_pm_stats { u64 last_wake_event, last_doze_event, awake_time, doze_time; };
+struct mt76_connac_pm { int mutex; struct mt76_connac_pm_stats stats; };
+struct mt792x_dev { struct mt76_dev mt76; struct mt792x_phy phy; struct mt76_connac_pm pm; struct mt792x_link_sta *wcids[MT792x_WTBL_SIZE]; bool aspm_supported; };
+#define MT792x_DRV_OWN_RETRY_COUNT 10
+#define MT_CONN_ON_LPCTL 0x7c060010
+#define PCIE_LPCR_HOST_SET_OWN BIT(0)
+#define PCIE_LPCR_HOST_CLR_OWN BIT(1)
+#define PCIE_LPCR_HOST_OWN_SYNC BIT(2)
+#define MT76_STATE_PM 0
+#define PATCH_SEM_RELEASE 0
+#define PATCH_SEM_GET 1
+#define MCU_PATCH_ADDRESS 0x200000
+static inline bool is_connac_v1(struct mt76_dev *d) { (void)d; return false; }
+static inline bool is_connac2(struct mt76_dev *d) { (void)d; return true; }
+static inline bool is_mt7925(struct mt76_dev *d) { (void)d; return false; }
+static inline bool is_mt799x(struct mt76_dev *d) { (void)d; return false; }
+static inline void clear_bit(unsigned int bit, u64 *value) { *value &= ~(1ULL << bit); }
+static u64 jiffies;
+struct oracle_power_event { u8 kind; u8 pad[3]; u32 value; u64 at_us; };
+static struct oracle_power_event oracle_power_events[2048];
+static size_t oracle_power_event_count;
+static u64 oracle_power_time_us;
+static u8 oracle_power_success_attempt, oracle_power_success_read;
+static u8 oracle_power_attempt, oracle_power_read;
+static bool oracle_power_firmware;
+static void oracle_power_push(u8 kind, u32 value) {
+    oracle_power_events[oracle_power_event_count++] =
+        (struct oracle_power_event){ kind, {0}, value, oracle_power_time_us };
+}
+static inline void oracle_mt76_wr(struct mt792x_dev *d, u32 reg, u32 value) {
+    (void)d; (void)reg; oracle_power_attempt++; oracle_power_read = 0;
+    oracle_power_push(1, value);
+}
+#define mt76_wr(dev, reg, value) oracle_mt76_wr((dev), (reg), (value))
+static inline u32 __mt76_rr(struct mt76_dev *d, u32 reg) {
+    bool success;
+    (void)d; (void)reg; oracle_power_read++;
+    success = oracle_power_success_attempt == oracle_power_attempt &&
+              oracle_power_success_read == oracle_power_read;
+    u32 value = oracle_power_firmware ? (success ? PCIE_LPCR_HOST_OWN_SYNC : 0)
+                                      : (success ? 0 : PCIE_LPCR_HOST_OWN_SYNC);
+    oracle_power_push(2, value);
+    return value;
+}
+static inline void usleep_range(u64 minimum, u64 maximum) {
+    (void)maximum; oracle_power_push(3, (u32)minimum);
+    oracle_power_time_us += minimum;
+}
+#define mt76_poll_msec_tick(dev, ...) ____mt76_poll_msec(&((dev)->mt76), __VA_ARGS__)
+struct mt7921_clc_rule { u8 alpha2[2]; u8 type[2]; __le16 len; u8 data[]; } __packed;
+struct mt7921_clc { __le32 len; u8 idx, ver, nr_country, type; u8 rsv[8]; u8 data[]; } __packed;
+struct mt7921_clc_info_tlv { __le16 tag, len; u8 chan_conf; u8 rsv[63]; } __packed;
+enum environment_cap { ENVIRON_INDOOR = 1 };
+#define MT792x_CHIP_CAP_CLC_EVT_EN BIT(0)
+#define GFP_KERNEL 0
+static u8 oracle_mcu_payload[4096];
+static size_t oracle_mcu_payload_len;
+static int oracle_mcu_command;
+static bool oracle_mcu_wait;
+static u8 oracle_channel_bw;
+static bool oracle_reg_can_beacon = true;
+static u8 oracle_acpi_flags, oracle_mtcl_conf;
+static bool oracle_power_limits;
+static struct sk_buff oracle_alloc_skb;
+static inline struct sk_buff *mt76_mcu_msg_alloc(struct mt76_dev *d, const void *data, int len) { (void)d; (void)data; (void)len; oracle_alloc_skb.data = oracle_mcu_payload; oracle_alloc_skb.len = 0; return &oracle_alloc_skb; }
+static inline struct sk_buff *__mt76_mcu_msg_alloc(struct mt76_dev *d, const void *data, int len, int headroom, int flags) { (void)d; (void)flags; oracle_alloc_skb.data = oracle_mcu_payload; oracle_alloc_skb.len = 0; if (data && headroom) skb_put_data(&oracle_alloc_skb, data, headroom); (void)len; return &oracle_alloc_skb; }
+static inline int mt76_mcu_send_msg(struct mt76_dev *d, int cmd, const void *data, int len, bool wait) { (void)d; memcpy(oracle_mcu_payload, data, len); oracle_mcu_payload_len = len; oracle_mcu_command = cmd; oracle_mcu_wait = wait; return 0; }
+static inline int mt76_mcu_skb_send_msg(struct mt76_dev *d, struct sk_buff *skb, int cmd, bool wait) { return mt76_mcu_send_msg(d, cmd, skb->data, skb->len, wait); }
+static inline int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *d, struct sk_buff *skb, int cmd, bool wait, struct sk_buff **ret) { *ret = NULL; return mt76_mcu_skb_send_msg(d, skb, cmd, wait); }
+static inline int ieee80211_frequency_to_channel(int freq) { return freq == 2484 ? 14 : freq < 2484 ? (freq - 2407) / 5 : (freq - 5000) / 5; }
+static inline u8 mt76_connac_chan_bw(struct cfg80211_chan_def *c) { (void)c; return oracle_channel_bw; }
+static inline int hweight8(u8 value) { return __builtin_popcount(value); }
+static inline bool cfg80211_reg_can_beacon(void *w, struct cfg80211_chan_def *c, int t) { (void)w; (void)c; (void)t; return oracle_reg_can_beacon; }
+static inline u8 mt792x_acpi_get_flags(struct mt792x_phy *p) { (void)p; return oracle_acpi_flags; }
+static inline u8 mt792x_acpi_get_mtcl_conf(struct mt792x_phy *p, u8 *a) { (void)p; (void)a; return oracle_mtcl_conf; }
+static inline void *mt76_find_power_limits_node(struct mt76_dev *d) { (void)d; return oracle_power_limits ? (void *)1 : NULL; }
+static struct sk_buff *oracle_status_skb;
+static bool oracle_status_done, oracle_polled;
+static inline int mt76_get_rate(struct mt76_dev *d, struct ieee80211_supported_band *s, int idx, bool cck) { (void)d; (void)s; (void)cck; return idx; }
+static inline void ieee80211_refresh_tx_agg_session_timer(struct ieee80211_sta *s, u8 tid) { (void)s; (void)tid; }
+static inline void mt76_tx_status_lock(struct mt76_dev *d, struct sk_buff_head *l) { (void)d; (void)l; }
+static inline void mt76_tx_status_unlock(struct mt76_dev *d, struct sk_buff_head *l) { (void)d; (void)l; }
+static inline struct sk_buff *mt76_tx_status_skb_get(struct mt76_dev *d, struct mt76_wcid *w, int pid, struct sk_buff_head *l) { (void)d; (void)w; (void)pid; (void)l; struct sk_buff *skb = oracle_status_skb; oracle_status_skb = NULL; return skb; }
+static inline void mt76_tx_status_skb_done(struct mt76_dev *d, struct sk_buff *s, struct sk_buff_head *l) { (void)d; (void)s; (void)l; oracle_status_done = true; }
+static inline struct mt76_wcid *mt76_wcid_ptr(struct mt792x_dev *d, u16 i) { return d->wcids[i] ? &d->wcids[i]->wcid : NULL; }
+static inline void mt76_wcid_add_poll(struct mt76_dev *d, struct mt76_wcid *w) { (void)d; (void)w; oracle_polled = true; }
+#define container_of(ptr, type, member) ((type *)((u8 *)(ptr) - offsetof(type, member)))
+#define rcu_read_lock() ((void)0)
+#define rcu_read_unlock() ((void)0)
+static inline void *mt76_dma_get_rxdmad_c_buf(struct mt76_dev *d, struct mt76_queue *q, int i, int *l, bool *m) { (void)d; (void)q; (void)i; (void)l; (void)m; return NULL; }
+static inline void mt76_dma_should_drop_buf(bool *drop, u32 ctrl, u32 buf1, u32 info) { (void)drop; (void)ctrl; (void)buf1; (void)info; }
+#define READ_ONCE(x) (x)
+#define SKB_WITH_OVERHEAD(x) (x)
+#define DMA_FROM_DEVICE 0
+static inline int page_pool_get_dma_dir(void *p) { (void)p; return 0; }
+static inline void dma_sync_single_for_cpu(void *d, dma_addr_t a, unsigned int l, int dir) { (void)d; (void)a; (void)l; (void)dir; }
+#define RRO_IND_DATA1_MAGIC_CNT_MASK GENMASK(3, 0)
+#define RRO_RXDMAD_DATA3_MAGIC_CNT_MASK GENMASK(3, 0)
+#define MT_DMA_WED_IND_CMD_CNT 16
+struct mt76_wed_rro_ind { __le32 data1; };
+struct mt76_rro_rxdmad_c { __le32 data3; };
+#define spin_lock_bh(x) ((void)(x))
+#define spin_unlock_bh(x) ((void)(x))
+static unsigned int oracle_released_buffers;
+static inline void mt76_put_page_pool_buf(void *p, bool allow_direct) { (void)p; (void)allow_direct; oracle_released_buffers++; }
+static inline void mt76_npu_queue_cleanup(struct mt76_dev *d, struct mt76_queue *q) { (void)d; (void)q; }
+static inline bool mt76_npu_device_active(struct mt76_dev *d) { (void)d; return false; }
+static inline bool mtk_wed_device_active(void *wed) { (void)wed; return false; }
+static inline void dev_kfree_skb(void *p) { (void)p; }
+"#
+}

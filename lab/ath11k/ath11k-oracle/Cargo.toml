@@ -1,0 +1,22 @@
+[package]
+name = "ath11k-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+ath11k-qmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-qmi", features = ["trace"] }
+ath11k-wmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-wmi" }
+ath11k-dp = { path = "../../../crates/wifi/drivers/ath11k/ath11k-dp" }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"
+ath11k-qmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-qmi", features = ["proptest"] }
+ath11k-wmi = { path = "../../../crates/wifi/drivers/ath11k/ath11k-wmi", features = ["proptest"] }
+ath11k-hal = { path = "../../../crates/wifi/drivers/ath11k/ath11k-hal" }
+ath11k-platform-backend = { path = "../../../crates/wifi/drivers/ath11k/ath11k-platform-backend" }
+drv-hardware-backends = { path = "../../../crates/platform/hardware-backends" }
