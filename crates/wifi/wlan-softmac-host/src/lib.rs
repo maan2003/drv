@@ -160,6 +160,7 @@ pub trait WlanSoftmac {
 
     fn set_channel(
         &mut self,
+        context: OperationContext,
         request: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn join_bss(
@@ -291,6 +292,7 @@ mod tests {
         }
         fn set_channel(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseSetChannelRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready({
@@ -391,7 +393,9 @@ mod tests {
         device.query_mac_sublayer_support()?;
         device.query_security_support()?;
         device.query_spectrum_management_support()?;
-        device.set_channel(Default::default()).await?;
+        device
+            .set_channel(context.clone(), Default::default())
+            .await?;
         device.join_bss(Default::default()).await?;
         device.install_key(Default::default()).await?;
         device

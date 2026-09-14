@@ -867,9 +867,11 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn set_channel(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
+            context.check(std::time::Instant::now())?;
             let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
             if request.bandwidth != Some(ChannelBandwidth::Cbw20)
                 || request.vht_secondary_80_channel.is_none()
@@ -1783,17 +1785,25 @@ mod tests {
     fn ready_adapter() -> Ath11kClientDevice<ModelSubsystems> {
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(NoopUpcalls)).unwrap();
-        futures::executor::block_on(adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
-            primary: Some(ChannelNumber {
-                band: WlanBand::TwoGhz,
-                number: 6,
-            }),
-            bandwidth: Some(ChannelBandwidth::Cbw20),
-            vht_secondary_80_channel: Some(ChannelNumber {
-                band: WlanBand::TwoGhz,
-                number: 0,
-            }),
-        }))
+        futures::executor::block_on(
+            adapter.set_channel(
+                wlan_softmac_host::conformance::operation_context(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .0,
+                WlanSoftmacBaseSetChannelRequest {
+                    primary: Some(ChannelNumber {
+                        band: WlanBand::TwoGhz,
+                        number: 6,
+                    }),
+                    bandwidth: Some(ChannelBandwidth::Cbw20),
+                    vht_secondary_80_channel: Some(ChannelNumber {
+                        band: WlanBand::TwoGhz,
+                        number: 0,
+                    }),
+                },
+            ),
+        )
         .unwrap();
         adapter.device.backend_mut().clear();
         adapter
@@ -2378,17 +2388,25 @@ mod tests {
         let records = Arc::new(Mutex::new(RecordedUpcalls::default()));
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(Recorder(records.clone()))).unwrap();
-        futures::executor::block_on(adapter.set_channel(WlanSoftmacBaseSetChannelRequest {
-            primary: Some(ChannelNumber {
-                band: WlanBand::TwoGhz,
-                number: 6,
-            }),
-            bandwidth: Some(ChannelBandwidth::Cbw20),
-            vht_secondary_80_channel: Some(ChannelNumber {
-                band: WlanBand::TwoGhz,
-                number: 0,
-            }),
-        }))
+        futures::executor::block_on(
+            adapter.set_channel(
+                wlan_softmac_host::conformance::operation_context(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .0,
+                WlanSoftmacBaseSetChannelRequest {
+                    primary: Some(ChannelNumber {
+                        band: WlanBand::TwoGhz,
+                        number: 6,
+                    }),
+                    bandwidth: Some(ChannelBandwidth::Cbw20),
+                    vht_secondary_80_channel: Some(ChannelNumber {
+                        band: WlanBand::TwoGhz,
+                        number: 0,
+                    }),
+                },
+            ),
+        )
         .unwrap();
         let mut frame = vec![0; 24];
         frame[0] = 0xb0;

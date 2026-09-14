@@ -220,9 +220,14 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn set_channel(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         _: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
+        std::future::ready(
+            context
+                .check(std::time::Instant::now())
+                .and(Err(zx::Status::NOT_SUPPORTED)),
+        )
     }
     fn join_bss(
         &mut self,

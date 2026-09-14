@@ -94,14 +94,17 @@ where
         .unwrap()
         .push(ConformanceEvent::SupportQueried);
 
-    let completion = device.set_channel(WlanSoftmacBaseSetChannelRequest {
-        primary: Some(channel),
-        bandwidth: Some(ChannelBandwidth::Cbw20),
-        vht_secondary_80_channel: Some(ChannelNumber {
-            number: 0,
-            ..channel
-        }),
-    });
+    let completion = device.set_channel(
+        crate::OperationContext::new(deadline),
+        WlanSoftmacBaseSetChannelRequest {
+            primary: Some(channel),
+            bandwidth: Some(ChannelBandwidth::Cbw20),
+            vht_secondary_80_channel: Some(ChannelNumber {
+                number: 0,
+                ..channel
+            }),
+        },
+    );
     drive_operation(&mut device, completion)?;
     events.lock().unwrap().push(ConformanceEvent::ChannelSet);
 
@@ -239,6 +242,7 @@ mod tests {
         }
         fn set_channel(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseSetChannelRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))

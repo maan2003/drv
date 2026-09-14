@@ -103,6 +103,7 @@ impl WlanSoftmac for FakeSoftmac {
     }
     fn set_channel(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))

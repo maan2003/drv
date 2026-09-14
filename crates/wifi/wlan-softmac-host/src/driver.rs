@@ -30,6 +30,7 @@ pub(crate) enum Command {
         oneshot::Sender<Result<SpectrumManagementSupport, zx::Status>>,
     ),
     Channel(
+        OperationContext,
         WlanSoftmacBaseSetChannelRequest,
         oneshot::Sender<Result<(), zx::Status>>,
     ),
@@ -69,9 +70,11 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    fn scan_context(&self) -> Option<&OperationContext> {
+    fn operation_context(&self) -> Option<&OperationContext> {
         match self {
-            Self::PassiveScan(context, ..) | Self::ActiveScan(context, ..) => Some(context),
+            Self::Channel(context, ..)
+            | Self::PassiveScan(context, ..)
+            | Self::ActiveScan(context, ..) => Some(context),
             _ => None,
         }
     }
@@ -93,7 +96,7 @@ impl Command {
             Self::Spectrum(_, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::Channel(_, reply) => {
+            Self::Channel(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
             Self::Join(_, reply) => {
@@ -149,7 +152,7 @@ impl DriverHandle {
         if !epoch.is_live() {
             return Err(zx::Status::CANCELED);
         }
-        if let Some(context) = command.scan_context() {
+        if let Some(context) = command.operation_context() {
             context.check(std::time::Instant::now())?;
         }
         // Revocation discards only unpublished work. This also reserves space
@@ -158,7 +161,7 @@ impl DriverHandle {
             message.epoch.is_live()
                 && message
                     .command
-                    .scan_context()
+                    .operation_context()
                     .is_none_or(OperationContext::is_live)
         });
         if mailbox.queue.len() == COMMAND_CAPACITY {
@@ -290,7 +293,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             message.command.reject(zx::Status::CANCELED);
             return Ok(true);
         }
-        if let Some(context) = message.command.scan_context()
+        if let Some(context) = message.command.operation_context()
             && let Err(status) = context.check(std::time::Instant::now())
         {
             message.command.reject(status);
@@ -313,8 +316,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             Command::Spectrum((), reply) => {
                 let _ = reply.send(self.device.query_spectrum_management_support());
             }
-            Command::Channel(request, reply) => {
-                let completion = self.device.set_channel(request);
+            Command::Channel(context, request, reply) => {
+                let completion = self.device.set_channel(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));

@@ -42,6 +42,7 @@ struct ScanOperation {
 }
 
 struct MlmeExecution {
+    operation: RefCell<OperationContext>,
     scan: RefCell<Option<ScanOperation>>,
     epoch: RefCell<OperationEpoch>,
     rejected: Cell<bool>,
@@ -173,10 +174,13 @@ struct HostMlmeDevice {
 impl HostMlmeDevice {
     fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>) -> Self {
         let (event_sink, event_stream) = mpsc::unbounded();
+        let operation =
+            OperationContext::new(std::time::Instant::now() + std::time::Duration::from_secs(3));
         Self {
             execution: Rc::new(MlmeExecution {
+                operation: RefCell::new(operation.clone()),
                 scan: RefCell::new(None),
-                epoch: RefCell::new(OperationEpoch::new()),
+                epoch: RefCell::new(operation.epoch.clone()),
                 rejected: Cell::new(false),
             }),
             driver,
@@ -299,9 +303,17 @@ impl DeviceOps for HostMlmeDevice {
         eprintln!(
             "client_softmac_channel stage=bridge_enter primary={primary:?} bandwidth={bandwidth:?} secondary={secondary:?}"
         );
+        let context = self
+            .execution
+            .scan
+            .borrow()
+            .as_ref()
+            .map(|scan| scan.context.clone())
+            .unwrap_or_else(|| self.execution.operation.borrow().clone());
         let result = self
             .request(|reply| {
                 Command::Channel(
+                    context,
                     fidl_softmac::WlanSoftmacBaseSetChannelRequest {
                         primary: Some(primary),
                         bandwidth: Some(bandwidth),
@@ -538,7 +550,7 @@ enum MlmeInput {
 /// Owns MLME across awaited device operations; it never borrows ClientRuntime.
 /// Scheduled on the service LocalSet; completion wakes the owning protocol loop.
 struct MlmeTask {
-    sender: mpsc::Sender<(OperationEpoch, MlmeInput)>,
+    sender: mpsc::Sender<(OperationContext, MlmeInput)>,
     epoch: OperationEpoch,
     task: Option<tokio::task::JoinHandle<Result<(), ConnectError>>>,
     changed: std::rc::Rc<tokio::sync::Notify>,
@@ -557,13 +569,15 @@ impl MlmeTask {
     ) -> Self {
         let epoch = execution.epoch.borrow().clone();
         let (sender, mut receiver) =
-            mpsc::channel::<(OperationEpoch, MlmeInput)>(UPCALL_QUEUE_CAPACITY);
+            mpsc::channel::<(OperationContext, MlmeInput)>(UPCALL_QUEUE_CAPACITY);
         let pending = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let work = pending.clone();
         let changed = std::rc::Rc::new(tokio::sync::Notify::new());
         let progress = changed.clone();
         let future = async move {
-            while let Some((epoch, input)) = receiver.next().await {
+            while let Some((context, input)) = receiver.next().await {
+                let epoch = context.epoch.clone();
+                execution.operation.replace(context);
                 execution.epoch.replace(epoch.clone());
                 execution.rejected.set(false);
                 // Completion still retires scanner bookkeeping after revocation,
@@ -739,15 +753,31 @@ impl MlmeTask {
     }
 
     fn enqueue(&mut self, input: MlmeInput) -> Result<(), ConnectError> {
-        self.enqueue_for(self.epoch.clone(), input)
+        self.enqueue_for(
+            self.epoch.clone(),
+            input,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
     }
 
-    fn enqueue_for(&mut self, epoch: OperationEpoch, input: MlmeInput) -> Result<(), ConnectError> {
+    fn enqueue_for(
+        &mut self,
+        epoch: OperationEpoch,
+        input: MlmeInput,
+        deadline: std::time::Instant,
+    ) -> Result<(), ConnectError> {
         if self.pending.get() == UPCALL_QUEUE_CAPACITY {
             return Err(ConnectError::Driver(DriverError::ControlBudgetExhausted));
         }
         self.sender
-            .try_send((epoch, input))
+            .try_send((
+                OperationContext {
+                    epoch,
+                    parent: None,
+                    deadline,
+                },
+                input,
+            ))
             .map_err(|_| ConnectError::Driver(DriverError::RequestStreamClosed))?;
         self.pending.set(self.pending.get() + 1);
         Ok(())
@@ -1114,10 +1144,27 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             };
             let Some(upcall) = upcall else { break };
             let epoch = self.upcalls.lock().unwrap().epoch.clone();
-            self.mlme.enqueue_for(epoch, MlmeInput::Upcall(upcall))?;
+            self.mlme
+                .enqueue_for(epoch, MlmeInput::Upcall(upcall), self.operation_deadline())?;
             progressed = true;
         }
         Ok(progressed)
+    }
+
+    /// Snapshot the owning attempt's original budget before queuing MLME work.
+    /// Associated work has no connect budget left; each new input gets one
+    /// bounded hardware-operation budget, never renewed at driver dispatch.
+    fn operation_deadline(&self) -> std::time::Instant {
+        self.cleanup
+            .as_ref()
+            .map(|attempt| attempt.deadline)
+            .or_else(|| {
+                self.connect_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.deadline)
+            })
+            .or_else(|| self.scan_attempt.as_ref().map(|attempt| attempt.deadline))
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(3))
     }
 
     fn capture_sme_outputs(&mut self, epoch: Option<OperationEpoch>) -> Result<(), ConnectError> {
@@ -1136,8 +1183,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             } else {
                 None
             };
-            self.mlme
-                .enqueue_for(epoch, MlmeInput::Request(request, context))?;
+            self.mlme.enqueue_for(
+                epoch,
+                MlmeInput::Request(request, context),
+                self.operation_deadline(),
+            )?;
         }
         while let Some((deadline, event, handle)) = self
             .sme_timer_source
@@ -1237,8 +1287,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 "client_mlme_timer stage=stream_dequeued timer_id={} event={:?}",
                 event.id, event.event.1
             );
-            self.mlme
-                .enqueue_for(event.event.0, MlmeInput::Timeout(event.event.1))?;
+            self.mlme.enqueue_for(
+                event.event.0,
+                MlmeInput::Timeout(event.event.1),
+                self.operation_deadline(),
+            )?;
             progressed = true;
             control_ready_drained = false;
         }
@@ -1888,6 +1941,7 @@ mod tests {
         reset_failure: bool,
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
+        channel_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
         suppress_auth_response: bool,
@@ -2054,10 +2108,12 @@ mod tests {
         }
         fn set_channel(
             &mut self,
+            context: crate::OperationContext,
             request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             let completion = {
                 let mut effects = self.0.lock().unwrap();
+                effects.channel_contexts.push(context);
                 effects.channels.push(request);
                 effects.calls.push("channel");
                 effects.channel_completion.take()
@@ -2272,7 +2328,17 @@ mod tests {
             let epoch = OperationEpoch::new();
             let (reply, receiver) = oneshot::channel();
             handle
-                .send(epoch.clone(), Command::Channel(Default::default(), reply))
+                .send(
+                    epoch.clone(),
+                    Command::Channel(
+                        OperationContext::child(
+                            epoch.clone(),
+                            std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        ),
+                        Default::default(),
+                        reply,
+                    ),
+                )
                 .unwrap();
             actor.drive_once().await.unwrap();
             drop(receiver);
@@ -2356,7 +2422,9 @@ mod tests {
             context.revoke();
             assert!(parent.is_live());
             let (reply, receiver) = oneshot::channel();
-            handle.send(parent, Command::ClearAssociation(Default::default(), reply)).unwrap();
+            handle
+                .send(parent, Command::ClearAssociation(Default::default(), reply))
+                .unwrap();
             actor.drive_once().await.unwrap();
             assert_eq!(receiver.await.unwrap(), Ok(()));
             assert_eq!(effects.lock().unwrap().calls, ["clear"]);
@@ -2381,6 +2449,70 @@ mod tests {
             let io = io.lock().unwrap();
             assert!(!io.ethernet.is_link_up());
             assert!(io.pending_ethernet_devices.is_empty());
+        });
+    }
+
+    #[test]
+    fn channel_context_rejects_expiry_and_revocation_before_hardware_dispatch() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut actor, handle) = DriverActor::new(fake);
+            let epoch = OperationEpoch::new();
+            let (reply, _) = oneshot::channel();
+            assert_eq!(
+                handle.send(
+                    epoch.clone(),
+                    Command::Channel(
+                        OperationContext::child(epoch.clone(), std::time::Instant::now()),
+                        Default::default(),
+                        reply
+                    )
+                ),
+                Err(zx::Status::TIMED_OUT),
+            );
+            let context = OperationContext::child(
+                epoch.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let (reply, receiver) = oneshot::channel();
+            handle
+                .send(
+                    epoch,
+                    Command::Channel(context.clone(), Default::default(), reply),
+                )
+                .unwrap();
+            context.revoke();
+            actor.drive_once().await.unwrap();
+            assert_eq!(receiver.await.unwrap(), Err(zx::Status::CANCELED));
+            assert!(effects.lock().unwrap().channels.is_empty());
+        });
+    }
+
+    #[test]
+    fn bridge_preserves_channel_authority_and_original_deadline() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut bridge, mut actor, _) = parts(fake);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let context =
+                OperationContext::child(bridge.execution.epoch.borrow().clone(), deadline);
+            bridge.execution.operation.replace(context.clone());
+            actor
+                .run_until(bridge.set_channel(
+                    wlan_channel(),
+                    fidl_ieee80211::ChannelBandwidth::Cbw20,
+                    wlan_channel(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let effects = effects.lock().unwrap();
+            assert_eq!(effects.channel_contexts[0].deadline(), deadline);
+            context.revoke();
+            assert_eq!(
+                effects.channel_contexts[0].check(std::time::Instant::now()),
+                Err(zx::Status::CANCELED)
+            );
         });
     }
 
@@ -2414,7 +2546,12 @@ mod tests {
             let (mut fake, effects) = Fake::new(0);
             let (reply, completion) = oneshot::channel();
             effects.lock().unwrap().channel_completion = Some(completion);
-            let completion = fake.set_channel(Default::default());
+            let completion = fake.set_channel(
+                OperationContext::new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ),
+                Default::default(),
+            );
             assert_eq!(
                 effects.lock().unwrap().channels.len(),
                 1,
@@ -3398,14 +3535,16 @@ mod tests {
             let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
             let mut request = connect_request();
             request.bss_description.bandwidth = fidl_ieee80211::ChannelBandwidth::Cbw40;
-            (runtime.connect(
-                request,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            ))
-            .await
-            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            (runtime.connect(request, deadline)).await.unwrap();
             let state = effects.lock().unwrap();
             assert_eq!(state.channels.len(), 1);
+            assert_eq!(state.channel_contexts[0].deadline(), deadline);
+            runtime.mlme.epoch.revoke();
+            assert_eq!(
+                state.channel_contexts[0].check(std::time::Instant::now()),
+                Err(zx::Status::CANCELED)
+            );
             assert_eq!(state.channels[0].primary, Some(wlan_channel()));
             assert_eq!(
                 state.channels[0].bandwidth,
