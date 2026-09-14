@@ -5,7 +5,9 @@
 use crate::ethernet::{
     DriverEthernetPort, EthernetIngressError, HostEthernetDevice, ethernet_port,
 };
-use crate::{ClientRuntimeDriver, WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls};
+use crate::{
+    ClientRuntimeDriver, OperationEpoch, WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls,
+};
 use fdf::ArenaStaticBox;
 use fidl_fuchsia_wlan_common as fidl_common;
 use fidl_fuchsia_wlan_driver as fidl_driver;
@@ -20,7 +22,6 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use wlan_mlme::MlmeImpl;
 use wlan_mlme::device::{DeviceOps, LinkStatus};
@@ -31,23 +32,6 @@ const ETHERNET_QUEUE_CAPACITY: usize = 256;
 /// Bounded Ethernet generations created before production lockdown. Exhaustion
 /// terminates the runtime cleanly rather than creating a descriptor post-lock.
 pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
-
-/// Revocable authority for one protocol operation or its cleanup. Cloning
-/// preserves identity; a revoked epoch can never be upgraded or reactivated.
-#[derive(Clone)]
-struct OperationEpoch(Arc<AtomicBool>);
-
-impl OperationEpoch {
-    fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
-    }
-    fn revoke(&self) {
-        self.0.store(false, Ordering::Release);
-    }
-    fn is_live(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
 
 struct MlmeExecution {
     epoch: RefCell<OperationEpoch>,

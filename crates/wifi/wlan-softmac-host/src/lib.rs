@@ -25,6 +25,75 @@ pub use fidl_fuchsia_wlan_softmac::{
     WlanSoftmacStartActiveScanRequest, WlanTxInfoFlags, WlanTxResult,
 };
 
+/// Immutable publication authority for one bounded operation.
+///
+/// All deadlines use `std::time::Instant` (Linux CLOCK_MONOTONIC). Drivers
+/// check with an injected reading of that clock immediately before publishing,
+/// without an intervening await. Expiration or revocation never releases
+/// already-published DMA or correlation state.
+#[derive(Clone)]
+pub struct OperationContext {
+    epoch: OperationEpoch,
+    deadline: std::time::Instant,
+}
+
+impl OperationContext {
+    pub(crate) fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            epoch: OperationEpoch::new(),
+            deadline,
+        }
+    }
+
+    pub(crate) fn for_deadline(&self, deadline: std::time::Instant) -> Self {
+        Self {
+            epoch: self.epoch.clone(),
+            deadline,
+        }
+    }
+
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+
+    pub fn check(&self, now: std::time::Instant) -> Result<(), zx::Status> {
+        if !self.epoch.is_live() {
+            Err(zx::Status::CANCELED)
+        } else if now >= self.deadline {
+            Err(zx::Status::TIMED_OUT)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.epoch.revoke();
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.epoch.is_live()
+    }
+}
+
+/// Lifetime identity is independent of each operation's deadline. A successful
+/// connection may authorize new work after its original connect budget ends.
+#[derive(Clone)]
+pub(crate) struct OperationEpoch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl OperationEpoch {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )))
+    }
+    pub(crate) fn revoke(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Device-to-host callbacks installed by [`WlanSoftmacLifecycle::start`].
 pub trait WlanSoftmacUpcalls: Send {
     fn recv(&mut self, bytes: Vec<u8>, info: WlanRxInfo);
@@ -124,6 +193,23 @@ pub trait WlanSoftmac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_deadline_is_absolute_and_revocation_spans_later_work() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(1);
+        let (context, revoke) = crate::conformance::operation_context(deadline);
+        assert_eq!(context.deadline(), deadline);
+        assert_eq!(context.check(now), Ok(()));
+        assert_eq!(context.check(deadline), Err(zx::Status::TIMED_OUT));
+        // Association lifetime and the original connect budget are distinct.
+        let associated = context.for_deadline(deadline + std::time::Duration::from_secs(1));
+        assert_eq!(associated.check(deadline), Ok(()));
+        revoke();
+        assert_eq!(context.check(now), Err(zx::Status::CANCELED));
+        assert_eq!(associated.check(deadline), Err(zx::Status::CANCELED));
+        assert!(!associated.is_live());
+    }
 
     #[derive(Default)]
     struct Fake {
