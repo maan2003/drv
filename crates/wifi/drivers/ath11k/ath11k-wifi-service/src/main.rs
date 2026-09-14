@@ -269,7 +269,7 @@ async fn activate_and_run(
         eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
         let mut runtime = server.into_runtime();
         diagnostic_pause("runtime_stop_enter");
-        let stop = runtime.stop();
+        let stop = runtime.shutdown().await;
         TRACE_CE_RUNTIME.store(false, Ordering::Release);
         eprintln!(
             "ath11k_wifi_cleanup=RUNTIME_STOP_RETURNED success={}",

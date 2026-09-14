@@ -207,7 +207,7 @@ fn run() -> Result<(), String> {
         eprintln!("mt7921_service=READY owner=typed-driver radio_operations=unavailable");
         let result = server.run_to_terminal().await;
         let mut runtime = server.into_runtime();
-        let stopped = runtime.stop();
+        let stopped = runtime.shutdown().await;
         result.map_err(|error| format!("control service: {error}"))?;
         stopped.map_err(|error| format!("contain driver: {error}"))
     })

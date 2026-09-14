@@ -24,7 +24,7 @@ fuchsia-inspect = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea96
 fuchsia-trace = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/trace/rust" }
 futures = "=0.3.32"
 netstack3-port-spike = { path = "../../net/netstack3-port-spike" }
-tokio = { version = "=1.52.3", features = ["rt", "time"] }
+tokio = { version = "=1.52.3", features = ["rt", "time", "sync"] }
 wlan-mlme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
 wlan-common = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/common/rust" }
 wlan-sme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/sme" }
