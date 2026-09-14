@@ -18,6 +18,7 @@ fn hardware_containment_never_leaks_or_suppresses_owner_drop() {
         &mut source,
     );
     for forbidden in [
+        "thread::park",
         "mem::forget",
         "ManuallyDrop",
         "Box::leak",

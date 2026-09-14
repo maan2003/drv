@@ -912,8 +912,8 @@ impl Mt7921Driver {
                 session.lifecycle = SessionLifecycle::Closing;
                 let acquisition = session.acquisition.clone();
                 let containment = session.contain();
-                // Failed containment cannot drop the resources: session Drop
-                // retains them in the existing recovery hold.
+                // Session Drop retries containment and then releases the
+                // kernel references. Failure is not a successful reset proof.
                 Err(Mt7921FirmwareRunError::Loader {
                     source: Box::new(source),
                     acquisition,
@@ -1011,34 +1011,16 @@ fn close_after_transaction_error<T, E>(
     }
 }
 
-fn hold_for_manual_recovery<R, P>(_resources: &mut Option<R>, _pci: &mut Option<P>) -> ! {
-    loop {
-        std::thread::park();
-    }
-}
-
-fn finish_active_drop<R, P>(
-    lifecycle: SessionLifecycle,
-    resources: &mut Option<R>,
-    pci: &mut Option<P>,
-) {
-    if lifecycle != SessionLifecycle::Contained {
-        // The complete owning graph remains in these stack slots. Production
-        // never returns from this hold; an operator-controlled recovery can
-        // reset or power-cycle the machine without Rust releasing live DMA.
-        hold_for_manual_recovery(resources, pci);
-    }
-}
-
 impl Drop for Mt7921HardwareSession {
     fn drop(&mut self) {
         if !self.potentially_active || self.lifecycle == SessionLifecycle::Contained {
             return;
         }
         let _ = self.contain();
-        // Releasing VFIO/IOAS/BAR/DMA/IRQ after unproved containment is less
-        // safe than deliberately retaining the complete graph.
-        finish_active_drop(self.lifecycle, &mut self.resources, &mut self.pci);
+        // Drop releases our mappings and final VFIO/IOMMUFD references.
+        // Kernel teardown disables PCI DMA and unmaps before unpinning, even
+        // when this explicit functional-reset attempt failed. Do not park and
+        // prevent that cleanup. This is not evidence permitting device restart.
     }
 }
 
@@ -1596,59 +1578,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn failed_containment_holds_owners_until_external_termination() {
-        if std::env::var_os("MT7921_HOLD_TEST_CHILD").is_none() {
-            use std::io::{BufRead, Read};
-            use std::process::Stdio;
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("tests::failed_containment_holds_owners_until_external_termination")
-                .arg("--nocapture")
-                .env("MT7921_HOLD_TEST_CHILD", "1")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-            let mut line = String::new();
-            loop {
-                assert_ne!(
-                    stdout.read_line(&mut line).unwrap(),
-                    0,
-                    "hold child exited early"
-                );
-                if line.contains("uncontained_hold_entering") {
-                    break;
-                }
-                line.clear();
-            }
-            assert_eq!(line, "uncontained_hold_entering owners=2 dropped=0\n");
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            assert!(child.try_wait().unwrap().is_none(), "hold returned");
-            child.kill().unwrap();
-            child.wait().unwrap();
-            let mut rest = String::new();
-            stdout.read_to_string(&mut rest).unwrap();
-            assert!(!rest.contains("OWNER_DROPPED"));
-            return;
-        }
-
-        struct ReleaseProbe;
-        impl Drop for ReleaseProbe {
-            fn drop(&mut self) {
-                println!("OWNER_DROPPED");
-            }
-        }
-
-        use std::io::Write;
-        let mut resources = Some(ReleaseProbe);
-        let mut pci = Some(ReleaseProbe);
-        println!("uncontained_hold_entering owners=2 dropped=0");
-        std::io::stdout().flush().unwrap();
-        finish_active_drop(SessionLifecycle::Closing, &mut resources, &mut pci);
     }
 
     #[test]
