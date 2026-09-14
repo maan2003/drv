@@ -1325,6 +1325,7 @@ dependencies = [
  "num-bigint",
  "sha2",
  "userspace-vfio",
+ "wifi-control-service",
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
@@ -2592,6 +2593,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-control-service"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-sme",
+ "futures",
+ "libc",
+ "linux-self-sandbox",
+ "wifi-supervisor-wire",
+ "wlan-control-wire",
+ "wlan-softmac-host",
+]
+
+[[package]]
 name = "wifi-supervisor-wire"
 version = "0.1.0"
 
@@ -2756,6 +2771,16 @@ dependencies = [
  "wlan-bitfield",
  "zerocopy",
  "zx",
+]
+
+[[package]]
+name = "wlan-control-wire"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-sme",
 ]
 
 [[package]]
