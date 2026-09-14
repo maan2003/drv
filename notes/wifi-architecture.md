@@ -132,11 +132,13 @@ Next implementation order:
    blocking control dispatch while awaiting them.
 2. Establish exclusive driver ownership with bounded commands and completion
    delivery, reusing the existing bounded MCU begin/poll mechanics.
-3. Port firmware-backed scan through the real CLI/service path using the old
-   working MT7921 implementation as the behavioral reference, then association
+3. Port firmware-backed scan through the real CLI/service path, then association
    and bidirectional Ethernet, Netstack Internet, security and recovery coverage.
-   Preserve command bytes, ordering, completion correlation and proven fixes;
-   do not restore the retired resource owner or one-shot production path.
+   The pinned Linux kernel driver is the hardware-behavior source of truth.
+   The old working MT7921 implementation supplies regression evidence and paths
+   to investigate, not authoritative command bytes, sequencing or semantics.
+   Validate those against Linux; do not restore the retired resource owner or
+   one-shot production path.
 
 Use an advisor at the final implementation review to check architectural fit:
 exclusive ownership rather than extra wrappers; responsive control during held

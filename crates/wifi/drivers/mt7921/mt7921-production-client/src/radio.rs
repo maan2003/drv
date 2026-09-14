@@ -80,6 +80,7 @@ impl MacPreparation {
             }
             PassiveMacMmioOperation::WtblClear {
                 address,
+                index_mask,
                 value,
                 busy_mask,
                 timeout_us,
@@ -91,7 +92,15 @@ impl MacPreparation {
                     busy_mask,
                     now + Duration::from_micros(u64::from(timeout_us)),
                 ));
-                bar.write_u32(offset, value).map_err(|_| zx::Status::IO)?;
+                let initial = bar.read_u32(offset).map_err(|_| zx::Status::IO)?;
+                validate_passive_mac_bar_read(address, initial)
+                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                // Linux mt7921_mac_wtbl_update uses mt76_rmw, not writel.
+                bar.write_u32(
+                    offset,
+                    passive_mac_source_rmw_value(initial, index_mask, value),
+                )
+                .map_err(|_| zx::Status::IO)?;
             }
         }
         Ok(true)
@@ -131,6 +140,20 @@ mod tests {
                 .count(),
             writes
         );
+    }
+
+    #[test]
+    fn wtbl_clear_preserves_fields_outside_linux_station_index_mask() {
+        let (device, _) = DeterministicBackend::recording_mt7921_activation_device();
+        let (resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let mut prep = MacPreparation::new();
+        let now = Instant::now();
+        let offset = passive_mac_bar_offset(0x820d_4230).unwrap();
+        resources.bar0.write_u32(offset, 0x0040_03ff).unwrap();
+        for _ in 0..4 {
+            prep.drive(&resources.bar0, now).unwrap();
+        }
+        assert_eq!(resources.bar0.read_u32(offset).unwrap(), 0x0040_1000);
     }
 
     #[test]

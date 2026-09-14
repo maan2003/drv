@@ -4106,6 +4106,8 @@ pub enum PassiveMacMmioOperation {
     WtblClear {
         index: u8,
         address: u32,
+        /// MT_WTBL_UPDATE_WLAN_IDX: preserve unrelated register fields.
+        index_mask: u32,
         value: u32,
         busy_mask: u32,
         timeout_us: u32,
@@ -4137,6 +4139,7 @@ pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
     plan.extend((0..20).map(|index| PassiveMacMmioOperation::WtblClear {
         index,
         address: 0x820d_4230,
+        index_mask: 0x3ff,
         value: u32::from(index) | (1 << 12),
         busy_mask: 1 << 31,
         timeout_us: 5000,
@@ -15470,6 +15473,7 @@ mod tests {
                 PassiveMacMmioOperation::WtblClear {
                     index: index as u8,
                     address: 0x820d_4230,
+                    index_mask: 0x3ff,
                     value: index as u32 | (1 << 12),
                     busy_mask: 1 << 31,
                     timeout_us: 5000,
