@@ -200,51 +200,23 @@ fn run() -> Result<(), String> {
         let database = database
             .verify(regulatory_length, regulatory_sha256)
             .map_err(|error| format!("verify regulatory database: {error}"))?;
-        let driver = Mt7921Driver::initialize(config, images, database)
+        let mut driver = Mt7921Driver::initialize(config, images, database)
             .map_err(|error| format!("initialize MT7921: {error:?}"))?;
         if driver.firmware().nic_capability.mac_address != Some(mac) {
             return Err(
                 "configured MAC differs from firmware identity; MAC override is unavailable".into(),
             );
         }
-        let channels = driver.passive_channels();
-        let bands = [
-            fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
-            fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz,
-        ]
-        .into_iter()
-        .filter_map(|band| {
-            let primary_channels: Vec<_> = channels
-                .iter()
-                .filter(|channel| {
-                    (channel.band == mt7921_core::PhysicalBand::Ghz2)
-                        == (band == fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz)
-                })
-                .map(|channel| fidl_fuchsia_wlan_ieee80211::ChannelNumber {
-                    band,
-                    number: channel.number as u8,
-                })
-                .collect();
-            (!primary_channels.is_empty()).then_some(fidl_fuchsia_wlan_mlme::BandCapability {
-                band,
-                basic_rates: vec![0x8c, 0x98, 0xb0],
-                ht_cap: None,
-                vht_cap: None,
-                primary_channels,
-            })
-        })
-        .collect();
+        // One capability source for both SME selection and MLME joining.
+        let device_info = wlan_mlme::mlme_device_info_from_softmac(
+            wlan_softmac_host::WlanSoftmac::query(&mut driver)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         let runtime = ClientRuntime::new_with_prepared_resources(
             driver,
             wlan_sme::client::ClientConfig::default(),
-            fidl_fuchsia_wlan_mlme::DeviceInfo {
-                sta_addr: mac,
-                factory_addr: mac,
-                role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
-                bands,
-                softmac_hardware_capability: 0,
-                qos_capable: false,
-            },
+            device_info,
             Default::default(),
             Default::default(),
             fuchsia_inspect::Inspector::default(),
@@ -256,7 +228,9 @@ fn run() -> Result<(), String> {
             .bind_runtime(runtime)
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
-        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=passive-scan+channel20");
+        eprintln!(
+            "mt7921_service=READY owner=typed-driver radio_operations=passive-scan+channel20"
+        );
         let result = server.run_to_terminal().await;
         let mut runtime = server.into_runtime();
         let stopped = runtime.shutdown().await;

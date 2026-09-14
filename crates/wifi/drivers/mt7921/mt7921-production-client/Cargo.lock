@@ -588,6 +588,7 @@ version = "0.1.0"
 dependencies = [
  "drv-hardware",
  "drv-hardware-backends",
+ "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-softmac",
  "futures-channel",

@@ -189,6 +189,9 @@ impl WlanSoftmac for Mt7921Driver {
         Ok(WlanSoftmacQueryResponse {
             sta_addr: Some(mac),
             factory_addr: Some(mac),
+            mac_role: Some(fidl_fuchsia_wlan_common::WlanMacRole::Client),
+            hardware_capability: Some(0),
+            supported_phys: Some(vec![fidl_fuchsia_wlan_ieee80211::WlanPhyType::Ofdm]),
             band_caps: Some(
                 [
                     fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz,
@@ -211,6 +214,8 @@ impl WlanSoftmac for Mt7921Driver {
                     (!channels.is_empty()).then_some(
                         fidl_fuchsia_wlan_softmac::WlanSoftmacBandCapability {
                             band: Some(band),
+                            // Non-HT OFDM rates supported by the radio (500 kbit/s).
+                            basic_rates: Some(vec![12, 18, 24, 36, 48, 72, 96, 108]),
                             primary_channels: Some(channels),
                             ..Default::default()
                         },
