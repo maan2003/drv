@@ -77,7 +77,7 @@ pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
-pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write,readiness-fd-F_GETFD; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl-except-service-readiness-F_GETFD,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
 
 #[derive(Debug)]
 pub enum Error {
@@ -592,6 +592,11 @@ fn install_filter(profile: &Profile) -> Result<(), Error> {
             append_fd_sendmsg(&mut f, &[service.control_fd, service.supervisor_fd]);
             append_fd_recvmsg(&mut f, service.control_fd);
             append_runtime_poller(&mut f, &service.runtime_fds);
+            let mut readiness_fds = vec![*irq_eventfd, service.control_fd, service.supervisor_fd];
+            readiness_fds.extend(&service.ethernet_fds);
+            readiness_fds.extend(&service.runtime_fds);
+            append_runtime_registration(&mut f, &service.runtime_fds, &readiness_fds);
+            append_getfd(&mut f, &readiness_fds);
             readable.extend(&service.runtime_fds);
             writable.extend(&service.runtime_fds);
             let send_flags = [(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32];
@@ -1173,6 +1178,76 @@ fn append_runtime_poller(f: &mut Vec<Filter>, runtime_fds: &[RawFd]) {
     append_epoll_pwait_fds(f, runtime_fds);
 }
 
+// Rust's debug OwnedFd drop checks validity with F_GETFD before close.
+// This read-only query must not admit duplication or flag mutation.
+fn append_getfd(f: &mut Vec<Filter>, fds: &[RawFd]) {
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_fcntl as u32, 0, 0));
+    f.push(arg_high(1));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(arg(1));
+    f.push(jump(libc::F_GETFD as u32, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(arg_high(0));
+    f.push(jump(0, 1, 0));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(arg(0));
+    for &fd in fds {
+        f.push(jump(fd as u32, 0, 1));
+        f.push(stmt(RET_K, ALLOW));
+    }
+    f.push(stmt(RET_K, KILL_PROCESS));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small getfd filter");
+}
+
+// Unlike the policy reactor's ambient registration, driver registrations may
+// reference only the pre-lockdown reactor and its exact readiness inventory.
+fn append_runtime_registration(f: &mut Vec<Filter>, reactors: &[RawFd], targets: &[RawFd]) {
+    if reactors.is_empty() {
+        return;
+    }
+    let dispatch = f.len();
+    f.push(jump(libc::SYS_epoll_ctl as u32, 0, 0));
+    for (argument, values) in [
+        (0, reactors),
+        (
+            1,
+            &[
+                libc::EPOLL_CTL_ADD,
+                libc::EPOLL_CTL_MOD,
+                libc::EPOLL_CTL_DEL,
+            ][..],
+        ),
+        (2, targets),
+    ] {
+        f.push(arg_high(argument));
+        f.push(jump(0, 1, 0));
+        f.push(stmt(RET_K, KILL_PROCESS));
+        f.push(arg(argument));
+        for (index, &value) in values.iter().enumerate() {
+            f.push(jump(
+                value as u32,
+                (values.len() - index)
+                    .try_into()
+                    .expect("small registration inventory"),
+                0,
+            ));
+        }
+        f.push(stmt(RET_K, KILL_PROCESS));
+    }
+    f.push(stmt(RET_K, ALLOW));
+    let reload = f.len();
+    f.push(stmt(LD_W_ABS, 0));
+    f[dispatch].jf = (reload - dispatch - 1)
+        .try_into()
+        .expect("small registration filter");
+}
+
 fn append_epoll_pwait_fds(f: &mut Vec<Filter>, fds: &[RawFd]) {
     let dispatch = f.len();
     f.push(jump(libc::SYS_epoll_pwait as u32, 0, 0));
@@ -1194,7 +1269,7 @@ fn append_epoll_pwait_fds(f: &mut Vec<Filter>, fds: &[RawFd]) {
             .try_into()
             .expect("small runtime fd inventory");
     }
-    for argument in [4, 5] {
+    for argument in [4] {
         f.push(arg_high(argument));
         failures.push(f.len());
         f.push(jump(0, 0, 0));
@@ -1202,6 +1277,15 @@ fn append_epoll_pwait_fds(f: &mut Vec<Filter>, fds: &[RawFd]) {
         failures.push(f.len());
         f.push(jump(0, 0, 0));
     }
+    // The signal mask is NULL. libc passes the kernel sigset width, while
+    // direct reactor syscalls may pass zero; neither changes signal authority.
+    f.push(arg_high(5));
+    failures.push(f.len());
+    f.push(jump(0, 0, 0));
+    f.push(arg(5));
+    f.push(jump(0, 1, 0));
+    failures.push(f.len());
+    f.push(jump(8, 0, 0));
     f.push(stmt(RET_K, ALLOW));
     let denied = f.len();
     f.push(stmt(RET_K, KILL_PROCESS));
@@ -1960,6 +2044,208 @@ mod filter_tests {
             "mt:recvmsg",
         ] {
             kill_child(probe);
+        }
+    }
+
+    #[test]
+    fn mt7921_tokio_readiness_and_drop_work_after_lockdown() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const TEST: &str = "filter_tests::mt7921_tokio_readiness_and_drop_work_after_lockdown";
+        if std::env::var_os("DRV_MT7921_TOKIO_PROBE").is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let runtime_fds = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .parse::<RawFd>()
+                        .unwrap()
+                })
+                .filter(|fd| {
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok_and(|path| {
+                        path == std::path::Path::new("anon_inode:[eventpoll]")
+                            || path == std::path::Path::new("anon_inode:[eventfd]")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let raw = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            assert!(raw >= 0);
+            let event = {
+                let _enter = runtime.enter();
+                tokio::io::unix::AsyncFd::with_interest(
+                    unsafe { OwnedFd::from_raw_fd(raw) },
+                    tokio::io::Interest::READABLE,
+                )
+                .unwrap()
+            };
+            let device = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            enable_filter(Profile::Mt7921Vfio {
+                pci_config_fd: device,
+                vfio_fd: device,
+                iommufd: device,
+                irq_eventfd: raw,
+                service: Some(WifiServiceFds {
+                    control_fd: device,
+                    supervisor_fd: device,
+                    ethernet_fds: Vec::new(),
+                    runtime_fds,
+                }),
+            });
+            local.block_on(&runtime, async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        let mut ready = event.readable().await.unwrap();
+                        let result = ready.try_io(|fd| {
+                            let mut count = 0u64;
+                            let n = unsafe {
+                                libc::read(fd.as_raw_fd(), (&mut count as *mut u64).cast(), 8)
+                            };
+                            if n < 0 {
+                                Err(io::Error::last_os_error())
+                            } else {
+                                assert_eq!(n, 8);
+                                Ok(count)
+                            }
+                        });
+                        if let Ok(count) = result {
+                            assert_eq!(count.unwrap(), 1);
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            drop(event);
+            drop(local);
+            drop(runtime);
+            unsafe { libc::_exit(0) }
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST)
+            .env("DRV_MT7921_TOKIO_PROBE", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "Tokio under MT7921 filter: {status}");
+    }
+
+    #[test]
+    fn mt7921_runtime_registration_is_fd_scoped() {
+        const TEST: &str = "filter_tests::mt7921_runtime_registration_is_fd_scoped";
+        if let Ok(mode) = std::env::var("DRV_MT7921_REACTOR_PROBE") {
+            let reactor = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            let foreign = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            let irq = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            let device = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            assert!(reactor >= 0 && foreign >= 0 && irq >= 0 && device >= 0);
+            enable_filter(Profile::Mt7921Vfio {
+                pci_config_fd: device,
+                vfio_fd: device,
+                iommufd: device,
+                irq_eventfd: irq,
+                service: Some(WifiServiceFds {
+                    control_fd: device,
+                    supervisor_fd: device,
+                    ethernet_fds: Vec::new(),
+                    runtime_fds: vec![reactor],
+                }),
+            });
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: 7,
+            };
+            assert_eq!(unsafe { libc::fcntl(irq, libc::F_GETFD) }, libc::FD_CLOEXEC);
+            match mode.as_str() {
+                "getfd-foreign" => unsafe {
+                    libc::fcntl(foreign, libc::F_GETFD);
+                },
+                "setfd" => unsafe {
+                    libc::fcntl(irq, libc::F_SETFD, 0);
+                },
+                "dupfd" => unsafe {
+                    libc::fcntl(irq, libc::F_DUPFD_CLOEXEC, 0);
+                },
+                "getfd-high" => unsafe {
+                    libc::syscall(libc::SYS_fcntl, (1u64 << 32) | irq as u64, libc::F_GETFD);
+                },
+                "getfd-command-high" => unsafe {
+                    libc::syscall(libc::SYS_fcntl, irq, (1u64 << 32) | libc::F_GETFD as u64);
+                },
+                _ => {}
+            }
+            let (epoll, op, target) = match mode.as_str() {
+                "allowed" => (reactor as u64, libc::EPOLL_CTL_ADD as u64, irq as u64),
+                "foreign-reactor" => (foreign as u64, libc::EPOLL_CTL_ADD as u64, irq as u64),
+                "foreign-target" => (reactor as u64, libc::EPOLL_CTL_ADD as u64, foreign as u64),
+                "bad-operation" => (reactor as u64, 99, irq as u64),
+                "reactor-high" => (
+                    (1u64 << 32) | reactor as u64,
+                    libc::EPOLL_CTL_ADD as u64,
+                    irq as u64,
+                ),
+                "operation-high" => (
+                    reactor as u64,
+                    (1u64 << 32) | libc::EPOLL_CTL_ADD as u64,
+                    irq as u64,
+                ),
+                "target-high" => (
+                    reactor as u64,
+                    libc::EPOLL_CTL_ADD as u64,
+                    (1u64 << 32) | irq as u64,
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_epoll_ctl, epoll, op, target, &mut event) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::epoll_ctl(reactor, libc::EPOLL_CTL_MOD, irq, &mut event) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::epoll_pwait(reactor, &mut event, 1, 0, std::ptr::null()) },
+                1
+            );
+            assert_eq!(
+                unsafe { libc::epoll_ctl(reactor, libc::EPOLL_CTL_DEL, irq, std::ptr::null_mut()) },
+                0
+            );
+            unsafe { libc::_exit(0) }
+        }
+        for mode in [
+            "allowed",
+            "foreign-reactor",
+            "foreign-target",
+            "bad-operation",
+            "reactor-high",
+            "operation-high",
+            "target-high",
+            "getfd-foreign",
+            "setfd",
+            "dupfd",
+            "getfd-high",
+            "getfd-command-high",
+        ] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .env("DRV_MT7921_REACTOR_PROBE", mode)
+                .status()
+                .unwrap();
+            if mode == "allowed" {
+                assert!(status.success(), "{mode}: {status}");
+            } else {
+                assert_eq!(status.signal(), Some(libc::SIGSYS), "{mode}: {status}");
+            }
         }
     }
 

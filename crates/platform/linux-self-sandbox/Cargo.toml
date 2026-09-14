@@ -15,6 +15,9 @@ filter-integration-test = []
 libc = "0.2"
 userspace-vfio = { path = "../userspace-vfio" }
 
+[dev-dependencies]
+tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
+
 [[bin]]
 name = "mt-hashmap-filter-probe"
 path = "src/bin/mt-hashmap-filter-probe.rs"

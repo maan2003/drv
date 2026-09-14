@@ -5,7 +5,7 @@
 
 use std::{
     fs::File,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr::NonNull,
     sync::Arc,
 };
@@ -1409,9 +1409,9 @@ pub fn irq_capability(device: &File, index: u32) -> Result<IrqCapability, String
         automasked: info.flags & (1 << 2) != 0,
     })
 }
-pub struct VfioIrq {
+pub struct VfioIrq<E: AsFd = OwnedFd> {
     device: Arc<File>,
-    event_fd: OwnedFd,
+    event_fd: E,
     index: u32,
     start: u32,
     installed: bool,
@@ -1430,7 +1430,9 @@ impl VfioIrq {
     ) -> Result<Self, String> {
         Self::install_prepared_at(device, capability, start, create_irq_eventfd()?)
     }
+}
 
+impl<E: AsFd> VfioIrq<E> {
     /// Install a caller-created IRQ eventfd without duplicating or replacing it.
     ///
     /// Sandboxed users create this descriptor before lockdown so the filter can
@@ -1439,7 +1441,7 @@ impl VfioIrq {
         device: &Arc<File>,
         capability: IrqCapability,
         start: u32,
-        event_fd: OwnedFd,
+        event_fd: E,
     ) -> Result<Self, String> {
         if capability.count == 0 || !capability.eventfd {
             return Err("refused non-eventfd VFIO interrupt".into());
@@ -1455,7 +1457,7 @@ impl VfioIrq {
                 start,
                 count: 1,
             },
-            eventfd: event_fd.as_raw_fd(),
+            eventfd: event_fd.as_fd().as_raw_fd(),
         };
         ioctl_mut(
             device.as_raw_fd(),
@@ -1477,7 +1479,7 @@ impl VfioIrq {
         let mut count = 0u64;
         let result = unsafe {
             read(
-                self.event_fd.as_raw_fd(),
+                self.event_fd.as_fd().as_raw_fd(),
                 (&mut count as *mut u64).cast(),
                 8,
             )
@@ -1498,7 +1500,7 @@ impl VfioIrq {
     }
     pub fn wait_until(&self, deadline_ns: u64) -> Result<Option<u64>, String> {
         self.prepare_wait()?;
-        if wait_eventfds_until(&[self.event_fd.as_raw_fd()], deadline_ns)?.is_empty() {
+        if wait_eventfds_until(&[self.event_fd.as_fd().as_raw_fd()], deadline_ns)?.is_empty() {
             Ok(None)
         } else {
             self.try_read()
@@ -1526,8 +1528,13 @@ impl VfioIrq {
         }
         Ok(())
     }
+    /// The same owned event capability supplied at installation. Its descriptor
+    /// must remain stable until this IRQ has been disabled and dropped.
+    pub fn event(&self) -> &E {
+        &self.event_fd
+    }
     pub fn event_fd(&self) -> RawFd {
-        self.event_fd.as_raw_fd()
+        self.event_fd.as_fd().as_raw_fd()
     }
     pub fn disable(&mut self) -> Result<(), String> {
         if !self.installed {
@@ -1622,7 +1629,7 @@ pub fn monotonic_time_ns() -> Result<u64, String> {
         .and_then(|nanos| nanos.checked_add(time.nanoseconds as u64))
         .ok_or_else(|| "invalid monotonic clock value".into())
 }
-impl Drop for VfioIrq {
+impl<E: AsFd> Drop for VfioIrq<E> {
     fn drop(&mut self) {
         let _ = self.disable();
     }

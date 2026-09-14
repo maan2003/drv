@@ -9,7 +9,13 @@
 extern crate alloc;
 
 use alloc::{rc::Rc, vec, vec::Vec};
-use core::{cell::RefCell, marker::PhantomData, mem, ops::Range};
+use core::{
+    cell::RefCell,
+    marker::PhantomData,
+    mem,
+    ops::Range,
+    task::{Context, Poll},
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,6 +188,16 @@ pub trait Backend {
         interrupt: &Self::Interrupt,
         deadline_ns: u64,
     ) -> Result<Option<IrqEvent>>;
+    /// Poll one interrupt without blocking. A pending result must arrange a
+    /// wakeup when readiness changes; no backend borrow survives this call.
+    /// Backends without a prepared reactor explicitly reject async use.
+    fn poll_interrupt(
+        &mut self,
+        _interrupt: &Self::Interrupt,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<IrqEvent>> {
+        Poll::Ready(Err(Error::Unsupported))
+    }
     /// Wait for any of several interrupts with one absolute monotonic
     /// deadline. Implementations must not serialize blocking waits.
     fn wait_any(
@@ -906,6 +922,21 @@ impl<B: Backend> Interrupt<B> {
             .0
             .borrow_mut()
             .wait_interrupt(self.token.as_ref().unwrap(), deadline_ns)
+    }
+    /// Await the next interrupt without retaining a backend borrow while
+    /// suspended. Dropping this future leaves the interrupt installed.
+    /// Use one waiter per interrupt; deadline policy belongs to the caller.
+    pub async fn next(&self) -> Result<IrqEvent> {
+        core::future::poll_fn(|cx| {
+            if let Err(error) = current(&self.shared, self.generation) {
+                return Poll::Ready(Err(error));
+            }
+            self.shared
+                .0
+                .borrow_mut()
+                .poll_interrupt(self.token.as_ref().unwrap(), cx)
+        })
+        .await
     }
     pub fn wait_any(interrupts: &[&Self], deadline_ns: u64) -> Result<InterruptSet> {
         let first = interrupts.first().ok_or(Error::Invalid)?;

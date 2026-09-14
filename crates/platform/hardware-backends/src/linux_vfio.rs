@@ -7,7 +7,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     ops::Range,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     path::Path,
     sync::{
         Arc,
@@ -18,6 +18,39 @@ use userspace_vfio::{
     AnonymousMapping, DeviceMapping, DmaBrokerCommand, DmaMapping, Ioas, IrqCapability,
     RegionMapping, VfioIrq, dma_broker_uapi as broker,
 };
+
+use std::task::{Context, Poll, Waker};
+use tokio::io::unix::AsyncFd;
+
+// Both variants own a nonblocking eventfd. Registration travels with the
+// descriptor into VfioIrq, so disable precedes deregistration and close.
+enum InterruptEvent {
+    Unregistered(OwnedFd),
+    Registered(AsyncFd<OwnedFd>),
+}
+impl AsFd for InterruptEvent {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Unregistered(fd) => fd.as_fd(),
+            Self::Registered(fd) => fd.get_ref().as_fd(),
+        }
+    }
+}
+impl AsRawFd for InterruptEvent {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_fd().as_raw_fd()
+    }
+}
+impl InterruptEvent {
+    fn register(self) -> std::io::Result<Self> {
+        match self {
+            Self::Unregistered(fd) => {
+                AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).map(Self::Registered)
+            }
+            registered => Ok(registered),
+        }
+    }
+}
 
 const PAGE: usize = 4096;
 const FIRST_IOVA: u64 = 0x0100_0000;
@@ -75,7 +108,7 @@ pub struct LinuxVfioPciCapabilities {
     pci: PciControl,
     device: Arc<File>,
     iommu: Arc<File>,
-    irq_event: OwnedFd,
+    irq_event: InterruptEvent,
     hash_state: RandomState,
 }
 
@@ -86,7 +119,7 @@ pub struct LinuxVfioPciCapabilities {
 pub struct LinuxVfioPlatformCapabilities {
     device: Arc<File>,
     dma: PlatformDmaCapabilities,
-    irq_events: VecDeque<OwnedFd>,
+    irq_events: VecDeque<InterruptEvent>,
 }
 
 enum PlatformDmaCapabilities {
@@ -264,13 +297,27 @@ impl LinuxVfioPciCapabilities {
         device: File,
         iommu: File,
     ) -> std::result::Result<Self, LinuxVfioError> {
-        let irq_event = userspace_vfio::create_irq_eventfd().map_err(LinuxVfioError::Setup)?;
+        let irq_event = InterruptEvent::Unregistered(
+            userspace_vfio::create_irq_eventfd().map_err(LinuxVfioError::Setup)?,
+        );
         Ok(Self {
             pci: PciControl::from_file(pci_config),
             device: Arc::new(device),
             iommu: Arc::new(iommu),
             irq_event,
             hash_state: RandomState::new(),
+        })
+    }
+
+    /// Register the inert IRQ eventfd with the current Tokio I/O reactor.
+    /// Call before lockdown, while reactor registration is still permitted.
+    pub fn with_async_interrupt(self) -> std::result::Result<Self, LinuxVfioError> {
+        Ok(Self {
+            irq_event: self
+                .irq_event
+                .register()
+                .map_err(|error| LinuxVfioError::Setup(error.to_string()))?,
+            ..self
         })
     }
 
@@ -342,7 +389,10 @@ impl LinuxVfioPlatformCapabilities {
             dma: PlatformDmaCapabilities::Coherent {
                 iommu: Arc::new(iommu),
             },
-            irq_events: irq_events.into(),
+            irq_events: irq_events
+                .into_iter()
+                .map(InterruptEvent::Unregistered)
+                .collect(),
         }
     }
 
@@ -351,7 +401,10 @@ impl LinuxVfioPlatformCapabilities {
         Self {
             device: Arc::new(device),
             dma: PlatformDmaCapabilities::Broker,
-            irq_events: irq_events.into(),
+            irq_events: irq_events
+                .into_iter()
+                .map(InterruptEvent::Unregistered)
+                .collect(),
         }
     }
 
@@ -444,12 +497,13 @@ pub struct LinuxVfio {
     regions: HashMap<u64, RegionMapping>,
     dmas: HashMap<u64, Dma>,
     quarantined_dmas: HashMap<u64, Dma>,
-    interrupts: HashMap<u64, (u32, VfioIrq)>,
+    interrupts: HashMap<u64, (u32, VfioIrq<InterruptEvent>)>,
+    interrupt_waiters: HashMap<u64, Waker>,
     ambiguous_irq_indices: HashSet<u32>,
     hash_state: RandomState,
     dma_trace: bool,
     runtime_trace: Option<fn(&'static str, u64, usize, u64)>,
-    prepared_irqs: Option<VecDeque<OwnedFd>>,
+    prepared_irqs: Option<VecDeque<InterruptEvent>>,
 }
 
 impl LinuxVfio {
@@ -628,7 +682,7 @@ impl LinuxVfio {
         mut pci: PciControl,
         device: Arc<File>,
         iommu: Arc<File>,
-        irq_event: OwnedFd,
+        irq_event: InterruptEvent,
         hash_state: RandomState,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<OpenedPciCoherent, LinuxVfioError> {
@@ -664,7 +718,7 @@ impl LinuxVfio {
     fn initialize_coherent_with_irqs(
         device: Arc<File>,
         iommu: Arc<File>,
-        prepared_irqs: Option<VecDeque<OwnedFd>>,
+        prepared_irqs: Option<VecDeque<InterruptEvent>>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         let ioas = userspace_vfio::bind_iommufd(&device, &iommu)
             .and_then(|_| userspace_vfio::allocate_ioas(&iommu))
@@ -686,7 +740,7 @@ impl LinuxVfio {
     fn initialize_pci_coherent(
         device: Arc<File>,
         iommu: Arc<File>,
-        irq_event: OwnedFd,
+        irq_event: InterruptEvent,
         hash_state: RandomState,
         setup: impl FnOnce(&File, &Arc<File>) -> std::result::Result<Ioas, String>,
     ) -> std::result::Result<Self, LinuxVfioError> {
@@ -725,7 +779,7 @@ impl LinuxVfio {
 
     fn initialize_broker_with_irqs(
         device: Arc<File>,
-        prepared_irqs: Option<VecDeque<OwnedFd>>,
+        prepared_irqs: Option<VecDeque<InterruptEvent>>,
     ) -> std::result::Result<Self, LinuxVfioError> {
         userspace_vfio::probe_dma_broker(&device).map_err(LinuxVfioError::DmaBrokerUnavailable)?;
         Ok(Self::new(
@@ -744,7 +798,7 @@ impl LinuxVfio {
         iommu: Option<Arc<File>>,
         ioas: Option<Ioas>,
         pci_irq: Option<IrqCapability>,
-        prepared_irqs: Option<VecDeque<OwnedFd>>,
+        prepared_irqs: Option<VecDeque<InterruptEvent>>,
     ) -> Self {
         Self::new_with_hash_state(
             device,
@@ -763,7 +817,7 @@ impl LinuxVfio {
         iommu: Option<Arc<File>>,
         ioas: Option<Ioas>,
         pci_irq: Option<IrqCapability>,
-        prepared_irqs: Option<VecDeque<OwnedFd>>,
+        prepared_irqs: Option<VecDeque<InterruptEvent>>,
         hash_state: RandomState,
     ) -> Self {
         Self {
@@ -779,6 +833,7 @@ impl LinuxVfio {
             dmas: HashMap::with_hasher(hash_state.clone()),
             quarantined_dmas: HashMap::with_hasher(hash_state.clone()),
             interrupts: HashMap::with_hasher(hash_state.clone()),
+            interrupt_waiters: HashMap::with_hasher(hash_state.clone()),
             ambiguous_irq_indices: HashSet::with_hasher(hash_state.clone()),
             hash_state,
             dma_trace: false,
@@ -1290,7 +1345,14 @@ impl Backend for LinuxVfio {
             Some(event_fd) => {
                 VfioIrq::install_prepared_at(&self.device, capability, start, event_fd)
             }
-            None => VfioIrq::install_at(&self.device, capability, start),
+            None => VfioIrq::install_prepared_at(
+                &self.device,
+                capability,
+                start,
+                InterruptEvent::Unregistered(
+                    userspace_vfio::create_irq_eventfd().map_err(|_| Error::DeviceFault)?,
+                ),
+            ),
         }
         .map_err(|_| Error::DeviceFault)?;
         let id = self.id()?;
@@ -1310,6 +1372,42 @@ impl Backend for LinuxVfio {
             count,
             at_ns,
         }))
+    }
+
+    fn poll_interrupt(&mut self, id: &u64, cx: &mut Context<'_>) -> Poll<Result<IrqEvent>> {
+        self.interrupt_waiters.remove(id);
+        let (vector, interrupt) = self.interrupts.get(id).ok_or(Error::StaleHandle)?;
+        let InterruptEvent::Registered(event) = interrupt.event() else {
+            return Poll::Ready(Err(Error::Unsupported));
+        };
+        interrupt.prepare_wait().map_err(|_| Error::DeviceFault)?;
+        loop {
+            let mut ready = match event.poll_read_ready(cx) {
+                Poll::Pending => {
+                    match self.interrupt_waiters.get_mut(id) {
+                        Some(waker) => waker.clone_from(cx.waker()),
+                        None => {
+                            self.interrupt_waiters.insert(*id, cx.waker().clone());
+                        }
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result.map_err(|_| Error::DeviceFault)?,
+            };
+            match interrupt.try_read().map_err(|_| Error::DeviceFault)? {
+                Some(count) => {
+                    return Poll::Ready(Ok(IrqEvent {
+                        vector: *vector,
+                        count,
+                        at_ns: userspace_vfio::monotonic_time_ns()
+                            .map_err(|_| Error::DeviceFault)?,
+                    }));
+                }
+                // Only an actual WouldBlock clears reactor readiness. A ring
+                // budget being exhausted is not evidence the IRQ was drained.
+                None => ready.clear_ready(),
+            }
+        }
     }
 
     fn wait_any(&mut self, interrupts: &[&u64], deadline_ns: u64) -> Result<Vec<IrqEvent>> {
@@ -1375,6 +1473,11 @@ impl Backend for LinuxVfio {
         // From this point cleanup mutates live resources, so all issued handles
         // must become stale even if cleanup or the reset ioctl later fails.
         self.generation = next_generation;
+        // AsyncFd destruction clears reactor wakers; it does not notify
+        // waiters. Wake independently before any fallible revocation.
+        for (_, waiter) in self.interrupt_waiters.drain() {
+            waiter.wake();
+        }
         self.revoke_interrupts()?;
         self.regions.clear();
         if self.flavor == Flavor::Broker {
@@ -1400,6 +1503,7 @@ impl Backend for LinuxVfio {
         }
     }
     fn release_interrupt(&mut self, interrupt: u64) {
+        self.interrupt_waiters.remove(&interrupt);
         if let Some((vector, mut resource)) = self.interrupts.remove(&interrupt)
             && resource.disable().is_err()
         {
@@ -1474,7 +1578,7 @@ mod tests {
         LinuxVfio::initialize_pci_coherent(
             device,
             iommu,
-            userspace_vfio::create_irq_eventfd().unwrap(),
+            InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap()),
             RandomState::new(),
             |device, iommu| {
                 userspace_vfio::bind_iommufd(device, iommu)?;
@@ -1790,6 +1894,152 @@ mod tests {
     }
 
     #[test]
+    fn async_irq_retains_registration_after_waiter_drop_and_rearms() {
+        use drv_hardware::Device;
+        use std::future::Future;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let (file, path) = fake_device();
+        let (_, records) = with_fake_automasked_io(|| {
+            local.block_on(&runtime, async {
+                let event =
+                    InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap())
+                        .register()
+                        .unwrap();
+                let fd = event.as_raw_fd();
+                let mut backend = LinuxVfio::initialize_broker(file, |_| Ok(())).unwrap();
+                backend.prepared_irqs = Some(VecDeque::from([event]));
+                let device = Device::from_backend(backend);
+                let irq = device.open_interrupt(3).unwrap();
+                {
+                    let mut abandoned = std::pin::pin!(irq.next());
+                    std::future::poll_fn(|cx| {
+                        assert!(abandoned.as_mut().poll(cx).is_pending());
+                        // A pending wait must not retain a RefCell borrow.
+                        assert_eq!(device.generation(), 1);
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                for count in [2, 5] {
+                    tokio::task::spawn_local(async move {
+                        tokio::task::yield_now().await;
+                        signal_eventfd(fd, count).unwrap();
+                    });
+                    let event = tokio::time::timeout(std::time::Duration::from_secs(1), irq.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!((event.vector, event.count), (3, count));
+                }
+                drop(irq);
+                drop(device);
+            });
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                Record::QueryIrq(3),
+                Record::InstallIrq(3),
+                Record::UnmaskIrq(3),
+                Record::UnmaskIrq(3),
+                Record::DisableIrq(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_wakes_pending_irq_to_report_stale_handle() {
+        use drv_hardware::Device;
+        use std::{future::Future, sync::atomic::AtomicBool, task::Wake};
+        struct WakeFlag(AtomicBool);
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        for fail_unmap in [false, true] {
+            let (file, path) = fake_device();
+            with_fake_io_failure(false, fail_unmap.then_some(Failure::IoasUnmap), || {
+                let event =
+                    InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap())
+                        .register()
+                        .unwrap();
+                let iommu = Arc::new(File::open("/dev/null").unwrap());
+                let mut backend = LinuxVfio::initialize_coherent(file, iommu, |device, iommu| {
+                    userspace_vfio::bind_iommufd(device, iommu)?;
+                    let ioas = userspace_vfio::allocate_ioas(iommu)?;
+                    userspace_vfio::attach_ioas(device, ioas.id())?;
+                    Ok(ioas)
+                })
+                .unwrap();
+                backend
+                    .alloc_dma(PAGE, PAGE, DmaDirection::Bidirectional, true)
+                    .unwrap();
+                backend.prepared_irqs = Some(VecDeque::from([event]));
+                let device = Device::from_backend(backend);
+                let irq = device.open_interrupt(3).unwrap();
+                let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+                let waker = Waker::from(flag.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut waiting = std::pin::pin!(irq.next());
+                assert!(waiting.as_mut().poll(&mut cx).is_pending());
+                flag.0.store(false, Ordering::SeqCst);
+                assert_eq!(
+                    device.reset(),
+                    if fail_unmap {
+                        Err(Error::DeviceFault)
+                    } else {
+                        Ok(2)
+                    }
+                );
+                assert!(
+                    flag.0.load(Ordering::SeqCst),
+                    "reset must wake without a timer or another IRQ"
+                );
+                assert_eq!(
+                    waiting.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::StaleHandle))
+                );
+            });
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn async_irq_rejects_unregistered_events() {
+        use drv_hardware::Device;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (file, path) = fake_device();
+        let (_, _) = with_fake_io(true, || {
+            let backend = LinuxVfio::initialize_broker(file, |_| Ok(())).unwrap();
+            let device = Device::from_backend(backend);
+            let irq = device.open_interrupt(3).unwrap();
+            assert_eq!(runtime.block_on(irq.next()), Err(Error::Unsupported));
+            drop(irq);
+            drop(device);
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn wait_any_returns_every_ready_fake_eventfd_in_one_batch() {
         let (device, path) = fake_device();
         let (_, records) = with_fake_io(true, || {
@@ -1870,7 +2120,7 @@ mod tests {
                 unsafe_pci,
                 Arc::clone(&device),
                 Arc::clone(&iommu),
-                userspace_vfio::create_irq_eventfd().unwrap(),
+                InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap()),
                 RandomState::new(),
                 |_, _| {
                     attached.set(true);
@@ -1899,7 +2149,7 @@ mod tests {
                         safe_pci,
                         device,
                         iommu,
-                        userspace_vfio::create_irq_eventfd().unwrap(),
+                        InterruptEvent::Unregistered(userspace_vfio::create_irq_eventfd().unwrap()),
                         RandomState::new(),
                         |device, iommu| {
                             userspace_vfio::bind_iommufd(device, iommu)?;

@@ -9,6 +9,10 @@ drv-hardware = { path = "../hardware-api" }
 userspace-vfio = { path = "../userspace-vfio" }
 linux-self-sandbox = { path = "../linux-self-sandbox" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "=1.52.3", features = ["rt", "net"] }
+
 [dev-dependencies]
+tokio = { version = "=1.52.3", features = ["time"] }
 proptest = "1"
 userspace-vfio = { path = "../userspace-vfio", features = ["test-support"] }

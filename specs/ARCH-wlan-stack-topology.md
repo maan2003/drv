@@ -144,6 +144,27 @@ supervisor/host binding owns privileged device assignment and recovery, not
 network-selection policy. The Wi-Fi process does not launch the network service
 or receive general filesystem, host-network, or unrelated device access.
 
+## Async execution and fault recovery
+
+The selected Linux execution model is one Tokio current-thread runtime with a
+LocalSet and readiness-driven descriptor integration. Portable driver contracts
+remain executor-neutral. The current timer-only runtime and synchronous
+downcalls are transitional, not the completed async lifecycle.
+
+The driver owns submitted operations and their hardware-visible resources
+independently of waiting futures. Dropping a waiter or reaching its deadline
+does not authorize DMA reclamation. Resources remain owned until terminal
+hardware completion or verified containment.
+
+Normal shutdown attempts bounded asynchronous drain and containment. Failure to
+quiesce makes the Wi-Fi service unhealthy; an independent supervisor terminates
+and restarts it rather than relying on its stalled executor. Replacement device
+acquisition waits for old ownership and teardown, including any duplicated VFIO
+references. Kernel final-reference cleanup is the process-death safety boundary.
+Reset or reinitialization failure leaves the service unavailable with backoff;
+it does not authorize reuse of uncertain hardware state. Wi-Fi recovery does
+not inherently restart the network service.
+
 ## Crate ownership
 
 Crates enforce dependency boundaries; they do not themselves provide process
