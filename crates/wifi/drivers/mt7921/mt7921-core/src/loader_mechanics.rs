@@ -345,6 +345,37 @@ impl LoaderMechanics {
         completion: LoaderCommandCompletion,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
+        self.publish_reserved_template(t, o, sequence, template, completion)?;
+
+        let result = match completion {
+            LoaderCommandCompletion::NoResponse => Ok(LoaderCompletion::NoResponse),
+            LoaderCommandCompletion::Response => self
+                .wait_response(t, o, sequence, deadline)
+                .map(LoaderCompletion::Response),
+        };
+        // A response parse/correlation failure does not transfer the command
+        // slot back to the caller.  Reclaim it from exact DIDX + DMA_DONE
+        // evidence before surfacing that primary protocol failure.
+        let reclaimed = self.wait_command_reclaim(t, o, deadline);
+        match (result, reclaimed) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(completion), Ok(())) => Ok(completion),
+        }
+    }
+
+    /// Publish without waiting. The engine retains the slot even when producer
+    /// MMIO fails, because failure cannot prove that hardware did not see it.
+    /// Keep this internal until the deferred operation also owns response
+    /// correlation and completion, not just TX reclamation.
+    fn publish_reserved_template<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+        sequence: u8,
+        template: &[u8],
+        completion: LoaderCommandCompletion,
+    ) -> Result<(), LoaderMechanicsError<T::Error>> {
         if let Some(slot) = self.pending_command {
             return Err(LoaderMechanicsError::CommandPending { slot });
         }
@@ -401,66 +432,44 @@ impl LoaderMechanics {
             sequence,
         });
 
-        let result = match completion {
-            LoaderCommandCompletion::NoResponse => Ok(LoaderCompletion::NoResponse),
-            LoaderCommandCompletion::Response => self
-                .wait_response(t, o, sequence, deadline)
-                .map(LoaderCompletion::Response),
-        };
-        // A response parse/correlation failure does not transfer the command
-        // slot back to the caller.  Reclaim it from exact DIDX + DMA_DONE
-        // evidence before surfacing that primary protocol failure.
-        let reclaimed = self
-            .wait_command_reclaim(t, slot, producer, deadline)
-            .and_then(|()| {
-                t.reclaim_command(slot)
-                    .map_err(LoaderMechanicsError::ContainmentRequired)
-            });
-        if reclaimed.is_ok() {
-            self.pending_command = None;
-            o.observe_loader_mechanics(LoaderMechanicsEvent::CommandReclaimed { slot });
-        }
-        match (result, reclaimed) {
-            (_, Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(completion), Ok(())) => Ok(completion),
-        }
+        Ok(())
     }
 
-    fn wait_command_reclaim<T: LoaderMechanicsTransport>(
+    fn wait_command_reclaim<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
         &mut self,
         t: &mut T,
-        slot: u16,
-        producer: u16,
+        o: &mut O,
         deadline: u64,
     ) -> Result<(), LoaderMechanicsError<T::Error>> {
         loop {
-            let didx = t
-                .command_dma_index()
-                .map_err(LoaderMechanicsError::ContainmentRequired)?;
-            if didx >= MT7921_MCU_TX_RING_COUNT {
-                return Err(LoaderMechanicsError::InvalidCommandDmaIndex(didx));
-            }
-            if didx == u32::from(producer) {
-                fence(Ordering::Acquire);
-                break;
+            if self.try_reclaim_command(t, o)? {
+                return Ok(());
             }
             if !t
                 .wait_for_progress(deadline)
                 .map_err(LoaderMechanicsError::ContainmentRequired)?
             {
-                let didx = t
-                    .command_dma_index()
-                    .map_err(LoaderMechanicsError::ContainmentRequired)?;
-                if didx >= MT7921_MCU_TX_RING_COUNT {
-                    return Err(LoaderMechanicsError::InvalidCommandDmaIndex(didx));
-                }
-                if didx != u32::from(producer) {
-                    return Err(LoaderMechanicsError::Timeout);
-                }
-                fence(Ordering::Acquire);
-                break;
+                return if self.try_reclaim_command(t, o)? {
+                    Ok(())
+                } else {
+                    Err(LoaderMechanicsError::Timeout)
+                };
             }
+        }
+    }
+
+    /// Observe and reclaim TX ownership only; this says nothing about whether
+    /// firmware has returned the command's response.
+    fn try_reclaim_command<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+    ) -> Result<bool, LoaderMechanicsError<T::Error>> {
+        let Some(slot) = self.pending_command else {
+            return Ok(true);
+        };
+        if !self.command_consumed(t, self.command_producer)? {
+            return Ok(false);
         }
         let descriptor = t
             .read_command_descriptor(slot)
@@ -468,7 +477,32 @@ impl LoaderMechanics {
         if !descriptor.is_dma_done() {
             return Err(LoaderMechanicsError::TxDescriptorNotDone { slot });
         }
-        Ok(())
+        t.reclaim_command(slot)
+            .map_err(LoaderMechanicsError::ContainmentRequired)?;
+        self.pending_command = None;
+        o.observe_loader_mechanics(LoaderMechanicsEvent::CommandReclaimed { slot });
+        Ok(true)
+    }
+
+    /// One nonwaiting consumer observation. A deadline is never evidence of
+    /// ownership transfer; the synchronous waiter also uses this for its final
+    /// observation after a timed wait.
+    fn command_consumed<T: LoaderMechanicsTransport>(
+        &self,
+        t: &mut T,
+        producer: u16,
+    ) -> Result<bool, LoaderMechanicsError<T::Error>> {
+        let didx = t
+            .command_dma_index()
+            .map_err(LoaderMechanicsError::ContainmentRequired)?;
+        if didx >= MT7921_MCU_TX_RING_COUNT {
+            return Err(LoaderMechanicsError::InvalidCommandDmaIndex(didx));
+        }
+        if didx != u32::from(producer) {
+            return Ok(false);
+        }
+        fence(Ordering::Acquire);
+        Ok(true)
     }
 
     fn wait_response<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
@@ -833,6 +867,7 @@ mod tests {
         rx: [Vec<Rx>; 2],
         rx_next: [usize; 2],
         fail_publish_command: bool,
+        fail_reclaim_command: bool,
         refill_rx: bool,
         fail_publish_scatter: bool,
         command_capacity: usize,
@@ -864,6 +899,7 @@ mod tests {
                 }),
                 rx_next: [0; 2],
                 fail_publish_command: false,
+                fail_reclaim_command: false,
                 refill_rx: false,
                 fail_publish_scatter: false,
                 command_capacity: MT7921_LOADER_COMMAND_MAX_BYTES,
@@ -948,6 +984,9 @@ mod tests {
             Ok(self.command_descriptor)
         }
         fn reclaim_command(&mut self, slot: u16) -> Result<(), Self::Error> {
+            if self.fail_reclaim_command {
+                return Err("command reclaim");
+            }
             self.command_wipe_bytes = MT7921_LOADER_COMMAND_MAX_BYTES;
             self.ops.push(Op::ReclaimCommand(slot));
             Ok(())
@@ -1071,6 +1110,47 @@ mod tests {
             self.ops.push(Op::ReclaimScatter(slot));
             Ok(())
         }
+    }
+
+    #[test]
+    fn deferred_publication_and_reclaim_never_wait_and_retain_ownership_on_failure() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake::default();
+        let sequence = engine.reserve_sequence(&mut ());
+        engine
+            .publish_reserved_template(
+                &mut io,
+                &mut (),
+                sequence,
+                &[0x5a; 48],
+                LoaderCommandCompletion::NoResponse,
+            )
+            .unwrap();
+        assert_eq!(engine.pending_command, Some(0));
+        assert!(!io.ops.contains(&Op::CommandDidx));
+        assert!(!io.ops.contains(&Op::Wait));
+
+        io.command_didx = VecDeque::from([0, 1, 1]);
+        assert_eq!(engine.try_reclaim_command(&mut io, &mut ()), Ok(false));
+        assert_eq!(engine.pending_command, Some(0));
+        assert_eq!(io.command_wipe_bytes, 0);
+
+        io.fail_reclaim_command = true;
+        assert_eq!(
+            engine.try_reclaim_command(&mut io, &mut ()),
+            Err(LoaderMechanicsError::ContainmentRequired("command reclaim"))
+        );
+        assert_eq!(engine.pending_command, Some(0));
+        assert_eq!(io.command_wipe_bytes, 0);
+
+        io.fail_reclaim_command = false;
+        assert_eq!(engine.try_reclaim_command(&mut io, &mut ()), Ok(true));
+        assert_eq!(engine.pending_command, None);
+        assert_eq!(io.command_wipe_bytes, MT7921_LOADER_COMMAND_MAX_BYTES);
+        assert!(!io.ops.contains(&Op::Wait));
+        let before = io.ops.clone();
+        assert_eq!(engine.try_reclaim_command(&mut io, &mut ()), Ok(true));
+        assert_eq!(io.ops, before, "already reclaimed must not touch hardware");
     }
 
     #[test]
