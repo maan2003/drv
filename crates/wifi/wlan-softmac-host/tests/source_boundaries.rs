@@ -21,7 +21,7 @@ fn host_sources_and_dependencies_are_chip_independent() {
     let mut sources = String::new();
     collect_rs(&root.join("src"), &mut sources);
     let owned = format!("{manifest}\n{sources}").to_ascii_lowercase();
-    for chip_name in ["mt7921", "mt76"] {
+    for chip_name in ["mt7921", "mt76", "ath11k", "wcn6750"] {
         assert!(
             !owned.contains(chip_name),
             "host boundary contains chip name {chip_name}"

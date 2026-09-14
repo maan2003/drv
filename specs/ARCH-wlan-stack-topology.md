@@ -164,8 +164,10 @@ request-handler futures. Control dispatch remains available while cleanup or
 hardware work is pending. Queue admission and completed effects are distinct;
 mailbox ordering alone is not cancellation or hardware-completion evidence.
 
-Migration is incomplete: MLME already has an owning task, but shared driver
-access, inline admission cleanup and manual progress polling remain.
+MLME has an owning task and the generic driver actor exclusively owns the
+device behind a bounded typed mailbox; the protocol bridge has no mutable
+device reference. Actor progression remains cooperatively driven by runtime
+turns. Inline admission cleanup and manual progress polling remain transitional.
 Explicit disconnect/cancel cleanup and its replies are retained and advanced
 in bounded service turns; driver cleanup certification can still block in
 legacy adapters.
@@ -191,6 +193,12 @@ it does not authorize reuse of uncertain hardware state. Wi-Fi recovery does
 not inherently restart the network service.
 
 ## Crate ownership
+
+WLAN protocol code and device-specific driver code remain in separate crates,
+even when their actors execute in the same process. Generic mailbox scheduling
+may live with the host bindings; chip register, firmware, DMA-descriptor and
+radio-operation implementations belong to the chip crates, not the protocol
+crate.
 
 Crates enforce dependency boundaries; they do not themselves provide process
 isolation. `mt76-core` / `mt7921-core`, the chip SoftMAC adapters, and

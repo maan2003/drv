@@ -2,6 +2,7 @@
 
 //! Chip-independent ownership of the pinned Fuchsia client MLME/SME/RSN loop.
 
+use crate::driver::{Command, DriverActor, DriverHandle};
 use crate::ethernet::{
     DriverEthernetPort, EthernetIngressError, HostEthernetDevice, ethernet_port,
 };
@@ -46,12 +47,6 @@ impl MlmeExecution {
         self.rejected.set(true);
         Err(zx::Status::CANCELED)
     }
-}
-
-struct StartedDevice<D> {
-    device: D,
-    // A failed stop remains pending. Later explicit stop calls and Drop retry it.
-    stop_pending: bool,
 }
 
 struct HostIo {
@@ -150,22 +145,6 @@ fn sme_is_retry_quiescent(status: &wlan_sme::client::ClientSmeStatus) -> bool {
     matches!(status, wlan_sme::client::ClientSmeStatus::Idle)
 }
 
-fn stop_device<D: WlanSoftmacLifecycle>(
-    device: &Mutex<StartedDevice<D>>,
-) -> Result<(), zx::Status> {
-    let mut state = device.lock().unwrap();
-    if !state.stop_pending {
-        return Ok(());
-    }
-    match state.device.stop() {
-        Ok(()) => {
-            state.stop_pending = false;
-            Ok(())
-        }
-        Err(status) => Err(status),
-    }
-}
-
 fn ethernet_status(error: EthernetIngressError) -> zx::Status {
     match error {
         EthernetIngressError::Closed => zx::Status::CANCELED,
@@ -175,59 +154,66 @@ fn ethernet_status(error: EthernetIngressError) -> zx::Status {
     }
 }
 
-struct HostMlmeDevice<D> {
+struct HostMlmeDevice {
     execution: Rc<MlmeExecution>,
-    device: Arc<Mutex<StartedDevice<D>>>,
+    driver: DriverHandle,
     io: Arc<Mutex<HostIo>>,
     event_sink: mpsc::UnboundedSender<(OperationEpoch, fidl_mlme::MlmeEvent)>,
     event_stream: Option<mpsc::UnboundedReceiver<(OperationEpoch, fidl_mlme::MlmeEvent)>>,
 }
 
-impl<D> HostMlmeDevice<D> {
-    fn new(device: Arc<Mutex<StartedDevice<D>>>, io: Arc<Mutex<HostIo>>) -> Self {
+impl HostMlmeDevice {
+    fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>) -> Self {
         let (event_sink, event_stream) = mpsc::unbounded();
         Self {
             execution: Rc::new(MlmeExecution {
                 epoch: RefCell::new(OperationEpoch::new()),
                 rejected: Cell::new(false),
             }),
-            device,
+            driver,
             io,
             event_sink,
             event_stream: Some(event_stream),
         }
     }
+    async fn request<T>(
+        &mut self,
+        make: impl FnOnce(oneshot::Sender<Result<T, zx::Status>>) -> Command,
+    ) -> Result<T, zx::Status> {
+        let epoch = self.execution.epoch.borrow().clone();
+        let (reply, receiver) = oneshot::channel();
+        let result = match self.driver.send(epoch.clone(), make(reply)) {
+            Ok(()) => receiver.await.unwrap_or(Err(zx::Status::CANCELED)),
+            Err(status) => Err(status),
+        };
+        if matches!(&result, Err(status) if *status == zx::Status::CANCELED) && !epoch.is_live() {
+            self.execution.rejected.set(true);
+        }
+        result
+    }
 }
 
-impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for HostMlmeDevice<D> {
+impl DeviceOps for HostMlmeDevice {
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
-        self.device.lock().unwrap().device.query()
+        self.request(|reply| Command::Query((), reply)).await
     }
     async fn discovery_support(&mut self) -> Result<fidl_softmac::DiscoverySupport, zx::Status> {
-        self.device.lock().unwrap().device.query_discovery_support()
+        self.request(|reply| Command::Discovery((), reply)).await
     }
     async fn mac_sublayer_support(
         &mut self,
     ) -> Result<fidl_common::MacSublayerSupport, zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .query_mac_sublayer_support()
+        self.request(|reply| Command::MacSublayer((), reply)).await
     }
     async fn security_support(&mut self) -> Result<fidl_common::SecuritySupport, zx::Status> {
-        self.device.lock().unwrap().device.query_security_support()
+        self.request(|reply| Command::Security((), reply)).await
     }
     async fn spectrum_management_support(
         &mut self,
     ) -> Result<fidl_common::SpectrumManagementSupport, zx::Status> {
-        self.device
-            .lock()
-            .unwrap()
-            .device
-            .query_spectrum_management_support()
+        self.request(|reply| Command::Spectrum((), reply)).await
     }
     fn deliver_eth_frame(&mut self, packet: &[u8]) -> Result<(), zx::Status> {
         self.execution.admit()?;
@@ -248,7 +234,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         if buffer.get(1).is_some_and(|byte| byte & 0x40 != 0) {
             flags |= fidl_softmac::WlanTxInfoFlags::PROTECTED;
         }
-        self.device.lock().unwrap().device.queue_tx(&buffer, flags)
+        self.driver.send(
+            self.execution.epoch.borrow().clone(),
+            Command::Transmit(buffer.to_vec(), flags),
+        )
     }
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
         self.execution.admit()?;
@@ -258,7 +247,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
             io.unpublished_ethernet_device = None;
             io.ethernet.set_link(false);
             drop(io);
-            return self.device.lock().unwrap().device.set_link_up(false);
+            return self.request(|reply| Command::Link(false, reply)).await;
         }
 
         let host = {
@@ -275,13 +264,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
                 io.unpublished_ethernet_device.take()
             }
         };
-        if let Err(status) = self.device.lock().unwrap().device.set_link_up(true) {
+        if let Err(status) = self.request(|reply| Command::Link(true, reply)).await {
             let mut io = self.io.lock().unwrap();
             io.pending_ethernet_devices.clear();
             io.unpublished_ethernet_device = None;
             io.ethernet.teardown();
             return Err(status);
         }
+        self.execution.admit()?;
         let mut io = self.io.lock().unwrap();
         io.ethernet.set_link(true);
         if let Some(host) = host {
@@ -300,18 +290,18 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         eprintln!(
             "client_softmac_channel stage=bridge_enter primary={primary:?} bandwidth={bandwidth:?} secondary={secondary:?}"
         );
-        let result = {
-            let completion = {
-                self.device.lock().unwrap().device.set_channel(
+        let result = self
+            .request(|reply| {
+                Command::Channel(
                     fidl_softmac::WlanSoftmacBaseSetChannelRequest {
                         primary: Some(primary),
                         bandwidth: Some(bandwidth),
                         vht_secondary_80_channel: Some(secondary),
                     },
+                    reply,
                 )
-            };
-            completion.await
-        };
+            })
+            .await;
         eprintln!("client_softmac_channel stage=bridge_complete result={result:?}");
         result
     }
@@ -330,16 +320,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
             request.max_channel_time,
             request.min_home_time,
         );
-        let response = {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .start_passive_scan(request.clone())
-            };
-            completion.await
-        };
+        let response = self
+            .request(|reply| Command::PassiveScan(request.clone(), reply))
+            .await;
         eprintln!(
             "client_softmac_scan stage=bridge_complete kind=passive status={}",
             if response.is_ok() { "ok" } else { "error" }
@@ -351,39 +334,21 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         request: &fidl_softmac::WlanSoftmacStartActiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .start_active_scan(request.clone())
-            };
-            completion.await
-        }
+        self.request(|reply| Command::ActiveScan(request.clone(), reply))
+            .await
     }
     async fn cancel_scan(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .cancel_scan(request.clone())
-            };
-            completion.await
-        }
+        self.request(|reply| Command::CancelScan(request.clone(), reply))
+            .await
     }
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = { self.device.lock().unwrap().device.join_bss(request.clone()) };
-            completion.await
-        }
+        self.request(|reply| Command::Join(request.clone(), reply))
+            .await
     }
     async fn enable_beaconing(
         &mut self,
@@ -399,10 +364,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         key: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = { self.device.lock().unwrap().device.install_key(key.clone()) };
-            completion.await
-        }
+        self.request(|reply| Command::Key(key.clone(), reply)).await
     }
     async fn notify_association_complete(
         &mut self,
@@ -410,16 +372,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
         eprintln!("client_association stage=configure_enter config={config:?}");
-        let result = {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .notify_association_complete(config)
-            };
-            completion.await
-        };
+        let result = self
+            .request(|reply| Command::Association(config, reply))
+            .await;
         eprintln!("client_association stage=configure_complete result={result:?}");
         result
     }
@@ -428,32 +383,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .clear_association(request.clone())
-            };
-            completion.await
-        }
+        self.request(|reply| Command::ClearAssociation(request.clone(), reply))
+            .await
     }
     async fn update_wmm_parameters(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseUpdateWmmParametersRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        {
-            let completion = {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .device
-                    .update_wmm_parameters(request.clone())
-            };
-            completion.await
-        }
+        self.request(|reply| Command::Wmm(request.clone(), reply))
+            .await
     }
     fn take_mlme_event_stream(&mut self) -> Option<mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>> {
         // The owning runtime takes the origin-bearing route directly. An
@@ -549,8 +488,8 @@ struct MlmeTask {
 }
 
 impl MlmeTask {
-    fn new<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver + 'static>(
-        mut mlme: wlan_mlme::client::ClientMlme<HostMlmeDevice<D>>,
+    fn new(
+        mut mlme: wlan_mlme::client::ClientMlme<HostMlmeDevice>,
         io: Arc<Mutex<HostIo>>,
         execution: Rc<MlmeExecution>,
         mut timers: wlan_common::timer::EventStream<wlan_mlme::client::TimedEvent>,
@@ -781,6 +720,7 @@ impl MlmeTask {
 }
 
 struct ConnectAttempt {
+    result: Option<fidl_sme::ConnectResult>,
     transaction: wlan_sme::client::ConnectTransactionStream,
     deadline: std::time::Instant,
 }
@@ -805,7 +745,7 @@ struct ScanAttempt {
 /// Bounded production owner for SME, MLME, RSN, timers, device events, and
 /// chip-supplied RX. No parallel association state is attached to this owner.
 pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> {
-    device: Arc<Mutex<StartedDevice<D>>>,
+    device: DriverActor<D>,
     upcalls: Arc<Mutex<UpcallQueue>>,
     io: Arc<Mutex<HostIo>>,
     sme: wlan_sme::client::ClientSme,
@@ -960,10 +900,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             raw_queued: 0,
             queue: VecDeque::new(),
         }));
-        let device = Arc::new(Mutex::new(StartedDevice {
-            device,
-            stop_pending: false,
-        }));
+        let (mut device, driver) = DriverActor::new(device);
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
             replacement_ethernet,
@@ -972,7 +909,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             ethernet_mac_address: mac_address,
             minstrel: None,
         }));
-        let mut mlme_device = HostMlmeDevice::new(device.clone(), io.clone());
+        let mut mlme_device = HostMlmeDevice::new(driver, io.clone());
         let events = mlme_device
             .event_stream
             .take()
@@ -980,8 +917,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let execution = mlme_device.execution.clone();
         upcalls.lock().unwrap().epoch = execution.epoch.borrow().clone();
         let (mlme_timer, mlme_timer_stream) = wlan_mlme::common::timer::create_timer();
-        let mlme =
-            wlan_mlme::client::ClientMlme::new(Default::default(), mlme_device, mlme_timer).await?;
+        let mlme = device
+            .run_until(wlan_mlme::client::ClientMlme::new(
+                Default::default(),
+                mlme_device,
+                mlme_timer,
+            ))
+            .await
+            .map_err(|status| anyhow::anyhow!("driver initialization: {status}"))??;
         let (sme, _sink, requests, sme_timer_stream) = wlan_sme::client::ClientSme::new(
             sme_config,
             device_info,
@@ -1009,13 +952,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let mlme_timers = Box::pin(wlan_mlme::common::timer::make_async_timed_event_stream(
             timed_receiver,
         ));
-        {
-            let mut state = device.lock().unwrap();
-            if let Err(status) = state.device.start(Box::new(UpcallSender(upcalls.clone()))) {
-                revoke_and_drain(&upcalls);
-                return Err(anyhow::anyhow!("SoftMAC start failed: {status}"));
-            }
-            state.stop_pending = true;
+        if let Err(status) = device.start(Box::new(UpcallSender(upcalls.clone()))) {
+            revoke_and_drain(&upcalls);
+            return Err(anyhow::anyhow!("SoftMAC start failed: {status}"));
         }
         let mut runtime = Self {
             device,
@@ -1071,7 +1010,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         self.connection = None;
         revoke_and_drain(&self.upcalls);
         self.io.lock().unwrap().ethernet.teardown();
-        stop_device(&self.device)
+        self.device.stop()
     }
 
     /// Terminal service shutdown joins the MLME task before its LocalSet is
@@ -1232,10 +1171,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
 
         let device_progressed = self
             .device
-            .lock()
-            .unwrap()
-            .device
-            .drive()
+            .drive_once()
+            .await
             .map_err(|status| ConnectError::Driver(DriverError::ClientRx(status)))?;
         let upcall_progressed = self.pump_upcalls().await?;
         progressed |= device_progressed || upcall_progressed;
@@ -1335,6 +1272,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }
         self.begin_epoch();
         self.connect_attempt = Some(ConnectAttempt {
+            result: None,
             transaction: self.sme.on_connect_command(request),
             deadline,
         });
@@ -1484,9 +1422,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if let Some(cleanup) = &self.cleanup {
             return Ok(cleanup.deadline);
         }
+        let terminal = self
+            .connect_attempt
+            .as_mut()
+            .and_then(|attempt| attempt.result.take())
+            .map(|result| fidl_sme::ConnectTransactionEvent::OnConnectResult { result });
         self.cleanup = Some(Cleanup {
             deadline,
-            terminal: None,
+            terminal,
             transaction_closed: false,
         });
         // Revoke the old continuation before SME emits cleanup. Keep driver
@@ -1494,7 +1437,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         self.mlme.epoch.revoke();
         self.mlme.epoch = OperationEpoch::new();
         self.io.lock().unwrap().ethernet.set_link(false);
-        let result = self.device.lock().unwrap().device.set_link_up(false);
+        let result = self.device.set_link_up(false);
         if let Err(status) = result {
             return Err(self.contain_error(ConnectError::Driver(DriverError::Ethernet(status))));
         }
@@ -1666,11 +1609,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             return Err(ConnectError::Timeout);
         }
         self.pump_once().await?;
-        loop {
+        while self.connect_attempt.as_ref().unwrap().result.is_none() {
             let event = self
                 .connect_attempt
                 .as_mut()
-                .expect("connect attempt checked by caller")
+                .unwrap()
                 .transaction
                 .try_recv();
             match event {
@@ -1683,16 +1626,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                     if result.code != fidl_ieee80211::StatusCode::Success {
                         return Err(ConnectError::Failed(result));
                     }
-                    self.pump_once().await?;
-                    if !self.sme.status().is_connected() {
-                        return Err(ConnectError::Driver(DriverError::ConnectStateMismatch));
-                    }
-                    let attempt = self
-                        .connect_attempt
-                        .take()
-                        .expect("connect attempt retained");
-                    self.connection = Some(Connection::Active(attempt.transaction));
-                    return Ok(Some(result));
+                    self.connect_attempt.as_mut().unwrap().result = Some(result);
                 }
                 Ok(_) => {}
                 Err(mpsc::TryRecvError::Empty) => return Ok(None),
@@ -1701,6 +1635,20 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 }
             }
         }
+        // SME success can precede the awaited driver controlled-port effect.
+        // Retain it across turns and waiter loss until that handler completes.
+        if !self.mlme.is_idle() {
+            return Ok(None);
+        }
+        if !self.sme.status().is_connected() || !self.io.lock().unwrap().ethernet.is_link_up() {
+            return Err(ConnectError::Driver(DriverError::ConnectStateMismatch));
+        }
+        let attempt = self
+            .connect_attempt
+            .take()
+            .expect("connect attempt retained");
+        self.connection = Some(Connection::Active(attempt.transaction));
+        Ok(attempt.result)
     }
 
     fn finish_connect_error(&mut self, error: ConnectError) -> ConnectError {
@@ -1729,13 +1677,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let sme_quiescent = sme_is_retry_quiescent(&self.sme.status());
         let device_quiescent = sme_quiescent
             && self.mlme.is_idle()
-            && self
-                .device
-                .lock()
-                .unwrap()
-                .device
-                .finish_failed_connect_attempt()
-                .is_ok();
+            && self.device.finish_failed_connect_attempt().is_ok();
         let drained = device_quiescent && drain_completed_attempt(&self.upcalls);
         if drained {
             self.mlme.epoch.revoke();
@@ -1752,7 +1694,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         self.connection = None;
         revoke_and_drain(&self.upcalls);
         self.io.lock().unwrap().ethernet.teardown();
-        match self.device.lock().unwrap().device.reset() {
+        match self.device.reset() {
             Ok(()) => error,
             Err(_) => ConnectError::Containment,
         }
@@ -1793,7 +1735,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                     ) {
                         self.mlme.epoch.revoke();
                         self.io.lock().unwrap().ethernet.set_link(false);
-                        let result = self.device.lock().unwrap().device.set_link_up(false);
+                        let result = self.device.set_link_up(false);
                         if let Err(status) = result {
                             return Err(self.contain_error(ConnectError::Driver(
                                 DriverError::Ethernet(status),
@@ -2136,12 +2078,9 @@ mod tests {
         }
     }
 
-    fn parts(fake: Fake) -> (HostMlmeDevice<Fake>, Arc<Mutex<Effects>>) {
+    fn parts(fake: Fake) -> (HostMlmeDevice, DriverActor<Fake>, Arc<Mutex<Effects>>) {
         let effects = fake.0.clone();
-        let device = Arc::new(Mutex::new(StartedDevice {
-            device: fake,
-            stop_pending: true,
-        }));
+        let (mut actor, driver) = DriverActor::new(fake);
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
@@ -2151,7 +2090,7 @@ mod tests {
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
             minstrel: None,
         }));
-        (HostMlmeDevice::new(device, io), effects)
+        (HostMlmeDevice::new(driver, io), actor, effects)
     }
 
     fn wlan_channel() -> fidl_ieee80211::ChannelNumber {
@@ -2220,26 +2159,112 @@ mod tests {
     }
 
     #[test]
-    fn deferred_downcall_releases_driver_lock_and_reports_completion_error() {
+    fn actor_retains_admitted_completion_after_waiter_drop_and_revocation() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().retry_cleanup = true;
+            let (hardware_reply, completion) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(completion);
+            let (mut actor, handle) = DriverActor::new(fake);
+            let epoch = OperationEpoch::new();
+            let (reply, receiver) = oneshot::channel();
+            handle
+                .send(epoch.clone(), Command::Channel(Default::default(), reply))
+                .unwrap();
+            actor.drive_once().await.unwrap();
+            drop(receiver);
+            epoch.revoke();
+            assert_eq!(
+                actor.finish_failed_connect_attempt(),
+                Err(zx::Status::SHOULD_WAIT)
+            );
+            assert_eq!(effects.lock().unwrap().calls, ["channel"]);
+            hardware_reply
+                .send(Ok(()))
+                .expect("actor retained the hardware completion");
+            actor.drive_once().await.unwrap();
+            actor.finish_failed_connect_attempt().unwrap();
+            assert_eq!(
+                effects.lock().unwrap().calls,
+                ["channel", "finish_failed_connect_attempt"]
+            );
+        });
+    }
+
+    #[test]
+    fn full_actor_mailbox_discards_revoked_unpublished_work_before_cleanup_admission() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut actor, handle) = DriverActor::new(fake);
+            let epoch = OperationEpoch::new();
+            for _ in 0..256 {
+                let (reply, _receiver) = oneshot::channel();
+                handle
+                    .send(epoch.clone(), Command::Link(true, reply))
+                    .unwrap();
+            }
+            let (reply, _receiver) = oneshot::channel();
+            assert_eq!(
+                handle.send(epoch.clone(), Command::Link(true, reply)),
+                Err(zx::Status::NO_RESOURCES)
+            );
+            assert!(effects.lock().unwrap().calls.is_empty());
+            epoch.revoke();
+            let (reply, receiver) = oneshot::channel();
+            handle
+                .send(
+                    OperationEpoch::new(),
+                    Command::ClearAssociation(Default::default(), reply),
+                )
+                .unwrap();
+            actor.drive_once().await.unwrap();
+            assert_eq!(receiver.await.unwrap(), Ok(()));
+            assert_eq!(effects.lock().unwrap().calls, ["clear"]);
+        });
+    }
+
+    #[test]
+    fn revoked_link_completion_cannot_publish_an_ethernet_attachment() {
+        run_local_test(async {
+            let (fake, _) = Fake::new(0);
+            let (mut bridge, mut actor, _) = parts(fake);
+            let epoch = bridge.execution.epoch.borrow().clone();
+            let io = bridge.io.clone();
+            {
+                let mut operation = std::pin::pin!(bridge.set_ethernet_status(LinkStatus::UP));
+                assert!(operation.as_mut().now_or_never().is_none());
+                actor.drive_once().await.unwrap();
+                epoch.revoke();
+                actor.set_link_up(false).unwrap();
+                assert_eq!(operation.await, Err(zx::Status::CANCELED));
+            }
+            let io = io.lock().unwrap();
+            assert!(!io.ethernet.is_link_up());
+            assert!(io.pending_ethernet_devices.is_empty());
+        });
+    }
+
+    #[test]
+    fn deferred_downcall_leaves_exclusive_actor_available_and_reports_completion_error() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);
             let (reply, completion) = oneshot::channel();
             effects.lock().unwrap().channel_completion = Some(completion);
-            let (mut bridge, _) = parts(fake);
-            let device = bridge.device.clone();
+            let (mut bridge, mut actor, _) = parts(fake);
             let mut operation = std::pin::pin!(bridge.set_channel(
                 wlan_channel(),
                 fidl_ieee80211::ChannelBandwidth::Cbw20,
                 wlan_channel(),
             ));
             assert!(operation.as_mut().now_or_never().is_none());
-            assert!(
-                device.try_lock().is_ok(),
-                "downcall must release the driver before Pending"
-            );
+            actor.drive_once().await.unwrap();
             assert_eq!(effects.lock().unwrap().calls, ["channel"]);
+            assert!(!actor.drive_once().await.unwrap());
             reply.send(Err(zx::Status::IO)).unwrap();
-            assert_eq!(operation.await, Err(zx::Status::IO));
+            assert_eq!(
+                actor.run_until(operation).await.unwrap(),
+                Err(zx::Status::IO)
+            );
         });
     }
 
@@ -2271,40 +2296,42 @@ mod tests {
     fn host_mlme_device_forwards_the_complete_applicable_surface() {
         run_local_test(async {
             let (fake, _) = Fake::new(0);
-            let (mut device, effects) = parts(fake);
-            (async {
-                device.wlan_softmac_query_response().await.unwrap();
-                device.discovery_support().await.unwrap();
-                device.mac_sublayer_support().await.unwrap();
-                device.security_support().await.unwrap();
-                device.spectrum_management_support().await.unwrap();
-                device
-                    .set_channel(
-                        wlan_channel(),
-                        fidl_ieee80211::ChannelBandwidth::Cbw20,
-                        wlan_channel(),
-                    )
-                    .await
-                    .unwrap();
-                device.join_bss(&Default::default()).await.unwrap();
-                device.install_key(&Default::default()).await.unwrap();
-                device
-                    .notify_association_complete(Default::default())
-                    .await
-                    .unwrap();
-                device.clear_association(&Default::default()).await.unwrap();
-                device
-                    .start_passive_scan(&Default::default())
-                    .await
-                    .unwrap();
-                device.start_active_scan(&Default::default()).await.unwrap();
-                device.cancel_scan(&Default::default()).await.unwrap();
-                device
-                    .update_wmm_parameters(&Default::default())
-                    .await
-                    .unwrap();
-            })
-            .await;
+            let (mut device, mut actor, effects) = parts(fake);
+            actor
+                .run_until(async {
+                    device.wlan_softmac_query_response().await.unwrap();
+                    device.discovery_support().await.unwrap();
+                    device.mac_sublayer_support().await.unwrap();
+                    device.security_support().await.unwrap();
+                    device.spectrum_management_support().await.unwrap();
+                    device
+                        .set_channel(
+                            wlan_channel(),
+                            fidl_ieee80211::ChannelBandwidth::Cbw20,
+                            wlan_channel(),
+                        )
+                        .await
+                        .unwrap();
+                    device.join_bss(&Default::default()).await.unwrap();
+                    device.install_key(&Default::default()).await.unwrap();
+                    device
+                        .notify_association_complete(Default::default())
+                        .await
+                        .unwrap();
+                    device.clear_association(&Default::default()).await.unwrap();
+                    device
+                        .start_passive_scan(&Default::default())
+                        .await
+                        .unwrap();
+                    device.start_active_scan(&Default::default()).await.unwrap();
+                    device.cancel_scan(&Default::default()).await.unwrap();
+                    device
+                        .update_wmm_parameters(&Default::default())
+                        .await
+                        .unwrap();
+                })
+                .await
+                .unwrap();
             device
                 .send_wlan_frame(
                     vec![1, 0x40, 3].into(),
@@ -2312,6 +2339,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
+            actor.drive_once().await.unwrap();
             assert_eq!(
                 effects.lock().unwrap().calls,
                 [
@@ -2362,7 +2390,8 @@ mod tests {
     async fn drain_mlme(runtime: &mut ClientRuntime<Fake>) {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !runtime.mlme.is_idle() {
-                runtime.mlme.changed.notified().await;
+                runtime.pump_once().await.unwrap();
+                tokio::task::yield_now().await;
                 runtime.mlme.check().unwrap();
             }
         })
@@ -2451,6 +2480,7 @@ mod tests {
             assert_eq!(runtime.drive_connect_once().await.unwrap(), None);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while !effects.lock().unwrap().calls.contains(&"channel") {
+                    runtime.pump_once().await.unwrap();
                     tokio::task::yield_now().await;
                 }
             })
@@ -2491,6 +2521,7 @@ mod tests {
                 runtime.drive_connect_once().await.unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
                     while !effects.lock().unwrap().calls.contains(&"channel") {
+                        runtime.pump_once().await.unwrap();
                         tokio::task::yield_now().await;
                     }
                 })
@@ -3495,10 +3526,7 @@ mod tests {
                 .map(|_| ethernet_port(mac, capacity).unwrap())
                 .collect();
             let (fake, effects) = Fake::new(0);
-            let device = Arc::new(Mutex::new(StartedDevice {
-                device: fake,
-                stop_pending: false,
-            }));
+            let (mut actor, driver) = DriverActor::new(fake);
             let io = Arc::new(Mutex::new(HostIo {
                 ethernet,
                 replacement_ethernet: replacements,
@@ -3507,28 +3535,37 @@ mod tests {
                 ethernet_mac_address: mac,
                 minstrel: None,
             }));
-            let mut host_device = HostMlmeDevice::new(device, io.clone());
+            let mut host_device = HostMlmeDevice::new(driver, io.clone());
 
-            (host_device.set_ethernet_status(LinkStatus::UP))
+            actor
+                .run_until(host_device.set_ethernet_status(LinkStatus::UP))
                 .await
+                .unwrap()
                 .unwrap();
-            (host_device.set_ethernet_status(LinkStatus::DOWN))
+            actor
+                .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
                 .await
+                .unwrap()
                 .unwrap();
             assert!(io.lock().unwrap().ethernet.is_closed());
             assert_eq!(old_host.properties().unwrap().mac_address, mac);
 
             effects.lock().unwrap().link_failure = true;
             assert_eq!(
-                (host_device.set_ethernet_status(LinkStatus::UP)).await,
+                actor
+                    .run_until(host_device.set_ethernet_status(LinkStatus::UP))
+                    .await
+                    .unwrap(),
                 Err(zx::Status::IO)
             );
             assert!(io.lock().unwrap().ethernet.is_closed());
             assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
 
             effects.lock().unwrap().link_failure = false;
-            (host_device.set_ethernet_status(LinkStatus::UP))
+            actor
+                .run_until(host_device.set_ethernet_status(LinkStatus::UP))
                 .await
+                .unwrap()
                 .unwrap();
             let mut state = io.lock().unwrap();
             assert!(!state.ethernet.is_closed());
@@ -3538,15 +3575,22 @@ mod tests {
             assert_eq!(replacement.properties().unwrap().mac_address, mac);
             drop(state);
 
-            (host_device.set_ethernet_status(LinkStatus::UP))
+            actor
+                .run_until(host_device.set_ethernet_status(LinkStatus::UP))
                 .await
+                .unwrap()
                 .unwrap();
             assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
-            (host_device.set_ethernet_status(LinkStatus::DOWN))
+            actor
+                .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
                 .await
+                .unwrap()
                 .unwrap();
             assert_eq!(
-                (host_device.set_ethernet_status(LinkStatus::UP)).await,
+                actor
+                    .run_until(host_device.set_ethernet_status(LinkStatus::UP))
+                    .await
+                    .unwrap(),
                 Err(zx::Status::NO_RESOURCES)
             );
         });
@@ -3559,10 +3603,7 @@ mod tests {
             let make_host = || {
                 let (host, ethernet) = ethernet_port(mac, 3).unwrap();
                 let (fake, _) = Fake::new(0);
-                let device = Arc::new(Mutex::new(StartedDevice {
-                    device: fake,
-                    stop_pending: false,
-                }));
+                let (mut actor, driver) = DriverActor::new(fake);
                 let io = Arc::new(Mutex::new(HostIo {
                     ethernet,
                     replacement_ethernet: VecDeque::new(),
@@ -3571,12 +3612,14 @@ mod tests {
                     ethernet_mac_address: mac,
                     minstrel: None,
                 }));
-                (HostMlmeDevice::new(device, io.clone()), io)
+                (HostMlmeDevice::new(driver, io.clone()), actor, io)
             };
 
-            let (mut before_up, before_up_io) = make_host();
-            (before_up.set_ethernet_status(LinkStatus::DOWN))
+            let (mut before_up, mut before_actor, before_up_io) = make_host();
+            before_actor
+                .run_until(before_up.set_ethernet_status(LinkStatus::DOWN))
                 .await
+                .unwrap()
                 .unwrap();
             let before_up_io = before_up_io.lock().unwrap();
             assert!(before_up_io.unpublished_ethernet_device.is_none());
@@ -3584,9 +3627,11 @@ mod tests {
             assert!(before_up_io.ethernet.is_closed());
             drop(before_up_io);
 
-            let (mut while_pending, while_pending_io) = make_host();
-            (while_pending.set_ethernet_status(LinkStatus::UP))
+            let (mut while_pending, mut pending_actor, while_pending_io) = make_host();
+            pending_actor
+                .run_until(while_pending.set_ethernet_status(LinkStatus::UP))
                 .await
+                .unwrap()
                 .unwrap();
             assert_eq!(
                 while_pending_io
@@ -3596,8 +3641,10 @@ mod tests {
                     .len(),
                 1
             );
-            (while_pending.set_ethernet_status(LinkStatus::DOWN))
+            pending_actor
+                .run_until(while_pending.set_ethernet_status(LinkStatus::DOWN))
                 .await
+                .unwrap()
                 .unwrap();
             let while_pending_io = while_pending_io.lock().unwrap();
             assert!(while_pending_io.unpublished_ethernet_device.is_none());

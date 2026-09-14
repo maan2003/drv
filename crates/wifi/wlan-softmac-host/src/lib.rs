@@ -9,6 +9,7 @@
 
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
+mod driver;
 pub mod ethernet;
 pub mod runtime;
 
