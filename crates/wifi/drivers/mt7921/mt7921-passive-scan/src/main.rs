@@ -171,6 +171,12 @@ fn run() -> Result<(), String> {
     let setup =
         Mt7921HardwareSessionConfig::setup(required("DRV_VFIO_DEVICE")?, &required("DRV_PCI_BDF")?)
             .map_err(|error| format!("prepare device capabilities: {error:?}"))?;
+    let setup = {
+        let _entered = executor.enter();
+        setup
+            .with_async_interrupt()
+            .map_err(|error| format!("register device IRQ: {error:?}"))?
+    };
     let config = setup
         .lock_down_with_service(service)
         .map_err(|error| format!("lock down MT7921 service: {error}"))?;

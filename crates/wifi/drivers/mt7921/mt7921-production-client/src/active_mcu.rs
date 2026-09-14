@@ -155,7 +155,13 @@ impl<B: Backend> LoaderMechanicsTransport for ActiveMcuViews<'_, B> {
         )
     }
     fn enable_response_interrupts(&mut self, mask: u32) -> Result<(), Self::Error> {
-        self.wfdma.write_u32(HOST_INT_ENABLE, mask)
+        // This serialized hardware owner also drives data rings. MCU service
+        // must not replace the full interrupt mask with its response subset.
+        let enabled = self.wfdma.read_u32(HOST_INT_ENABLE)?;
+        if enabled == u32::MAX {
+            return Err(drv_hardware::Error::DeviceFault);
+        }
+        self.wfdma.write_u32(HOST_INT_ENABLE, enabled | mask)
     }
     fn publish_command_producer(&mut self, producer: u16) -> Result<(), Self::Error> {
         self.wfdma.write_u32(MCU_TX_CIDX, u32::from(producer))
@@ -200,7 +206,14 @@ impl<B: Backend> LoaderMechanicsTransport for ActiveMcuViews<'_, B> {
         Ok(true)
     }
     fn mask_response_interrupts(&mut self) -> Result<(), Self::Error> {
-        self.wfdma.write_u32(HOST_INT_ENABLE, 0)
+        let enabled = self.wfdma.read_u32(HOST_INT_ENABLE)?;
+        if enabled == u32::MAX {
+            return Err(drv_hardware::Error::DeviceFault);
+        }
+        self.wfdma.write_u32(
+            HOST_INT_ENABLE,
+            enabled & !mt7921_core::MT7921_LOADER_RESPONSE_IRQ_MASK,
+        )
     }
     fn response_interrupt_status(&mut self) -> Result<u32, Self::Error> {
         self.wfdma.read_u32(HOST_INT_STATUS)

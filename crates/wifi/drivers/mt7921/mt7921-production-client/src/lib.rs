@@ -168,6 +168,14 @@ fn verified_vfio_pci_paths(
 }
 
 impl Mt7921HardwareSessionSetup {
+    /// Register the inert IRQ capability with the entered Linux service
+    /// reactor before lockdown. Ownership stays inside the VFIO capability.
+    pub fn with_async_interrupt(self) -> Result<Self, LinuxVfioError> {
+        Ok(Self {
+            vfio: self.vfio.with_async_interrupt()?,
+        })
+    }
+
     pub fn lock_down(self) -> Result<Mt7921HardwareSessionConfig, linux_self_sandbox::Error> {
         Ok(Mt7921HardwareSessionConfig {
             vfio: self.vfio.lock_down()?,

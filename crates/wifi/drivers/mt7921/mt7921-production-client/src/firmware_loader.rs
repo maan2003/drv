@@ -249,7 +249,6 @@ impl<B: Backend, P: ActivationPci> FirmwareLoaderTransport for ProductionFirmwar
 mod tests {
     use super::*;
     use crate::{HardwareResource, activation::ActivationPci};
-    use drv_hardware::Device;
     use drv_hardware_backends::DeterministicBackend;
     use mt7921_core::{BusMasterState, InterruptInstallState};
 
@@ -277,7 +276,7 @@ mod tests {
 
     #[test]
     fn real_loader_scatter_deadline_is_non_irq_and_cleanup_is_shared_quiesce() {
-        let device = Device::from_backend(DeterministicBackend::default());
+        let (device, _) = DeterministicBackend::recording_mt7921_activation_device();
         let (mut resources, mut acquisition) = OwnedHardwareResources::acquire(device).unwrap();
         resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
         acquisition.record(HardwareResource::Interrupt);
@@ -310,6 +309,53 @@ mod tests {
             receive: &mut receive,
             start: Instant::now(),
         };
+        loader
+            .with_views(|_, views| {
+                use mt7921_core::LoaderMechanicsTransport;
+                let response_mask = mt7921_core::MT7921_LOADER_RESPONSE_IRQ_MASK;
+                let data_mask = 1 << 2;
+                views
+                    .wfdma
+                    .write_u32(0x204, data_mask)
+                    .map_err(LoaderMechanicsError::Transport)?;
+                views
+                    .enable_response_interrupts(response_mask)
+                    .map_err(LoaderMechanicsError::Transport)?;
+                assert_eq!(
+                    views.wfdma.read_u32(0x204).unwrap(),
+                    data_mask | response_mask
+                );
+                views
+                    .mask_response_interrupts()
+                    .map_err(LoaderMechanicsError::Transport)?;
+                assert_eq!(views.wfdma.read_u32(0x204).unwrap(), data_mask);
+                views
+                    .enable_response_interrupts(response_mask)
+                    .map_err(LoaderMechanicsError::Transport)?;
+                assert_eq!(
+                    views.wfdma.read_u32(0x204).unwrap(),
+                    data_mask | response_mask
+                );
+                views
+                    .wfdma
+                    .write_u32(0x204, u32::MAX)
+                    .map_err(LoaderMechanicsError::Transport)?;
+                assert_eq!(
+                    views.mask_response_interrupts(),
+                    Err(drv_hardware::Error::DeviceFault)
+                );
+                assert_eq!(
+                    views.enable_response_interrupts(response_mask),
+                    Err(drv_hardware::Error::DeviceFault)
+                );
+                assert_eq!(views.wfdma.read_u32(0x204).unwrap(), u32::MAX);
+                views
+                    .wfdma
+                    .write_u32(0x204, data_mask | response_mask)
+                    .map_err(LoaderMechanicsError::Transport)?;
+                Ok(())
+            })
+            .unwrap();
         let sequence = loader.next_sequence().unwrap();
         loader
             .publish_scatter(FirmwareImagePart::Patch, sequence, &[0x5a; 64])
