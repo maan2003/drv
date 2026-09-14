@@ -17,10 +17,17 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use fidl_fuchsia_wlan_sme as sme;
 use futures::{
-    StreamExt as _,
+    FutureExt as _, StreamExt as _,
     channel::{mpsc, oneshot},
 };
-use std::{fs::File, os::fd::OwnedFd, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    fs::File,
+    os::fd::OwnedFd,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 use wlancfg_selection::{
     client::{
         connection_selection::{ConnectionSelector, ConnectionSelectorApi as _},
@@ -88,6 +95,13 @@ impl ScanRequestApi for ControlScan {
 struct Machine {
     client: state_machine::Client,
     status: StateMachineStatusReader<state_machine::Status>,
+    network: NetworkIdentifier,
+}
+
+#[derive(Default)]
+struct PolicyState {
+    desired: Option<NetworkIdentifier>,
+    machine: Option<Machine>,
 }
 
 fn start_machine(
@@ -96,6 +110,7 @@ fn start_machine(
     telemetry: TelemetrySender,
     selection: ConnectSelection,
 ) -> Machine {
+    let network = selection.target.network.clone();
     let event_stream = control.take_event_stream();
     let transport: Rc<dyn ClientSmeTransport> = Rc::new(control);
     let (request_tx, request_rx) = mpsc::channel(4);
@@ -123,7 +138,11 @@ fn start_machine(
         let _receivers = (listener_rx, defect_rx, roam_rx);
         machine.await;
     });
-    Machine { client, status }
+    Machine {
+        client,
+        status,
+        network,
+    }
 }
 
 /// Load persistence before opening either untrusted IPC receive path, then run
@@ -169,41 +188,118 @@ pub fn serve(
             inspector.root().create_child("selection"),
             telemetry.clone(),
         );
-        let mut current: Option<NetworkIdentifier> = None;
-        let mut machine: Option<Machine> = None;
-
-        if let Some(target) = selector
-            .find_and_select_connection_candidate(None, ConnectReason::IdleInterfaceAutoconnect)
-            .await
-        {
-            current = Some(target.network.clone());
-            machine = Some(start_machine(
-                control.clone(),
-                saved.clone(),
-                telemetry.clone(),
-                ConnectSelection {
-                    target,
-                    reason: ConnectReason::IdleInterfaceAutoconnect,
+        let state = RefCell::new(PolicyState::default());
+        let cancelled = Cell::new(false);
+        let startup = async {
+            if let Some(target) = selector
+                .find_and_select_connection_candidate(None, ConnectReason::IdleInterfaceAutoconnect)
+                .await
+                && !cancelled.get()
+            {
+                state.borrow_mut().desired = Some(target.network.clone());
+                state.borrow_mut().machine = Some(start_machine(
+                    control.clone(),
+                    saved.clone(),
+                    telemetry.clone(),
+                    ConnectSelection {
+                        target,
+                        reason: ConnectReason::IdleInterfaceAutoconnect,
+                    },
+                ));
+            }
+            Reply::Ok
+        };
+        let (_, mut queued) = drive_operation(startup, &mut commands, &state, &cancelled).await;
+        loop {
+            let command = match queued.take() {
+                Some(command) => command,
+                None => match commands.next().await {
+                    Some(command) => command,
+                    None => break,
                 },
-            ));
-        }
-
-        while let Some(command) = commands.next().await {
-            let reply = handle(
+            };
+            cancelled.set(false);
+            let operation = handle(
                 command.request,
                 &control,
                 scan.as_ref(),
                 &selector,
                 saved.clone(),
                 telemetry.clone(),
-                &mut machine,
-                &mut current,
-            )
-            .await;
+                &state,
+                &cancelled,
+            );
+            let (reply, next) = drive_operation(operation, &mut commands, &state, &cancelled).await;
             let _ = command.responder.send(reply);
+            queued = next;
         }
         Ok(())
     })
+}
+
+/// Keep one mutating operation alive until completion. Cancelling intent does
+/// not drop its transport future: scan/connect replies must still be drained.
+async fn drive_operation(
+    operation: impl std::future::Future<Output = Reply>,
+    commands: &mut mpsc::Receiver<ApplicationCommand>,
+    state: &RefCell<PolicyState>,
+    cancelled: &Cell<bool>,
+) -> (Reply, Option<ApplicationCommand>) {
+    let operation = operation.fuse();
+    futures::pin_mut!(operation);
+    let mut queued = None;
+    loop {
+        futures::select_biased! {
+            reply = operation => return (reply, queued),
+            command = commands.next().fuse() => match command {
+                Some(command) => match command.request {
+                    Request::Status => {
+                        let _ = command.responder.send(Reply::Status(policy_status(&state.borrow())));
+                    }
+                    Request::Disconnect => {
+                        cancelled.set(true);
+                        state.borrow_mut().desired = None;
+                        if let Some(previous) = queued.replace(command) {
+                            let _ = previous.responder.send(Reply::Error("superseded by disconnect".into()));
+                        }
+                    }
+                    _ if queued.is_none() => queued = Some(command),
+                    _ => {
+                        let _ = command.responder.send(Reply::Error("policy operation busy".into()));
+                    }
+                },
+                None => {
+                    cancelled.set(true);
+                    return (operation.await, queued);
+                }
+            },
+        }
+    }
+}
+
+async fn disconnect_machine(
+    state: &RefCell<PolicyState>,
+    reason: types::DisconnectReason,
+) -> Reply {
+    let receiver = {
+        let mut state = state.borrow_mut();
+        let Some(active) = state
+            .machine
+            .as_mut()
+            .filter(|value| value.client.is_alive())
+        else {
+            return Reply::Ok;
+        };
+        let (tx, rx) = oneshot::channel();
+        if active.client.disconnect(reason, tx).is_err() {
+            return Reply::Error("disconnect policy unavailable".into());
+        }
+        rx
+    };
+    match receiver.await {
+        Ok(()) => Reply::Ok,
+        Err(_) => Reply::Error("disconnect failed".into()),
+    }
 }
 
 async fn handle(
@@ -213,8 +309,8 @@ async fn handle(
     selector: &ConnectionSelector,
     saved: Arc<dyn SavedNetworksManagerApi>,
     telemetry: TelemetrySender,
-    machine: &mut Option<Machine>,
-    current: &mut Option<NetworkIdentifier>,
+    state: &RefCell<PolicyState>,
+    cancelled: &Cell<bool>,
 ) -> Reply {
     match request {
         Request::Scan => match scan
@@ -249,6 +345,7 @@ async fn handle(
             credential,
         } => {
             let id = network_id(ssid, security);
+            state.borrow_mut().desired = Some(id.clone());
             let credential = if security == Security::Open {
                 Credential::None
             } else {
@@ -270,57 +367,33 @@ async fn handle(
                 target,
                 reason: ConnectReason::FidlConnectRequest,
             };
-            if machine
-                .as_ref()
-                .is_some_and(|value| value.client.is_alive())
-            {
-                let (disconnected_tx, disconnected_rx) = oneshot::channel();
-                if machine
-                    .as_mut()
-                    .unwrap()
-                    .client
-                    .disconnect(types::DisconnectReason::FidlConnectRequest, disconnected_tx)
-                    .is_err()
-                    || disconnected_rx.await.is_err()
-                {
-                    return Reply::Error("connection policy unavailable".into());
-                }
+            if cancelled.get() {
+                return Reply::Error("connection cancelled".into());
             }
-            *current = None;
-            *machine = Some(start_machine(
+            let disconnected =
+                disconnect_machine(state, types::DisconnectReason::FidlConnectRequest).await;
+            if disconnected != Reply::Ok {
+                return disconnected;
+            }
+            if cancelled.get() {
+                return Reply::Error("connection cancelled".into());
+            }
+            state.borrow_mut().machine = Some(start_machine(
                 control.clone(),
                 saved.clone(),
                 telemetry,
                 selection,
             ));
-            // The target belongs to this fresh state-machine generation. Keep
-            // it across a bounded request wait so a later policy retry cannot
-            // report Connected without the identity it is connecting to.
-            *current = Some(id);
-            wait_for_connection(machine.as_ref().unwrap()).await
+            wait_for_connection(state, cancelled).await
         }
-        Request::Status => Reply::Status(policy_status(machine.as_ref(), current)),
+        Request::Status => Reply::Status(policy_status(&state.borrow())),
         Request::Disconnect => {
-            let Some(active) = machine.as_mut().filter(|value| value.client.is_alive()) else {
-                *current = None;
-                return Reply::Ok;
-            };
-            let (tx, rx) = oneshot::channel();
-            if active
-                .client
-                .disconnect(
-                    types::DisconnectReason::FidlStopClientConnectionsRequest,
-                    tx,
-                )
-                .is_err()
-            {
-                return Reply::Error("disconnect policy unavailable".into());
-            }
-            if rx.await.is_err() {
-                return Reply::Error("disconnect failed".into());
-            }
-            *current = None;
-            Reply::Ok
+            state.borrow_mut().desired = None;
+            disconnect_machine(
+                state,
+                types::DisconnectReason::FidlStopClientConnectionsRequest,
+            )
+            .await
         }
         Request::Saved => {
             let values = saved
@@ -337,18 +410,21 @@ async fn handle(
         }
         Request::Forget { ssid, security } => {
             let id = network_id(ssid, security);
-            if current.as_ref() == Some(&id) {
-                if let Some(active) = machine.as_mut().filter(|value| value.client.is_alive()) {
-                    let (tx, rx) = oneshot::channel();
-                    if active
-                        .client
-                        .disconnect(types::DisconnectReason::NetworkUnsaved, tx)
-                        .is_ok()
-                    {
-                        let _ = rx.await;
-                    }
+            let is_current = {
+                let state = state.borrow();
+                state.desired.as_ref() == Some(&id)
+                    || state
+                        .machine
+                        .as_ref()
+                        .is_some_and(|machine| machine.network == id)
+            };
+            if is_current {
+                state.borrow_mut().desired = None;
+                let disconnected =
+                    disconnect_machine(state, types::DisconnectReason::NetworkUnsaved).await;
+                if disconnected != Reply::Ok {
+                    return disconnected;
                 }
-                *current = None;
             }
             match saved.remove(id).await {
                 Ok(true) => Reply::Ok,
@@ -359,29 +435,44 @@ async fn handle(
     }
 }
 
-async fn wait_for_connection(machine: &Machine) -> Reply {
-    let mut saw_progress = false;
-    for _ in 0..500 {
-        match machine.status.read_status() {
-            Ok(state_machine::Status::Connected { .. }) => return Reply::Ok,
-            Ok(state_machine::Status::Connecting | state_machine::Status::Disconnecting) => {
-                saw_progress = true
-            }
-            Ok(state_machine::Status::Disconnected)
-                if saw_progress && !machine.client.is_alive() =>
-            {
-                return Reply::Error("connection failed".into());
-            }
-            Err(_) => return Reply::Error("connection status unavailable".into()),
-            _ => {}
+async fn wait_for_connection(state: &RefCell<PolicyState>, cancelled: &Cell<bool>) -> Reply {
+    loop {
+        if cancelled.get() {
+            // Keep the state machine and transport/event consumer alive until
+            // disconnect acknowledges quiescence, before completing Connect.
+            let disconnected = disconnect_machine(
+                state,
+                types::DisconnectReason::FidlStopClientConnectionsRequest,
+            )
+            .await;
+            return if disconnected == Reply::Ok {
+                Reply::Error("connection cancelled".into())
+            } else {
+                disconnected
+            };
         }
+        {
+            let state = state.borrow();
+            let machine = state.machine.as_ref().expect("connecting machine");
+            match machine.status.read_status() {
+                Ok(state_machine::Status::Connected { .. }) => return Reply::Ok,
+                Ok(state_machine::Status::Disconnected) if !machine.client.is_alive() => {
+                    return Reply::Error("connection failed".into());
+                }
+                Err(_) => return Reply::Error("connection status unavailable".into()),
+                _ => {}
+            }
+        }
+        // The actual connection operation owns its timeout. Do not report a
+        // second, shorter timeout while its state machine is still connecting.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Reply::Error("connection timed out".into())
 }
 
-fn policy_status(machine: Option<&Machine>, current: &Option<NetworkIdentifier>) -> Status {
-    let association = machine
+fn policy_status(state: &PolicyState) -> Status {
+    let association = state
+        .machine
+        .as_ref()
         .and_then(|value| value.status.read_status().ok())
         .map_or(Association::Disconnected, |status| match status {
             state_machine::Status::Disconnected => Association::Disconnected,
@@ -393,10 +484,15 @@ fn policy_status(machine: Option<&Machine>, current: &Option<NetworkIdentifier>)
                 snr_db: snr,
             },
         });
-    Status {
-        association,
-        ssid: current.as_ref().map(|id| id.ssid.to_vec()),
-    }
+    let ssid = if association == Association::Disconnected {
+        None
+    } else {
+        state
+            .machine
+            .as_ref()
+            .map(|machine| machine.network.ssid.to_vec())
+    };
+    Status { association, ssid }
 }
 
 fn network_id(ssid: Vec<u8>, security: Security) -> NetworkIdentifier {
@@ -426,5 +522,103 @@ fn scan_security(security: sme::Protection) -> Option<Security> {
         | sme::Protection::Wpa1Wpa2PersonalTkipOnly => Some(Security::Wpa2),
         sme::Protection::Wpa3Personal | sme::Protection::Wpa2Wpa3Personal => Some(Security::Wpa3),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc as sync_mpsc;
+
+    #[test]
+    fn status_and_disconnect_progress_without_dropping_the_active_operation() {
+        let state = RefCell::new(PolicyState::default());
+        let cancelled = Cell::new(false);
+        let (mut commands, mut incoming) = mpsc::channel(4);
+        let (complete, completion) = oneshot::channel();
+        let operation = async { completion.await.unwrap() };
+        let mut driving = Box::pin(drive_operation(
+            operation,
+            &mut incoming,
+            &state,
+            &cancelled,
+        ));
+        let (status_tx, status_rx) = sync_mpsc::sync_channel(1);
+        commands
+            .try_send(ApplicationCommand {
+                request: Request::Status,
+                responder: status_tx,
+            })
+            .unwrap();
+        assert!(driving.as_mut().now_or_never().is_none());
+        assert!(matches!(status_rx.try_recv().unwrap(), Reply::Status(_)));
+
+        let (disconnect_tx, disconnect_rx) = sync_mpsc::sync_channel(1);
+        commands
+            .try_send(ApplicationCommand {
+                request: Request::Disconnect,
+                responder: disconnect_tx,
+            })
+            .unwrap();
+        assert!(driving.as_mut().now_or_never().is_none());
+        assert!(cancelled.get());
+        assert!(
+            disconnect_rx.try_recv().is_err(),
+            "receipt is not quiescence"
+        );
+        complete.send(Reply::Ok).unwrap();
+        let (reply, queued) = futures::executor::block_on(driving);
+        assert_eq!(reply, Reply::Ok);
+        assert!(matches!(queued.unwrap().request, Request::Disconnect));
+    }
+
+    #[test]
+    fn actual_status_identity_does_not_follow_new_desired_network() {
+        let (tx, _rx) = mpsc::channel(4);
+        let (publisher, status) = status_publisher_and_reader();
+        publisher.publish_status(state_machine::Status::Connected {
+            channel: 6,
+            rssi: -40,
+            snr: 30,
+        });
+        let state = PolicyState {
+            desired: Some(network_id(b"new-intent".to_vec(), Security::Wpa3)),
+            machine: Some(Machine {
+                client: state_machine::Client::new(tx),
+                status,
+                network: network_id(b"actual-peer".to_vec(), Security::Wpa3),
+            }),
+        };
+        assert_eq!(policy_status(&state).ssid, Some(b"actual-peer".to_vec()));
+        publisher.publish_status(state_machine::Status::Disconnected);
+        assert_eq!(policy_status(&state).ssid, None);
+    }
+
+    #[test]
+    fn cancelled_connect_waits_for_state_machine_disconnect_acknowledgment() {
+        let (tx, mut requests) = mpsc::channel(4);
+        let (publisher, status) = status_publisher_and_reader();
+        publisher.publish_status(state_machine::Status::Connecting);
+        let state = RefCell::new(PolicyState {
+            desired: None,
+            machine: Some(Machine {
+                client: state_machine::Client::new(tx),
+                status,
+                network: network_id(b"ap".to_vec(), Security::Wpa3),
+            }),
+        });
+        let cancelled = Cell::new(true);
+        let mut waiting = Box::pin(wait_for_connection(&state, &cancelled));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        let state_machine::ManualRequest::Disconnect((_, ack)) = requests.try_recv().unwrap()
+        else {
+            panic!("cancellation must explicitly disconnect");
+        };
+        assert!(waiting.as_mut().now_or_never().is_none());
+        ack.send(()).unwrap();
+        assert_eq!(
+            futures::executor::block_on(waiting),
+            Reply::Error("connection cancelled".into())
+        );
     }
 }

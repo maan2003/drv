@@ -13,6 +13,7 @@ const MAGIC: &[u8; 4] = b"WLP1";
 const MAX_SSID: usize = 32;
 const MAX_SECRET: usize = 63;
 const MAX_ITEMS: usize = 64;
+const MAX_APPLICATION_CLIENTS: usize = 16;
 
 use futures::channel::mpsc;
 use std::{
@@ -44,6 +45,10 @@ impl PreparedApplicationServer {
                 io::ErrorKind::InvalidInput,
                 "application fd is not a listening Unix seqpacket socket",
             ));
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
         }
         Ok(Self { listener })
     }
@@ -101,48 +106,122 @@ impl ParkedApplicationServer {
     }
 }
 
-fn serve_applications(listener: OwnedFd, mut commands: mpsc::Sender<ApplicationCommand>) {
-    loop {
-        let client = unsafe {
-            libc::accept4(
-                listener.as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            )
-        };
-        if client < 0 {
-            match io::Error::last_os_error().kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                _ => return,
-            }
+enum ApplicationExchange {
+    Receiving { deadline: Instant },
+    Waiting(sync_mpsc::Receiver<Reply>),
+    Sending { packet: Vec<u8>, deadline: Instant },
+}
+
+struct ApplicationClient {
+    fd: OwnedFd,
+    exchange: ApplicationExchange,
+}
+
+impl ApplicationClient {
+    fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            exchange: ApplicationExchange::Receiving {
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
         }
-        let client = unsafe { OwnedFd::from_raw_fd(client) };
-        let reply = match receive_one(client.as_raw_fd()).and_then(|packet| {
-            decode_request(&packet)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid command"))
-        }) {
-            Ok(request) => {
-                let (reply_tx, reply_rx) = sync_mpsc::sync_channel(0);
+    }
+
+    fn reply(&mut self, reply: Reply) -> bool {
+        let Ok(packet) = encode_reply(&reply) else {
+            return false;
+        };
+        self.exchange = ApplicationExchange::Sending {
+            packet,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        true
+    }
+
+    /// Do at most one nonblocking operation per client, so a slow request,
+    /// policy operation or reply reader cannot stall other applications.
+    fn poll(&mut self, commands: &mut mpsc::Sender<ApplicationCommand>) -> bool {
+        match &mut self.exchange {
+            ApplicationExchange::Receiving { deadline } => {
+                let mut packet = [0u8; MAX_PACKET + 1];
+                let count = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        packet.as_mut_ptr().cast(),
+                        packet.len(),
+                    )
+                };
+                if count < 0 {
+                    return io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < *deadline;
+                }
+                let request = usize::try_from(count)
+                    .ok()
+                    .filter(|count| (1..=MAX_PACKET).contains(count))
+                    .and_then(|count| decode_request(&packet[..count]).ok());
+                let Some(request) = request else {
+                    return self.reply(Reply::Error("invalid application request".into()));
+                };
+                // The policy executor must never block on the socket owner
+                // being scheduled; each one-shot reply has one reserved slot.
+                let (reply_tx, reply_rx) = sync_mpsc::sync_channel(1);
                 match commands.try_send(ApplicationCommand {
                     request,
                     responder: reply_tx,
                 }) {
-                    Ok(()) => reply_rx
-                        .recv()
-                        .unwrap_or_else(|_| Reply::Error("policy generation ended".into())),
-                    Err(_) => Reply::Error("policy command queue unavailable".into()),
+                    Ok(()) => {
+                        self.exchange = ApplicationExchange::Waiting(reply_rx);
+                        true
+                    }
+                    Err(_) => self.reply(Reply::Error("policy command queue unavailable".into())),
                 }
             }
-            Err(_) => Reply::Error("invalid application request".into()),
-        };
-        if let Ok(packet) = encode_reply(&reply) {
-            let _ = send_one(client.as_raw_fd(), &packet);
+            ApplicationExchange::Waiting(receiver) => match receiver.try_recv() {
+                Ok(reply) => self.reply(reply),
+                Err(sync_mpsc::TryRecvError::Empty) => true,
+                Err(sync_mpsc::TryRecvError::Disconnected) => {
+                    self.reply(Reply::Error("policy generation ended".into()))
+                }
+            },
+            ApplicationExchange::Sending { packet, deadline } => {
+                let count = unsafe {
+                    libc::write(self.fd.as_raw_fd(), packet.as_ptr().cast(), packet.len())
+                };
+                if count >= 0 {
+                    return false; // Complete or short send: never send a second packet.
+                }
+                io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+                    && Instant::now() < *deadline
+            }
         }
+    }
+}
+
+fn serve_applications(listener: OwnedFd, mut commands: mpsc::Sender<ApplicationCommand>) {
+    let mut clients = Vec::with_capacity(MAX_APPLICATION_CLIENTS);
+    loop {
+        if clients.len() < MAX_APPLICATION_CLIENTS {
+            let client = unsafe {
+                libc::accept4(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                )
+            };
+            if client >= 0 {
+                clients.push(ApplicationClient::new(unsafe {
+                    OwnedFd::from_raw_fd(client)
+                }));
+            } else if !matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                return;
+            }
+        }
+        clients.retain_mut(|client| client.poll(&mut commands));
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -624,6 +703,95 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn client_pair() -> (ApplicationClient, OwnedFd) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        unsafe {
+            (
+                ApplicationClient::new(OwnedFd::from_raw_fd(fds[0])),
+                OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn pending_connect_reply_does_not_block_another_client_status() {
+        let (mut connect, connect_peer) = client_pair();
+        let (mut status, status_peer) = client_pair();
+        let (mut commands, mut requests) = mpsc::channel(4);
+        send_one(
+            connect_peer.as_raw_fd(),
+            &encode_request(&Request::Connect {
+                ssid: b"ap".to_vec(),
+                security: Security::Open,
+                credential: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(connect.poll(&mut commands));
+        let pending_connect = requests.try_recv().unwrap();
+        assert!(matches!(pending_connect.request, Request::Connect { .. }));
+        // No connect response is available; this poll must return immediately.
+        assert!(connect.poll(&mut commands));
+
+        send_one(
+            status_peer.as_raw_fd(),
+            &encode_request(&Request::Status).unwrap(),
+        )
+        .unwrap();
+        assert!(status.poll(&mut commands));
+        let status_request = requests.try_recv().unwrap();
+        assert_eq!(status_request.request, Request::Status);
+        status_request.responder.send(Reply::Ok).unwrap();
+        assert!(status.poll(&mut commands));
+        assert!(!status.poll(&mut commands));
+        assert_eq!(
+            decode_reply(&receive_one(status_peer.as_raw_fd()).unwrap()).unwrap(),
+            Reply::Ok
+        );
+
+        pending_connect
+            .responder
+            .send(Reply::Error("cancelled".into()))
+            .unwrap();
+        assert!(connect.poll(&mut commands));
+        assert!(!connect.poll(&mut commands));
+        assert_eq!(
+            decode_reply(&receive_one(connect_peer.as_raw_fd()).unwrap()).unwrap(),
+            Reply::Error("cancelled".into())
+        );
+    }
+
+    #[test]
+    fn incomplete_client_expires_without_stalling_a_complete_request() {
+        let (mut slow, _slow_peer) = client_pair();
+        let (mut ready, ready_peer) = client_pair();
+        let (mut commands, mut requests) = mpsc::channel(4);
+        assert!(slow.poll(&mut commands));
+        send_one(
+            ready_peer.as_raw_fd(),
+            &encode_request(&Request::Disconnect).unwrap(),
+        )
+        .unwrap();
+        assert!(ready.poll(&mut commands));
+        assert_eq!(requests.try_recv().unwrap().request, Request::Disconnect);
+        slow.exchange = ApplicationExchange::Receiving {
+            deadline: Instant::now(),
+        };
+        assert!(!slow.poll(&mut commands));
+    }
+
     #[test]
     fn request_round_trip_and_debug_redacts_secret() {
         let request = Request::Connect {

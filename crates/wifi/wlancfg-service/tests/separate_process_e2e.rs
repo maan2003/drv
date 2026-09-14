@@ -181,13 +181,46 @@ fn parent() -> anyhow::Result<()> {
     let status = cli(&switch_socket, &["status"], None)?;
     let status = String::from_utf8(status.stdout)?;
     assert!(
-        status.contains("association=disconnected") && status.contains("ssid=second-target"),
-        "fresh machine did not retain its target identity after failure: {status}"
+        status.contains("association=disconnected") && !status.contains("ssid="),
+        "failed desired target was reported as an actual association: {status}"
     );
     let switching_wifi = switching.stop()?;
     assert!(
         lines(&switching_wifi, "CONNECT ").len() >= 2,
         "second request never reached Wi-Fi runtime: {switching_wifi}"
+    );
+
+    drop(switch_listener);
+    drop(switch_state);
+    let cancel_state = TestDirectory::new()?;
+    let cancel_socket = cancel_state.path().join("wlancfg.sock");
+    let cancel_listener = application_listener(&cancel_socket)?;
+    let cancelling = start_generation(&cancel_state, &cancel_listener, "pending-until-cancelled")?;
+    let mut connecting = start_cli(
+        &cancel_socket,
+        &["connect", "selected-network", "wpa3"],
+        Some(PASSWORD),
+    )?;
+    wait_status(&cancel_socket, "association=connecting")?;
+    assert!(
+        connecting.try_wait()?.is_none(),
+        "fixture must still be connecting"
+    );
+    let began_disconnect = Instant::now();
+    require_success(
+        &cli(&cancel_socket, &["disconnect"], None)?,
+        "cancel pending connect",
+    )?;
+    assert!(
+        began_disconnect.elapsed() < Duration::from_secs(5),
+        "disconnect waited for the 30-second connection deadline"
+    );
+    assert!(!connecting.wait_with_output()?.status.success());
+    wait_status(&cancel_socket, "association=disconnected")?;
+    let cancelled_wifi = cancelling.stop()?;
+    assert_eq!(
+        lines(&cancelled_wifi, "CONNECT_CANCELLED_AND_QUIESCENT").len(),
+        1
     );
 
     Ok(())
@@ -244,6 +277,10 @@ fn start_generation(
 }
 
 fn cli(path: &Path, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Output> {
+    Ok(start_cli(path, args, input)?.wait_with_output()?)
+}
+
+fn start_cli(path: &Path, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Child> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wlanctl"));
     command
         .arg("--socket")
@@ -260,7 +297,7 @@ fn cli(path: &Path, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Outpu
     if let Some(input) = input {
         child.stdin.take().unwrap().write_all(input)?;
     }
-    Ok(child.wait_with_output()?)
+    Ok(child)
 }
 fn require_success(output: &Output, operation: &str) -> anyhow::Result<()> {
     if output.status.success() {
@@ -487,6 +524,9 @@ impl WifiRuntime for FixtureWifi {
         Ok(())
     }
     async fn drive_connect_once(&mut self) -> Result<Option<sme::ConnectResult>, RuntimeError> {
+        if self.scenario == "pending-until-cancelled" {
+            return Ok(None);
+        }
         let Some(request) = self.pending_connect.take() else {
             return Ok(None);
         };
@@ -536,7 +576,14 @@ impl WifiRuntime for FixtureWifi {
         _: sme::UserDisconnectReason,
         _: Instant,
     ) -> Result<sme::ConnectResult, RuntimeError> {
-        unreachable!()
+        assert_eq!(self.scenario, "pending-until-cancelled");
+        assert!(self.pending_connect.take().is_some());
+        println!("CONNECT_CANCELLED_AND_QUIESCENT");
+        Ok(sme::ConnectResult {
+            code: ieee::StatusCode::RefusedReasonUnspecified,
+            is_credential_rejected: false,
+            is_reconnect: false,
+        })
     }
     fn roam(&mut self, _: sme::RoamRequest) -> Result<(), RuntimeError> {
         Ok(())

@@ -35,9 +35,40 @@ Durable credentials stay in policy. Wi-Fi receives only the active attempt's
 authentication material and session keys. Netstack3 and DNS have no device or
 DMA authority. Device assignment, sandboxing and child-specific restart belong
 to one lifecycle authority, not connection policy. A surviving containment
-owner must retain the authority needed after driver death; process exit or a
-successful kill is never evidence of hardware containment. Restart requires
-verified containment, otherwise quarantine/escalation.
+owner governs restart after driver death. Kernel VFIO/IOMMUFD final-reference
+cleanup already owns DMA isolation and pin lifetime; do not duplicate that
+ownership without a demonstrated gap. Process exit alone is not proof that
+chip firmware has reset successfully or that immediate restart will work.
+
+### Kernel cleanup owns DMA memory safety
+
+Review of Linux 6.18.43 VFIO/IOMMUFD source, matching the running host version,
+contradicts the earlier proposal that surviving Wi-Fi process death requires
+supervisor-owned DMA backing. That requirement is withdrawn, including by
+advisor adv-6u68. Keep DMA ownership in the driver/backend unless a concrete
+kernel guarantee gap or another product requirement justifies moving it.
+
+The cdev final-release path invokes the device's close operation before
+IOMMUFD unbinding. VFIO PCI clears bus mastering, disables interrupts and
+attempts reset. Physical unbinding detaches the device from its IOAS.
+IOMMUFD retains context/page references and unmaps DMA before unpinning;
+the unmap path synchronizes IOTLB invalidation. Rust destructors are not the
+sole protection, and SIGKILL does not skip kernel file-release cleanup.
+
+These guarantees concern final **references**, not merely one numeric FD:
+duplicated/inherited descriptors and retained mappings can extend lifetimes.
+The blocked domain used during detach is not permanent; releasing DMA
+ownership restores the group's default domain. Device-specific reset is
+best-effort, so DMA memory safety and successful firmware recovery/restart
+remain distinct. Reboot-time IOMMU transitions are another separate boundary.
+
+Source evidence retained at `/src/kernel-6.18.43-review/`:
+`drivers/vfio/vfio_main.c` (last-close/release),
+`drivers/vfio/pci/vfio_pci_core.c` (disable),
+`drivers/vfio/iommufd.c` (physical unbind),
+`drivers/iommu/iommufd/{main.c,device.c,pages.c}` (references/unmap/unpin),
+and `drivers/iommu/iommu.c` (detach/default domain/IOTLB sync).
+No physical kill/reset experiment was performed for this review.
 
 ## Types establish ownership boundaries
 

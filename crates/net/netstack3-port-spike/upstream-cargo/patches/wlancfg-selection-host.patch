@@ -460,7 +460,94 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
      req_stream: mpsc::Receiver<ManualRequest>,
      update_sender: ClientListenerMessageSender,
      saved_networks_manager: Arc<dyn SavedNetworksManagerApi>,
-@@ -575,7 +582,7 @@
+@@ -449,11 +456,70 @@
+         authentication: options.connect_selection.target.authenticator.clone().into(),
+         deprecated_scan_type: fidl_fuchsia_wlan_common::ScanType::Active,
+     };
+-    let (sme_result, connect_txn_stream) = common_options
+-        .proxy
+-        .connect(&sme_connect_request)
+-        .await
+-        .map_err(|e| ExitReason(Err(format_err!("{:?}", e))))?;
++    // Keep the transport transaction alive while servicing policy cancellation.
++    // Dropping the connect future alone does not quiesce the underlying SME.
++    let connected = {
++        let connect = common_options.proxy.connect(&sme_connect_request).fuse();
++        futures::pin_mut!(connect);
++        // The host transport submits only when polled. Establish Connect
++        // submission before an already-queued Disconnect can be observed.
++        let mut immediate = connect.as_mut().now_or_never();
++        loop {
++            if let Some(result) = immediate.take() {
++                break Ok(result.map_err(|e| ExitReason(Err(format_err!("{:?}", e))))?);
++            }
++            select! {
++                result = connect => {
++                    break Ok(result.map_err(|e| ExitReason(Err(format_err!("{:?}", e))))?);
++                }
++                request = common_options.req_stream.next() => {
++                    let disconnecting = match request {
++                        Some(ManualRequest::Connect(selection)) => {
++                            if selection.target.network == options.connect_selection.target.network {
++                                continue;
++                            }
++                            let reason = convert_manual_connect_to_disconnect_reason(&selection.reason)
++                                .unwrap_or(types::DisconnectReason::Unknown);
++                            DisconnectingOptions {
++                                disconnect_responder: None,
++                                previous_network: None,
++                                next_network: Some(ConnectingOptions {
++                                    connect_selection: *selection,
++                                    attempt_counter: 0,
++                                }),
++                                reason,
++                            }
++                        }
++                        Some(ManualRequest::Disconnect((reason, responder))) => DisconnectingOptions {
++                            disconnect_responder: Some(responder),
++                            previous_network: None,
++                            next_network: None,
++                            reason,
++                        },
++                        None => DisconnectingOptions {
++                            disconnect_responder: None,
++                            previous_network: None,
++                            next_network: None,
++                            reason: types::DisconnectReason::FidlStopClientConnectionsRequest,
++                        },
++                    };
++                    // An explicit disconnect unblocks the pending connect. Drain
++                    // both replies before permitting a new state/attempt.
++                    let _drained = futures::try_join!(
++                        connect,
++                        common_options.proxy.disconnect(
++                            types::convert_to_sme_disconnect_reason(disconnecting.reason)
++                        )
++                    ).map_err(|e| ExitReason(Err(format_err!("{:?}", e))))?;
++                    break Err(disconnecting);
++                }
++            }
++        }
++    };
++    let (sme_result, connect_txn_stream) = match connected {
++        Ok(connected) => connected,
++        Err(disconnecting) => return Ok(to_disconnecting_state(common_options, disconnecting)),
++    };
+
+     notify_on_connection_result(&mut common_options, &options, ap_state.clone(), sme_result).await;
+
+@@ -513,7 +579,9 @@
+     ap_state: types::ApState,
+     sme_result: fidl_sme::ConnectResult,
+ ) {
+-    common_options.status_publisher.publish_status(Status::from_ap_state(&ap_state));
++    if sme_result.code == fidl_ieee80211::StatusCode::Success {
++        common_options.status_publisher.publish_status(Status::from_ap_state(&ap_state));
++    }
+
+     // Report the connect result to the saved networks manager.
+     common_options
+@@ -575,7 +643,7 @@
      network_identifier: types::NetworkIdentifier,
      credential: Credential,
      ess_connect_reason: types::ConnectReason,
@@ -469,7 +556,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
      network_is_likely_hidden: bool,
      ess_connect_start_time: fasync::MonotonicInstant,
      bss_connect_start_time: fasync::MonotonicInstant,
-@@ -596,7 +603,7 @@
+@@ -596,7 +664,7 @@
          network_identifier: types::NetworkIdentifier,
          credential: Credential,
          ess_connect_reason: types::ConnectReason,

@@ -58,6 +58,13 @@ enum OwnerCommand {
 
 type EventReceiver = mpsc::Receiver<anyhow::Result<sme::ConnectTransactionEvent>>;
 
+enum Transaction {
+    Deliver(mpsc::Sender<anyhow::Result<sme::ConnectTransactionEvent>>),
+    // Losing a policy receiver does not cancel the firmware operation.
+    // Retain this route until explicit disconnect or its terminal event.
+    Draining,
+}
+
 enum Pending {
     Connect {
         reply: oneshot::Sender<anyhow::Result<(sme::ConnectResult, EventReceiver)>>,
@@ -286,7 +293,7 @@ struct Owner {
     pending: HashMap<u64, Pending>,
     outgoing: VecDeque<Outgoing>,
     outgoing_bytes: usize,
-    transaction: Option<mpsc::Sender<anyhow::Result<sme::ConnectTransactionEvent>>>,
+    transaction: Option<Transaction>,
     liveness: Arc<Mutex<Vec<mpsc::Sender<anyhow::Result<()>>>>>,
 }
 
@@ -371,12 +378,9 @@ impl Owner {
         self.next_sequence = self.next_sequence.checked_add(1).ok_or("outgoing sequence exhausted")?;
         let (message, pending) = match command {
             OwnerCommand::Connect { request, reply } => {
-                if self.transaction.as_ref().is_some_and(|sender| sender.is_closed()) {
-                    self.transaction = None;
-                }
                 if self.transaction.is_some() { let _ = reply.send(Err(anyhow!("connect transaction already active"))); return Ok(()); }
                 let (tx, rx) = mpsc::channel(QUEUE_PACKETS - 1);
-                self.transaction = Some(tx);
+                self.transaction = Some(Transaction::Deliver(tx));
                 (Message::Connect(request), Pending::Connect { reply, events: rx })
             }
             OwnerCommand::Disconnect { reason, reply } => (Message::Disconnect(reason), Pending::Disconnect(reply)),
@@ -421,7 +425,17 @@ impl Owner {
                         if !info.is_sme_reconnecting
                 );
                 let transaction = self.transaction.as_mut().ok_or("event without connect transaction")?;
-                try_send(transaction, Ok(event), "connect event")?;
+                if let Transaction::Deliver(sender) = transaction {
+                    if sender.is_closed() {
+                        *transaction = Transaction::Draining;
+                    } else if let Err(error) = sender.try_send(Ok(event)) {
+                        if error.is_disconnected() {
+                            *transaction = Transaction::Draining;
+                        } else {
+                            return Err("connect event backpressure".into());
+                        }
+                    }
+                }
                 if ends_transaction { self.transaction = None; }
             }
             Message::GenerationEnd(reason) => return Err(format!("peer ended generation: {}", reason_name(reason))),
@@ -440,16 +454,18 @@ impl Owner {
                 if result.code.into_primitive() != 0 {
                     self.transaction = None;
                 }
-                if reply.send(Ok((result, events))).is_err() {
-                    // The connect future was cancelled before its reply. Do
-                    // not leave an unreachable transaction blocking a later
-                    // policy attempt.
-                    self.transaction = None;
+                if reply.send(Ok((result, events))).is_err() && self.transaction.is_some() {
+                    self.transaction = Some(Transaction::Draining);
                 }
             }
             (Pending::Disconnect(reply), Message::DisconnectReply(reply_body)) => {
                 let result = command_result(reply_body.result, "disconnect");
-                if result.is_ok() { self.transaction = None; }
+                if let Err(error) = &result {
+                    // Failed disconnect is not quiescence. End the transport
+                    // generation so a later machine cannot reuse this device.
+                    return Err(error.to_string());
+                }
+                self.transaction = None;
                 let _ = reply.send(result);
             }
             (Pending::Roam, Message::RoamReply(reply_body)) => {
@@ -484,7 +500,7 @@ impl Owner {
                 Pending::Roam => {}
             }
         }
-        if let Some(mut tx) = self.transaction.take() { let _ = tx.try_send(Err(anyhow!(reason.clone()))); }
+        if let Some(Transaction::Deliver(mut tx)) = self.transaction.take() { let _ = tx.try_send(Err(anyhow!(reason.clone()))); }
         let _ = self.broadcast_liveness(Err(anyhow!(reason)));
         self.liveness.lock().expect("mutex poisoned").clear();
     }
@@ -502,10 +518,6 @@ fn command_reply_name(result: CommandReply) -> &'static str {
 }
 fn reason_name(reason: GenerationEndReason) -> &'static str {
     match reason { GenerationEndReason::Shutdown => "shutdown", GenerationEndReason::Timeout => "timeout", GenerationEndReason::DriverFault => "driver fault", GenerationEndReason::ContainmentFault => "containment fault", GenerationEndReason::Backpressure => "backpressure", GenerationEndReason::ProtocolViolation => "protocol violation" }
-}
-
-fn try_send<T>(sender: &mut mpsc::Sender<anyhow::Result<T>>, value: anyhow::Result<T>, name: &str) -> Result<(), String> {
-    sender.try_send(value).map_err(|_| format!("{name} backpressure"))
 }
 
 struct Received { bytes: Vec<u8> }
@@ -736,13 +748,15 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_connect_future_does_not_block_overlapping_disconnect() {
+    fn cancelled_connect_drains_late_success_event_before_disconnect_and_reconnect() {
         let (client_fd, server_fd) = sockets();
         let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
         let request = connect_request();
         let mut cancelled = Box::pin(client.connect(&request));
         assert!(cancelled.as_mut().now_or_never().is_none());
         drop(cancelled);
+        // Dropping the future is not quiescence and must not admit a replacement.
+        assert!(futures::executor::block_on(client.connect(&request)).is_err());
         let server = thread::spawn(move || {
             let connect = receive(server_fd.as_raw_fd());
             let disconnect = receive(server_fd.as_raw_fd());
@@ -750,9 +764,18 @@ mod tests {
             assert!(matches!(disconnect.message, Message::Disconnect(_)));
             let result = sme::ConnectResult { code: ieee::StatusCode::Success, is_credential_rejected: false, is_reconnect: false };
             send_packet(server_fd.as_raw_fd(), 1, Message::ConnectReply(Reply { in_reply_to: connect.request_id, result: ConnectReply::Completed(result) }), &[]);
-            send_packet(server_fd.as_raw_fd(), 2, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
+            send_packet(server_fd.as_raw_fd(), 2, Message::Event(
+                sme::ConnectTransactionEvent::OnConnectResult { result }
+            ), &[]);
+            send_packet(server_fd.as_raw_fd(), 3, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
+            let replacement = receive(server_fd.as_raw_fd());
+            assert!(matches!(replacement.message, Message::Connect(_)));
+            send_packet(server_fd.as_raw_fd(), 4, Message::ConnectReply(Reply {
+                in_reply_to: replacement.request_id, result: ConnectReply::Completed(result),
+            }), &[]);
         });
         futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::WlanstackUnitTesting)).unwrap();
+        assert!(futures::executor::block_on(client.connect(&request)).is_ok());
         server.join().unwrap();
     }
 

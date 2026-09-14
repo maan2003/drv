@@ -8,7 +8,7 @@ use fidl_fuchsia_wlan_ieee80211::{
 use fidl_fuchsia_wlan_sme as fidl_sme;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,7 +33,9 @@ use wlancfg_selection::mode_management::{
     Defect,
 };
 use wlancfg_selection::telemetry::{TelemetryEvent, TelemetrySender};
-use wlancfg_selection::util::state_machine::status_publisher_and_reader;
+use wlancfg_selection::util::state_machine::{
+    StateMachineStatusReader, status_publisher_and_reader,
+};
 use wlancfg_selection::wlan_metrics_registry::PolicyConnectionAttemptMigratedMetricDimensionReason as ConnectReason;
 
 struct Saved(NetworkConfig);
@@ -106,6 +108,13 @@ impl SavedNetworksManagerApi for Saved {
 }
 
 struct Sim {
+    defer_connect: Cell<bool>,
+    pending_connect: RefCell<
+        Option<(
+            oneshot::Sender<fidl_sme::ConnectResult>,
+            fidl_sme::ConnectResult,
+        )>,
+    >,
     results: RefCell<VecDeque<fidl_sme::ConnectResult>>,
     attempts: RefCell<Vec<(Instant, fidl_sme::ConnectRequest)>>,
     events: RefCell<
@@ -116,6 +125,8 @@ struct Sim {
 impl Sim {
     fn new(results: impl IntoIterator<Item = fidl_sme::ConnectResult>) -> Rc<Self> {
         Rc::new(Self {
+            defer_connect: Cell::new(false),
+            pending_connect: RefCell::new(None),
             results: RefCell::new(results.into_iter().collect()),
             attempts: RefCell::new(vec![]),
             events: RefCell::new(vec![]),
@@ -134,19 +145,30 @@ impl ClientSmeTransport for Sim {
             .push((Instant::now(), request.clone()));
         let (tx, rx) = mpsc::unbounded();
         self.events.borrow_mut().push(tx);
-        Ok((
-            self.results
-                .borrow_mut()
-                .pop_front()
-                .expect("unexpected connect"),
-            rx.boxed_local().fuse(),
-        ))
+        let result = self
+            .results
+            .borrow_mut()
+            .pop_front()
+            .expect("unexpected connect");
+        let result = if self.defer_connect.get() {
+            let (tx, rx) = oneshot::channel();
+            *self.pending_connect.borrow_mut() = Some((tx, result));
+            rx.await?
+        } else {
+            result
+        };
+        Ok((result, rx.boxed_local().fuse()))
     }
     async fn disconnect(
         &self,
         reason: fidl_sme::UserDisconnectReason,
     ) -> Result<(), anyhow::Error> {
         self.disconnects.borrow_mut().push(reason);
+        if let Some((reply, result)) = self.pending_connect.borrow_mut().take() {
+            reply
+                .send(result)
+                .expect("connect future must remain alive while draining");
+        }
         Ok(())
     }
     fn roam(&self, _: &fidl_sme::RoamRequest) -> Result<(), anyhow::Error> {
@@ -228,18 +250,18 @@ fn selection() -> (ConnectSelection, NetworkConfig) {
     )
 }
 
-async fn run(
+async fn run<F: std::future::Future<Output = ()>>(
     sim: Rc<Sim>,
     selected: ConnectSelection,
     saved: NetworkConfig,
-    driver: impl std::future::Future<Output = ()>,
+    driver: impl FnOnce(StateMachineStatusReader<state_machine::Status>) -> F,
 ) {
     let (req_tx, req_rx) = mpsc::channel(4);
     let (listener_tx, _listener_rx) = mpsc::unbounded();
     let (telemetry_tx, _telemetry_rx) = mpsc::channel::<TelemetryEvent>(100);
     let (defect_tx, _defect_rx) = mpsc::channel::<Defect>(10);
     let (roam_tx, _roam_rx) = mpsc::unbounded();
-    let (status_tx, _) = status_publisher_and_reader();
+    let (status_tx, status) = status_publisher_and_reader();
     let client = state_machine::Client::new(req_tx);
     let machine = state_machine::serve(
         7,
@@ -254,10 +276,8 @@ async fn run(
         RoamManager::new(roam_tx),
         status_tx,
     );
-    futures::join!(machine, async move {
-        let _client = client;
-        driver.await;
-    });
+    let _client = client;
+    futures::join!(machine, driver(status));
 }
 
 fn execute(f: impl std::future::Future<Output = ()>) {
@@ -274,7 +294,19 @@ fn exact_four_attempt_linear_backoff() {
         let sim = Sim::new([result(StatusCode::RefusedReasonUnspecified, false); 4]);
         let (selected, saved) = selection();
         let started = Instant::now();
-        run(sim.clone(), selected, saved, async {}).await;
+        run(sim.clone(), selected, saved, |status| async move {
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                assert!(
+                    !matches!(
+                        status.read_status().unwrap(),
+                        state_machine::Status::Connected { .. }
+                    ),
+                    "a rejected attempt must not publish Connected during retry backoff"
+                );
+            }
+        })
+        .await;
         let calls = sim.attempts.borrow();
         assert_eq!(calls.len(), 4);
         let elapsed: Vec<_> = calls
@@ -301,7 +333,7 @@ fn credential_rejection_never_retries() {
     execute(async {
         let sim = Sim::new([result(StatusCode::RefusedReasonUnspecified, true)]);
         let (selected, saved) = selection();
-        run(sim.clone(), selected, saved, async {}).await;
+        run(sim.clone(), selected, saved, |_| async {}).await;
         assert_eq!(sim.attempts.borrow().len(), 1);
     })
 }
@@ -370,4 +402,55 @@ fn connected_events_progress_and_manual_disconnect_cancels() {
         futures::join!(machine, drive);
         assert_eq!(sim.disconnects.borrow().len(), 2);
     })
+}
+
+#[test]
+fn already_queued_disconnect_submits_connect_first_and_drains_late_success() {
+    execute(async {
+        let sim = Sim::new([result(StatusCode::Success, false)]);
+        sim.defer_connect.set(true);
+        let (selected, saved) = selection();
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (listener_tx, _listener_rx) = mpsc::unbounded();
+        let (telemetry_tx, _telemetry_rx) = mpsc::channel::<TelemetryEvent>(100);
+        let (defect_tx, _defect_rx) = mpsc::channel::<Defect>(10);
+        let (roam_tx, _roam_rx) = mpsc::unbounded();
+        let (status_tx, status) = status_publisher_and_reader();
+        let mut client = state_machine::Client::new(req_tx);
+        let (ack, completed) = oneshot::channel();
+        client
+            .disconnect(
+                types::DisconnectReason::FidlStopClientConnectionsRequest,
+                ack,
+            )
+            .unwrap();
+        let machine = state_machine::serve(
+            7,
+            SmeForClientStateMachine::new(sim.clone()),
+            sim.take_event_stream(),
+            req_rx,
+            listener_tx,
+            Arc::new(Saved(saved)),
+            Some(selected),
+            TelemetrySender::new(telemetry_tx),
+            defect_tx,
+            RoamManager::new(roam_tx),
+            status_tx,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), machine)
+            .await
+            .unwrap();
+        completed.await.unwrap();
+        assert_eq!(sim.attempts.borrow().len(), 1);
+        assert!(sim.pending_connect.borrow().is_none());
+        assert_eq!(
+            status.read_status().unwrap(),
+            state_machine::Status::Disconnected
+        );
+        assert_eq!(
+            sim.disconnects.borrow().len(),
+            3,
+            "startup, cancellation, final teardown"
+        );
+    });
 }
