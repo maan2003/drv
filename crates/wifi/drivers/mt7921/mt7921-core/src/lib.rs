@@ -3847,7 +3847,7 @@ pub fn encode_client_interface_commands(
     bss_sequence: u8,
 ) -> Result<[Vec<u8>; 2], String> {
     if client == [0; 6]
-        || client[0] & 3 != 2
+        || client[0] & 1 != 0
         || !(1..=15).contains(&dev_sequence)
         || !(1..=15).contains(&bss_sequence)
         || dev_sequence == bss_sequence
@@ -3865,7 +3865,7 @@ pub fn encode_client_interface_dev_command(
     enable: bool,
     sequence: u8,
 ) -> Result<Vec<u8>, String> {
-    if client == [0; 6] || client[0] & 3 != 2 || !(1..=15).contains(&sequence) {
+    if client == [0; 6] || client[0] & 1 != 0 || !(1..=15).contains(&sequence) {
         return Err("client interface DEV identity or sequence is invalid".into());
     }
     let mut dev = vec![0; 16];
@@ -10590,7 +10590,7 @@ mod tests {
     }
 
     #[test]
-    fn client_interface_commands_bind_one_local_vif_identity_before_authentication() {
+    fn client_interface_commands_bind_one_unicast_vif_identity_before_authentication() {
         let client = [0x8a, 0xfd, 0x2a, 0x8b, 0x70, 0x5a];
         let [dev, bss] = encode_client_interface_commands(client, true, 14, 15).unwrap();
         assert_eq!(u16::from_le_bytes(dev[34..36].try_into().unwrap()), 1);
@@ -10622,7 +10622,11 @@ mod tests {
         );
         assert_eq!(disable_dev[56], 0);
 
-        for invalid in [[0x50, 1, 2, 3, 4, 5], [0x8b, 1, 2, 3, 4, 5], [0; 6]] {
+        // Hardware factory addresses need not set the locally-administered bit.
+        let factory = [0x50, 1, 2, 3, 4, 5];
+        let [factory_dev, _] = encode_client_interface_commands(factory, true, 1, 2).unwrap();
+        assert_eq!(&factory_dev[58..64], &factory);
+        for invalid in [[0xff; 6], [0x8b, 1, 2, 3, 4, 5], [0; 6]] {
             assert!(encode_client_interface_commands(invalid, true, 1, 2).is_err());
         }
         assert!(encode_client_interface_commands(client, true, 1, 1).is_err());

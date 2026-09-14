@@ -485,45 +485,72 @@ impl LoaderMechanics {
             if !interrupted {
                 return Err(LoaderMechanicsError::Timeout);
             }
-            if let Err(source) = t.mask_response_interrupts() {
-                t.abort_rx()
-                    .map_err(LoaderMechanicsError::ContainmentRequired)?;
-                return Err(LoaderMechanicsError::ContainmentRequired(source));
-            }
-            let operation = (|| {
-                let status = t
-                    .response_interrupt_status()
-                    .map_err(LoaderMechanicsError::ContainmentRequired)?;
-                t.acknowledge_response_interrupts(status & MT7921_LOADER_RESPONSE_IRQ_MASK)
-                    .map_err(LoaderMechanicsError::ContainmentRequired)?;
-                let mut matched = None;
-                for ring in [McuRxIrqRing::Wm, McuRxIrqRing::Wm2] {
-                    if let Some(candidate) = self.drain_rx(t, o, ring, sequence)? {
-                        if matched.is_some() {
-                            return Err(LoaderMechanicsError::DuplicateResponse);
-                        }
-                        matched = Some(candidate);
-                    }
-                }
-                Ok(matched)
-            })();
-            let unmask = t
-                .enable_response_interrupts(MT7921_LOADER_RESPONSE_IRQ_MASK)
-                .map_err(LoaderMechanicsError::ContainmentRequired);
-            let matched = match (operation, unmask) {
-                (Ok(matched), Ok(())) => matched,
-                (operation, unmask) => {
-                    t.abort_rx()
-                        .map_err(LoaderMechanicsError::ContainmentRequired)?;
-                    // Once masked, failure to restore the mask dominates the
-                    // protocol error because interrupt state is ambiguous.
-                    return Err(unmask.err().unwrap_or_else(|| operation.unwrap_err()));
-                }
-            };
+            let matched = self.poll_response(t, o, Some(sequence), usize::MAX)?;
             if let Some(response) = matched {
                 return Ok(response);
             }
         }
+    }
+
+    /// Drain a bounded turn of unsolicited MCU events without waiting for IRQ.
+    /// The transport commits each event only after repost/publication. There
+    /// must be no outstanding synchronous command borrowing this executor.
+    pub fn poll_events<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+    ) -> Result<bool, LoaderMechanicsError<T::Error>> {
+        if let Some(slot) = self.pending_command {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
+        let before = self.rx_head;
+        self.poll_response(t, o, None, MT7921_MCU_RX_RING_COUNT - 1)?;
+        Ok(before != self.rx_head)
+    }
+
+    fn poll_response<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+        sequence: Option<u8>,
+        budget: usize,
+    ) -> Result<Option<FirmwareRx>, LoaderMechanicsError<T::Error>> {
+        if let Err(source) = t.mask_response_interrupts() {
+            t.abort_rx()
+                .map_err(LoaderMechanicsError::ContainmentRequired)?;
+            return Err(LoaderMechanicsError::ContainmentRequired(source));
+        }
+        let operation = (|| {
+            let status = t
+                .response_interrupt_status()
+                .map_err(LoaderMechanicsError::ContainmentRequired)?;
+            t.acknowledge_response_interrupts(status & MT7921_LOADER_RESPONSE_IRQ_MASK)
+                .map_err(LoaderMechanicsError::ContainmentRequired)?;
+            let mut matched = None;
+            for ring in [McuRxIrqRing::Wm, McuRxIrqRing::Wm2] {
+                if let Some(candidate) = self.drain_rx(t, o, ring, sequence, budget)? {
+                    if matched.is_some() {
+                        return Err(LoaderMechanicsError::DuplicateResponse);
+                    }
+                    matched = Some(candidate);
+                }
+            }
+            Ok(matched)
+        })();
+        let unmask = t
+            .enable_response_interrupts(MT7921_LOADER_RESPONSE_IRQ_MASK)
+            .map_err(LoaderMechanicsError::ContainmentRequired);
+        let matched = match (operation, unmask) {
+            (Ok(matched), Ok(())) => matched,
+            (operation, unmask) => {
+                t.abort_rx()
+                    .map_err(LoaderMechanicsError::ContainmentRequired)?;
+                // Once masked, failure to restore the mask dominates the
+                // protocol error because interrupt state is ambiguous.
+                return Err(unmask.err().unwrap_or_else(|| operation.unwrap_err()));
+            }
+        };
+        Ok(matched)
     }
 
     fn drain_rx<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
@@ -531,11 +558,12 @@ impl LoaderMechanics {
         t: &mut T,
         o: &mut O,
         ring: McuRxIrqRing,
-        sequence: u8,
+        sequence: Option<u8>,
+        budget: usize,
     ) -> Result<Option<FirmwareRx>, LoaderMechanicsError<T::Error>> {
         let ri = ring_index(ring);
         let mut matched = None;
-        loop {
+        for _ in 0..budget {
             let consumed = self.rx_head[ri];
             let descriptor = t
                 .read_rx_descriptor(ring, consumed)
@@ -557,7 +585,7 @@ impl LoaderMechanics {
             let disposition = routed.as_ref().and_then(|routed| {
                 routed.as_ref().ok().and_then(|route| match route {
                     McuRxRoute::Firmware(response) => {
-                        Some(classify_firmware_rx(Some(sequence), &response.response))
+                        Some(classify_firmware_rx(sequence, &response.response))
                     }
                     _ => None,
                 })
@@ -805,6 +833,7 @@ mod tests {
         rx: [Vec<Rx>; 2],
         rx_next: [usize; 2],
         fail_publish_command: bool,
+        refill_rx: bool,
         fail_publish_scatter: bool,
         command_capacity: usize,
         written_command_descriptor: Option<DmaDescriptor>,
@@ -835,6 +864,7 @@ mod tests {
                 }),
                 rx_next: [0; 2],
                 fail_publish_command: false,
+                refill_rx: false,
                 fail_publish_scatter: false,
                 command_capacity: MT7921_LOADER_COMMAND_MAX_BYTES,
                 written_command_descriptor: None,
@@ -978,6 +1008,15 @@ mod tests {
             producer: u16,
         ) -> Result<(), Self::Error> {
             self.ops.push(Op::RxCidx(ring, producer));
+            if self.refill_rx {
+                let posted = (usize::from(producer) + MT7921_MCU_RX_RING_COUNT - 1)
+                    % MT7921_MCU_RX_RING_COUNT;
+                let bytes = firmware(0, 0x13, 0);
+                self.rx[Self::ri(ring)][posted] = Rx {
+                    descriptor: done(bytes.len()),
+                    bytes,
+                };
+            }
             Ok(())
         }
         fn prepare_rx_result(
@@ -1144,6 +1183,65 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_poll_visits_both_rings_without_waiting_or_reserving_a_sequence() {
+        let mut engine = LoaderMechanics::new(7);
+        let mut io = Fake::default();
+        io.push_rx(McuRxIrqRing::Wm, firmware(0, 0x13, 0));
+        io.push_rx(McuRxIrqRing::Wm2, firmware(0, 0x13, 0));
+        assert_eq!(engine.poll_events(&mut io, &mut ()), Ok(true));
+        assert_eq!(engine.sequence(), 7);
+        assert_eq!(engine.command_producer(), 0);
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm), 1);
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm2), 1);
+        assert!(!io.ops.contains(&Op::Wait));
+        assert_eq!(engine.poll_events(&mut io, &mut ()), Ok(false));
+    }
+
+    #[test]
+    fn unsolicited_poll_has_a_per_ring_budget_and_refuses_pending_command() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake {
+            refill_rx: true,
+            ..Fake::default()
+        };
+        for ring in [McuRxIrqRing::Wm, McuRxIrqRing::Wm2] {
+            for _ in 0..MT7921_MCU_RX_RING_COUNT - 1 {
+                io.push_rx(ring, firmware(0, 0x13, 0));
+            }
+        }
+        assert_eq!(engine.poll_events(&mut io, &mut ()), Ok(true));
+        assert_eq!(
+            io.ops
+                .iter()
+                .filter(|op| matches!(op, Op::ReadRx(..)))
+                .count(),
+            2 * (MT7921_MCU_RX_RING_COUNT - 1)
+        );
+        assert!(!io.ops.contains(&Op::Wait));
+        // Firmware can refill reposted slots while a turn is being drained.
+        // Progress must be revisited immediately, not gated on a new IRQ.
+        io.ops.clear();
+        assert_eq!(engine.poll_events(&mut io, &mut ()), Ok(true));
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm), 6);
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm2), 6);
+        assert_eq!(
+            io.ops
+                .iter()
+                .filter(|op| matches!(op, Op::ReadRx(..)))
+                .count(),
+            2 * (MT7921_MCU_RX_RING_COUNT - 1)
+        );
+        assert!(!io.ops.contains(&Op::Wait));
+        engine.pending_command = Some(0);
+        io.ops.clear();
+        assert_eq!(
+            engine.poll_events(&mut io, &mut ()),
+            Err(LoaderMechanicsError::CommandPending { slot: 0 })
+        );
+        assert!(io.ops.is_empty());
+    }
+
+    #[test]
     fn encoding_failure_still_consumes_the_sole_sequence() {
         let mut engine = LoaderMechanics::new(14);
         let mut io = Fake::default();
@@ -1193,12 +1291,24 @@ mod tests {
             .unwrap();
         }
         engine
-            .drain_rx(&mut io, &mut observer, McuRxIrqRing::Wm, 1)
+            .drain_rx(
+                &mut io,
+                &mut observer,
+                McuRxIrqRing::Wm,
+                Some(1),
+                usize::MAX,
+            )
             .unwrap();
         engine.rx_head[0] = 7;
         io.rx[0][7].descriptor = done(36);
         engine
-            .drain_rx(&mut io, &mut observer, McuRxIrqRing::Wm, 1)
+            .drain_rx(
+                &mut io,
+                &mut observer,
+                McuRxIrqRing::Wm,
+                Some(1),
+                usize::MAX,
+            )
             .unwrap();
         assert!(io.ops.windows(2).any(|w| w
             == [
@@ -1221,7 +1331,13 @@ mod tests {
         io.push_rx(McuRxIrqRing::Wm, firmware(1, 1, 0));
         io.rx[0][0].descriptor.ctrl &= !(1 << 31);
         assert_eq!(
-            engine.drain_rx(&mut io, &mut observer, McuRxIrqRing::Wm, 1),
+            engine.drain_rx(
+                &mut io,
+                &mut observer,
+                McuRxIrqRing::Wm,
+                Some(1),
+                usize::MAX
+            ),
             Ok(None)
         );
         assert_eq!(engine.rx_head(McuRxIrqRing::Wm), 0);

@@ -9,6 +9,11 @@ SOCKS-only proof, or the retired one-shot implementation. KVM orchestration,
 AP controls, fault injection and proof commands belong in the external test
 harness, not special production modes or fixed-target policy overrides.
 
+The owner explicitly includes IPv6 and suspend/resume as blocking daily-laptop
+requirements. Enterprise/EAP and hidden-network support are outside the initial
+profile; WPA2-Personal/WPA3-SAE remain required. Normal use must not depend on
+manual process restarts, finite reconnect counts or fresh boot-only credentials.
+
 Acceptance must distinguish physically exercised cases from deterministic
 fault coverage; no finite test suite proves every possible Wi-Fi environment.
 The concrete matrix is:
@@ -21,13 +26,16 @@ The concrete matrix is:
   and channel modes must fail explicitly, never silently weaken security.
 - Real firmware-backed channel/peer/key programming and TX/RX, controlled-port
   enforcement, replay/key-generation isolation and cleanup after failure.
-- DHCP, DNS/NSS and ordinary application TCP/UDP/verified HTTPS through the
+- IPv4 and IPv6 address configuration, DHCP/RA lifetime and DNS renewal,
+  DNS/NSS and ordinary application TCP/UDP/verified HTTPS through the
   sandboxed network service and Linux socket provider; no native INET fallback
   or alternate guest Internet interface. Repeated transfers and idle periods.
 - AP/link loss, retry/backoff, repeated reconnect beyond the current finite
   Ethernet inventory, service death/restart, resource exhaustion and shutdown.
-  Roaming, rekey and power transitions require explicit tests and capability
-  claims rather than inference from one successful association.
+  Suspend/resume is a blocking requirement: idle and connected suspend, repeated
+  resume and automatic reconnect must work without reboot or manual repair.
+  Rekey, network switching and ordinary multi-AP roaming need explicit tests
+  rather than inference from one successful association.
 - Negative/fault cases use deterministic tests when safe physical injection or
   an appropriately controllable AP is unavailable; those rows remain physically
   unverified. Available AP/security/control coverage must be recorded before
