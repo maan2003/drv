@@ -17,6 +17,7 @@ required-features = ["test-fixture"]
 resolver = "3"
 
 [dependencies]
+tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
 fidl-fuchsia-wlan-sme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 futures = "=0.3.32"

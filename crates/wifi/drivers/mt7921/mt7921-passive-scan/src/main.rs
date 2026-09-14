@@ -146,6 +146,18 @@ fn run() -> Result<(), String> {
         },
     )
     .map_err(|error| format!("verify firmware: {error:?}"))?;
+    let before = linux_self_sandbox::open_fd_snapshot().map_err(|error| error.to_string())?;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("prepare executor: {error}"))?;
+    let local = tokio::task::LocalSet::new();
+    let runtime_fds = linux_self_sandbox::open_fd_snapshot()
+        .map_err(|error| error.to_string())?
+        .difference(&before)
+        .copied()
+        .collect();
     let resources = PreparedRuntimeResources::new(mac)
         .map_err(|error| format!("prepare protocol runtime: {error}"))?;
     let [control_fd, supervisor_fd] = endpoints.fd_identities();
@@ -153,7 +165,7 @@ fn run() -> Result<(), String> {
         control_fd,
         supervisor_fd,
         ethernet_fds: resources.fd_identities(),
-        runtime_fds: resources.runtime_fd_identities().to_vec(),
+        runtime_fds,
     };
     require_armed_watchdog()?;
     let setup =
@@ -162,40 +174,43 @@ fn run() -> Result<(), String> {
     let config = setup
         .lock_down_with_service(service)
         .map_err(|error| format!("lock down MT7921 service: {error}"))?;
-    let driver = Mt7921Driver::initialize(config, images)
-        .map_err(|error| format!("initialize MT7921: {error:?}"))?;
-    if driver.firmware().nic_capability.mac_address != Some(mac) {
-        return Err(
-            "configured MAC differs from firmware identity; MAC override is unavailable".into(),
-        );
-    }
-    let runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
-        driver,
-        wlan_sme::client::ClientConfig::default(),
-        fidl_fuchsia_wlan_mlme::DeviceInfo {
-            sta_addr: mac,
-            factory_addr: mac,
-            role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
-            bands: Vec::new(),
-            softmac_hardware_capability: 0,
-            qos_capable: false,
-        },
-        Default::default(),
-        Default::default(),
-        fuchsia_inspect::Inspector::default(),
-        resources,
-    ))
-    .map_err(|error| format!("construct protocol runtime: {error}"))?;
-    let mut server = endpoints
-        .bind_runtime(runtime)
-        .post_lockdown_open_complete()
-        .map_err(|error| format!("open control generation: {error}"))?;
-    eprintln!("mt7921_service=READY owner=typed-driver radio_operations=unavailable");
-    let result = server.run_to_terminal();
-    let mut runtime = server.into_runtime();
-    let stopped = runtime.stop();
-    result.map_err(|error| format!("control service: {error}"))?;
-    stopped.map_err(|error| format!("contain driver: {error}"))
+    local.block_on(&executor, async move {
+        let driver = Mt7921Driver::initialize(config, images)
+            .map_err(|error| format!("initialize MT7921: {error:?}"))?;
+        if driver.firmware().nic_capability.mac_address != Some(mac) {
+            return Err(
+                "configured MAC differs from firmware identity; MAC override is unavailable".into(),
+            );
+        }
+        let runtime = ClientRuntime::new_with_prepared_resources(
+            driver,
+            wlan_sme::client::ClientConfig::default(),
+            fidl_fuchsia_wlan_mlme::DeviceInfo {
+                sta_addr: mac,
+                factory_addr: mac,
+                role: fidl_fuchsia_wlan_common::WlanMacRole::Client,
+                bands: Vec::new(),
+                softmac_hardware_capability: 0,
+                qos_capable: false,
+            },
+            Default::default(),
+            Default::default(),
+            fuchsia_inspect::Inspector::default(),
+            resources,
+        )
+        .await
+        .map_err(|error| format!("construct protocol runtime: {error}"))?;
+        let mut server = endpoints
+            .bind_runtime(runtime)
+            .post_lockdown_open_complete()
+            .map_err(|error| format!("open control generation: {error}"))?;
+        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=unavailable");
+        let result = server.run_to_terminal().await;
+        let mut runtime = server.into_runtime();
+        let stopped = runtime.stop();
+        result.map_err(|error| format!("control service: {error}"))?;
+        stopped.map_err(|error| format!("contain driver: {error}"))
+    })
 }
 
 #[cfg(test)]

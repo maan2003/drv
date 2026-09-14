@@ -9,6 +9,7 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
 drv-network-service = { path = "../../../../net/network-service" }
 ath11k-core = { path = "../ath11k-core" }
 ath11k-qmi-qrtr = { path = "../ath11k-qmi-qrtr" }

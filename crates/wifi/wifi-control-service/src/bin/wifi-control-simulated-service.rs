@@ -86,11 +86,13 @@ fn start() -> Result<(), StartError> {
         .lockdown(Profile::WifiSimulated)
         .map_err(StartError::Sandbox)?;
     locked.run(move || {
-        prepared
-            .post_lockdown_open_complete()
-            .map_err(StartError::Service)?
-            .run()
-            .map_err(StartError::Service)
+        futures::executor::block_on(
+            prepared
+                .post_lockdown_open_complete()
+                .map_err(StartError::Service)?
+                .run(),
+        )
+        .map_err(StartError::Service)
     })
 }
 

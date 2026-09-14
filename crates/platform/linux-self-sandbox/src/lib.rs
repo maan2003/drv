@@ -381,6 +381,27 @@ fn syscall_ok(result: c_int, operation: &'static str) -> Result<(), Error> {
     }
 }
 
+/// Snapshot live descriptors around inert runtime preparation. The caller must
+/// keep unrelated descriptor creation outside the interval and retain the
+/// resulting inventory for exact sandbox setup.
+pub fn open_fd_snapshot() -> Result<BTreeSet<RawFd>, io::Error> {
+    let entries = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_string_lossy()
+                .parse::<std::os::fd::RawFd>()
+                .map_err(std::io::Error::other)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // The directory stream's own descriptor is closed when read_dir is
+    // dropped. Exclude that now-stale number from the retained inventory.
+    Ok(entries
+        .into_iter()
+        .filter(|fd| std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok())
+        .collect())
+}
+
 fn require_single_threaded() -> Result<(), Error> {
     let tasks = std::fs::read_dir("/proc/self/task")
         .map_err(|error| system("inspect process threads", error))?

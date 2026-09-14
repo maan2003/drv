@@ -156,206 +156,216 @@ impl WlanSoftmac for FakeSoftmac {
 
 #[test]
 fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
-    let effects = Arc::new(Mutex::new(Effects::default()));
-    let runtime = futures::executor::block_on(ClientRuntime::new(
-        FakeSoftmac(effects.clone()),
-        Default::default(),
-        device_info(),
-        Default::default(),
-        Default::default(),
-        fuchsia_inspect::Inspector::default(),
-    ))
-    .unwrap();
-    let (policy_server, policy_peer) = pair();
-    let (supervisor_server, supervisor_peer) = pair();
-    let policy = UnixSeqpacketEndpoint::from_inherited_fd(policy_peer).unwrap();
-    let mut server = PreparedServer::new(policy_server, supervisor_server, GENERATION, runtime)
-        .unwrap()
-        .post_lockdown_open_complete()
+    run_local_test(async {
+        let effects = Arc::new(Mutex::new(Effects::default()));
+        let runtime = (ClientRuntime::new(
+            FakeSoftmac(effects.clone()),
+            Default::default(),
+            device_info(),
+            Default::default(),
+            Default::default(),
+            fuchsia_inspect::Inspector::default(),
+        ))
+        .await
         .unwrap();
+        let (policy_server, policy_peer) = pair();
+        let (supervisor_server, supervisor_peer) = pair();
+        let policy = UnixSeqpacketEndpoint::from_inherited_fd(policy_peer).unwrap();
+        let mut server = PreparedServer::new(policy_server, supervisor_server, GENERATION, runtime)
+            .unwrap()
+            .post_lockdown_open_complete()
+            .unwrap();
 
-    drive_until(&mut server, || {
-        policy.try_receive_packet().unwrap().is_some()
-    });
-    send(
-        &policy,
-        1,
-        Message::Connect {
-            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
-                30,
-            ))
-            .unwrap(),
-            request: connect_request(),
-        },
-    );
-    let mut connected = false;
-    let mut ethernet = None;
-    for _ in 0..2_000 {
-        futures::executor::block_on(server.drive_once()).unwrap();
-        while let Some(packet) = policy.try_receive_packet().unwrap() {
-            if matches!(
-                packet.packet.message,
-                Message::ConnectReply(wlan_control_wire::Reply {
-                    result: ConnectReply::Completed(sme::ConnectResult {
-                        code: ieee::StatusCode::Success,
-                        ..
-                    }),
-                    ..
-                })
-            ) {
-                connected = true;
-            }
-        }
-        if ethernet.is_none() {
-            ethernet = try_receive_supervisor(&supervisor_peer);
-        }
-        if connected && ethernet.is_some() {
-            break;
-        }
-    }
-    assert!(connected, "pinned runtime did not complete connection");
-    let (record, mut fds) = ethernet.expect("Ethernet generation was not published");
-    assert_eq!(
-        LifecycleMessage::decode(&record).unwrap(),
-        LifecycleMessage {
-            kind: LifecycleKind::Install,
-            wifi_generation: GENERATION,
-            ethernet_generation: 1,
-            mac_address: CLIENT
-        }
-    );
-    assert_eq!(fds.len(), 1);
-    let frame = fds.pop().unwrap();
-    assert_eq!(effects.lock().unwrap().links.as_slice(), &[true]);
-    for _ in 0..8 {
-        futures::executor::block_on(server.drive_once()).unwrap();
-        assert!(
-            try_receive_supervisor(&supervisor_peer).is_none(),
-            "Ethernet capability published twice"
-        );
-    }
-
-    send(
-        &policy,
-        2,
-        Message::Roam {
-            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
-                10,
-            ))
-            .unwrap(),
-            request: sme::RoamRequest {
-                bss_description: connect_request().bss_description,
+        drive_until(&mut server, || {
+            policy.try_receive_packet().unwrap().is_some()
+        })
+        .await;
+        send(
+            &policy,
+            1,
+            Message::Connect {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap(),
+                request: connect_request(),
             },
-        },
-    );
-    let mut roam_rejected = false;
-    for _ in 0..100 {
-        futures::executor::block_on(server.drive_once()).unwrap();
-        while let Some(packet) = policy.try_receive_packet().unwrap() {
-            if matches!(
-                packet.packet.message,
-                Message::RoamReply(wlan_control_wire::Reply {
-                    result: CommandReply::Unsupported,
-                    ..
-                })
-            ) {
-                roam_rejected = true;
-            }
-        }
-        if roam_rejected {
-            break;
-        }
-    }
-    assert!(roam_rejected, "unsupported SoftMAC roam was not rejected");
-    assert!(effects.lock().unwrap().links.ends_with(&[true]));
-    assert!(!poll_hup(frame.as_raw_fd()), "roam rejection revoked link");
-
-    send(
-        &policy,
-        3,
-        Message::Disconnect {
-            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
-                10,
-            ))
-            .unwrap(),
-            reason: sme::UserDisconnectReason::FidlStopClientConnectionsRequest,
-        },
-    );
-    let mut disconnected = false;
-    for _ in 0..2_000 {
-        futures::executor::block_on(server.drive_once()).unwrap();
-        while let Some(packet) = policy.try_receive_packet().unwrap() {
-            if matches!(packet.packet.message, Message::DisconnectReply(_)) {
-                disconnected = true;
-            }
-        }
-        if disconnected && poll_hup(frame.as_raw_fd()) {
-            break;
-        }
-    }
-    assert!(disconnected, "disconnect reply was not delivered");
-    assert!(
-        poll_hup(frame.as_raw_fd()),
-        "published Ethernet generation stayed live"
-    );
-    assert!(effects.lock().unwrap().links.ends_with(&[false]));
-
-    send(
-        &policy,
-        4,
-        Message::Connect {
-            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
-                30,
-            ))
-            .unwrap(),
-            request: connect_request(),
-        },
-    );
-    let mut reconnected = false;
-    let mut replacement = None;
-    for _ in 0..2_000 {
-        futures::executor::block_on(server.drive_once()).unwrap();
-        while let Some(packet) = policy.try_receive_packet().unwrap() {
-            if matches!(
-                packet.packet.message,
-                Message::ConnectReply(wlan_control_wire::Reply {
-                    result: ConnectReply::Completed(sme::ConnectResult {
-                        code: ieee::StatusCode::Success,
+        );
+        let mut connected = false;
+        let mut ethernet = None;
+        for _ in 0..2_000 {
+            (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
+            while let Some(packet) = policy.try_receive_packet().unwrap() {
+                if matches!(
+                    packet.packet.message,
+                    Message::ConnectReply(wlan_control_wire::Reply {
+                        result: ConnectReply::Completed(sme::ConnectResult {
+                            code: ieee::StatusCode::Success,
+                            ..
+                        }),
                         ..
-                    }),
-                    ..
-                })
-            ) {
-                reconnected = true;
+                    })
+                ) {
+                    connected = true;
+                }
+            }
+            if ethernet.is_none() {
+                ethernet = try_receive_supervisor(&supervisor_peer);
+            }
+            if connected && ethernet.is_some() {
+                break;
             }
         }
-        if replacement.is_none() {
-            replacement = try_receive_supervisor(&supervisor_peer);
+        assert!(connected, "pinned runtime did not complete connection");
+        let (record, mut fds) = ethernet.expect("Ethernet generation was not published");
+        assert_eq!(
+            LifecycleMessage::decode(&record).unwrap(),
+            LifecycleMessage {
+                kind: LifecycleKind::Install,
+                wifi_generation: GENERATION,
+                ethernet_generation: 1,
+                mac_address: CLIENT
+            }
+        );
+        assert_eq!(fds.len(), 1);
+        let frame = fds.pop().unwrap();
+        assert_eq!(effects.lock().unwrap().links.as_slice(), &[true]);
+        for _ in 0..8 {
+            (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                try_receive_supervisor(&supervisor_peer).is_none(),
+                "Ethernet capability published twice"
+            );
         }
-        if reconnected && replacement.is_some() {
-            break;
+
+        send(
+            &policy,
+            2,
+            Message::Roam {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(10),
+                )
+                .unwrap(),
+                request: sme::RoamRequest {
+                    bss_description: connect_request().bss_description,
+                },
+            },
+        );
+        let mut roam_rejected = false;
+        for _ in 0..100 {
+            (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
+            while let Some(packet) = policy.try_receive_packet().unwrap() {
+                if matches!(
+                    packet.packet.message,
+                    Message::RoamReply(wlan_control_wire::Reply {
+                        result: CommandReply::Unsupported,
+                        ..
+                    })
+                ) {
+                    roam_rejected = true;
+                }
+            }
+            if roam_rejected {
+                break;
+            }
         }
-    }
-    assert!(reconnected, "pinned runtime did not reconnect");
-    let (record, fds) = replacement.expect("replacement Ethernet generation was not published");
-    assert_eq!(
-        LifecycleMessage::decode(&record).unwrap(),
-        LifecycleMessage {
-            kind: LifecycleKind::Install,
-            wifi_generation: GENERATION,
-            ethernet_generation: 2,
-            mac_address: CLIENT
+        assert!(roam_rejected, "unsupported SoftMAC roam was not rejected");
+        assert!(effects.lock().unwrap().links.ends_with(&[true]));
+        assert!(!poll_hup(frame.as_raw_fd()), "roam rejection revoked link");
+
+        send(
+            &policy,
+            3,
+            Message::Disconnect {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(10),
+                )
+                .unwrap(),
+                reason: sme::UserDisconnectReason::FidlStopClientConnectionsRequest,
+            },
+        );
+        let mut disconnected = false;
+        for _ in 0..2_000 {
+            (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
+            while let Some(packet) = policy.try_receive_packet().unwrap() {
+                if matches!(packet.packet.message, Message::DisconnectReply(_)) {
+                    disconnected = true;
+                }
+            }
+            if disconnected && poll_hup(frame.as_raw_fd()) {
+                break;
+            }
         }
-    );
-    assert_eq!(fds.len(), 1);
+        assert!(disconnected, "disconnect reply was not delivered");
+        assert!(
+            poll_hup(frame.as_raw_fd()),
+            "published Ethernet generation stayed live"
+        );
+        assert!(effects.lock().unwrap().links.ends_with(&[false]));
+
+        send(
+            &policy,
+            4,
+            Message::Connect {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap(),
+                request: connect_request(),
+            },
+        );
+        let mut reconnected = false;
+        let mut replacement = None;
+        for _ in 0..2_000 {
+            (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
+            while let Some(packet) = policy.try_receive_packet().unwrap() {
+                if matches!(
+                    packet.packet.message,
+                    Message::ConnectReply(wlan_control_wire::Reply {
+                        result: ConnectReply::Completed(sme::ConnectResult {
+                            code: ieee::StatusCode::Success,
+                            ..
+                        }),
+                        ..
+                    })
+                ) {
+                    reconnected = true;
+                }
+            }
+            if replacement.is_none() {
+                replacement = try_receive_supervisor(&supervisor_peer);
+            }
+            if reconnected && replacement.is_some() {
+                break;
+            }
+        }
+        assert!(reconnected, "pinned runtime did not reconnect");
+        let (record, fds) = replacement.expect("replacement Ethernet generation was not published");
+        assert_eq!(
+            LifecycleMessage::decode(&record).unwrap(),
+            LifecycleMessage {
+                kind: LifecycleKind::Install,
+                wifi_generation: GENERATION,
+                ethernet_generation: 2,
+                mac_address: CLIENT
+            }
+        );
+        assert_eq!(fds.len(), 1);
+    });
 }
 
-fn drive_until<R: wifi_control_service::WifiRuntime>(
+async fn drive_until<R: wifi_control_service::WifiRuntime>(
     server: &mut wifi_control_service::ControlServer<R>,
     mut done: impl FnMut() -> bool,
 ) {
     for _ in 0..2_000 {
-        futures::executor::block_on(server.drive_once()).unwrap();
+        (server.drive_once()).await.unwrap();
+            tokio::task::yield_now().await;
         if done() {
             return;
         }
@@ -523,4 +533,12 @@ fn poll_hup(fd: i32) -> bool {
     };
     assert!(unsafe { libc::poll(&mut p, 1, 0) } >= 0);
     p.revents & libc::POLLHUP != 0
+}
+
+fn run_local_test(future: impl std::future::Future<Output = ()>) {
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    tokio::task::LocalSet::new().block_on(&executor, future);
 }

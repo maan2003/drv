@@ -43,10 +43,12 @@ fn main() {
     let _ethernet_driver = unsafe { OwnedFd::from_raw_fd(ethernet[1]) };
     let mut runtime = SimulatedWifiRuntime::new([2, 4, 6, 8, 10, 12]);
     runtime.publish_ethernet_after_connect(ethernet_service);
-    PreparedServer::new(control, supervisor, [generation_byte; 16], runtime)
-        .expect("validated control fd")
-        .post_lockdown_open_complete()
-        .expect("post-lockdown open")
-        .run()
-        .expect("simulated service loop");
+    futures::executor::block_on(
+        PreparedServer::new(control, supervisor, [generation_byte; 16], runtime)
+            .expect("validated control fd")
+            .post_lockdown_open_complete()
+            .expect("post-lockdown open")
+            .run(),
+    )
+    .expect("simulated service loop");
 }

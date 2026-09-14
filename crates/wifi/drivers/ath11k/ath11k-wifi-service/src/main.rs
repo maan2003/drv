@@ -87,11 +87,22 @@ fn start() -> Result<(), String> {
     let qrtr = QrtrSocket::open().map_err(|error| format!("open AF_QIPCRTR: {error}"))?;
     eprintln!("ath11k_wifi_startup=QRTR_READY");
     let qrtr_fd = qrtr.raw_fd();
+    let before = linux_self_sandbox::open_fd_snapshot().map_err(|error| error.to_string())?;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("prepare executor: {error}"))?;
+    let local = tokio::task::LocalSet::new();
+    let runtime_fds = linux_self_sandbox::open_fd_snapshot()
+        .map_err(|error| error.to_string())?
+        .difference(&before)
+        .copied()
+        .collect::<Vec<_>>();
     let runtime_resources = PreparedRuntimeResources::new(config.mac)
         .map_err(|error| format!("prepare host runtime: {error}"))?;
     eprintln!("ath11k_wifi_startup=RUNTIME_RESOURCES_READY");
     let ethernet_fds = runtime_resources.fd_identities();
-    let runtime_fds = runtime_resources.runtime_fd_identities().to_vec();
     let mut remoteproc_state = OpenOptions::new()
         .read(true)
         .write(true)
@@ -120,14 +131,17 @@ fn start() -> Result<(), String> {
     };
     let diagnostic_unsandboxed = config.diagnostic_unsandboxed;
     let run = move || {
-        activate_and_run(
-            config,
-            endpoints,
-            runtime_resources,
-            platform,
-            qrtr,
-            firmware,
-            remoteproc_state,
+        local.block_on(
+            &executor,
+            activate_and_run(
+                config,
+                endpoints,
+                runtime_resources,
+                platform,
+                qrtr,
+                firmware,
+                remoteproc_state,
+            ),
         )
     };
     if diagnostic_unsandboxed {
@@ -153,7 +167,7 @@ fn start() -> Result<(), String> {
     locked.run(run)
 }
 
-fn activate_and_run(
+async fn activate_and_run(
     config: Config,
     endpoints: PreparedServerEndpoints,
     runtime_resources: PreparedRuntimeResources,
@@ -178,7 +192,7 @@ fn activate_and_run(
     // The inner owners may unwind, but mappings cannot be released until WPSS
     // has synchronously reached offline below.
     let hardware_guard = HardwareDevice::from_backend(vfio);
-    let operation = (|| -> Result<(), String> {
+    let operation: Result<(), String> = async {
         let hardware = hardware_guard.clone();
         let (waiter, dp_interrupts) = Wcn6750Interrupts::configure_with_ce_polling(
             hardware.clone(),
@@ -228,7 +242,7 @@ fn activate_and_run(
         let mut sme_config = wlan_sme::client::ClientConfig::default();
         sme_config.wpa3_supported = true;
         eprintln!("ath11k_wifi_startup=SOFTMAC_START_ENTER");
-        let runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
+        let runtime = ClientRuntime::new_with_prepared_resources(
             adapter,
             sme_config,
             device_info,
@@ -236,7 +250,8 @@ fn activate_and_run(
             spectrum,
             fuchsia_inspect::Inspector::default(),
             runtime_resources,
-        ))
+        )
+        .await
         .map_err(|error| format!("activate pinned client runtime: {error}"))?;
         eprintln!("ath11k_wifi_startup=CLIENT_RUNTIME_READY");
         diagnostic_pause("client_runtime_ready");
@@ -250,7 +265,7 @@ fn activate_and_run(
         TRACE_CE_SEQUENCE.store(0, Ordering::Release);
         TRACE_CE_RUNTIME.store(true, Ordering::Release);
         evidence(format_args!("stage=control_run_enter"))?;
-        let result = server.run_to_terminal();
+        let result = server.run_to_terminal().await;
         eprintln!("ath11k_wifi_cleanup=CONTROL_TERMINAL");
         let mut runtime = server.into_runtime();
         diagnostic_pause("runtime_stop_enter");
@@ -262,7 +277,8 @@ fn activate_and_run(
         );
         result.map_err(|error| format!("control service: {error}"))?;
         stop.map_err(|error| format!("stop physical runtime: {error}"))
-    })();
+    }
+    .await;
     eprintln!("ath11k_wifi_cleanup=REMOTEPROC_STOP_ENTER");
     diagnostic_pause("remoteproc_stop_enter");
     let containment = stop_and_verify_remoteproc(&mut remoteproc_state);

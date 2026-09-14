@@ -148,8 +148,9 @@ or receive general filesystem, host-network, or unrelated device access.
 
 The selected Linux execution model is one Tokio current-thread runtime with a
 LocalSet and readiness-driven descriptor integration. Portable driver contracts
-remain executor-neutral. The current timer-only runtime and synchronous
-downcalls are transitional, not the completed async lifecycle.
+remain executor-neutral. Entrypoints own that executor; protocol state does not own a nested runtime.
+Manual driver-turn polling and synchronous downcalls remain transitional,
+not the completed async lifecycle.
 
 The driver owns submitted operations and their hardware-visible resources
 independently of waiting futures. Dropping a waiter or reaching its deadline

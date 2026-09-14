@@ -15,7 +15,7 @@ use fidl_fuchsia_wlan_sme as fidl_sme;
 use fidl_fuchsia_wlan_softmac as fidl_softmac;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, Stream, StreamExt};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use wlan_mlme::MlmeImpl;
@@ -532,7 +532,7 @@ impl MlmeTask {
                         &mut mlme,
                         &bytes,
                         info,
-                        fuchsia_trace::Id::new(),
+                        fuchsia_trace::Id::new()
                     )
                     .await;
                     if let Some((algorithm, transaction, status, rejected_group)) = auth {
@@ -625,7 +625,6 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     events: mpsc::UnboundedReceiver<fidl_mlme::MlmeEvent>,
     sme_timers: Pin<Box<dyn Stream<Item = SmeTimerAction>>>,
     mlme_timers: Pin<Box<dyn Stream<Item = MlmeTimerAction>>>,
-    timer_runtime: tokio::runtime::Runtime,
     connect_attempt: Option<ConnectAttempt>,
     scan_attempt: Option<ScanAttempt>,
     connection: Option<wlan_sme::client::ConnectTransactionStream>,
@@ -634,16 +633,14 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
 
 /// Inert host runtime capabilities created before process lockdown.
 ///
-/// This owns the Tokio timer reactor and Ethernet socketpair, the only
-/// descriptor-creating parts of [`ClientRuntime`] construction. Device,
-/// firmware, QMI, and RX activation are deliberately absent.
+/// This owns only prepared Ethernet socketpairs. The Linux entrypoint owns
+/// the Tokio runtime, LocalSet, reactor inventory and sandbox registration.
+/// Device, firmware, QMI, and RX activation are deliberately absent.
 pub struct PreparedRuntimeResources {
-    timer_runtime: tokio::runtime::Runtime,
     ethernet_device: HostEthernetDevice,
     ethernet: DriverEthernetPort,
     replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
     mac_address: [u8; 6],
-    runtime_fds: Vec<std::os::fd::RawFd>,
 }
 
 impl PreparedRuntimeResources {
@@ -655,23 +652,16 @@ impl PreparedRuntimeResources {
         mac_address: [u8; 6],
         ethernet_queue_capacity: usize,
     ) -> Result<Self, anyhow::Error> {
-        let before = open_fd_snapshot()?;
-        let timer_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?;
-        let runtime_fds = open_fd_snapshot()?.difference(&before).copied().collect();
         let mut generations = (0..PREPARED_ETHERNET_GENERATIONS)
             .map(|_| ethernet_port(mac_address, ethernet_queue_capacity))
             .collect::<Result<VecDeque<_>, _>>()
             .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
         let (ethernet_device, ethernet) = generations.pop_front().unwrap();
         Ok(Self {
-            timer_runtime,
             ethernet_device,
             ethernet,
             replacement_ethernet: generations,
             mac_address,
-            runtime_fds,
         })
     }
 
@@ -684,28 +674,6 @@ impl PreparedRuntimeResources {
         }
         fds
     }
-
-    pub fn runtime_fd_identities(&self) -> &[std::os::fd::RawFd] {
-        &self.runtime_fds
-    }
-}
-
-fn open_fd_snapshot() -> Result<BTreeSet<std::os::fd::RawFd>, anyhow::Error> {
-    let entries = std::fs::read_dir("/proc/self/fd")?
-        .map(|entry| {
-            entry?
-                .file_name()
-                .to_string_lossy()
-                .parse::<std::os::fd::RawFd>()
-                .map_err(std::io::Error::other)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // The directory stream's own descriptor is closed when read_dir is
-    // dropped. Exclude that now-stale number from the retained inventory.
-    Ok(entries
-        .into_iter()
-        .filter(|fd| std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok())
-        .collect())
 }
 
 impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<D> {
@@ -775,18 +743,19 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     where
         D: 'static,
     {
+        tokio::runtime::Handle::try_current().map_err(|error| {
+            anyhow::anyhow!("ClientRuntime requires an owning Tokio runtime: {error}")
+        })?;
         if device_info.sta_addr != resources.mac_address {
             return Err(anyhow::anyhow!(
                 "prepared Ethernet MAC differs from queried SoftMAC MAC"
             ));
         }
         let PreparedRuntimeResources {
-            timer_runtime,
             ethernet_device,
             ethernet,
             replacement_ethernet,
             mac_address,
-            runtime_fds: _,
         } = resources;
         let upcalls = Arc::new(Mutex::new(UpcallQueue {
             live: true,
@@ -851,7 +820,6 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             events,
             sme_timers,
             mlme_timers,
-            timer_runtime,
             connect_attempt: None,
             scan_attempt: None,
             connection: None,
@@ -985,18 +953,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let resumed = self.mlme.poll_once()?;
         let (mut progressed, mut control_quiescent) = self.drain_control(CONTROL_BUDGET).await?;
         progressed |= resumed;
-        if let Some(action) = self.timer_runtime.block_on(async {
-            tokio::task::yield_now().await;
-            self.sme_timers.as_mut().next().now_or_never().flatten()
-        }) {
+        if let Some(action) = self.sme_timers.as_mut().next().now_or_never().flatten() {
             action(&mut self.sme);
             progressed = true;
             control_quiescent = false;
         }
-        if let Some(event) = self.timer_runtime.block_on(async {
-            tokio::task::yield_now().await;
-            self.mlme_timers.as_mut().next().now_or_never().flatten()
-        }) {
+        if let Some(event) = self.mlme_timers.as_mut().next().now_or_never().flatten() {
             println!(
                 "client_mlme_timer stage=stream_dequeued timer_id={} event={:?}",
                 event.id, event.event
@@ -1088,7 +1050,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             if let Some(result) = self.drive_connect_once().await? {
                 return Ok(result);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -1251,7 +1213,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 break Ok(());
             }
             if !progressed {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         };
         match result {
@@ -1322,7 +1284,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 break Ok(());
             }
             if !progressed {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         };
         if let Err(error) = result {
@@ -1506,6 +1468,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> Drop for Clien
 
 #[cfg(test)]
 mod tests {
+    fn run_local_test(future: impl std::future::Future<Output = ()>) {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&executor, future);
+    }
+
     use super::*;
 
     #[derive(Default)]
@@ -1844,82 +1814,85 @@ mod tests {
 
     #[test]
     fn host_mlme_device_forwards_the_complete_applicable_surface() {
-        let (fake, _) = Fake::new(0);
-        let (mut device, effects) = parts(fake);
-        futures::executor::block_on(async {
-            device.wlan_softmac_query_response().await.unwrap();
-            device.discovery_support().await.unwrap();
-            device.mac_sublayer_support().await.unwrap();
-            device.security_support().await.unwrap();
-            device.spectrum_management_support().await.unwrap();
+        run_local_test(async {
+            let (fake, _) = Fake::new(0);
+            let (mut device, effects) = parts(fake);
+            (async {
+                device.wlan_softmac_query_response().await.unwrap();
+                device.discovery_support().await.unwrap();
+                device.mac_sublayer_support().await.unwrap();
+                device.security_support().await.unwrap();
+                device.spectrum_management_support().await.unwrap();
+                device
+                    .set_channel(
+                        wlan_channel(),
+                        fidl_ieee80211::ChannelBandwidth::Cbw20,
+                        wlan_channel(),
+                    )
+                    .await
+                    .unwrap();
+                device.join_bss(&Default::default()).await.unwrap();
+                device.install_key(&Default::default()).await.unwrap();
+                device
+                    .notify_association_complete(Default::default())
+                    .await
+                    .unwrap();
+                device.clear_association(&Default::default()).await.unwrap();
+                device
+                    .start_passive_scan(&Default::default())
+                    .await
+                    .unwrap();
+                device.start_active_scan(&Default::default()).await.unwrap();
+                device.cancel_scan(&Default::default()).await.unwrap();
+                device
+                    .update_wmm_parameters(&Default::default())
+                    .await
+                    .unwrap();
+            })
+            .await;
             device
-                .set_channel(
-                    wlan_channel(),
-                    fidl_ieee80211::ChannelBandwidth::Cbw20,
-                    wlan_channel(),
+                .send_wlan_frame(
+                    vec![1, 0x40, 3].into(),
+                    fidl_softmac::WlanTxInfoFlags::empty(),
+                    None,
                 )
-                .await
                 .unwrap();
-            device.join_bss(&Default::default()).await.unwrap();
-            device.install_key(&Default::default()).await.unwrap();
-            device
-                .notify_association_complete(Default::default())
-                .await
-                .unwrap();
-            device.clear_association(&Default::default()).await.unwrap();
-            device
-                .start_passive_scan(&Default::default())
-                .await
-                .unwrap();
-            device.start_active_scan(&Default::default()).await.unwrap();
-            device.cancel_scan(&Default::default()).await.unwrap();
-            device
-                .update_wmm_parameters(&Default::default())
-                .await
-                .unwrap();
+            assert_eq!(
+                effects.lock().unwrap().calls,
+                [
+                    "query",
+                    "discovery",
+                    "mac",
+                    "security",
+                    "spectrum",
+                    "channel",
+                    "join",
+                    "key",
+                    "assoc",
+                    "clear",
+                    "passive",
+                    "active",
+                    "cancel",
+                    "wmm",
+                    "tx"
+                ]
+            );
+            assert_eq!(
+                effects.lock().unwrap().tx_flags,
+                [fidl_softmac::WlanTxInfoFlags::PROTECTED]
+            );
         });
-        device
-            .send_wlan_frame(
-                vec![1, 0x40, 3].into(),
-                fidl_softmac::WlanTxInfoFlags::empty(),
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            effects.lock().unwrap().calls,
-            [
-                "query",
-                "discovery",
-                "mac",
-                "security",
-                "spectrum",
-                "channel",
-                "join",
-                "key",
-                "assoc",
-                "clear",
-                "passive",
-                "active",
-                "cancel",
-                "wmm",
-                "tx"
-            ]
-        );
-        assert_eq!(
-            effects.lock().unwrap().tx_flags,
-            [fidl_softmac::WlanTxInfoFlags::PROTECTED]
-        );
     }
 
-    fn runtime(fake: Fake) -> ClientRuntime<Fake> {
-        runtime_with_device_info(fake, device_info())
+    async fn runtime(fake: Fake) -> ClientRuntime<Fake> {
+        runtime_with_device_info(fake, device_info()).await
     }
 
-    fn runtime_with_device_info(
+    async fn runtime_with_device_info(
         fake: Fake,
         device_info: fidl_mlme::DeviceInfo,
     ) -> ClientRuntime<Fake> {
-        futures::executor::block_on(ClientRuntime::new(
+        (ClientRuntime::new(
             fake,
             Default::default(),
             device_info,
@@ -1927,6 +1900,7 @@ mod tests {
             Default::default(),
             Default::default(),
         ))
+        .await
         .unwrap()
     }
 
@@ -1979,124 +1953,109 @@ mod tests {
 
     #[test]
     fn runtime_is_constructible_and_all_upcalls_enter_the_host_pump() {
-        let (fake, effects) = Fake::new(0);
-        let mut runtime = runtime(fake);
-        {
-            let mut effects = effects.lock().unwrap();
-            let upcalls = effects.upcalls.as_mut().unwrap();
-            upcalls.recv(vec![0, 0], rx_info());
-            upcalls.notify_scan_complete(zx::Status::OK, 9);
-            upcalls.report_tx_result(tx_result());
-        }
-        assert!(futures::executor::block_on(runtime.pump_upcalls()).unwrap());
-        assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let mut runtime = runtime(fake).await;
+            {
+                let mut effects = effects.lock().unwrap();
+                let upcalls = effects.upcalls.as_mut().unwrap();
+                upcalls.recv(vec![0, 0], rx_info());
+                upcalls.notify_scan_complete(zx::Status::OK, 9);
+                upcalls.report_tx_result(tx_result());
+            }
+            assert!((runtime.pump_upcalls()).await.unwrap());
+            assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+        });
     }
 
     #[test]
     fn control_at_capacity_evicts_oldest_raw_and_preserves_remaining_order() {
-        let state = Arc::new(Mutex::new(UpcallQueue {
-            live: true,
-            overflowed: false,
-            raw_queued: 0,
-            queue: VecDeque::new(),
-        }));
-        let mut sender = UpcallSender(state.clone());
-        for marker in 0..UPCALL_QUEUE_CAPACITY + 8 {
-            sender.recv(vec![marker as u8], rx_info());
-        }
-        sender.notify_scan_complete(zx::Status::OK, 3);
-        sender.report_tx_result(tx_result());
-        let state = state.lock().unwrap();
-        assert_eq!(state.queue.len(), UPCALL_QUEUE_CAPACITY);
-        assert_eq!(state.raw_queued, UPCALL_QUEUE_CAPACITY - 2);
-        assert!(matches!(
-            state.queue.front(),
-            Some(Upcall::Recv { bytes, .. }) if bytes == &[2]
-        ));
-        assert!(matches!(
-            state.queue.get(UPCALL_QUEUE_CAPACITY - 2),
-            Some(Upcall::ScanComplete { scan_id: 3, .. })
-        ));
-        assert!(matches!(state.queue.back(), Some(Upcall::TxResult(_))));
+        run_local_test(async {
+            let state = Arc::new(Mutex::new(UpcallQueue {
+                live: true,
+                overflowed: false,
+                raw_queued: 0,
+                queue: VecDeque::new(),
+            }));
+            let mut sender = UpcallSender(state.clone());
+            for marker in 0..UPCALL_QUEUE_CAPACITY + 8 {
+                sender.recv(vec![marker as u8], rx_info());
+            }
+            sender.notify_scan_complete(zx::Status::OK, 3);
+            sender.report_tx_result(tx_result());
+            let state = state.lock().unwrap();
+            assert_eq!(state.queue.len(), UPCALL_QUEUE_CAPACITY);
+            assert_eq!(state.raw_queued, UPCALL_QUEUE_CAPACITY - 2);
+            assert!(matches!(
+                state.queue.front(),
+                Some(Upcall::Recv { bytes, .. }) if bytes == &[2]
+            ));
+            assert!(matches!(
+                state.queue.get(UPCALL_QUEUE_CAPACITY - 2),
+                Some(Upcall::ScanComplete { scan_id: 3, .. })
+            ));
+            assert!(matches!(state.queue.back(), Some(Upcall::TxResult(_))));
+        });
     }
 
     #[test]
     fn all_control_overflow_is_fatal_and_next_pump_contains_device() {
-        let (fake, effects) = Fake::new(0);
-        let mut runtime = runtime(fake);
-        {
-            let mut effects = effects.lock().unwrap();
-            let upcalls = effects.upcalls.as_mut().unwrap();
-            for _ in 0..=UPCALL_QUEUE_CAPACITY {
-                upcalls.report_tx_result(tx_result());
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let mut runtime = runtime(fake).await;
+            {
+                let mut effects = effects.lock().unwrap();
+                let upcalls = effects.upcalls.as_mut().unwrap();
+                for _ in 0..=UPCALL_QUEUE_CAPACITY {
+                    upcalls.report_tx_result(tx_result());
+                }
             }
-        }
-        assert_eq!(
-            futures::executor::block_on(runtime.pump_associated_once()),
-            Err(ConnectError::Driver(DriverError::UpcallOverflow))
-        );
-        let state = runtime.upcalls.lock().unwrap();
-        assert!(!state.live);
-        assert!(state.overflowed);
-        assert!(state.queue.is_empty());
-        drop(state);
-        assert_eq!(
-            effects
-                .lock()
-                .unwrap()
-                .calls
-                .iter()
-                .filter(|call| **call == "stop")
-                .count(),
-            1
-        );
+            assert_eq!(
+                (runtime.pump_associated_once()).await,
+                Err(ConnectError::Driver(DriverError::UpcallOverflow))
+            );
+            let state = runtime.upcalls.lock().unwrap();
+            assert!(!state.live);
+            assert!(state.overflowed);
+            assert!(state.queue.is_empty());
+            drop(state);
+            assert_eq!(
+                effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "stop")
+                    .count(),
+                1
+            );
+        });
     }
 
     #[test]
     fn mlme_initialization_failure_never_starts_the_device() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().query_failure = true;
-        let result = futures::executor::block_on(ClientRuntime::new(
-            fake,
-            Default::default(),
-            device_info(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        ));
-        assert!(result.is_err());
-        assert_eq!(effects.lock().unwrap().calls, ["query"]);
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().query_failure = true;
+            let result = (ClientRuntime::new(
+                fake,
+                Default::default(),
+                device_info(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ))
+            .await;
+            assert!(result.is_err());
+            assert_eq!(effects.lock().unwrap().calls, ["query"]);
+        });
     }
 
     #[test]
     fn stop_drains_queued_callbacks_and_excludes_late_callbacks() {
-        let (fake, effects) = Fake::new(0);
-        let mut runtime = runtime(fake);
-        effects
-            .lock()
-            .unwrap()
-            .upcalls
-            .as_mut()
-            .unwrap()
-            .recv(vec![0, 0], rx_info());
-        runtime.stop().unwrap();
-        effects
-            .lock()
-            .unwrap()
-            .upcalls
-            .as_mut()
-            .unwrap()
-            .notify_scan_complete(zx::Status::OK, 1);
-        assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-    }
-
-    #[test]
-    fn failed_connect_terminally_revokes_host_state_even_when_reset_fails() {
-        for reset_failure in [false, true] {
+        run_local_test(async {
             let (fake, effects) = Fake::new(0);
-            effects.lock().unwrap().reset_failure = reset_failure;
-            let mut runtime = runtime(fake);
-            assert!(runtime.take_ethernet_device().is_none());
+            let mut runtime = runtime(fake).await;
             effects
                 .lock()
                 .unwrap()
@@ -2104,32 +2063,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .recv(vec![0, 0], rx_info());
-
-            let error = futures::executor::block_on(
-                runtime.connect(connect_request(), std::time::Instant::now()),
-            )
-            .unwrap_err();
-            assert_eq!(
-                error,
-                if reset_failure {
-                    ConnectError::Containment
-                } else {
-                    ConnectError::Timeout
-                }
-            );
-            assert!(runtime.revoked);
-            assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-            assert!(runtime.take_ethernet_device().is_none());
-            assert_eq!(
-                futures::executor::block_on(
-                    runtime.connect(connect_request(), std::time::Instant::now()),
-                ),
-                Err(ConnectError::Driver(DriverError::Stopped))
-            );
-            assert_eq!(
-                futures::executor::block_on(runtime.pump_associated_once()),
-                Err(ConnectError::Driver(DriverError::Stopped))
-            );
+            runtime.stop().unwrap();
             effects
                 .lock()
                 .unwrap()
@@ -2138,636 +2072,751 @@ mod tests {
                 .unwrap()
                 .notify_scan_complete(zx::Status::OK, 1);
             assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-        }
+        });
+    }
+
+    #[test]
+    fn failed_connect_terminally_revokes_host_state_even_when_reset_fails() {
+        run_local_test(async {
+            for reset_failure in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                effects.lock().unwrap().reset_failure = reset_failure;
+                let mut runtime = runtime(fake).await;
+                assert!(runtime.take_ethernet_device().is_none());
+                effects
+                    .lock()
+                    .unwrap()
+                    .upcalls
+                    .as_mut()
+                    .unwrap()
+                    .recv(vec![0, 0], rx_info());
+
+                let error = (runtime.connect(connect_request(), std::time::Instant::now()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    if reset_failure {
+                        ConnectError::Containment
+                    } else {
+                        ConnectError::Timeout
+                    }
+                );
+                assert!(runtime.revoked);
+                assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+                assert!(runtime.take_ethernet_device().is_none());
+                assert_eq!(
+                    (runtime.connect(connect_request(), std::time::Instant::now())).await,
+                    Err(ConnectError::Driver(DriverError::Stopped))
+                );
+                assert_eq!(
+                    (runtime.pump_associated_once()).await,
+                    Err(ConnectError::Driver(DriverError::Stopped))
+                );
+                effects
+                    .lock()
+                    .unwrap()
+                    .upcalls
+                    .as_mut()
+                    .unwrap()
+                    .notify_scan_complete(zx::Status::OK, 1);
+                assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+            }
+        });
     }
 
     #[test]
     fn completed_failure_drains_stale_callbacks_and_allows_successful_retry() {
-        let (fake, effects) = Fake::new(0);
-        {
-            let mut state = effects.lock().unwrap();
-            state.simulate_ap = true;
-            state.reject_next_auth = true;
-            state.retry_cleanup = true;
-            state.stale_callback_during_cleanup = true;
-        }
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        assert!(runtime.take_ethernet_device().is_none());
-
-        let failure = futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap_err();
-        assert!(matches!(
-            failure,
-            ConnectError::Failed(fidl_sme::ConnectResult {
-                code: fidl_ieee80211::StatusCode::RefusedReasonUnspecified,
-                is_credential_rejected: false,
-                is_reconnect: false,
-            })
-        ));
-        assert!(!runtime.revoked);
-        assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
-        assert_eq!(
-            runtime.io.lock().unwrap().ethernet.deliver(&[0; 14]),
-            Err(EthernetIngressError::LinkDown)
-        );
-        {
-            let state = effects.lock().unwrap();
-            assert_eq!(
-                state
-                    .calls
-                    .iter()
-                    .filter(|call| **call == "finish_failed_connect_attempt")
-                    .count(),
-                1
-            );
-            assert!(!state.calls.contains(&"reset"));
-        }
-
-        let result = futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        assert_eq!(
-            result,
-            fidl_sme::ConnectResult {
-                code: fidl_ieee80211::StatusCode::Success,
-                is_credential_rejected: false,
-                is_reconnect: false,
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.reject_next_auth = true;
+                state.retry_cleanup = true;
+                state.stale_callback_during_cleanup = true;
             }
-        );
-        assert!(runtime.sme().status().is_connected());
-        let ethernet = runtime.take_ethernet_device().unwrap();
-        assert!(ethernet.properties().is_some());
-        assert!(runtime.take_ethernet_device().is_none());
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            assert!(runtime.take_ethernet_device().is_none());
+
+            let failure = (runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                failure,
+                ConnectError::Failed(fidl_sme::ConnectResult {
+                    code: fidl_ieee80211::StatusCode::RefusedReasonUnspecified,
+                    is_credential_rejected: false,
+                    is_reconnect: false,
+                })
+            ));
+            assert!(!runtime.revoked);
+            assert!(runtime.upcalls.lock().unwrap().queue.is_empty());
+            assert_eq!(
+                runtime.io.lock().unwrap().ethernet.deliver(&[0; 14]),
+                Err(EthernetIngressError::LinkDown)
+            );
+            {
+                let state = effects.lock().unwrap();
+                assert_eq!(
+                    state
+                        .calls
+                        .iter()
+                        .filter(|call| **call == "finish_failed_connect_attempt")
+                        .count(),
+                    1
+                );
+                assert!(!state.calls.contains(&"reset"));
+            }
+
+            let result = (runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                fidl_sme::ConnectResult {
+                    code: fidl_ieee80211::StatusCode::Success,
+                    is_credential_rejected: false,
+                    is_reconnect: false,
+                }
+            );
+            assert!(runtime.sme().status().is_connected());
+            let ethernet = runtime.take_ethernet_device().unwrap();
+            assert!(ethernet.properties().is_some());
+            assert!(runtime.take_ethernet_device().is_none());
+        });
     }
 
     #[test]
     fn reconnecting_disconnect_retains_the_transaction_stream() {
-        let (fake, _) = Fake::new(0);
-        let mut runtime = runtime(fake);
-        let (events, stream) = mpsc::unbounded();
-        runtime.connection = Some(stream);
-        events
-            .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
-                info: fidl_sme::DisconnectInfo {
-                    is_sme_reconnecting: true,
-                    disconnect_source: fidl_sme::DisconnectSource::User(
-                        fidl_sme::UserDisconnectReason::FailedToConnect,
-                    ),
-                },
-            })
-            .unwrap();
-        events
-            .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
-                result: wlan_sme::client::ConnectResult::Success,
-                is_reconnect: true,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            runtime.next_connection_event().unwrap(),
-            Some(fidl_sme::ConnectTransactionEvent::OnDisconnect {
-                info: fidl_sme::DisconnectInfo {
-                    is_sme_reconnecting: true,
-                    ..
-                }
-            })
-        ));
-        assert!(matches!(
-            runtime.next_connection_event().unwrap(),
-            Some(fidl_sme::ConnectTransactionEvent::OnConnectResult {
-                result: fidl_sme::ConnectResult {
-                    code: fidl_ieee80211::StatusCode::Success,
-                    is_credential_rejected: false,
+        run_local_test(async {
+            let (fake, _) = Fake::new(0);
+            let mut runtime = runtime(fake).await;
+            let (events, stream) = mpsc::unbounded();
+            runtime.connection = Some(stream);
+            events
+                .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+                    info: fidl_sme::DisconnectInfo {
+                        is_sme_reconnecting: true,
+                        disconnect_source: fidl_sme::DisconnectSource::User(
+                            fidl_sme::UserDisconnectReason::FailedToConnect,
+                        ),
+                    },
+                })
+                .unwrap();
+            events
+                .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
+                    result: wlan_sme::client::ConnectResult::Success,
                     is_reconnect: true,
-                },
-            })
-        ));
+                })
+                .unwrap();
+
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect {
+                    info: fidl_sme::DisconnectInfo {
+                        is_sme_reconnecting: true,
+                        ..
+                    }
+                })
+            ));
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnConnectResult {
+                    result: fidl_sme::ConnectResult {
+                        code: fidl_ieee80211::StatusCode::Success,
+                        is_credential_rejected: false,
+                        is_reconnect: true,
+                    },
+                })
+            ));
+        });
     }
 
     #[test]
     fn retained_connect_attempt_can_be_canceled_and_reused() {
-        let (fake, effects) = Fake::new(0);
-        {
-            let mut state = effects.lock().unwrap();
-            state.simulate_ap = true;
-            state.suppress_auth_response = true;
-            state.retry_cleanup = true;
-        }
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        runtime
-            .begin_connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
-        assert_eq!(
-            runtime.begin_connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            ),
-            Err(ConnectError::Driver(DriverError::ConnectInProgress))
-        );
-
-        let result = futures::executor::block_on(runtime.cancel_connect(
-            fidl_sme::UserDisconnectReason::FailedToConnect,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        assert_eq!(
-            result,
-            fidl_sme::ConnectResult {
-                code: fidl_ieee80211::StatusCode::Canceled,
-                is_credential_rejected: false,
-                is_reconnect: false,
-            }
-        );
-        assert!(sme_is_retry_quiescent(&runtime.sme().status()));
-        assert!(!runtime.revoked);
-        assert!(
-            effects
-                .lock()
-                .unwrap()
-                .calls
-                .contains(&"finish_failed_connect_attempt")
-        );
-
-        effects.lock().unwrap().suppress_auth_response = false;
-        runtime
-            .begin_connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
-        let result = loop {
-            if let Some(result) = futures::executor::block_on(runtime.drive_connect_once()).unwrap()
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
             {
-                break result;
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.suppress_auth_response = true;
+                state.retry_cleanup = true;
             }
-        };
-        assert_eq!(result.code, fidl_ieee80211::StatusCode::Success);
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .begin_connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(
+                runtime.begin_connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ),
+                Err(ConnectError::Driver(DriverError::ConnectInProgress))
+            );
+
+            let result = (runtime.cancel_connect(
+                fidl_sme::UserDisconnectReason::FailedToConnect,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                fidl_sme::ConnectResult {
+                    code: fidl_ieee80211::StatusCode::Canceled,
+                    is_credential_rejected: false,
+                    is_reconnect: false,
+                }
+            );
+            assert!(sme_is_retry_quiescent(&runtime.sme().status()));
+            assert!(!runtime.revoked);
+            assert!(
+                effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .contains(&"finish_failed_connect_attempt")
+            );
+
+            effects.lock().unwrap().suppress_auth_response = false;
+            runtime
+                .begin_connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            let result = loop {
+                if let Some(result) = (runtime.drive_connect_once()).await.unwrap() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(result.code, fidl_ieee80211::StatusCode::Success);
+        });
     }
 
     #[test]
     fn canceled_connect_without_certified_cleanup_is_contained() {
-        let (fake, effects) = Fake::new(0);
-        {
-            let mut state = effects.lock().unwrap();
-            state.simulate_ap = true;
-            state.suppress_auth_response = true;
-        }
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        runtime
-            .begin_connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.suppress_auth_response = true;
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .begin_connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
 
-        assert_eq!(
-            futures::executor::block_on(runtime.cancel_connect(
-                fidl_sme::UserDisconnectReason::FailedToConnect,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )),
-            Err(ConnectError::Driver(DriverError::RetryCleanup))
-        );
-        assert!(runtime.revoked);
-        let state = effects.lock().unwrap();
-        assert!(state.calls.contains(&"finish_failed_connect_attempt"));
-        assert!(state.calls.contains(&"reset"));
+            assert_eq!(
+                (runtime.cancel_connect(
+                    fidl_sme::UserDisconnectReason::FailedToConnect,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+                Err(ConnectError::Driver(DriverError::RetryCleanup))
+            );
+            assert!(runtime.revoked);
+            let state = effects.lock().unwrap();
+            assert!(state.calls.contains(&"finish_failed_connect_attempt"));
+            assert!(state.calls.contains(&"reset"));
+        });
     }
 
     #[test]
     fn non_ht_client_joins_wide_bss_on_primary_20mhz() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().simulate_ap = true;
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        let mut request = connect_request();
-        request.bss_description.bandwidth = fidl_ieee80211::ChannelBandwidth::Cbw40;
-        futures::executor::block_on(runtime.connect(
-            request,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        let state = effects.lock().unwrap();
-        assert_eq!(state.channels.len(), 1);
-        assert_eq!(state.channels[0].primary, Some(wlan_channel()));
-        assert_eq!(
-            state.channels[0].bandwidth,
-            Some(fidl_ieee80211::ChannelBandwidth::Cbw20)
-        );
-        assert_eq!(
-            state.channels[0].vht_secondary_80_channel.unwrap().number,
-            0
-        );
-        assert!(state.calls.contains(&"assoc"));
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            let mut request = connect_request();
+            request.bss_description.bandwidth = fidl_ieee80211::ChannelBandwidth::Cbw40;
+            (runtime.connect(
+                request,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            let state = effects.lock().unwrap();
+            assert_eq!(state.channels.len(), 1);
+            assert_eq!(state.channels[0].primary, Some(wlan_channel()));
+            assert_eq!(
+                state.channels[0].bandwidth,
+                Some(fidl_ieee80211::ChannelBandwidth::Cbw20)
+            );
+            assert_eq!(
+                state.channels[0].vht_secondary_80_channel.unwrap().number,
+                0
+            );
+            assert!(state.calls.contains(&"assoc"));
+        });
     }
 
     #[test]
     fn successful_connection_retains_events_and_disconnects_before_reuse() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().simulate_ap = true;
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-
-        futures::executor::block_on(runtime.pump_associated_once()).unwrap();
-        assert_eq!(
-            futures::executor::block_on(runtime.connect(
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            (runtime.connect(
                 connect_request(),
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )),
-            Err(ConnectError::Driver(DriverError::AlreadyConnected))
-        );
-        futures::executor::block_on(runtime.disconnect(
-            fidl_sme::UserDisconnectReason::FailedToConnect,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        assert!(matches!(
-            runtime.next_connection_event().unwrap(),
-            Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
-        ));
-        assert!(sme_is_retry_quiescent(&runtime.sme().status()));
+            ))
+            .await
+            .unwrap();
 
-        futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        runtime.stop().unwrap();
-        assert_eq!(
-            runtime.next_connection_event(),
-            Err(ConnectError::Driver(DriverError::Stopped))
-        );
+            (runtime.pump_associated_once()).await.unwrap();
+            assert_eq!(
+                (runtime.connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+                Err(ConnectError::Driver(DriverError::AlreadyConnected))
+            );
+            (runtime.disconnect(
+                fidl_sme::UserDisconnectReason::FailedToConnect,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
+            ));
+            assert!(sme_is_retry_quiescent(&runtime.sme().status()));
+
+            (runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            runtime.stop().unwrap();
+            assert_eq!(
+                runtime.next_connection_event(),
+                Err(ConnectError::Driver(DriverError::Stopped))
+            );
+        });
     }
 
     #[test]
     fn unsupported_roam_preserves_the_current_connection() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().simulate_ap = true;
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        assert_eq!(
-            runtime.roam(fidl_sme::RoamRequest {
-                bss_description: connect_request().bss_description,
-            }),
-            Err(ConnectError::Driver(DriverError::NotConnected))
-        );
-        futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            assert_eq!(
+                runtime.roam(fidl_sme::RoamRequest {
+                    bss_description: connect_request().bss_description,
+                }),
+                Err(ConnectError::Driver(DriverError::NotConnected))
+            );
+            (runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
 
-        assert_eq!(
-            runtime.roam(fidl_sme::RoamRequest {
-                bss_description: connect_request().bss_description,
-            }),
-            Err(ConnectError::Driver(DriverError::RoamUnsupported))
-        );
-        assert!(runtime.connection.is_some());
-        assert!(runtime.sme().status().is_connected());
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_service_once()),
-            Ok(false)
-        );
+            assert_eq!(
+                runtime.roam(fidl_sme::RoamRequest {
+                    bss_description: connect_request().bss_description,
+                }),
+                Err(ConnectError::Driver(DriverError::RoamUnsupported))
+            );
+            assert!(runtime.connection.is_some());
+            assert!(runtime.sme().status().is_connected());
+            assert_eq!((runtime.drive_service_once()).await, Ok(false));
+        });
     }
 
     #[test]
     fn service_drive_treats_a_revoked_ethernet_generation_as_idle() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().simulate_ap = true;
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        futures::executor::block_on(runtime.connect(
-            connect_request(),
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ))
-        .unwrap();
-        runtime.io.lock().unwrap().ethernet.set_link(false);
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_service_once()),
-            Ok(false)
-        );
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            (runtime.connect(
+                connect_request(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+            runtime.io.lock().unwrap().ethernet.set_link(false);
+            assert_eq!((runtime.drive_service_once()).await, Ok(false));
+        });
     }
 
     #[test]
     fn discovery_scan_result_is_retained_for_service_driving() {
-        let (fake, effects) = Fake::new(0);
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        runtime
-            .begin_scan(
-                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
-        assert_eq!(
-            runtime.begin_scan(
-                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            ),
-            Err(ConnectError::Driver(DriverError::ScanInProgress))
-        );
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
-            None
-        );
-        let scan_id = effects.lock().unwrap().scan_id;
-        effects
-            .lock()
-            .unwrap()
-            .upcalls
-            .as_mut()
-            .unwrap()
-            .notify_scan_complete(zx::Status::OK, scan_id);
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .begin_scan(
+                    fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                        channels: vec![],
+                    }),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(
+                runtime.begin_scan(
+                    fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                        channels: vec![]
+                    }),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ),
+                Err(ConnectError::Driver(DriverError::ScanInProgress))
+            );
+            assert_eq!((runtime.drive_scan_once()).await.unwrap(), None);
+            let scan_id = effects.lock().unwrap().scan_id;
+            effects
+                .lock()
+                .unwrap()
+                .upcalls
+                .as_mut()
+                .unwrap()
+                .notify_scan_complete(zx::Status::OK, scan_id);
 
-        let result = loop {
-            if let Some(result) = futures::executor::block_on(runtime.drive_scan_once()).unwrap() {
-                break result;
-            }
-        };
-        assert_eq!(result, Ok(vec![]));
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_scan_once()),
-            Err(ConnectError::Driver(DriverError::NoScanInProgress))
-        );
+            let result = loop {
+                if let Some(result) = (runtime.drive_scan_once()).await.unwrap() {
+                    break result;
+                }
+            };
+            assert_eq!(result, Ok(vec![]));
+            assert_eq!(
+                (runtime.drive_scan_once()).await,
+                Err(ConnectError::Driver(DriverError::NoScanInProgress))
+            );
+        });
     }
 
     #[test]
     fn rejected_discovery_scan_is_retained_as_a_policy_result() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().scan_offload = false;
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
-        runtime
-            .begin_scan(
-                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .unwrap();
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
-            Some(Err(fidl_sme::ScanErrorCode::NotSupported))
-        );
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().scan_offload = false;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .begin_scan(
+                    fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                        channels: vec![],
+                    }),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(
+                (runtime.drive_scan_once()).await.unwrap(),
+                Some(Err(fidl_sme::ScanErrorCode::NotSupported))
+            );
+        });
     }
 
     #[test]
     fn empty_radio_capabilities_construct_and_reject_scan_without_hardware() {
-        let (fake, effects) = Fake::new(0);
-        {
-            let mut effects = effects.lock().unwrap();
-            effects.empty_bands = true;
-            effects.scan_offload = false;
-        }
-        let info = device_info();
-        let resources = PreparedRuntimeResources::new(info.sta_addr).unwrap();
-        let mut runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
-            fake,
-            Default::default(),
-            info,
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            resources,
-        ))
-        .unwrap();
-        runtime
-            .begin_scan(
-                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut effects = effects.lock().unwrap();
+                effects.empty_bands = true;
+                effects.scan_offload = false;
+            }
+            let info = device_info();
+            let resources = PreparedRuntimeResources::new(info.sta_addr).unwrap();
+            let mut runtime = (ClientRuntime::new_with_prepared_resources(
+                fake,
+                Default::default(),
+                info,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                resources,
+            ))
+            .await
             .unwrap();
-        assert_eq!(
-            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
-            // Empty channel inventory is rejected by pinned MLME before the
-            // driver is called; SME currently maps InvalidArgs to InternalError.
-            Some(Err(fidl_sme::ScanErrorCode::InternalError))
-        );
-        runtime.stop().unwrap();
-        let effects = effects.lock().unwrap();
-        assert!(!effects.calls.contains(&"passive"));
-        assert!(!effects.calls.contains(&"active"));
-        assert!(effects.calls.contains(&"stop"));
+            runtime
+                .begin_scan(
+                    fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                        channels: vec![],
+                    }),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(
+                (runtime.drive_scan_once()).await.unwrap(),
+                // Empty channel inventory is rejected by pinned MLME before the
+                // driver is called; SME currently maps InvalidArgs to InternalError.
+                Some(Err(fidl_sme::ScanErrorCode::InternalError))
+            );
+            runtime.stop().unwrap();
+            let effects = effects.lock().unwrap();
+            assert!(!effects.calls.contains(&"passive"));
+            assert!(!effects.calls.contains(&"active"));
+            assert!(effects.calls.contains(&"stop"));
+        });
     }
 
     #[test]
     fn queued_mlme_work_cannot_be_certified_retry_quiescent() {
-        let (fake, effects) = Fake::new(0);
-        effects.lock().unwrap().retry_cleanup = true;
-        let mut runtime = runtime(fake);
-        runtime
-            .mlme
-            .enqueue(MlmeInput::Upcall(Upcall::ScanComplete {
-                status: zx::Status::OK,
-                scan_id: 1,
-            }))
-            .unwrap();
-        assert!(!runtime.finish_failed_attempt_cleanup());
-        assert!(
-            !effects
-                .lock()
-                .unwrap()
-                .calls
-                .contains(&"finish_failed_connect_attempt")
-        );
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().retry_cleanup = true;
+            let mut runtime = runtime(fake).await;
+            runtime
+                .mlme
+                .enqueue(MlmeInput::Upcall(Upcall::ScanComplete {
+                    status: zx::Status::OK,
+                    scan_id: 1,
+                }))
+                .unwrap();
+            assert!(!runtime.finish_failed_attempt_cleanup());
+            assert!(
+                !effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .contains(&"finish_failed_connect_attempt")
+            );
+        });
     }
 
     #[test]
     fn only_idle_sme_is_retry_quiescent() {
-        assert!(sme_is_retry_quiescent(
-            &wlan_sme::client::ClientSmeStatus::Idle
-        ));
-        assert!(!sme_is_retry_quiescent(
-            &wlan_sme::client::ClientSmeStatus::Roaming([1; 6].into())
-        ));
+        run_local_test(async {
+            assert!(sme_is_retry_quiescent(
+                &wlan_sme::client::ClientSmeStatus::Idle
+            ));
+            assert!(!sme_is_retry_quiescent(
+                &wlan_sme::client::ClientSmeStatus::Roaming([1; 6].into())
+            ));
+        });
     }
 
     #[test]
     fn link_up_after_hup_publishes_a_fresh_ethernet_generation() {
-        let mac = [2, 0, 0, 0, 0, 1];
-        let capacity = 3;
-        let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
-        let replacements = (0..2)
-            .map(|_| ethernet_port(mac, capacity).unwrap())
-            .collect();
-        let (fake, effects) = Fake::new(0);
-        let device = Arc::new(Mutex::new(StartedDevice {
-            device: fake,
-            stop_pending: false,
-        }));
-        let io = Arc::new(Mutex::new(HostIo {
-            ethernet,
-            replacement_ethernet: replacements,
-            unpublished_ethernet_device: None,
-            pending_ethernet_devices: VecDeque::new(),
-            ethernet_mac_address: mac,
-            minstrel: None,
-        }));
-        let mut host_device = HostMlmeDevice::new(device, io.clone());
-
-        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
-        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::DOWN)).unwrap();
-        assert!(io.lock().unwrap().ethernet.is_closed());
-        assert_eq!(old_host.properties().unwrap().mac_address, mac);
-
-        effects.lock().unwrap().link_failure = true;
-        assert_eq!(
-            futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)),
-            Err(zx::Status::IO)
-        );
-        assert!(io.lock().unwrap().ethernet.is_closed());
-        assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
-
-        effects.lock().unwrap().link_failure = false;
-        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
-        let mut state = io.lock().unwrap();
-        assert!(!state.ethernet.is_closed());
-        assert_eq!(state.pending_ethernet_devices.len(), 1);
-        assert_eq!(old_host.properties(), None);
-        let replacement = state.pending_ethernet_devices.pop_front().unwrap();
-        assert_eq!(replacement.properties().unwrap().mac_address, mac);
-        drop(state);
-
-        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)).unwrap();
-        assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
-        futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::DOWN)).unwrap();
-        assert_eq!(
-            futures::executor::block_on(host_device.set_ethernet_status(LinkStatus::UP)),
-            Err(zx::Status::NO_RESOURCES)
-        );
-    }
-
-    #[test]
-    fn link_down_revokes_unpublished_and_pending_ethernet_generations() {
-        let mac = [2, 0, 0, 0, 0, 1];
-        let make_host = || {
-            let (host, ethernet) = ethernet_port(mac, 3).unwrap();
-            let (fake, _) = Fake::new(0);
+        run_local_test(async {
+            let mac = [2, 0, 0, 0, 0, 1];
+            let capacity = 3;
+            let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
+            let replacements = (0..2)
+                .map(|_| ethernet_port(mac, capacity).unwrap())
+                .collect();
+            let (fake, effects) = Fake::new(0);
             let device = Arc::new(Mutex::new(StartedDevice {
                 device: fake,
                 stop_pending: false,
             }));
             let io = Arc::new(Mutex::new(HostIo {
                 ethernet,
-                replacement_ethernet: VecDeque::new(),
-                unpublished_ethernet_device: Some(host),
+                replacement_ethernet: replacements,
+                unpublished_ethernet_device: None,
                 pending_ethernet_devices: VecDeque::new(),
                 ethernet_mac_address: mac,
                 minstrel: None,
             }));
-            (HostMlmeDevice::new(device, io.clone()), io)
-        };
+            let mut host_device = HostMlmeDevice::new(device, io.clone());
 
-        let (mut before_up, before_up_io) = make_host();
-        futures::executor::block_on(before_up.set_ethernet_status(LinkStatus::DOWN)).unwrap();
-        let before_up_io = before_up_io.lock().unwrap();
-        assert!(before_up_io.unpublished_ethernet_device.is_none());
-        assert!(before_up_io.pending_ethernet_devices.is_empty());
-        assert!(before_up_io.ethernet.is_closed());
-        drop(before_up_io);
+            (host_device.set_ethernet_status(LinkStatus::UP))
+                .await
+                .unwrap();
+            (host_device.set_ethernet_status(LinkStatus::DOWN))
+                .await
+                .unwrap();
+            assert!(io.lock().unwrap().ethernet.is_closed());
+            assert_eq!(old_host.properties().unwrap().mac_address, mac);
 
-        let (mut while_pending, while_pending_io) = make_host();
-        futures::executor::block_on(while_pending.set_ethernet_status(LinkStatus::UP)).unwrap();
-        assert_eq!(
-            while_pending_io
-                .lock()
-                .unwrap()
-                .pending_ethernet_devices
-                .len(),
-            1
-        );
-        futures::executor::block_on(while_pending.set_ethernet_status(LinkStatus::DOWN)).unwrap();
-        let while_pending_io = while_pending_io.lock().unwrap();
-        assert!(while_pending_io.unpublished_ethernet_device.is_none());
-        assert!(while_pending_io.pending_ethernet_devices.is_empty());
-        assert!(while_pending_io.ethernet.is_closed());
+            effects.lock().unwrap().link_failure = true;
+            assert_eq!(
+                (host_device.set_ethernet_status(LinkStatus::UP)).await,
+                Err(zx::Status::IO)
+            );
+            assert!(io.lock().unwrap().ethernet.is_closed());
+            assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
+
+            effects.lock().unwrap().link_failure = false;
+            (host_device.set_ethernet_status(LinkStatus::UP))
+                .await
+                .unwrap();
+            let mut state = io.lock().unwrap();
+            assert!(!state.ethernet.is_closed());
+            assert_eq!(state.pending_ethernet_devices.len(), 1);
+            assert_eq!(old_host.properties(), None);
+            let replacement = state.pending_ethernet_devices.pop_front().unwrap();
+            assert_eq!(replacement.properties().unwrap().mac_address, mac);
+            drop(state);
+
+            (host_device.set_ethernet_status(LinkStatus::UP))
+                .await
+                .unwrap();
+            assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
+            (host_device.set_ethernet_status(LinkStatus::DOWN))
+                .await
+                .unwrap();
+            assert_eq!(
+                (host_device.set_ethernet_status(LinkStatus::UP)).await,
+                Err(zx::Status::NO_RESOURCES)
+            );
+        });
+    }
+
+    #[test]
+    fn link_down_revokes_unpublished_and_pending_ethernet_generations() {
+        run_local_test(async {
+            let mac = [2, 0, 0, 0, 0, 1];
+            let make_host = || {
+                let (host, ethernet) = ethernet_port(mac, 3).unwrap();
+                let (fake, _) = Fake::new(0);
+                let device = Arc::new(Mutex::new(StartedDevice {
+                    device: fake,
+                    stop_pending: false,
+                }));
+                let io = Arc::new(Mutex::new(HostIo {
+                    ethernet,
+                    replacement_ethernet: VecDeque::new(),
+                    unpublished_ethernet_device: Some(host),
+                    pending_ethernet_devices: VecDeque::new(),
+                    ethernet_mac_address: mac,
+                    minstrel: None,
+                }));
+                (HostMlmeDevice::new(device, io.clone()), io)
+            };
+
+            let (mut before_up, before_up_io) = make_host();
+            (before_up.set_ethernet_status(LinkStatus::DOWN))
+                .await
+                .unwrap();
+            let before_up_io = before_up_io.lock().unwrap();
+            assert!(before_up_io.unpublished_ethernet_device.is_none());
+            assert!(before_up_io.pending_ethernet_devices.is_empty());
+            assert!(before_up_io.ethernet.is_closed());
+            drop(before_up_io);
+
+            let (mut while_pending, while_pending_io) = make_host();
+            (while_pending.set_ethernet_status(LinkStatus::UP))
+                .await
+                .unwrap();
+            assert_eq!(
+                while_pending_io
+                    .lock()
+                    .unwrap()
+                    .pending_ethernet_devices
+                    .len(),
+                1
+            );
+            (while_pending.set_ethernet_status(LinkStatus::DOWN))
+                .await
+                .unwrap();
+            let while_pending_io = while_pending_io.lock().unwrap();
+            assert!(while_pending_io.unpublished_ethernet_device.is_none());
+            assert!(while_pending_io.pending_ethernet_devices.is_empty());
+            assert!(while_pending_io.ethernet.is_closed());
+        });
     }
 
     #[test]
     fn completed_failure_without_retry_safe_driver_cleanup_is_terminal() {
-        let (fake, effects) = Fake::new(0);
-        {
-            let mut state = effects.lock().unwrap();
-            state.simulate_ap = true;
-            state.reject_next_auth = true;
-        }
-        let mut runtime = runtime_with_device_info(fake, retry_device_info());
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.reject_next_auth = true;
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
 
-        assert_eq!(
-            futures::executor::block_on(runtime.connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )),
-            Err(ConnectError::Driver(DriverError::RetryCleanup))
-        );
-        assert!(runtime.revoked);
-        let state = effects.lock().unwrap();
-        assert!(state.calls.contains(&"finish_failed_connect_attempt"));
-        assert!(state.calls.contains(&"reset"));
+            assert_eq!(
+                (runtime.connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+                Err(ConnectError::Driver(DriverError::RetryCleanup))
+            );
+            assert!(runtime.revoked);
+            let state = effects.lock().unwrap();
+            assert!(state.calls.contains(&"finish_failed_connect_attempt"));
+            assert!(state.calls.contains(&"reset"));
+        });
     }
 
     #[test]
     fn failed_stop_is_retried_but_successful_stop_is_not() {
-        let (fake, effects) = Fake::new(1);
-        let mut runtime_instance = runtime(fake);
-        assert_eq!(runtime_instance.stop(), Err(zx::Status::IO));
-        runtime_instance.stop().unwrap();
-        drop(runtime_instance);
-        assert_eq!(
-            effects
-                .lock()
-                .unwrap()
-                .calls
-                .iter()
-                .filter(|call| **call == "stop")
-                .count(),
-            2
-        );
+        run_local_test(async {
+            let (fake, effects) = Fake::new(1);
+            let mut runtime_instance = runtime(fake).await;
+            assert_eq!(runtime_instance.stop(), Err(zx::Status::IO));
+            runtime_instance.stop().unwrap();
+            drop(runtime_instance);
+            assert_eq!(
+                effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "stop")
+                    .count(),
+                2
+            );
 
-        let (fake, effects) = Fake::new(1);
-        let mut runtime_after_failure = runtime(fake);
-        assert_eq!(runtime_after_failure.stop(), Err(zx::Status::IO));
-        drop(runtime_after_failure);
-        assert_eq!(
-            effects
-                .lock()
-                .unwrap()
-                .calls
-                .iter()
-                .filter(|call| **call == "stop")
-                .count(),
-            2
-        );
+            let (fake, effects) = Fake::new(1);
+            let mut runtime_after_failure = runtime(fake).await;
+            assert_eq!(runtime_after_failure.stop(), Err(zx::Status::IO));
+            drop(runtime_after_failure);
+            assert_eq!(
+                effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "stop")
+                    .count(),
+                2
+            );
+        });
     }
 
     #[test]
     fn successful_and_failed_stop_make_connect_and_pump_terminal() {
-        let (fake, effects) = Fake::new(0);
-        let mut stopped = runtime(fake);
-        stopped.stop().unwrap();
-        let calls_after_stop = effects.lock().unwrap().calls.clone();
-        assert_eq!(
-            futures::executor::block_on(stopped.connect(
-                connect_request(),
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )),
-            Err(ConnectError::Driver(DriverError::Stopped))
-        );
-        assert_eq!(*effects.lock().unwrap().calls, calls_after_stop);
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let mut stopped = runtime(fake).await;
+            stopped.stop().unwrap();
+            let calls_after_stop = effects.lock().unwrap().calls.clone();
+            assert_eq!(
+                (stopped.connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                ))
+                .await,
+                Err(ConnectError::Driver(DriverError::Stopped))
+            );
+            assert_eq!(*effects.lock().unwrap().calls, calls_after_stop);
 
-        let (fake, effects) = Fake::new(1);
-        let mut stop_failed = runtime(fake);
-        assert_eq!(stop_failed.stop(), Err(zx::Status::IO));
-        let calls_after_stop = effects.lock().unwrap().calls.clone();
-        assert_eq!(
-            futures::executor::block_on(stop_failed.pump_associated_once()),
-            Err(ConnectError::Driver(DriverError::Stopped))
-        );
-        assert_eq!(*effects.lock().unwrap().calls, calls_after_stop);
+            let (fake, effects) = Fake::new(1);
+            let mut stop_failed = runtime(fake).await;
+            assert_eq!(stop_failed.stop(), Err(zx::Status::IO));
+            let calls_after_stop = effects.lock().unwrap().calls.clone();
+            assert_eq!(
+                (stop_failed.pump_associated_once()).await,
+                Err(ConnectError::Driver(DriverError::Stopped))
+            );
+            assert_eq!(*effects.lock().unwrap().calls, calls_after_stop);
+        });
     }
 }

@@ -561,17 +561,18 @@ impl<R: WifiRuntime> ControlServer<R> {
         Ok(progressed)
     }
 
-    pub fn run(mut self) -> Result<(), ServiceError> {
-        self.run_to_terminal()
+    pub async fn run(mut self) -> Result<(), ServiceError> {
+        self.run_to_terminal().await
     }
 
     /// Drive until the generation is terminal while retaining runtime
     /// ownership for hardware-specific orderly shutdown.
-    pub fn run_to_terminal(&mut self) -> Result<(), ServiceError> {
+    pub async fn run_to_terminal(&mut self) -> Result<(), ServiceError> {
         while !self.is_terminal() {
-            if !futures::executor::block_on(self.drive_once())? {
+            if !self.drive_once().await? {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            tokio::task::yield_now().await;
         }
         Ok(())
     }

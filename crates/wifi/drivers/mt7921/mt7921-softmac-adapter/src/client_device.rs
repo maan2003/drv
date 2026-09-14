@@ -3164,7 +3164,11 @@ mod tests {
 
     #[test]
     fn pinned_runtime_reports_live_shape_connect_driver_stage_without_credentials() {
-        futures::executor::block_on(async {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&executor, async {
             let effects = FakeEffects {
                 fail_on: Some("channel"),
                 ..Default::default()
