@@ -7,11 +7,11 @@ use drv_hardware::{Backend, Bidirectional, CoherentDma, MmioRegion};
 use mt7921_core::{
     ActivationFailure, DMA_DESCRIPTOR_LEN, DisabledMcuRxTransport, DmaDescriptor,
     DmashdlInvariantIo, GlobalTxRingTransport, MT_HIF_REMAP_L1_BAR_OFFSET,
-    MT7921_MCU_RX_RING_COUNT, McuRxIrqTopology, McuRxRegisters, OwnershipTransport,
-    PCIE_LPCR_HOST_CLR_OWN, TopOwnershipTransport, TransportActivationOps, TxRingState,
-    WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
-    activate_transport, ensure_linux_dmashdl_invariant, prepare_global_rx_rings,
-    prepare_global_tx_rings, prepare_mcu_rx_ring, reset_wfsys,
+    MT7921_DATA_RX_RING_COUNT, MT7921_MCU_RX_RING_COUNT, McuRxIrqTopology, McuRxRegisters,
+    OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, TopOwnershipTransport, TransportActivationOps,
+    TxRingState, WfsysResetTransport, acquire_driver_ownership, acquire_top_driver_ownership,
+    activate_transport, ensure_linux_dmashdl_invariant, prepare_data_rx_ring,
+    prepare_global_rx_rings, prepare_global_tx_rings, prepare_mcu_rx_ring, reset_wfsys,
 };
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,15 @@ fn initialize_descriptors<B: Backend>(dma: &mut DmaArenas<B>) -> Result<(), drv_
         for (index, descriptor) in prepared.descriptors.into_iter().enumerate() {
             ring.write(index * DMA_DESCRIPTOR_LEN, &descriptor.to_le_bytes())?;
         }
+    }
+    let descriptors = prepare_data_rx_ring(
+        dma.data_rx_ring.device_address(0)?.bits(),
+        dma.data_rx_buffers.device_address(0)?.bits(),
+    )
+    .map_err(|_| drv_hardware::Error::Invalid)?;
+    for (index, descriptor) in descriptors.into_iter().enumerate() {
+        dma.data_rx_ring
+            .write(index * DMA_DESCRIPTOR_LEN, &descriptor.to_le_bytes())?;
     }
     Ok(())
 }
@@ -529,20 +538,25 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
         .map_err(|e| format!("{e:?}"))?;
         prepare_global_rx_rings(&mut RxIo(self.region(0xd4000)?), rx_guard, wm, |_| {})
             .map_err(|e| format!("{e:?}"))?;
-        let wfdma = self.region(0xd4000)?;
-        let wm2 = 0x500 + 4 * 0x10;
-        for (word, value) in [
-            wm2_base,
-            MT7921_MCU_RX_RING_COUNT as u32,
-            (MT7921_MCU_RX_RING_COUNT - 1) as u32,
-            0,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            wfdma
-                .write_u32(wm2 + word * 4, value)
-                .map_err(|e| format!("route WM2: {e:?}"))?;
+        // Install owned receive rings while global DMA is still disabled.
+        // Firmware IRQ topology remains MCU-only until radio RX is ready.
+        let data_base = self
+            .resources
+            .dma
+            .data_rx_ring
+            .device_address(0)
+            .map_err(|e| format!("data RX ring: {e:?}"))?
+            .bits() as u32;
+        let mut rx = RxIo(self.region(0xd4000)?);
+        for (index, base, count) in [
+            (2, data_base, MT7921_DATA_RX_RING_COUNT as u32),
+            (4, wm2_base, MT7921_MCU_RX_RING_COUNT as u32),
+        ] {
+            rx.write_ring_initial(index, base, count)
+                .map_err(|e| format!("route RX ring {index}: {e:?}"))?;
+            rx.release_fence();
+            rx.publish_ring_cpu_index(index, count - 1)
+                .map_err(|e| format!("publish RX ring {index}: {e:?}"))?;
         }
         Ok(())
     }
@@ -903,7 +917,57 @@ mod tests {
             drv_hardware_backends::Operation::WriteU32 { offset, .. } if (0xd4300..=0xd454c).contains(offset)
         )).unwrap();
         assert!(host_mask < route);
+        let dma_enable = operations
+            .iter()
+            .position(|op| {
+                matches!(op,
+                    drv_hardware_backends::Operation::WriteU32 { offset: 0xd4208, value, .. }
+                        if value & 5 == 5
+                )
+            })
+            .unwrap();
+        let data_base = resources.dma.data_rx_ring.device_address(0).unwrap().bits() as u32;
+        for (offset, expected) in [
+            (0xd4520, data_base),
+            (0xd4524, MT7921_DATA_RX_RING_COUNT as u32),
+            (0xd4528, (MT7921_DATA_RX_RING_COUNT - 1) as u32),
+            (0xd452c, 0),
+        ] {
+            let write = operations
+                .iter()
+                .rposition(|op| {
+                    matches!(op,
+                        drv_hardware_backends::Operation::WriteU32 { offset: actual, value, .. }
+                            if *actual == offset && *value == expected
+                    )
+                })
+                .unwrap();
+            assert!(host_mask < write && write < dma_enable);
+        }
+        assert!(operations.iter().all(|op| !matches!(op,
+            drv_hardware_backends::Operation::WriteU32 { offset: 0xd4204, value, .. }
+                if value & (1 << 2) != 0
+        )));
         drop(operations);
+        let expected = prepare_data_rx_ring(
+            u64::from(data_base),
+            resources
+                .dma
+                .data_rx_buffers
+                .device_address(0)
+                .unwrap()
+                .bits(),
+        )
+        .unwrap();
+        for (index, descriptor) in expected.into_iter().enumerate() {
+            let mut bytes = [0; DMA_DESCRIPTOR_LEN];
+            resources
+                .dma
+                .data_rx_ring
+                .read(index * DMA_DESCRIPTOR_LEN, &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, descriptor.to_le_bytes());
+        }
 
         assert!(
             quiesce(
