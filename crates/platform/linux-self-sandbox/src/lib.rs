@@ -31,12 +31,14 @@ pub enum Profile {
     },
     /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
-    /// One MT7921 PCI function and its precreated inert IRQ eventfd.
+    /// One MT7921 PCI function, its precreated IRQ eventfd, and optionally
+    /// the same-process protocol runtime's exact descriptor inventory.
     Mt7921Vfio {
         pci_config_fd: RawFd,
         vfio_fd: RawFd,
         iommufd: RawFd,
         irq_eventfd: RawFd,
+        service: Option<WifiServiceFds>,
     },
     /// One WCN6750 VFIO-platform device, its QRTR control plane, and the two
     /// process IPC seams. All interrupt eventfds must be created before setup.
@@ -53,6 +55,16 @@ pub enum Profile {
     },
 }
 
+/// Precreated IPC, Ethernet and reactor descriptors for the same-process
+/// protocol runtime. Setup checks the complete inventory before lockdown.
+#[derive(Clone, Debug)]
+pub struct WifiServiceFds {
+    pub control_fd: RawFd,
+    pub supervisor_fd: RawFd,
+    pub ethernet_fds: Vec<RawFd>,
+    pub runtime_fds: Vec<RawFd>,
+}
+
 pub const WCN6750_IRQ_EVENTFD_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +77,7 @@ pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
-pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg,recvmsg,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,exit,exit_group; denied=fcntl,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
 
 #[derive(Debug)]
 pub enum Error {
@@ -296,12 +308,18 @@ impl Sandbox<SetupComplete> {
             vfio_fd,
             iommufd,
             irq_eventfd,
+            service,
         } = &profile
         {
             if self.persistence_dir_fd.is_some() {
                 return Err(Error::ProfileAuthorityMismatch);
             }
             let mut expected = vec![*pci_config_fd, *vfio_fd, *iommufd, *irq_eventfd];
+            if let Some(service) = service {
+                expected.extend([service.control_fd, service.supervisor_fd]);
+                expected.extend(&service.ethernet_fds);
+                expected.extend(&service.runtime_fds);
+            }
             expected.sort_unstable();
             if expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
@@ -562,13 +580,43 @@ fn install_filter(profile: &Profile) -> Result<(), Error> {
         vfio_fd,
         iommufd,
         irq_eventfd,
+        service,
     } = profile
     {
         append_mt7921_ioctl(&mut f, *vfio_fd, *iommufd);
         append_fd_only(&mut f, libc::SYS_lseek, *pci_config_fd);
-        append_fd_set(&mut f, libc::SYS_read, &[*pci_config_fd, *irq_eventfd]);
-        append_fd_set(&mut f, libc::SYS_write, &[*pci_config_fd, 1, 2]);
+        let mut readable = vec![*pci_config_fd, *irq_eventfd];
+        let mut writable = vec![*pci_config_fd, 1, 2];
         append_mt_ppoll(&mut f);
+        if let Some(service) = service {
+            append_fd_sendmsg(&mut f, &[service.control_fd, service.supervisor_fd]);
+            append_fd_recvmsg(&mut f, service.control_fd);
+            append_runtime_poller(&mut f, &service.runtime_fds);
+            readable.extend(&service.runtime_fds);
+            writable.extend(&service.runtime_fds);
+            let send_flags = [(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32];
+            let recv_flags = [(libc::MSG_DONTWAIT | libc::MSG_TRUNC) as u32];
+            append_fd_flag_pairs(
+                &mut f,
+                libc::SYS_sendto,
+                &service
+                    .ethernet_fds
+                    .iter()
+                    .map(|fd| (*fd, &send_flags[..]))
+                    .collect::<Vec<_>>(),
+            );
+            append_fd_flag_pairs(
+                &mut f,
+                libc::SYS_recvfrom,
+                &service
+                    .ethernet_fds
+                    .iter()
+                    .map(|fd| (*fd, &recv_flags[..]))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        append_fd_set(&mut f, libc::SYS_read, &readable);
+        append_fd_set(&mut f, libc::SYS_write, &writable);
     }
     if let Profile::Ath11kWcn6750 {
         control_fd,
@@ -908,11 +956,11 @@ fn append_wlancfg_poll(f: &mut Vec<Filter>) {
     let dispatch = f.len();
     f.push(jump(libc::SYS_poll as u32, 0, 0));
     f.push(arg_high(1));
-    f.push(jump(0, 0, 4));
+    f.push(jump(0, 0, 2));
     f.push(arg(1));
-    f.push(jump(2, 0, 2));
-    f.push(arg(2));
-    f.push(jump(u32::MAX, 1, 0));
+    f.push(jump(2, 1, 0));
+    // Timeout changes no descriptor authority: permit both idle infinite
+    // waits and bounded waits for pending operation drain.
     f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(RET_K, ALLOW));
     let reload = f.len();
@@ -1552,6 +1600,124 @@ mod filter_tests {
     use std::process::Command;
 
     #[test]
+    fn mt7921_service_io_is_fd_scoped() {
+        const TEST: &str = "filter_tests::mt7921_service_io_is_fd_scoped";
+        if let Ok(probe) = std::env::var("DRV_MT_SERVICE_IO_PROBE") {
+            let hardware = resources();
+            let policy = resources();
+            let supervisor = resources();
+            let ethernet = resources();
+            let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            assert!(epoll >= 0);
+            let byte = [1u8];
+            assert_eq!(
+                unsafe { libc::send(policy[1], byte.as_ptr().cast(), 1, 0) },
+                1
+            );
+            enable_filter(Profile::Mt7921Vfio {
+                pci_config_fd: hardware[0],
+                vfio_fd: hardware[1],
+                iommufd: hardware[2],
+                irq_eventfd: hardware[3],
+                service: Some(WifiServiceFds {
+                    control_fd: policy[0],
+                    supervisor_fd: supervisor[0],
+                    ethernet_fds: vec![ethernet[0], ethernet[1]],
+                    runtime_fds: vec![epoll, policy[3]],
+                }),
+            });
+            let mut payload = [0u8];
+            let mut iov = libc::iovec {
+                iov_base: payload.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            let receive_fd = if probe == "wrong-fd" {
+                supervisor[0]
+            } else {
+                policy[0]
+            };
+            assert_eq!(
+                unsafe {
+                    libc::recvmsg(
+                        receive_fd,
+                        &mut message,
+                        libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+                    )
+                },
+                1
+            );
+            for fd in [policy[0], supervisor[0]] {
+                assert_eq!(
+                    unsafe { libc::sendmsg(fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) },
+                    1
+                );
+            }
+            let flags = if probe == "bad-flags" {
+                0
+            } else {
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL
+            };
+            assert_eq!(
+                unsafe {
+                    libc::sendto(
+                        ethernet[0],
+                        byte.as_ptr().cast(),
+                        1,
+                        flags,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    libc::recvfrom(
+                        ethernet[1],
+                        payload.as_mut_ptr().cast(),
+                        1,
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                1
+            );
+            let mut event: libc::epoll_event = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::epoll_wait(epoll, &mut event, 1, 0) }, 0);
+            let mut count = 0u64;
+            assert_eq!(
+                unsafe { libc::read(policy[3], (&mut count as *mut u64).cast(), 8) },
+                8
+            );
+            assert_eq!(
+                unsafe { libc::write(policy[3], (&count as *const u64).cast(), 8) },
+                8
+            );
+            assert_eq!(
+                unsafe { libc::read(hardware[3], (&mut count as *mut u64).cast(), 8) },
+                8
+            );
+            unsafe { libc::_exit(0) }
+        }
+        for probe in ["positive", "wrong-fd", "bad-flags"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env("DRV_MT_SERVICE_IO_PROBE", probe)
+                .status()
+                .unwrap();
+            if probe == "positive" {
+                assert!(status.success(), "{probe}: {status}");
+            } else {
+                assert_eq!(status.signal(), Some(libc::SIGSYS), "{probe}: {status}");
+            }
+        }
+    }
+
+    #[test]
     fn mt7921_profile_requires_exactly_four_capabilities() {
         let setup = Sandbox::<SetupComplete> {
             inherited: vec![3, 4, 5, 6],
@@ -1564,6 +1730,7 @@ mod filter_tests {
                 vfio_fd: 4,
                 iommufd: 5,
                 irq_eventfd: 6,
+                service: None,
             }),
             Err(Error::ProfileAuthorityMismatch)
         ));
@@ -2149,6 +2316,8 @@ mod filter_tests {
                 };
                 let mut pollfds = [pollfd; 2];
                 assert_eq!(unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) }, 2);
+                assert_eq!(unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 0) }, 2);
+                assert_eq!(unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 32000) }, 2);
                 let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
                 assert_eq!(unsafe { libc::sigfillset(&mut mask) }, 0);
                 assert_eq!(
@@ -2292,6 +2461,7 @@ mod filter_tests {
                 vfio_fd: fds[1],
                 iommufd: fds[2],
                 irq_eventfd: fds[3],
+                service: None,
             },
             _ => unreachable!(),
         }

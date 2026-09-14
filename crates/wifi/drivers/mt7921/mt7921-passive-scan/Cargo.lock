@@ -1301,48 +1301,17 @@ dependencies = [
 name = "mt7921-passive-scan"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "driver-runtime",
- "drv-hardware",
- "drv-hardware-backends",
  "drv-network-service",
- "fdf",
  "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-driver",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
  "fuchsia-inspect",
- "fuchsia-softmac-port",
- "fuchsia-trace",
  "futures",
- "ieee80211",
- "mt7921-port-spike",
+ "libc",
+ "linux-self-sandbox",
  "mt7921-production-client",
- "mt7921-softmac-adapter",
- "num-bigint",
- "sha2",
- "userspace-vfio",
  "wifi-control-service",
- "wlan-common",
- "wlan-mlme",
  "wlan-sme",
  "wlan-softmac-host",
- "zx",
-]
-
-[[package]]
-name = "mt7921-port-spike"
-version = "0.1.0"
-dependencies = [
- "driver-runtime",
- "drv-hardware",
- "drv-hardware-backends",
- "mt7921-core",
- "mt7921-production-client",
- "userspace-vfio",
 ]
 
 [[package]]
@@ -1354,37 +1323,8 @@ dependencies = [
  "linux-self-sandbox",
  "mt7921-core",
  "sha2",
- "zeroize",
-]
-
-[[package]]
-name = "mt7921-softmac-adapter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fdf",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-driver",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
- "fuchsia-inspect",
- "fuchsia-softmac-port",
- "fuchsia-trace",
- "futures",
- "mt7921-core",
- "netstack3-port-integration",
- "netstack3-port-spike",
- "num-bigint",
- "rand 0.9.4",
- "sha2",
- "tokio",
- "wlan-mlme",
- "wlan-sme",
- "wlan-softmac-class-support",
  "wlan-softmac-host",
+ "zeroize",
  "zx",
 ]
 
@@ -2781,6 +2721,7 @@ dependencies = [
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-sme",
+ "libc",
 ]
 
 [[package]]
@@ -2916,14 +2857,6 @@ dependencies = [
  "wlan-rsn",
  "wlan-statemachine",
  "zx",
-]
-
-[[package]]
-name = "wlan-softmac-class-support"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-softmac",
 ]
 
 [[package]]

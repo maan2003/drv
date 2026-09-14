@@ -123,6 +123,7 @@ fn run() -> Result<(), Error> {
                 vfio_fd: retained_fds[1],
                 iommufd: retained_fds[2],
                 irq_eventfd: retained_fds[3],
+            service: None,
             })?.run(|| {
                 positive_runtime_probes(retained_fds[3]);
                 println!("sandbox_self_test=PASS profile=mt7921-vfio namespaces_distinct=true sealed_empty_root=true uid=65534 gid=65534 effective_caps_empty=true permitted_caps_empty=true inheritable_caps_empty=true ambient_caps_empty=true bounding_caps_empty=true fds=stdio+4 no_new_privs=true seccomp=true allocator=true monotonic_sleep=true inherited_irq_eventfd=true");

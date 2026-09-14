@@ -1,8 +1,8 @@
 # Wi-Fi target architecture
 
-This is the agreed destination, not a claim that the current implementation
-already has these boundaries. The directory move is mechanical; it does not
-remove the existing production dependency on `vfio_read`.
+The reduced cutover now implements the same-process typed ownership boundary
+below. Radio operations are deliberately unavailable until ported to that owner;
+this is not a claim of Wi-Fi connectivity or physical recovery qualification.
 
 ## One Wi-Fi process, separate policy and IP services
 
@@ -121,8 +121,7 @@ same deadline explicitly. Repeated cancellation does not renew its original
 cleanup deadline. Active runtime timeout remains terminal, not a reusable
 timeout without proved quiescence. Autonomous SME recovery without a prior
 policy budget is cancelled; policy-authorized subsequent recovery and roaming
-still need complete operation/intent identity integration. No architecture-wide
-KVM acceptance is claimed yet.
+still need complete operation/intent identity integration.
 
 Device, connection and Ethernet attachment lifetimes are distinct. Replace
 the finite boot-time inventory of Ethernet generations with reusable
@@ -132,9 +131,41 @@ preserve DHCP/TCP state across arbitrary network changes.
 
 ## Remove experimental production ownership
 
-The production MT7921 executable currently imports `vfio_read.rs`, which owns
-physical initialization, target preparation and service construction. Remove
-that ownership, not just the filename.
+The production MT7921 executable no longer imports `vfio_read.rs`; that
+binary-local owner and its executable target are deleted. The replacement
+consumes `Mt7921Driver` directly into the shared MLME/SME runtime.
+
+The thin service accepts `--run-wifi-service` and a hardware-free `--describe`.
+Its trusted launcher supplies the policy/supervisor FDs and generation, PCI BDF
+and VFIO cdev, the firmware's MAC identity, and uncompressed firmware paths in
+`DRV_MT7921_PATCH_IMAGE` / `DRV_MT7921_RAM_IMAGE`. Exact build-pinned firmware
+lengths and hashes are checked before lockdown. Legacy artifact flavors and
+one-shot lab modes are removed; old lab launch scripts are not a supported
+entrypoint for this cutover. The existing external-watchdog activation gate
+remains while physical recovery qualification is outstanding.
+
+The `mt7921-wifi-service` package exposes the raw service binary; its lifecycle
+launcher supplies `--run-wifi-service` exactly once and the required firmware
+paths and setup capabilities. `--describe` remains available without hardware. The old
+validation/flavor packages, launchers and artifact checks are no longer flake
+outputs; their historical lab scripts are not a deployment interface.
+
+A Linux 7.3 KVM guest with CONFIG_INET disabled and **no VFIO/passthrough**
+passed 115 Rust tests plus the separate-process policy fixture: typed driver
+fault/containment tests, sandbox FD probes, runtime, wire-policy selection and
+deadline paths, release filtered control owner, and the replacement entrypoint.
+The entrypoint check is hardware-free `--describe`, not physical initialization.
+Evidence on np is under
+`/var/lib/poco-linux/redwood/work/crate-layout-primary/kvm-typed-cutover/output-2/`;
+serial SHA-256:
+`caffda797233333c0e6fe807f6cee3b1731d5d0eb46a6d5e65d0d7edf0aa93e7`.
+The empty-capability prepared runtime constructs and shuts down; a scan fails
+without driver scan calls. Pinned MLME/SME currently translates this empty-channel
+failure to `InternalError`, not `NotSupported`; clearer reporting is future work.
+Offline Nix parse and package derivation evaluation pass, but no Nix package
+build was run. Advisor adv-6u68 approved the reduced ownership design and final
+packaging/test changes. Physical firmware initialization, radio traffic and
+recovery remain unverified.
 
 The owner explicitly accepts removing old functionality to complete this
 cutover. Do not retain a compatibility owner or make full feature parity a

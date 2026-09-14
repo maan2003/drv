@@ -9,6 +9,8 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+wlan-softmac-host = { path = "../../../wlan-softmac-host" }
+zx = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 drv-hardware = { path = "../../../../platform/hardware-api" }
 drv-hardware-backends = { path = "../../../../platform/hardware-backends" }
 mt7921-core = { path = "../mt7921-core" }

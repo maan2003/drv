@@ -2,10 +2,13 @@
 
 ## Status
 
-MT7921 has demonstrated userspace Wi-Fi association and Internet connectivity
-through Fuchsia WLAN components and a separately sandboxed Netstack3 service.
-Its hardware ownership migration and full Wi-Fi process sandbox remain
-incomplete. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
+MT7921 previously demonstrated userspace Wi-Fi association and Internet
+connectivity through Fuchsia WLAN components and separately sandboxed Netstack3.
+The current cutover removes that binary-local implementation: a typed driver
+owns hardware/DMA inside the MLME/SME process and its exact capability sandbox.
+Firmware initialization and containment are implemented, while radio operation
+support is deliberately removed pending porting. Physical acceptance of this
+replacement remains outstanding. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
 mode; it remains a bring-up target, not production-ready.
 Legacy Wasm/WIT probes and Bluetooth scaffolding remain in the tree; they are
 not the production direction and are not extended by this architecture.

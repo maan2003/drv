@@ -60,6 +60,7 @@ fn main() {
         vfio_fd: fds[1],
         iommufd: fds[2],
         irq_eventfd: fds[3],
+        service: None,
     })
     .unwrap();
     exercise_runtime_collections(prepared_hash_state.unwrap_or_else(RandomState::new));

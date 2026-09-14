@@ -251,12 +251,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "const-oid"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
-
-[[package]]
 name = "core_detect"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,7 +474,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
- "const-oid",
  "crypto-common 0.2.2",
 ]
 
@@ -913,24 +906,7 @@ dependencies = [
 name = "mt7921-port-spike"
 version = "0.1.0"
 dependencies = [
- "driver-runtime",
- "drv-hardware",
- "drv-hardware-backends",
  "mt7921-core",
- "mt7921-production-client",
- "userspace-vfio",
-]
-
-[[package]]
-name = "mt7921-production-client"
-version = "0.1.0"
-dependencies = [
- "drv-hardware",
- "drv-hardware-backends",
- "linux-self-sandbox",
- "mt7921-core",
- "sha2 0.11.0",
- "zeroize",
 ]
 
 [[package]]
@@ -1953,12 +1929,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "zeroize"
-version = "1.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 
 [[package]]
 name = "zmij"

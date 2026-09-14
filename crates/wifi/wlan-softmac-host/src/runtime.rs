@@ -1428,6 +1428,7 @@ mod tests {
         link_failure: bool,
         scan_id: u64,
         scan_offload: bool,
+        empty_bands: bool,
     }
 
     #[derive(Clone)]
@@ -1532,12 +1533,16 @@ mod tests {
                     factory_addr: Some([2, 0, 0, 0, 0, 1]),
                     mac_role: Some(fidl_common::WlanMacRole::Client),
                     hardware_capability: Some(0),
-                    band_caps: Some(vec![fidl_softmac::WlanSoftmacBandCapability {
-                        band: Some(fidl_ieee80211::WlanBand::TwoGhz),
-                        basic_rates: Some(vec![0x82, 0x84]),
-                        primary_channels: Some(vec![wlan_channel()]),
-                        ..Default::default()
-                    }]),
+                    band_caps: Some(if self.0.lock().unwrap().empty_bands {
+                        vec![]
+                    } else {
+                        vec![fidl_softmac::WlanSoftmacBandCapability {
+                            band: Some(fidl_ieee80211::WlanBand::TwoGhz),
+                            basic_rates: Some(vec![0x82, 0x84]),
+                            primary_channels: Some(vec![wlan_channel()]),
+                            ..Default::default()
+                        }]
+                    }),
                     ..Default::default()
                 }
             )
@@ -2411,6 +2416,45 @@ mod tests {
             futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
             Some(Err(fidl_sme::ScanErrorCode::NotSupported))
         );
+    }
+
+    #[test]
+    fn empty_radio_capabilities_construct_and_reject_scan_without_hardware() {
+        let (fake, effects) = Fake::new(0);
+        {
+            let mut effects = effects.lock().unwrap();
+            effects.empty_bands = true;
+            effects.scan_offload = false;
+        }
+        let info = device_info();
+        let resources = PreparedRuntimeResources::new(info.sta_addr).unwrap();
+        let mut runtime = futures::executor::block_on(ClientRuntime::new_with_prepared_resources(
+            fake,
+            Default::default(),
+            info,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            resources,
+        ))
+        .unwrap();
+        runtime
+            .begin_scan(
+                fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest { channels: vec![] }),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(runtime.drive_scan_once()).unwrap(),
+            // Empty channel inventory is rejected by pinned MLME before the
+            // driver is called; SME currently maps InvalidArgs to InternalError.
+            Some(Err(fidl_sme::ScanErrorCode::InternalError))
+        );
+        runtime.stop().unwrap();
+        let effects = effects.lock().unwrap();
+        assert!(!effects.calls.contains(&"passive"));
+        assert!(!effects.calls.contains(&"active"));
+        assert!(effects.calls.contains(&"stop"));
     }
 
     #[test]

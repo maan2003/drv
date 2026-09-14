@@ -16,6 +16,7 @@ mod firmware_loader;
 mod receive;
 pub use receive::ReceivedEvent;
 mod setup_inputs;
+mod softmac;
 pub use setup_inputs::{
     CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
     FirmwareVerificationError, RegulatorySnapshotFile, VerifiedFirmware, VerifiedFirmwareImages,
@@ -172,6 +173,17 @@ impl Mt7921HardwareSessionSetup {
             vfio: self.vfio.lock_down()?,
         })
     }
+
+    /// Retain only the precreated protocol-runtime and control-channel FDs
+    /// alongside the driver's device capabilities in the same sandbox.
+    pub fn lock_down_with_service(
+        self,
+        service: linux_self_sandbox::WifiServiceFds,
+    ) -> Result<Mt7921HardwareSessionConfig, linux_self_sandbox::Error> {
+        Ok(Mt7921HardwareSessionConfig {
+            vfio: self.vfio.lock_down_with_service(Some(service))?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +292,7 @@ enum SessionLifecycle {
     LoaderTransportActive,
     BootstrapQuiesced,
     FirmwareInitialized,
+    ProtocolStarted,
     Closing,
     Contained,
 }

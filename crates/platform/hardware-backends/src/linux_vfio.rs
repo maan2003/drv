@@ -286,17 +286,31 @@ impl LinuxVfioPciCapabilities {
     pub fn lock_down(
         self,
     ) -> std::result::Result<LockedLinuxVfioPciCapabilities, linux_self_sandbox::Error> {
+        self.lock_down_with_service(None)
+    }
+
+    pub fn lock_down_with_service(
+        self,
+        service: Option<linux_self_sandbox::WifiServiceFds>,
+    ) -> std::result::Result<LockedLinuxVfioPciCapabilities, linux_self_sandbox::Error> {
         let pci_config_fd = self.pci.raw_fd();
         let vfio_fd = self.device.as_raw_fd();
         let iommufd = self.iommu.as_raw_fd();
         let irq_eventfd = self.irq_event.as_raw_fd();
+        let mut inherited = vec![pci_config_fd, vfio_fd, iommufd, irq_eventfd];
+        if let Some(service) = &service {
+            inherited.extend([service.control_fd, service.supervisor_fd]);
+            inherited.extend(&service.ethernet_fds);
+            inherited.extend(&service.runtime_fds);
+        }
         linux_self_sandbox::Sandbox::new()
-            .setup(&[pci_config_fd, vfio_fd, iommufd, irq_eventfd], None)?
+            .setup(&inherited, None)?
             .lockdown(linux_self_sandbox::Profile::Mt7921Vfio {
                 pci_config_fd,
                 vfio_fd,
                 iommufd,
                 irq_eventfd,
+                service,
             })?;
         Ok(LockedLinuxVfioPciCapabilities(self))
     }

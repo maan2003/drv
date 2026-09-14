@@ -2,25 +2,24 @@
 
 ## Status
 
-Full real-internet connectivity is proven end to end through the userspace
-MT7921 driver: it associates to a WPA3-SAE hotspot, completes the 4-way
-handshake, and passes DHCP, DNS, TCP, and HTTP to the public Internet. The
-current stack is split at the Ethernet seam: VFIO/DMA and Fuchsia MLME/SME stay
-in the driver process, while Netstack3 and the SOCKS service run in a second,
-self-sandboxed process reached only through a bounded Unix `SOCK_SEQPACKET`
-frame channel. The netstack process has an empty filesystem root, a private
-network namespace, no capabilities or device-backed mappings, and a seccomp
-allowlist; its run-state descriptors are only standard streams, the frame
-channel, the pre-bound SOCKS listener, one internal readiness poller, and
-accepted clients. The separate DNS
-process in the mature topology below remains future work. A separate,
-self-sandboxing wlancfg daemon now owns durable saved networks and drives the
-pinned Fuchsia selector and client state machine over bounded, fd-free policy
-IPC to a separate simulated Wi-Fi service. Deterministic process tests cover
-selection, exact retry classification and timing, connection events, and
-persistence across policy restart. The bounded project-native WLAN CLI drives
-the same long-lived policy and Wi-Fi service path for scan, connection,
-association status, disconnect, and saved-network management. The WCN6750
+MT7921 now uses one typed hardware/DMA owner consumed by the same-process
+Fuchsia MLME/SME runtime. The binary-local `vfio_read` owner and its executable
+are removed, not retained as a compatibility path. Firmware initialization
+and containment are implemented; scan, channel/peer/key configuration,
+association, radio TX/RX and MAC override are intentionally unavailable until
+ported into this owner. Earlier Internet demonstrations used the retired
+implementation and are not acceptance of this replacement.
+
+The policy daemon owns persistence and network intent, and drives the pinned
+Fuchsia selector/state machine over bounded, fd-free control IPC. Application
+queueing, selection scans and retries consume one policy-issued deadline.
+The Wi-Fi process retains only device authority and precreated control,
+Ethernet and runtime-reactor descriptors after lockdown. Netstack3 remains a
+separate process with no device/DMA capabilities, connected through the bounded
+Ethernet lifecycle seam. No-VFIO verification does not qualify physical radio
+recovery or restart.
+
+The WCN6750
 production service now adopts
 inert VFIO-platform, iommufd-or-broker, QRTR, interrupt, runtime-reactor,
 Ethernet, policy, network-lifecycle, and remoteproc capabilities before
@@ -37,20 +36,11 @@ uncatchable parent death or fatal-filter termination; production still needs a
 surviving external containment owner for that case, and diagnostic association
 does not wait on it. Explicit
 SoftMAC roam is reported unsupported without disturbing the current link;
-the pinned SoftMAC MLME does not implement the fullmac roam request. The
-current MT7921 path deliberately leaves BCNFT disabled, retains
-`MT_WF_RFCR_DROP_OTHER_BEACON`, and keeps the MLME's host lost-BSS monitor
-active: firmware beacon-loss event `0x13` is recognized but not yet routed into
-MLME teardown. This temporarily diverges from current Linux mt7921, which
-enables BCNFT at association. The tracked destination is to complete the `0x13`
-event route, enable BCNFT and firmware connection-monitor offload, and suppress
-the host monitor as Linux `IEEE80211_HW_CONNECTION_MONITOR` does; those changes
-must land together. Failed physical connections currently revoke the runtime
-unless the SME is idle and the driver certifies per-attempt cleanup and callback
-quiescence. MT7921 implements that retry contract while preserving
-selected-BSS authority; timeouts and device/containment faults remain terminal.
-The policy daemon drives the corrected retry path in the simulated process
-slice; renewed physical acceptance still waits on production composition.
+the pinned SoftMAC MLME does not implement the fullmac roam request.
+
+MT7921 radio recovery, firmware beacon-loss delivery, connection-monitor
+offload, and retry-safe per-attempt cleanup remain future work; the replacement
+does not admit those operations.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
@@ -162,9 +152,10 @@ isolation. `mt76-core` / `mt7921-core`, the chip SoftMAC adapters, and
 runtime responsibilities respectively. `userspace-vfio` and the typed hardware
 API/backends retain generic resource mechanics without device protocol policy.
 
-Remaining production transport mechanics move out of the lab binary into their
-library owner; production and lab entrypoints instantiate the same driver.
-The lab runner owns experiments and reporting, not an alternate implementation.
+The MT7921 service directly instantiates `mt7921-production-client`'s typed
+driver and consumes it into `wlan-softmac-host`'s protocol runtime. Unported
+operations fail explicitly rather than using the retired binary-local owner.
+Lab tooling is not an alternate production implementation.
 Netstack3 binding, SOCKS, and network-service startup live in
 `drv-network-service`, connected to `wlan-softmac-host` by the small Ethernet
 contract rather than a dependency from Wi-Fi runtime to Internet parsing.
