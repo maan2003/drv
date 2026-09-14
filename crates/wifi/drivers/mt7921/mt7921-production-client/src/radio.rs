@@ -220,9 +220,15 @@ impl MacInitialization {
 /// Firmware tables and policy are encoded once; no descriptor authority or
 /// protocol futures escape into the plan.
 pub(super) struct RadioPreparation {
-    commands: VecDeque<(Vec<u8>, RadioResponse)>,
-    pending: Option<(RadioResponse, Instant)>,
+    commands: FirmwareCommands,
     station: MacPreparation,
+}
+
+/// Shared MCU transaction progression; protocol replies stay in the operation
+/// that owns this sequence, never in this transport-only state.
+struct FirmwareCommands {
+    remaining: VecDeque<(Vec<u8>, RadioResponse)>,
+    pending: Option<(RadioResponse, Instant)>,
     failed: bool,
 }
 
@@ -359,18 +365,13 @@ impl RadioPreparation {
             waiting: None, failed: false,
         };
         Ok(Self {
-            commands,
-            pending: None,
+            commands: FirmwareCommands::new(commands),
             station,
-            failed: false,
         })
     }
 
     pub fn ready(&self) -> bool {
-        !self.failed
-            && self.commands.is_empty()
-            && self.pending.is_none()
-            && self.station.complete()
+        self.commands.ready() && self.station.complete()
     }
 
     pub fn drive<B: Backend>(
@@ -381,7 +382,43 @@ impl RadioPreparation {
         start: Instant,
         now: Instant,
     ) -> Result<bool, zx::Status> {
-        let result = self.step(resources, mechanics, receive, start, now);
+        if !self.commands.ready() {
+            return self
+                .commands
+                .drive(resources, mechanics, receive, start, now, None);
+        }
+        self.station.drive(&resources.bar0, now)
+    }
+}
+
+impl FirmwareCommands {
+    fn new(remaining: VecDeque<(Vec<u8>, RadioResponse)>) -> Self {
+        Self {
+            remaining,
+            pending: None,
+            failed: false,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        !self.failed && self.remaining.is_empty() && self.pending.is_none()
+    }
+
+    fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        start: Instant,
+        now: Instant,
+        context: Option<&wlan_softmac_host::OperationContext>,
+    ) -> Result<bool, zx::Status> {
+        let result = (|| {
+            if let Some(context) = context {
+                context.check(now)?;
+            }
+            self.step(resources, mechanics, receive, start, now, context)
+        })();
         if result.is_err() {
             self.failed = true;
         }
@@ -395,6 +432,7 @@ impl RadioPreparation {
         receive: &mut crate::receive::RxRouting,
         start: Instant,
         now: Instant,
+        context: Option<&wlan_softmac_host::OperationContext>,
     ) -> Result<bool, zx::Status> {
         use mt7921_core::{LoaderCommandCompletion, LoaderCommandProgress, LoaderCompletion};
         if self.failed {
@@ -442,10 +480,13 @@ impl RadioPreparation {
             self.pending = None;
             return Ok(true);
         }
-        if let Some((bytes, expected)) = self.commands.pop_front() {
+        if let Some((bytes, expected)) = self.remaining.pop_front() {
             let mut views = resources
                 .active_mcu_views(receive, start)
                 .map_err(|_| zx::Status::IO)?;
+            if let Some(context) = context {
+                context.check(Instant::now())?;
+            }
             mechanics
                 .begin_command(
                     &mut views,
@@ -461,7 +502,7 @@ impl RadioPreparation {
             self.pending = Some((expected, now + Duration::from_secs(3)));
             return Ok(true);
         }
-        self.station.drive(&resources.bar0, now)
+        Ok(false)
     }
 }
 
@@ -470,8 +511,7 @@ impl RadioPreparation {
 pub(super) struct ChannelChange {
     pub context: wlan_softmac_host::OperationContext,
     pub channel: mt7921_core::CandidateChannel,
-    command: Option<Vec<u8>>,
-    response_deadline: Option<Instant>,
+    commands: FirmwareCommands,
     operations: VecDeque<mt7921_core::ChannelMacOperation>,
     delay_until: Option<Instant>,
     pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
@@ -501,8 +541,7 @@ impl ChannelChange {
         Ok(Self {
             context,
             channel,
-            command: Some(command),
-            response_deadline: None,
+            commands: FirmwareCommands::new([(command, RadioResponse::Ack)].into()),
             operations: channel_mac_mmio_plan(channel.band).into(),
             delay_until: None,
             reply: Some(reply),
@@ -510,10 +549,7 @@ impl ChannelChange {
     }
 
     pub fn complete(&self) -> bool {
-        self.command.is_none()
-            && self.response_deadline.is_none()
-            && self.operations.is_empty()
-            && self.delay_until.is_none()
+        self.commands.ready() && self.operations.is_empty() && self.delay_until.is_none()
     }
 
     pub fn drive<B: Backend>(
@@ -526,43 +562,15 @@ impl ChannelChange {
     ) -> Result<bool, zx::Status> {
         use mt7921_core::*;
         self.context.check(now)?;
-        if let Some(command) = self.command.take() {
-            let mut views = resources
-                .active_mcu_views(receive, start)
-                .map_err(|_| zx::Status::IO)?;
-            // This is the final authority check immediately before publication.
-            self.context.check(Instant::now())?;
-            mechanics
-                .begin_command(
-                    &mut views,
-                    &mut (),
-                    &command,
-                    LoaderCommandCompletion::Response,
-                )
-                .map_err(|_| zx::Status::IO)?;
-            self.response_deadline = Some(now + Duration::from_secs(3));
-            return Ok(true);
-        }
-        if let Some(deadline) = self.response_deadline {
-            if now >= deadline {
-                return Err(zx::Status::TIMED_OUT);
-            }
-            let mut views = resources
-                .active_mcu_views(receive, start)
-                .map_err(|_| zx::Status::IO)?;
-            match mechanics
-                .poll_command(&mut views, &mut ())
-                .map_err(|_| zx::Status::IO)?
-            {
-                LoaderCommandProgress::Pending { progressed } => return Ok(progressed),
-                LoaderCommandProgress::Complete(LoaderCompletion::Response(_)) => {
-                    // Pinned mt7921_mcu_parse_response has no CHANNEL_SWITCH
-                    // payload status; its sequence-correlated response is ACK.
-                    self.response_deadline = None;
-                    return Ok(true);
-                }
-                _ => return Err(zx::Status::IO_DATA_INTEGRITY),
-            }
+        if !self.commands.ready() {
+            return self.commands.drive(
+                resources,
+                mechanics,
+                receive,
+                start,
+                now,
+                Some(&self.context),
+            );
         }
         if let Some(until) = self.delay_until {
             if now < until {
@@ -792,18 +800,18 @@ mod tests {
         )
         .unwrap();
         let mut preparation = RadioPreparation {
-            commands: [
-                (command.clone(), RadioResponse::None),
-                (command, RadioResponse::None),
-            ]
-            .into(),
-            pending: None,
+            commands: FirmwareCommands::new(
+                [
+                    (command.clone(), RadioResponse::None),
+                    (command, RadioResponse::None),
+                ]
+                .into(),
+            ),
             station: MacPreparation {
                 remaining: VecDeque::new(),
                 waiting: None,
                 failed: false,
             },
-            failed: false,
         };
         let mut mechanics = mt7921_core::LoaderMechanics::default();
         let mut receive = crate::receive::RxRouting::default();
@@ -813,13 +821,13 @@ mod tests {
                 .drive(&mut resources, &mut mechanics, &mut receive, now, now)
                 .unwrap()
         );
-        assert_eq!(preparation.commands.len(), 1);
+        assert_eq!(preparation.commands.remaining.len(), 1);
         assert!(
             !preparation
                 .drive(&mut resources, &mut mechanics, &mut receive, now, now)
                 .unwrap()
         );
-        assert_eq!(preparation.commands.len(), 1);
+        assert_eq!(preparation.commands.remaining.len(), 1);
         assert!(!preparation.ready());
         let before = log.borrow().len();
         assert_eq!(
@@ -837,7 +845,7 @@ mod tests {
             Err(zx::Status::BAD_STATE)
         );
         assert_eq!(log.borrow().len(), before);
-        assert_eq!(preparation.commands.len(), 1);
+        assert_eq!(preparation.commands.remaining.len(), 1);
     }
 
     #[test]
@@ -914,10 +922,10 @@ mod tests {
                     channel_mac_mmio_plan(channel.band).len()
                 );
                 if deliver_response == response_first {
-                    assert!(change.response_deadline.is_some());
+                    assert!(change.commands.pending.is_some());
                 }
             }
-            assert!(change.response_deadline.is_none());
+            assert!(change.commands.pending.is_none());
             let before = log.borrow().len();
             for step in 0..24 {
                 let time = now + Duration::from_micros(step * 2);
@@ -973,7 +981,7 @@ mod tests {
             Err(zx::Status::TIMED_OUT)
         );
         assert_eq!(log.borrow().len(), before);
-        assert!(change.command.is_some());
+        assert_eq!(change.commands.remaining.len(), 1);
     }
 
     #[test]
