@@ -2555,6 +2555,9 @@ dependencies = [
 [[package]]
 name = "userspace-vfio"
 version = "0.1.0"
+dependencies = [
+ "rustix",
+]
 
 [[package]]
 name = "utf8_iter"

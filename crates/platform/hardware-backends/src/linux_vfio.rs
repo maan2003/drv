@@ -1418,7 +1418,7 @@ impl Backend for LinuxVfio {
         for id in interrupts {
             let (_, interrupt) = self.interrupts.get(*id).ok_or(Error::StaleHandle)?;
             interrupt.prepare_wait().map_err(|_| Error::DeviceFault)?;
-            fds.push(interrupt.event_fd());
+            fds.push(interrupt.event().as_fd());
         }
         let ready = userspace_vfio::wait_eventfds_until(&fds, deadline_ns)
             .map_err(|_| Error::DeviceFault)?;

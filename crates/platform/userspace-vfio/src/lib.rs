@@ -5,7 +5,7 @@
 
 use std::{
     fs::File,
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     ptr::NonNull,
     sync::Arc,
 };
@@ -92,8 +92,6 @@ const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
 const VFIO_IRQ_SET_ACTION_UNMASK: u32 = 1 << 4;
 const VFIO_IRQ_SET_ACTION_TRIGGER: u32 = 1 << 5;
-const EFD_CLOEXEC: i32 = 0x80000;
-const EFD_NONBLOCK: i32 = 0x800;
 
 /// Frozen out-of-tree VFIO platform DMA broker ABI constants.
 pub mod dma_broker_uapi {
@@ -116,27 +114,9 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn eventfd(initval: u32, flags: i32) -> i32;
-    fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
     #[cfg(any(test, feature = "test-support"))]
     fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
-    fn ppoll(fds: *mut PollFd, count: usize, timeout: *const Timespec, sigmask: *const ()) -> i32;
-    fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
 }
-
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-#[repr(C)]
-struct Timespec {
-    seconds: i64,
-    nanoseconds: i64,
-}
-const POLLIN: i16 = 1;
-const CLOCK_MONOTONIC: i32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1476,31 +1456,22 @@ impl<E: AsFd> VfioIrq<E> {
         })
     }
     pub fn try_read(&self) -> Result<Option<u64>, String> {
-        let mut count = 0u64;
-        let result = unsafe {
-            read(
-                self.event_fd.as_fd().as_raw_fd(),
-                (&mut count as *mut u64).cast(),
-                8,
-            )
-        };
-        if result == 8 {
-            if self.automasked {
-                self.pending_unmask.set(true);
+        let mut bytes = [0u8; 8];
+        match rustix::io::read(self.event_fd.as_fd(), &mut bytes) {
+            Ok(8) => {
+                if self.automasked {
+                    self.pending_unmask.set(true);
+                }
+                Ok(Some(u64::from_ne_bytes(bytes)))
             }
-            Ok(Some(count))
-        } else if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
-            Ok(None)
-        } else {
-            Err(format!(
-                "read IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ))
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+            Err(error) => Err(format!("read IRQ eventfd: {error}")),
+            Ok(count) => Err(format!("short IRQ eventfd read: {count}")),
         }
     }
     pub fn wait_until(&self, deadline_ns: u64) -> Result<Option<u64>, String> {
         self.prepare_wait()?;
-        if wait_eventfds_until(&[self.event_fd.as_fd().as_raw_fd()], deadline_ns)?.is_empty() {
+        if wait_eventfds_until(&[self.event_fd.as_fd()], deadline_ns)?.is_empty() {
             Ok(None)
         } else {
             self.try_read()
@@ -1567,66 +1538,49 @@ impl<E: AsFd> VfioIrq<E> {
 
 /// Create the nonblocking, close-on-exec counter used by one VFIO IRQ.
 pub fn create_irq_eventfd() -> Result<OwnedFd, String> {
-    let raw = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-    if raw < 0 {
-        return Err(format!(
-            "create IRQ eventfd: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    use rustix::event::{EventfdFlags, eventfd};
+    eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+        .map_err(|error| format!("create IRQ eventfd: {error}"))
 }
 
-pub fn wait_eventfds_until(event_fds: &[RawFd], deadline_ns: u64) -> Result<Vec<usize>, String> {
-    let mut fds: Vec<PollFd> = event_fds
+pub fn wait_eventfds_until(
+    event_fds: &[BorrowedFd<'_>],
+    deadline_ns: u64,
+) -> Result<Vec<usize>, String> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = event_fds
         .iter()
-        .map(|fd| PollFd {
-            fd: *fd,
-            events: POLLIN,
-            revents: 0,
-        })
-        .collect();
+        .map(|fd| PollFd::new(fd, PollFlags::IN))
+        .collect::<Vec<_>>();
     loop {
         for fd in &mut fds {
-            fd.revents = 0;
+            fd.clear_revents();
         }
         let remaining = deadline_ns.saturating_sub(monotonic_time_ns()?);
         let timeout = Timespec {
-            seconds: (remaining / 1_000_000_000) as i64,
-            nanoseconds: (remaining % 1_000_000_000) as i64,
+            tv_sec: (remaining / 1_000_000_000) as i64,
+            tv_nsec: (remaining % 1_000_000_000) as i64,
         };
-        let result = unsafe { ppoll(fds.as_mut_ptr(), fds.len(), &timeout, std::ptr::null()) };
-        if result >= 0 {
-            return Ok(fds
-                .iter()
-                .enumerate()
-                .filter_map(|(index, fd)| (fd.revents & POLLIN != 0).then_some(index))
-                .collect());
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(4) {
-            return Err(format!(
-                "wait for IRQ eventfd: {}",
-                std::io::Error::last_os_error()
-            ));
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) => {
+                return Ok(fds
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, fd)| fd.revents().contains(PollFlags::IN).then_some(index))
+                    .collect());
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(format!("wait for IRQ eventfd: {error}")),
         }
     }
 }
 
 pub fn monotonic_time_ns() -> Result<u64, String> {
-    let mut time = Timespec {
-        seconds: 0,
-        nanoseconds: 0,
-    };
-    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut time) } < 0 {
-        return Err(format!(
-            "read monotonic clock: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    u64::try_from(time.seconds)
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    u64::try_from(time.tv_sec)
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-        .and_then(|nanos| nanos.checked_add(time.nanoseconds as u64))
+        .and_then(|nanos| nanos.checked_add(time.tv_nsec as u64))
         .ok_or_else(|| "invalid monotonic clock value".into())
 }
 impl<E: AsFd> Drop for VfioIrq<E> {
@@ -1728,8 +1682,8 @@ mod tests {
             .find_map(|line| line.strip_prefix("flags:\t"))
             .map(|flags| u32::from_str_radix(flags, 8).unwrap())
             .unwrap();
-        assert_ne!(flags & EFD_NONBLOCK as u32, 0);
-        assert_ne!(flags & EFD_CLOEXEC as u32, 0);
+        assert_ne!(flags & rustix::event::EventfdFlags::NONBLOCK.bits(), 0);
+        assert_ne!(flags & rustix::event::EventfdFlags::CLOEXEC.bits(), 0);
         let (irq, records) = with_fake_io(false, || {
             VfioIrq::install_prepared_at(
                 &device,
