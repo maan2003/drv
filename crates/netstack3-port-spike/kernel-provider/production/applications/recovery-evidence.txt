@@ -173,3 +173,32 @@ sockets.log SHA256:
 445a87fa597324a05d3fd17a8a3f26989f4cfad55c69808709e2e64b152bb2bc
 Logs reside in socket-provider-kvm/np-host/fwcfg/. All probe VMs exited.
 No physical-radio or physical-host-boot acceptance from these checks.
+
+Native recovery safety review (2026-09-14; read-only, not a reboot test):
+Exact installed Linux 6.18.43 source:
+  /nix/store/c99cfxbrimp7xhvc7x4ix113j4yv4ahv-linux-6.18.43.tar.xz
+The installed MT7921 patch only keeps D0 on remove; it does not add a
+pre-probe reset. Native mt7921 PCI probe enables bus mastering before its
+checked WFSYS reset, then disables/resets DMA before native queue allocation.
+
+Driver-core dma_configure runs before native probe. PCI default-domain
+ownership and AMD attachment therefore precede pci_set_master. np currently
+reports singleton group19 DMA-FQ, translated default domain and IRQ remapping;
+reserved regions are MSI and 0xfd00000000..0xffffffffff, not ordinary RAM.
+This supports only conditional post-IOMMU-initialization containment: a fresh
+empty translated domain could prevent ordinary stale untranslated DMA.
+Default-domain ownership is not proof of emptiness.
+
+Automatic ordinary reboot remains BLOCKED:
+- AMD early_enable_iommu explicitly disables translation while configuring it;
+  BME containment across firmware and that interval has not been proved.
+- Applicable ATS/device-cache state and completed invalidation are unverified.
+- Current interrupt remapping does not prove continuous reboot-time isolation;
+  neither IOMMU translation nor healthy post-boot status proves RF reset.
+
+Independent control is now verified after user-authorized scoped Redwood
+dwc3-qcom a600000.usb controller reprobe: direct Redwood Tailscale SSH forwarding
+to np USB yields SSH_CONNECTION 172.16.42.1 -> 172.16.42.2:22, with both-direction
+USB ping 3/3. This closes control access, not the hardware reset contract.
+No experimental boot, watchdog deployment or physical radio release follows
+from this review. Host remains on known-good Linux 6.18.43.
