@@ -15,6 +15,7 @@ mod active_mcu;
 mod firmware_loader;
 mod receive;
 pub use receive::ReceivedEvent;
+mod radio;
 mod setup_inputs;
 mod softmac;
 pub use setup_inputs::{
@@ -910,6 +911,7 @@ pub fn run_firmware_bootstrap(
 pub struct Mt7921Driver {
     session: Mt7921HardwareSession,
     firmware: FirmwareLoaderReport,
+    mac_preparation: radio::MacPreparation,
 }
 
 impl Mt7921Driver {
@@ -927,7 +929,11 @@ impl Mt7921Driver {
         match firmware {
             Ok(firmware) => {
                 session.lifecycle = SessionLifecycle::FirmwareInitialized;
-                Ok(Self { session, firmware })
+                Ok(Self {
+                    session,
+                    firmware,
+                    mac_preparation: radio::MacPreparation::new(),
+                })
             }
             Err(source) => {
                 session.lifecycle = SessionLifecycle::Closing;

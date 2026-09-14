@@ -29,9 +29,26 @@ impl ClientRuntimeDriver for Mt7921Driver {
         if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
             return Err(zx::Status::BAD_STATE);
         }
-        // No radio operation is currently admitted and no RX callback can be
-        // produced. Firmware events stay private to the hardware owner.
-        Ok(false)
+        if self.mac_preparation.complete() {
+            return Ok(false);
+        }
+        let resources = self
+            .session
+            .resources
+            .as_ref()
+            .ok_or(zx::Status::BAD_STATE)?;
+        match self
+            .mac_preparation
+            .drive(&resources.bar0, std::time::Instant::now())
+        {
+            Ok(progress) => Ok(progress),
+            Err(status) => {
+                // Block all further operational turns. The owner retains DMA
+                // resources until stop/reset completes containment.
+                self.session.lifecycle = SessionLifecycle::Closing;
+                Err(status)
+            }
+        }
     }
 
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
