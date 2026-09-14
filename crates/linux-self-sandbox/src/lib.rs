@@ -25,6 +25,9 @@ pub enum Profile {
     Wlancfg {
         control_fd: RawFd,
         persistence_dir_fd: RawFd,
+        /// Pre-bound application listener. `None` is retained only by legacy
+        /// filter tests; the production service always supplies it.
+        application_listener_fd: Option<RawFd>,
     },
     /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
@@ -186,44 +189,40 @@ impl Sandbox<Initial> {
             },
             "make mounts private",
         )?;
-        let state_mount = persistence_dir_fd.map(clone_directory_mount).transpose()?;
-        let empty_root = unsafe {
-            libc::mount(
-                c"tmpfs".as_ptr(),
-                c"/tmp".as_ptr(),
-                c"tmpfs".as_ptr(),
-                (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as c_ulong,
-                c"size=1048576,mode=0755".as_ptr().cast(),
-            )
-        };
-        if empty_root != 0 {
-            let error = system("mount empty root", io::Error::last_os_error());
-            if let Some(state_mount) = state_mount {
-                let _ = unsafe { libc::close(state_mount) };
-            }
-            return Err(error);
-        }
-        if let Some(state_mount) = state_mount {
-            if let Err(error) = attach_state_mount(state_mount) {
-                unsafe {
-                    libc::close(state_mount);
-                }
-                return Err(error);
-            }
-            syscall_ok(
-                unsafe { libc::close(state_mount) },
-                "close detached state mount",
-            )?;
-        }
-        syscall_ok(
-            unsafe { libc::chmod(c"/tmp".as_ptr(), 0o555) },
-            "seal empty root",
-        )?;
-        syscall_ok(unsafe { libc::chdir(c"/tmp".as_ptr()) }, "enter empty root")?;
-        syscall_ok(unsafe { libc::chroot(c".".as_ptr()) }, "chroot empty root")?;
-        syscall_ok(unsafe { libc::chdir(c"/".as_ptr()) }, "enter jailed root")?;
         if let Some(fd) = persistence_dir_fd {
+            // Make the capability itself the filesystem root. This preserves
+            // kernel-enforced `..` and symlink confinement without requiring
+            // bind-mount support from a minimal kernel.
+            syscall_ok(
+                unsafe { libc::fchdir(fd) },
+                "enter persistence directory capability",
+            )?;
+            syscall_ok(
+                unsafe { libc::chroot(c".".as_ptr()) },
+                "chroot persistence directory capability",
+            )?;
+            syscall_ok(unsafe { libc::chdir(c"/".as_ptr()) }, "enter jailed root")?;
             reopen_state_capability(fd)?;
+        } else {
+            syscall_ok(
+                unsafe {
+                    libc::mount(
+                        c"tmpfs".as_ptr(),
+                        c"/tmp".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as c_ulong,
+                        c"size=1048576,mode=0755".as_ptr().cast(),
+                    )
+                },
+                "mount empty root",
+            )?;
+            syscall_ok(
+                unsafe { libc::chmod(c"/tmp".as_ptr(), 0o555) },
+                "seal empty root",
+            )?;
+            syscall_ok(unsafe { libc::chdir(c"/tmp".as_ptr()) }, "enter empty root")?;
+            syscall_ok(unsafe { libc::chroot(c".".as_ptr()) }, "chroot empty root")?;
+            syscall_ok(unsafe { libc::chdir(c"/".as_ptr()) }, "enter jailed root")?;
         }
 
         syscall_ok(
@@ -279,12 +278,14 @@ impl Sandbox<SetupComplete> {
         if let Profile::Wlancfg {
             control_fd,
             persistence_dir_fd,
+            application_listener_fd,
         } = &profile
         {
             if self.persistence_dir_fd != Some(*persistence_dir_fd) {
                 return Err(Error::PersistenceFdNotInherited(*persistence_dir_fd));
             }
             let mut expected = vec![*control_fd, *persistence_dir_fd];
+            expected.extend(application_listener_fd);
             expected.sort_unstable();
             if expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
@@ -463,59 +464,10 @@ fn close_range(first: u32, last: u32) -> Result<(), Error> {
     }
 }
 
-const OPEN_TREE_CLONE: u32 = 1;
-const OPEN_TREE_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
-const AT_EMPTY_PATH: u32 = 0x1000;
-const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x0000_0004;
-
-fn clone_directory_mount(directory_fd: RawFd) -> Result<RawFd, Error> {
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_open_tree,
-            directory_fd,
-            c"".as_ptr(),
-            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH,
-        )
-    } as RawFd;
-    if fd >= 0 {
-        Ok(fd)
-    } else {
-        Err(system(
-            "clone persistence directory mount",
-            io::Error::last_os_error(),
-        ))
-    }
-}
-
-fn attach_state_mount(state_mount: RawFd) -> Result<(), Error> {
-    syscall_ok(
-        unsafe { libc::mkdir(c"/tmp/state".as_ptr(), 0o000) },
-        "create state mountpoint",
-    )?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            state_mount,
-            c"".as_ptr(),
-            libc::AT_FDCWD,
-            c"/tmp/state".as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(system(
-            "attach persistence directory mount",
-            io::Error::last_os_error(),
-        ))
-    }
-}
-
 fn reopen_state_capability(inherited_fd: RawFd) -> Result<(), Error> {
     let reopened = unsafe {
         libc::open(
-            c"/state".as_ptr(),
+            c"/".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
@@ -593,12 +545,17 @@ fn install_filter(profile: &Profile) -> Result<(), Error> {
     if let Profile::Wlancfg {
         control_fd,
         persistence_dir_fd: fd,
+        application_listener_fd,
     } = profile
     {
+        append_empty_path_statx(&mut f);
         append_openat(&mut f, *fd);
         append_renameat(&mut f, *fd);
         append_unlinkat(&mut f, *fd);
         append_wlancfg_packet_io(&mut f, *control_fd);
+        if let Some(listener) = application_listener_fd {
+            append_wlancfg_accept(&mut f, *listener);
+        }
     }
     if let Profile::Mt7921Vfio {
         pci_config_fd,
@@ -1447,6 +1404,21 @@ fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
     f.push(stmt(LD_W_ABS, 0));
 }
 
+fn append_empty_path_statx(f: &mut Vec<Filter>) {
+    // File::metadata uses statx on descriptors returned by the constrained
+    // state-directory openat path. Seccomp cannot prove the path is empty, but
+    // setup has already closed every unretained descriptor and made the state
+    // directory the process root, so even a nonempty path cannot escape it.
+    f.push(jump(libc::SYS_statx as u32, 0, 7));
+    f.push(arg_high(2));
+    f.push(jump(0, 0, 4));
+    f.push(arg(2));
+    f.push(jump(0x1000, 0, 2));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
 fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
     // Exactly the read and atomic-create flag sets used by HostPolicyStorage at
     // revision 96e37e09. O_NOFOLLOW is mandatory and excludes symlink-following
@@ -1504,6 +1476,29 @@ fn append_unlinkat(f: &mut Vec<Filter>, fd: RawFd) {
     f.push(jump(fd as u32, 0, 4));
     f.push(arg(2));
     f.push(jump(0, 0, 1));
+    f.push(stmt(RET_K, ALLOW));
+    f.push(stmt(RET_K, KILL_PROCESS));
+    f.push(stmt(LD_W_ABS, 0));
+}
+
+fn append_wlancfg_accept(f: &mut Vec<Filter>, listener: RawFd) {
+    // The listener was validated before setup. Only accept4 on that exact
+    // capability with CLOEXEC|NONBLOCK and null address outputs may create a runtime fd.
+    f.push(jump(libc::SYS_accept4 as u32, 0, 12));
+    f.push(arg(0));
+    f.push(jump(listener as u32, 0, 9));
+    f.push(arg(1));
+    f.push(jump(0, 0, 7));
+    f.push(arg_high(1));
+    f.push(jump(0, 0, 5));
+    f.push(arg(2));
+    f.push(jump(0, 0, 3));
+    f.push(arg(3));
+    f.push(jump(
+        (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32,
+        0,
+        1,
+    ));
     f.push(stmt(RET_K, ALLOW));
     f.push(stmt(RET_K, KILL_PROCESS));
     f.push(stmt(LD_W_ABS, 0));
@@ -1621,6 +1616,7 @@ mod filter_tests {
                 setup.lockdown(Profile::Wlancfg {
                     control_fd,
                     persistence_dir_fd,
+                    application_listener_fd: None,
                 }),
                 Err(Error::ProfileAuthorityMismatch)
             ));
@@ -1635,6 +1631,110 @@ mod filter_tests {
         for role in ["wifi", "wlancfg", "mt"] {
             positive_child(role);
         }
+    }
+
+    #[test]
+    fn wlancfg_application_listener_accept_is_filter_admitted() {
+        const TEST: &str = "filter_tests::wlancfg_application_listener_accept_is_filter_admitted";
+        if std::env::var_os("DRV_WLANCFG_ACCEPT_PROBE").is_some() {
+            wlancfg_accept_body();
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST)
+            .env("DRV_WLANCFG_ACCEPT_PROBE", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "wlancfg accept probe failed: {status}");
+    }
+
+    fn wlancfg_accept_body() -> ! {
+        let listener =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        let client =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(listener >= 0 && client >= 0);
+        let name = format!("drv-wlancfg-filter-{}", unsafe { libc::getpid() });
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as _;
+        for (target, source) in address.sun_path[1..].iter_mut().zip(name.bytes()) {
+            *target = source as _;
+        }
+        let address_len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    listener,
+                    (&address as *const libc::sockaddr_un).cast(),
+                    address_len as _,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { libc::listen(listener, 1) }, 0);
+        let mut sync = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sync.as_mut_ptr()) },
+            0
+        );
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let mut byte = 0;
+            assert_eq!(
+                unsafe { libc::read(sync[1], &mut byte as *mut u8 as _, 1) },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    libc::connect(
+                        client,
+                        (&address as *const libc::sockaddr_un).cast(),
+                        address_len as _,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { libc::write(client, b"x".as_ptr().cast(), 1) }, 1);
+            assert_eq!(
+                unsafe { libc::read(client, &mut byte as *mut u8 as _, 1) },
+                1
+            );
+            unsafe { libc::_exit(if byte == b'y' { 0 } else { 1 }) }
+        }
+
+        let mut control = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, control.as_mut_ptr())
+            },
+            0
+        );
+        let state = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(state >= 0);
+        enable_filter(Profile::Wlancfg {
+            control_fd: control[0],
+            persistence_dir_fd: state,
+            application_listener_fd: Some(listener),
+        });
+        assert_eq!(unsafe { libc::write(sync[0], b"s".as_ptr().cast(), 1) }, 1);
+        let accepted = unsafe {
+            libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            )
+        };
+        assert!(accepted >= 0);
+        let mut byte = 0;
+        while unsafe { libc::read(accepted, &mut byte as *mut u8 as _, 1) } < 0 {
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            unsafe { libc::sched_yield() };
+        }
+        assert_eq!(byte, b'x');
+        assert_eq!(unsafe { libc::write(accepted, b"y".as_ptr().cast(), 1) }, 1);
+        unsafe { libc::_exit(0) }
     }
 
     #[test]
@@ -2185,6 +2285,7 @@ mod filter_tests {
             "wlancfg" => Profile::Wlancfg {
                 control_fd: fds[0],
                 persistence_dir_fd: fds[2],
+                application_listener_fd: None,
             },
             "mt" => Profile::Mt7921Vfio {
                 pci_config_fd: fds[0],

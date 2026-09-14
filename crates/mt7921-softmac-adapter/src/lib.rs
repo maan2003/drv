@@ -652,13 +652,20 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
             || command.max_channel_time_nanos < command.min_channel_time_nanos
             || command.max_channel_time_nanos > 500_000_000
         {
+            eprintln!(
+                "passive_scan_start_rejected reason=invalid_dwell min_channel_time={} max_channel_time={}",
+                command.min_channel_time_nanos, command.max_channel_time_nanos
+            );
             return Err(SourceExactTransportError::InvalidDwell);
         }
         self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
-        self.issue(PassiveMcuCommand::StartScan {
+        if let Err(error) = self.issue(PassiveMcuCommand::StartScan {
             scan_sequence: self.scan_sequence,
             channel,
-        })?;
+        }) {
+            eprintln!("passive_scan_start_rejected reason=start_scan_command");
+            return Err(error);
+        }
         self.active = Some(ActivePassiveScan {
             scan_id: command.scan_id,
             scan_sequence: self.scan_sequence,
@@ -1470,10 +1477,8 @@ mod tests {
             chip_capability: None,
             unknown_elements: 0,
         };
-        let query = query_from_capabilities(
-            capability,
-            &mt7921_core::candidate_channels(capability),
-        );
+        let query =
+            query_from_capabilities(capability, &mt7921_core::candidate_channels(capability));
         let database = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
         let regulatory = mt7921_core::regulatory_rate_power_snapshot_from_regdb_v20(
             database, 0, *b"00", capability, [7; 32],
@@ -2471,12 +2476,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mt7921_core::encode_regulatory_rate_tx_power_commands(
-                capability,
-                &incomplete,
-                3,
-                1,
-            ),
+            mt7921_core::encode_regulatory_rate_tx_power_commands(capability, &incomplete, 3, 1,),
             Err(RateTxPowerError::InvalidRegulatoryLimit)
         );
 
@@ -2494,10 +2494,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let commands = mt7921_core::encode_regulatory_rate_tx_power_commands(
-            capability, &complete, 3, 1,
-        )
-        .unwrap();
+        let commands =
+            mt7921_core::encode_regulatory_rate_tx_power_commands(capability, &complete, 3, 1)
+                .unwrap();
         assert_eq!(commands.len(), 2);
         assert_eq!(
             complete

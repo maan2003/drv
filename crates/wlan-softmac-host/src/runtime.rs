@@ -288,8 +288,11 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DeviceOps for 
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
         eprintln!(
-            "client_softmac_scan stage=bridge_enter kind=passive channel_count={}",
-            request.channels.as_ref().map_or(0, Vec::len)
+            "client_softmac_scan stage=bridge_enter kind=passive channel_count={} min_channel_time={:?} max_channel_time={:?} min_home_time={:?}",
+            request.channels.as_ref().map_or(0, Vec::len),
+            request.min_channel_time,
+            request.max_channel_time,
+            request.min_home_time,
         );
         let response = self
             .device

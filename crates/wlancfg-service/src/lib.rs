@@ -5,6 +5,7 @@
 //! This library owns transport mechanics only. Policy, persistence, process
 //! setup, and sandboxing remain with the eventual service binary.
 
+pub mod application;
 pub mod policy;
 
 use anyhow::{anyhow, Context as _};
@@ -12,7 +13,6 @@ use async_trait::async_trait;
 use fidl_fuchsia_wlan_sme as sme;
 use futures::{
     channel::{mpsc, oneshot},
-    stream,
     StreamExt as _,
 };
 use std::{
@@ -73,6 +73,7 @@ struct ClientInner {
     wake: Arc<OwnedFd>,
     force_terminal: Arc<AtomicBool>,
     event_stream: Mutex<Option<mpsc::Receiver<anyhow::Result<()>>>>,
+    liveness: Arc<Mutex<Vec<mpsc::Sender<anyhow::Result<()>>>>>,
     owner: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -162,9 +163,11 @@ impl HostControlClient {
 
         let wake = wake_event()?;
         let (command_tx, command_rx) = sync_mpsc::sync_channel(QUEUE_PACKETS);
-        // futures mpsc reserves one slot per sender in addition to this
-        // buffer; there is exactly one owner-side sender.
+        // Every sequential pinned state-machine instance receives generation
+        // termination. Only the first exists when Ready arrives.
         let (event_tx, event_rx) = mpsc::channel(QUEUE_PACKETS - 1);
+        let liveness = Arc::new(Mutex::new(vec![event_tx]));
+        let owner_liveness = liveness.clone();
         let force_terminal = Arc::new(AtomicBool::new(false));
         let owner_terminal = force_terminal.clone();
         let owner_wake = wake.clone();
@@ -173,7 +176,7 @@ impl HostControlClient {
         let owner = thread::Builder::new()
             .name("wlancfg-control-io".into())
             .spawn(move || {
-                let owner = Owner::new(fd, owner_wake, generation, command_rx, event_tx);
+                let owner = Owner::new(fd, owner_wake, generation, command_rx, owner_liveness);
                 if ready_tx.send(()).is_err() {
                     return;
                 }
@@ -191,6 +194,7 @@ impl HostControlClient {
             wake,
             force_terminal,
             event_stream: Mutex::new(Some(event_rx)),
+            liveness,
             owner: Mutex::new(None),
         }));
         Ok(ParkedHostControlClient {
@@ -253,12 +257,18 @@ impl ClientSmeTransport for HostControlClient {
     }
 
     fn take_event_stream(&self) -> ClientSmeEventStream {
-        match self.0.event_stream.lock().expect("mutex poisoned").take() {
-            Some(receiver) => receiver.boxed_local().fuse(),
-            None => stream::once(async { Err(anyhow!("liveness stream already taken")) })
-                .boxed_local()
-                .fuse(),
+        if let Some(receiver) = self.0.event_stream.lock().expect("mutex poisoned").take() {
+            return receiver.boxed_local().fuse();
         }
+        let (mut sender, receiver) = mpsc::channel(QUEUE_PACKETS - 1);
+        if self.0.force_terminal.load(Ordering::Acquire) {
+            let _ = sender.try_send(Err(anyhow!("WLAN control generation ended")));
+        } else {
+            let mut subscribers = self.0.liveness.lock().expect("mutex poisoned");
+            subscribers.retain(|subscriber| !subscriber.is_closed());
+            subscribers.push(sender);
+        }
+        receiver.boxed_local().fuse()
     }
 }
 
@@ -277,7 +287,7 @@ struct Owner {
     outgoing: VecDeque<Outgoing>,
     outgoing_bytes: usize,
     transaction: Option<mpsc::Sender<anyhow::Result<sme::ConnectTransactionEvent>>>,
-    liveness: mpsc::Sender<anyhow::Result<()>>,
+    liveness: Arc<Mutex<Vec<mpsc::Sender<anyhow::Result<()>>>>>,
 }
 
 impl Owner {
@@ -286,7 +296,7 @@ impl Owner {
         wake: Arc<OwnedFd>,
         generation: [u8; 16],
         commands: sync_mpsc::Receiver<OwnerCommand>,
-        liveness: mpsc::Sender<anyhow::Result<()>>,
+        liveness: Arc<Mutex<Vec<mpsc::Sender<anyhow::Result<()>>>>>,
     ) -> Self {
         Self {
             socket,
@@ -403,7 +413,7 @@ impl Owner {
         let packet = wire::decode(&received.bytes).map_err(|e| format!("invalid control packet: {e}"))?;
         self.validator.validate(&packet).map_err(|e| format!("invalid control sequence: {e}"))?;
         match packet.message {
-            Message::Ready => try_send(&mut self.liveness, Ok(()), "liveness")?,
+            Message::Ready => self.broadcast_liveness(Ok(()))?,
             Message::Event(event) => {
                 let ends_transaction = matches!(
                     &event,
@@ -457,6 +467,14 @@ impl Owner {
         Ok(())
     }
 
+    fn broadcast_liveness(&self, value: anyhow::Result<()>) -> Result<(), String> {
+        let mut subscribers = self.liveness.lock().expect("mutex poisoned");
+        subscribers.retain_mut(|sender| {
+            sender.try_send(value.as_ref().map(|_| ()).map_err(|error| anyhow!(error.to_string()))).is_ok()
+        });
+        if subscribers.is_empty() { Err("liveness stream unavailable".into()) } else { Ok(()) }
+    }
+
     fn finish(&mut self, reason: String) {
         for (_, pending) in self.pending.drain() {
             match pending {
@@ -467,7 +485,8 @@ impl Owner {
             }
         }
         if let Some(mut tx) = self.transaction.take() { let _ = tx.try_send(Err(anyhow!(reason.clone()))); }
-        let _ = self.liveness.try_send(Err(anyhow!(reason)));
+        let _ = self.broadcast_liveness(Err(anyhow!(reason)));
+        self.liveness.lock().expect("mutex poisoned").clear();
     }
 }
 
@@ -801,6 +820,18 @@ mod tests {
         send_bad(server_fd.as_raw_fd());
         assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
         assert!(futures::executor::block_on(liveness.next()).is_none());
+    }
+
+    #[test]
+    fn replacement_state_machine_receives_generation_terminal() {
+        let (client_fd, server_fd) = sockets();
+        let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
+        let mut first = client.take_event_stream();
+        let mut replacement = client.take_event_stream();
+        assert_eq!(unsafe { libc::send(server_fd.as_raw_fd(), b"bad".as_ptr().cast(), 3, 0) }, 3);
+        assert!(futures::executor::block_on(first.next()).unwrap().is_err());
+        assert!(futures::executor::block_on(replacement.next()).unwrap().is_err());
+        assert!(futures::executor::block_on(replacement.next()).is_none());
     }
 
     #[test]

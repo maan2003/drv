@@ -7899,6 +7899,15 @@ impl ClientChannelContext {
         Ok(current)
     }
 
+    pub fn current_channel(&self) -> Option<ClientChannelLease> {
+        self.current
+    }
+
+    pub fn invalidate_current(&mut self) {
+        self.current = None;
+        self.authorized_generation = None;
+    }
+
     pub fn revoke_authorization(&mut self) {
         self.authorized_generation = None;
     }
@@ -10438,6 +10447,13 @@ mod tests {
             context.ensure_channel(channel36),
             ClientPhysicalChannelEnsure::TransitionRequired { current: Some(current), .. }
                 if current == second
+        ));
+        assert_eq!(context.current_channel(), Some(second));
+        context.invalidate_current();
+        assert_eq!(context.current_channel(), None);
+        assert!(matches!(
+            context.ensure_channel(channel40),
+            ClientPhysicalChannelEnsure::TransitionRequired { current: None, .. }
         ));
     }
 

@@ -100,6 +100,7 @@ fn child() -> anyhow::Result<()> {
     install_runtime_filter_for_integration_test(Profile::Wlancfg {
         control_fd: CHILD_CONTROL_FD,
         persistence_dir_fd: state_raw,
+        application_listener_fd: None,
     })?;
     let client = parked.activate_after_persistence()?;
     let mut liveness = client.take_event_stream();

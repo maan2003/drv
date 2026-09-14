@@ -14,7 +14,7 @@ use fuchsia_softmac_port::{ChannelNumber, WlanBand};
 use mt7921_core::{
     ClientChannelContext, ClientDataGeneration, ClientEdcaAc, ClientEdcaParameters,
     ClientFirmwareEffectsState, ClientPhysicalChannel, ClientPhysicalChannelEnsure,
-    ClientRxCandidate, ClientTargetBssLease, ClientWcid, LegacyWmeAssociation,
+    ClientRxCandidate, ClientScanEvidence, ClientTargetBssLease, ClientWcid, LegacyWmeAssociation,
     classify_preassociation_sae_auth, linux_legacy_rate_context_reference,
 };
 use num_bigint::BigUint;
@@ -602,6 +602,14 @@ pub fn is_anchored_eapol_data(bytes: &[u8]) -> bool {
         && classification.ether_type == Some(0x888e)
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeTargetScan {
+    id: u64,
+    observation_generation: u64,
+    operating_channel: Option<ClientPhysicalChannel>,
+    target_channel: Option<ClientPhysicalChannel>,
+}
+
 pub struct LiveClientEffects {
     state: Arc<Mutex<LiveClientState>>,
     target: [u8; 6],
@@ -620,6 +628,7 @@ pub struct LiveClientEffects {
     target_beacon_tim: TargetBeaconTimTelemetry,
     post_assoc_rx_ready_generation: Option<u64>,
     observer: LiveClientObserver,
+    runtime_scan: Option<RuntimeTargetScan>,
 }
 
 const EAPOL_START_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -731,6 +740,7 @@ impl LiveClientEffects {
                 target_beacon_tim: TargetBeaconTimTelemetry::default(),
                 post_assoc_rx_ready_generation: None,
                 observer,
+                runtime_scan: None,
             },
             LiveClientAuthorization { state, target },
         )
@@ -935,6 +945,144 @@ mod production_effects_tests {
                 )
                 .unwrap();
         });
+    }
+
+    #[derive(Default)]
+    struct ChannelIo(Vec<ClientPhysicalChannel>);
+
+    impl Mt7921ClientIo for ChannelIo {
+        fn submit_uni(&mut self, _: u8, _: &[u8]) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn submit_edca(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn submit_ce_no_ack(&mut self, _: &[u8]) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn establish_client_channel(
+            &mut self,
+            channel: ClientPhysicalChannel,
+        ) -> Result<(), zx::Status> {
+            self.0.push(channel);
+            Ok(())
+        }
+        fn transmit_client(
+            &mut self,
+            _: &[u8],
+            _: fidl_softmac::WlanTxInfoFlags,
+        ) -> Result<(), zx::Status> {
+            Err(zx::Status::NOT_SUPPORTED)
+        }
+        fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn runtime_scan_restores_operating_chandef_after_other_channel_before_reconnect() {
+        let target = [1, 2, 3, 4, 5, 6];
+        let channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 149,
+        };
+        let physical = client_physical_channel(
+            channel,
+            fidl_ieee80211::ChannelBandwidth::Cbw80,
+            ChannelNumber {
+                number: 0,
+                ..channel
+            },
+        )
+        .unwrap();
+        let selection = ClientTargetBssLease::retain(ClientScanEvidence {
+            scan_id: 1,
+            observation_generation: 1,
+            observation_timestamp_nanos: 1,
+            bssid: target,
+            channel: physical,
+        })
+        .unwrap();
+        let (mut effects, authorization) = LiveClientEffects::new(
+            selection,
+            target,
+            [7, 8, 9, 10, 11, 12],
+            100,
+            2,
+            None,
+            LiveClientObserver::default(),
+        );
+        effects
+            .set_channel(
+                channel,
+                fidl_ieee80211::ChannelBandwidth::Cbw80,
+                ChannelNumber {
+                    number: 0,
+                    ..channel
+                },
+            )
+            .unwrap();
+        effects.revoke_scan();
+        effects.begin_passive_scan(2, &[channel]).unwrap();
+        effects
+            .observe_passive_scan(
+                2,
+                &fuchsia_softmac_port::ScanObservation {
+                    kind: fuchsia_softmac_port::AdvertisementKind::Beacon,
+                    timestamp_nanos: 2,
+                    bss: fidl_ieee80211::BssDescription {
+                        bssid: target,
+                        bss_type: fidl_ieee80211::BssType::Infrastructure,
+                        beacon_period: 100,
+                        capability_info: 0x11,
+                        ies: vec![],
+                        primary: channel,
+                        bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw80,
+                        vht_secondary_80_channel: ChannelNumber {
+                            number: 0,
+                            ..channel
+                        },
+                        rssi_dbm: -40,
+                        snr_db: 20,
+                    },
+                },
+            )
+            .unwrap();
+        let other_channel = ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 36,
+        };
+        effects
+            .observe_passive_scan(
+                2,
+                &fuchsia_softmac_port::ScanObservation {
+                    kind: fuchsia_softmac_port::AdvertisementKind::Beacon,
+                    timestamp_nanos: 3,
+                    bss: fidl_ieee80211::BssDescription {
+                        bssid: [9, 8, 7, 6, 5, 4],
+                        bss_type: fidl_ieee80211::BssType::Infrastructure,
+                        beacon_period: 100,
+                        capability_info: 0x11,
+                        ies: vec![],
+                        primary: other_channel,
+                        bandwidth: fidl_ieee80211::ChannelBandwidth::Cbw20,
+                        vht_secondary_80_channel: ChannelNumber {
+                            number: 0,
+                            ..other_channel
+                        },
+                        rssi_dbm: -30,
+                        snr_db: 25,
+                    },
+                },
+            )
+            .unwrap();
+        let mut io = ChannelIo::default();
+        effects.complete_passive_scan(2, true, &mut io).unwrap();
+        assert_eq!(io.0, [physical]);
+
+        let state = authorization.state.lock().unwrap();
+        let lease = state.channel.authorized_channel().unwrap();
+        assert!(state.selection.permits_join(target, lease));
     }
 
     #[test]
@@ -1143,6 +1291,7 @@ impl Mt7921ClientEffects for LiveClientEffects {
     }
 
     fn revoke_scan(&mut self) {
+        self.runtime_scan = None;
         self.invalidate_association_rx();
         let mut state = self.state.lock().unwrap();
         state.selection.invalidate();
@@ -1935,6 +2084,13 @@ impl Mt7921ClientEffects for LiveClientEffects {
         {
             self.abort_join_roc(io)?;
         }
+        // Hardware scan observations and ordinary client RX share the data
+        // ring. While an offload scan is live, leave the ring exclusively to
+        // next_scan_event so beacons become scan results rather than ordinary
+        // MLME RX frames.
+        if self.runtime_scan.is_some() {
+            return Ok(ClientRxPoll::Idle);
+        }
         // Drain a successfully committed retained M1 before timers or hardware IO.
         let frame = match io.next_client_rx() {
             Ok(frame) => frame,
@@ -2449,22 +2605,108 @@ impl Mt7921ClientEffects for LiveClientEffects {
     }
     fn begin_passive_scan(
         &mut self,
-        _: u64,
-        _: &[fidl_ieee80211::ChannelNumber],
+        scan_id: u64,
+        channels: &[fidl_ieee80211::ChannelNumber],
     ) -> Result<(), zx::Status> {
-        Err(zx::Status::NOT_SUPPORTED)
+        if scan_id == 0 || channels.is_empty() || self.runtime_scan.is_some() {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let operating_channel = {
+            let mut state = self.state.lock().unwrap();
+            let operating = state.channel.current_channel().map(|lease| lease.channel);
+            state.channel.invalidate_current();
+            operating
+        };
+        self.established_channel = None;
+        self.runtime_scan = Some(RuntimeTargetScan {
+            id: scan_id,
+            observation_generation: 0,
+            operating_channel,
+            target_channel: None,
+        });
+        Ok(())
     }
     fn observe_passive_scan(
         &mut self,
-        _: u64,
+        scan_id: u64,
         observation: &fuchsia_softmac_port::ScanObservation,
     ) -> Result<(), zx::Status> {
-        let _ = observation;
-        Err(zx::Status::NOT_SUPPORTED)
+        let scan = self.runtime_scan.as_mut().ok_or(zx::Status::BAD_STATE)?;
+        if scan.id != scan_id {
+            return Err(zx::Status::BAD_STATE);
+        }
+        scan.observation_generation = scan
+            .observation_generation
+            .checked_add(1)
+            .ok_or(zx::Status::NO_RESOURCES)?;
+        if observation.bss.bssid == self.target {
+            let channel = client_physical_channel(
+                observation.bss.primary,
+                observation.bss.bandwidth,
+                observation.bss.vht_secondary_80_channel,
+            )?;
+            self.state.lock().unwrap().selection =
+                ClientTargetBssLease::retain(ClientScanEvidence {
+                    scan_id,
+                    observation_generation: scan.observation_generation,
+                    observation_timestamp_nanos: observation.timestamp_nanos,
+                    bssid: self.target,
+                    channel,
+                })
+                .map_err(|_| zx::Status::BAD_STATE)?;
+            scan.target_channel = Some(channel);
+        }
+        Ok(())
     }
-    fn complete_passive_scan(&mut self, _: u64, success: bool) -> Result<(), zx::Status> {
-        let _ = success;
-        Err(zx::Status::NOT_SUPPORTED)
+    fn complete_passive_scan(
+        &mut self,
+        scan_id: u64,
+        success: bool,
+        io: &mut dyn Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
+        let scan = self.runtime_scan.take().ok_or(zx::Status::BAD_STATE)?;
+        if scan.id != scan_id {
+            self.revoke_scan();
+            return Err(zx::Status::BAD_STATE);
+        }
+        let restore_channel = scan.operating_channel.or(scan.target_channel);
+        if let Some(channel) = restore_channel {
+            if let Err(status) = io.establish_client_channel(channel) {
+                self.revoke_scan();
+                return Err(status);
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .channel
+                .establish_channel(channel)
+                .map_err(|_| zx::Status::NO_RESOURCES)?;
+            self.established_channel = Some(channel);
+        }
+        if !success {
+            self.revoke_scan();
+            return Ok(());
+        }
+        let Some(channel) = scan.target_channel else {
+            return Ok(());
+        };
+        let mut state = self.state.lock().unwrap();
+        let ClientPhysicalChannelEnsure::Current(lease) = state.channel.ensure_channel(channel)
+        else {
+            state.selection.invalidate();
+            return Err(zx::Status::BAD_STATE);
+        };
+        state
+            .selection
+            .mark_rate_power_ready(self.target, channel)
+            .and_then(|()| {
+                state
+                    .selection
+                    .authorize_sae(self.target, lease)
+                    .map(|_| ())
+            })
+            .and_then(|()| state.channel.authorize_channel(channel).map(|_| ()))
+            .map_err(|_| zx::Status::BAD_STATE)
     }
     fn reset(&mut self) -> Result<(), zx::Status> {
         self.revoke_scan();

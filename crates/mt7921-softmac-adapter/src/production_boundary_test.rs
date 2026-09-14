@@ -401,7 +401,12 @@ impl Mt7921ClientEffects for ProductionBackend {
         state.pending_scan_channel = Some(observation.bss.primary);
         Ok(())
     }
-    fn complete_passive_scan(&mut self, scan_id: u64, success: bool) -> Result<(), zx::Status> {
+    fn complete_passive_scan(
+        &mut self,
+        scan_id: u64,
+        success: bool,
+        _: &mut dyn crate::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
         let mut state = self.0.lock().unwrap();
         state.regulatory_channel =
             if state.active_scan_id == Some(scan_id) && success && !state.lifecycle_poisoned {

@@ -20,6 +20,30 @@ credential_len=$(wc -c <"/proc/$$/fd/3")
 snapshot_len=$(wc -c <"/proc/$$/fd/4")
 test "$credential_len" -ge 8 && test "$credential_len" -le 63
 test "$snapshot_len" -ge 1 && test "$snapshot_len" -le 4096
+for binary in mt7921-passive-scan wlan-stack-kvm wlancfg-service wlanctl netstack3-provider drv-dns-service dns-check loopback-test curl; do
+    test -x "$root/bin/$binary"
+done
+test -f "$root/etc/quad9.toml"
+test -f "$root/etc/ssl/certs/ca-certificates.crt"
+# drv-dns-service uses a Nix RUNPATH for Rust unwinding. Require the exact
+# loader-resolved path inside the guest root; a same-basename fallback in /lib
+# does not satisfy that contract.
+dns_libgcc=$(ldd "$root/bin/drv-dns-service" |
+    awk '$1 == "libgcc_s.so.1" && $2 == "=>" && $3 ~ "^/" { print $3; exit }')
+case "$dns_libgcc" in
+    /nix/store/*/lib/libgcc_s.so.1) ;;
+    *) exit 1 ;;
+esac
+test -f "$root$dns_libgcc"
+test -f "$root/lib/libnss_drv.so.2"
+for dependency in $(ldd "$root/lib/libnss_drv.so.2" |
+    awk '$2 == "=>" && $3 ~ "^/" { print $3 } $1 ~ "^/" { print $1 }'); do
+    test -f "$root$dependency"
+done
+test "$(stat -Lc '%a' "$root/etc/quad9.toml")" = 444
+test "$(stat -Lc '%a' "$root/etc/ssl/certs/ca-certificates.crt")" = 444
+test "$(wc -c <"$root/etc/quad9.toml")" -le 8192
+test "$(wc -c <"$root/etc/ssl/certs/ca-certificates.crt")" -le 2097152
 mkdir -m 700 "$out"
 out=$(cd "$out" && pwd)
 watchdog=/run/current-system/sw/bin/wifi-lab-watchdog
@@ -49,7 +73,7 @@ timeout -k 3 75 "${QEMU:-qemu-system-x86_64}" \
     -device pcie-root-port,id=wifiport,chassis=1,slot=1 \
     -device "vfio-pci,host=$DRV_PCI_BDF,bus=wifiport,addr=0.0" \
     -kernel "$kernel" -initrd "$out/initrd.gz" \
-    -append 'console=ttyS0 panic=-1 rdinit=/init intel_iommu=on iommu.strict=1' \
+    -append 'console=ttyS0 panic=-1 rdinit=/init intel_iommu=on iommu.strict=1 vfio_pci.disable_idle_d3=1' \
     -fw_cfg name=opt/drv-credential,file=/proc/self/fd/3 \
     -fw_cfg name=opt/drv-regulatory,file=/proc/self/fd/4 \
     -fw_cfg "name=opt/drv-watchdog,file=$out/watchdog" \

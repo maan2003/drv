@@ -141,6 +141,10 @@ use std::{
     time::Instant,
 };
 use userspace_vfio::{Ioas, RegionInfo, VfioIrq};
+#[cfg(feature = "fuchsia-passive")]
+use wifi_control_service::{
+    PreparedServerEndpoints, RuntimeError as WifiRuntimeError, WifiRuntime,
+};
 
 const VFIO_TYPE: u64 = b';' as u64;
 const VFIO_BASE: u64 = 100;
@@ -171,8 +175,9 @@ const BAR0_REGION: u32 = 0;
 const VFIO_DEVICE_FLAGS_RESET: u32 = 1;
 const PAGE: usize = 4096;
 const MCU_TX_RING_COUNT: usize = 256;
-const MCU_COMMAND_SLOT_BYTES: usize = 256;
-const MCU_COMMAND_PAYLOAD_BYTES: usize = MCU_TX_RING_COUNT * MCU_COMMAND_SLOT_BYTES;
+const MCU_COMMAND_SLOT_BYTES: usize = 2048;
+const MCU_COMMAND_PAYLOAD_BYTES: usize = 64 * 1024;
+const MCU_COMMAND_PAYLOAD_SLOT_COUNT: usize = MCU_COMMAND_PAYLOAD_BYTES / MCU_COMMAND_SLOT_BYTES;
 const MCU_COMMAND_PAYLOAD_IOVA: u64 = 0x0102_0000;
 const VFIO_IRQ_SET_DATA_NONE: u32 = 1;
 const VFIO_IRQ_SET_DATA_EVENTFD: u32 = 1 << 2;
@@ -450,7 +455,10 @@ impl ActiveSignalGuard {
             }
             *slot = (number, handler);
         }
-        Ok(Self { previous, cleaning_up: std::cell::Cell::new(false) })
+        Ok(Self {
+            previous,
+            cleaning_up: std::cell::Cell::new(false),
+        })
     }
     fn stop_requested(&self) -> bool {
         !self.cleaning_up.get() && STOP_REQUESTED.load(Ordering::Acquire)
@@ -541,6 +549,147 @@ fn poll_network_ready_handshake(
             Err(error) => Err(format!("netstack bootstrap close acknowledgment: {error}")),
         };
     }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+struct MtWifiRuntime<'hardware>(Mt7921ProductionClient<'hardware>);
+
+#[cfg(feature = "fuchsia-passive")]
+fn wifi_runtime_error(error: PinnedConnectError) -> WifiRuntimeError {
+    match error {
+        PinnedConnectError::Failed(result) => WifiRuntimeError::Failed(result),
+        PinnedConnectError::Timeout => WifiRuntimeError::Timeout,
+        PinnedConnectError::Driver(PinnedDriverError::RoamUnsupported) => {
+            WifiRuntimeError::Unsupported
+        }
+        PinnedConnectError::Driver(_) => WifiRuntimeError::DriverFault,
+        PinnedConnectError::Containment => WifiRuntimeError::ContainmentFault,
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+impl WifiRuntime for MtWifiRuntime<'_> {
+    fn public_mac(&self) -> [u8; 6] {
+        self.0.public_mac()
+    }
+
+    fn take_ethernet_device(&mut self) -> Option<OwnedFd> {
+        self.0
+            .take_ethernet_device()
+            .map(|device| device.into_frame_fd())
+    }
+
+    fn begin_connect(
+        &mut self,
+        request: fidl_sme::ConnectRequest,
+        deadline: Instant,
+    ) -> Result<(), WifiRuntimeError> {
+        self.0
+            .begin_connect(request, deadline)
+            .map_err(wifi_runtime_error)
+    }
+
+    async fn drive_connect_once(
+        &mut self,
+    ) -> Result<Option<fidl_sme::ConnectResult>, WifiRuntimeError> {
+        self.0
+            .drive_connect_once()
+            .await
+            .map_err(wifi_runtime_error)
+    }
+
+    async fn cancel_connect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<fidl_sme::ConnectResult, WifiRuntimeError> {
+        self.0
+            .cancel_connect(reason, deadline)
+            .await
+            .map_err(wifi_runtime_error)
+    }
+
+    fn roam(&mut self, request: fidl_sme::RoamRequest) -> Result<(), WifiRuntimeError> {
+        self.0.roam(request).map_err(wifi_runtime_error)
+    }
+
+    fn begin_scan(
+        &mut self,
+        request: fidl_sme::ScanRequest,
+        deadline: Instant,
+    ) -> Result<(), WifiRuntimeError> {
+        self.0
+            .begin_scan(request, deadline)
+            .map_err(wifi_runtime_error)
+    }
+
+    async fn drive_scan_once(
+        &mut self,
+    ) -> Result<Option<Result<Vec<fidl_sme::ScanResult>, fidl_sme::ScanErrorCode>>, WifiRuntimeError>
+    {
+        self.0.drive_scan_once().await.map_err(wifi_runtime_error)
+    }
+
+    async fn drive_once(&mut self) -> Result<bool, WifiRuntimeError> {
+        self.0.drive_once().await.map_err(wifi_runtime_error)
+    }
+
+    fn next_connection_event(
+        &mut self,
+    ) -> Result<Option<fidl_sme::ConnectTransactionEvent>, WifiRuntimeError> {
+        self.0.next_connection_event().map_err(wifi_runtime_error)
+    }
+
+    async fn disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: Instant,
+    ) -> Result<(), WifiRuntimeError> {
+        self.0
+            .disconnect(reason, deadline)
+            .await
+            .map_err(wifi_runtime_error)
+    }
+}
+
+#[cfg(feature = "fuchsia-passive")]
+fn read_wifi_service_endpoints() -> Result<PreparedServerEndpoints, String> {
+    let fd = |name: &str| -> Result<RawFd, String> {
+        let value = env::var(name).map_err(|_| format!("{name} is required"))?;
+        let fd = value
+            .parse::<RawFd>()
+            .map_err(|_| format!("{name} is not a descriptor"))?;
+        if fd < 5 {
+            return Err(format!("{name} must not alias stdio or setup input"));
+        }
+        Ok(fd)
+    };
+    let policy = fd("DRV_WIFI_POLICY_FD")?;
+    let supervisor = fd("DRV_WIFI_SUPERVISOR_FD")?;
+    if policy == supervisor {
+        return Err("Wi-Fi policy and supervisor capabilities must be distinct".into());
+    }
+    let value = env::var("DRV_WIFI_GENERATION")
+        .map_err(|_| "DRV_WIFI_GENERATION is required".to_string())?;
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("DRV_WIFI_GENERATION must contain 32 hexadecimal digits".into());
+    }
+    let mut generation = [0u8; 16];
+    for (index, byte) in generation.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "DRV_WIFI_GENERATION is invalid".to_string())?;
+    }
+    if generation == [0; 16] {
+        return Err("DRV_WIFI_GENERATION must not be zero".into());
+    }
+    // SAFETY: the trusted launcher transfers unique ownership of both named
+    // descriptors to this process. Validation consumes no policy bytes.
+    PreparedServerEndpoints::new(
+        unsafe { OwnedFd::from_raw_fd(policy) },
+        unsafe { OwnedFd::from_raw_fd(supervisor) },
+        generation,
+    )
+    .map_err(|error| format!("validate Wi-Fi service endpoints: {error}"))
 }
 
 #[cfg(feature = "fuchsia-passive")]
@@ -698,7 +847,10 @@ fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_bootstrap_descriptors(descriptors: &[(String, String)], kernel_provider: bool) -> Result<(), String> {
+fn validate_netstack_bootstrap_descriptors(
+    descriptors: &[(String, String)],
+    kernel_provider: bool,
+) -> Result<(), String> {
     if descriptors.len() != 7
         || descriptors
             .iter()
@@ -775,13 +927,20 @@ fn spawn_netstack_child(
         .stderr(Stdio::inherit());
     match &frontend {
         NetworkFrontend::Socks(listener) => {
-            command.env("DRV_SOCKS5_LISTEN", listener.local_addr()
-                .map_err(|error| format!("SOCKS listener address: {error}"))?.to_string());
+            command.env(
+                "DRV_SOCKS5_LISTEN",
+                listener
+                    .local_addr()
+                    .map_err(|error| format!("SOCKS listener address: {error}"))?
+                    .to_string(),
+            );
         }
         NetworkFrontend::Kernel(_) => {
-            command.args(["--ethernet-mac",
+            command.args([
+                "--ethernet-mac",
                 &env::var("DRV_SAE_CLIENT_MAC").map_err(|_| "missing client MAC")?,
-                "--bootstrap"]);
+                "--bootstrap",
+            ]);
         }
     }
     unsafe {
@@ -926,7 +1085,10 @@ fn audit_netstack_runtime_fds(pid: u32, kernel_provider: bool) -> Result<(), Str
 }
 
 #[cfg(feature = "fuchsia-passive")]
-fn validate_netstack_runtime_descriptors(descriptors: &[(String, String)], kernel_provider: bool) -> Result<(), String> {
+fn validate_netstack_runtime_descriptors(
+    descriptors: &[(String, String)],
+    kernel_provider: bool,
+) -> Result<(), String> {
     let mut base = [false; 5];
     let mut poller = false;
     let mut seen = Vec::new();
@@ -1759,6 +1921,7 @@ fn run_contained_dma_resource_round_trip(
                             active_join_roc: None,
                             scan_started: None,
                             pending_scan_done: None,
+                                scan_return_phase: None,
                             advertisements: Vec::new(),
                             tx_completions: Vec::new(),
                             mgmt_tx_outstanding: MgmtTxOutstanding::default(),
@@ -2920,7 +3083,12 @@ impl mt7921_softmac_adapter::client_device::Mt7921ClientEffects for ComebackSelf
     ) -> Result<(), zx::Status> {
         Ok(())
     }
-    fn complete_passive_scan(&mut self, _: u64, _: bool) -> Result<(), zx::Status> {
+    fn complete_passive_scan(
+        &mut self,
+        _: u64,
+        _: bool,
+        _: &mut dyn mt7921_softmac_adapter::client_device::Mt7921ClientIo,
+    ) -> Result<(), zx::Status> {
         Ok(())
     }
     fn reset(&mut self) -> Result<(), zx::Status> {
@@ -4917,6 +5085,8 @@ fn run() -> Result<(), String> {
         Some("--run-one-shot-power-setup") => Operation::RunOneShotPowerSetup,
         #[cfg(feature = "fuchsia-passive")]
         Some("--run-one-shot-sae-auth") => Operation::RunOneShotSaeAuth,
+        #[cfg(feature = "fuchsia-passive")]
+        Some("--run-wifi-service") => Operation::RunWifiService,
         #[cfg(not(feature = "fuchsia-passive"))]
         Some("--run-one-shot-sae-auth") => return Err("SAE TX is disabled; connect orchestration must come from the full pinned Fuchsia client MLME".into()),
         Some(argument) => return Err(format!("unknown argument {argument}")),
@@ -4944,7 +5114,11 @@ fn run() -> Result<(), String> {
     };
     let active_client = env::var("DRV_ACTIVE_CLIENT").is_ok();
     #[cfg(feature = "fuchsia-passive")]
-    if operation == Operation::RunOneShotSaeAuth && !active_client {
+    if matches!(
+        operation,
+        Operation::RunOneShotSaeAuth | Operation::RunWifiService
+    ) && !active_client
+    {
         return Err("SAE operation requires the production active-client mode".into());
     }
     #[cfg(feature = "fuchsia-passive")]
@@ -5052,7 +5226,7 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "fuchsia-passive")]
     let power_target = if matches!(
         operation,
-        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth | Operation::RunWifiService
     ) {
         let bssid = parse_mac(
             &env::var("DRV_SAE_BSSID").map_err(|_| "DRV_SAE_BSSID is required for power setup")?,
@@ -5124,7 +5298,7 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "fuchsia-passive")]
     let rate_power_snapshot = matches!(
         operation,
-        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth
+        Operation::RunOneShotPowerSetup | Operation::RunOneShotSaeAuth | Operation::RunWifiService
     )
     .then(read_rate_power_snapshot)
     .transpose()?;
@@ -5145,6 +5319,10 @@ fn run() -> Result<(), String> {
     if operation == Operation::RunOneShotSaeAuth {
         record_sae_stage("credential_read");
     }
+    #[cfg(feature = "fuchsia-passive")]
+    let mut service_endpoints = (operation == Operation::RunWifiService)
+        .then(read_wifi_service_endpoints)
+        .transpose()?;
     let bdf = env::var("DRV_PCI_BDF").map_err(|_| "DRV_PCI_BDF is required")?;
     let vfio = env::var("DRV_VFIO_DEVICE").map_err(|_| "DRV_VFIO_DEVICE is required")?;
     verify_pci_identity(&bdf)?;
@@ -6509,6 +6687,7 @@ fn run() -> Result<(), String> {
             .expect("active MCU operation has containment ledger");
         ledger.mark_possibly_active(Hazard::LabMutated);
         ledger.mark_possibly_active(Hazard::HostControl);
+        let mut wifi_control_terminal = false;
         let active = (|| -> Result<(), String> {
             set_lab_safety("MUTATED")?;
             disable_pci_intx(&bdf)?;
@@ -6836,6 +7015,7 @@ fn run() -> Result<(), String> {
                                 active_join_roc: None,
                                 scan_started: None,
                                 pending_scan_done: None,
+                                scan_return_phase: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
@@ -6886,18 +7066,7 @@ fn run() -> Result<(), String> {
                             Ok(())
                         },
                     )
-                } else if matches!(
-                    operation,
-                    Operation::RunOneShotPassiveChannel1
-                        | Operation::RunOneShotPassiveChannels1And6
-                        | Operation::RunOneShotPassive2Ghz
-                        | Operation::RunOneShotPassive5GhzNonDfs
-                        | Operation::RunOneShotPassive5GhzDfsLow
-                        | Operation::RunOneShotPassive5GhzDfsHigh
-                        | Operation::RunOneShotPassiveSmeFull
-                        | Operation::RunOneShotPowerSetup
-                        | Operation::RunOneShotSaeAuth
-                ) {
+                } else if operation.uses_full_passive_runtime() {
                     load_mt7921_firmware_with_passive_boundary(
                         &mut loader,
                         patch,
@@ -6939,6 +7108,7 @@ fn run() -> Result<(), String> {
                                 active_join_roc: None,
                                 scan_started: None,
                                 pending_scan_done: None,
+                                scan_return_phase: None,
                                 advertisements: Vec::new(),
                                 tx_completions: Vec::new(),
                                 mgmt_tx_outstanding: MgmtTxOutstanding::default(),
@@ -7033,17 +7203,23 @@ fn run() -> Result<(), String> {
                                     let channel = power_target.as_ref().expect("power target").2;
                                     channels_for(WlanBand::FiveGhz, &[channel])
                                 }
-                                Operation::RunOneShotSaeAuth => {
+                                Operation::RunOneShotSaeAuth | Operation::RunWifiService => {
                                     let channel = power_target.as_ref().expect("SAE target").2;
                                     channels_for(WlanBand::FiveGhz, &[channel])
                                 }
                                 _ => unreachable!("passive scan operation matched above"),
                             };
+                            let runtime_channels = operation.runtime_authorized_channels(
+                                report.nic_capability,
+                                &candidates,
+                                report.special_unii_mask,
+                                &channels,
+                            )?;
                             let mut adapter = Mt7921SoftmacAdapter::new(
                                 transport,
                                 report.nic_capability,
                                 candidates.clone(),
-                                channels.clone(),
+                                runtime_channels,
                             )
                             .map_err(|error| error.to_string())?;
                             if operation == Operation::RunOneShotPowerSetup {
@@ -7244,7 +7420,10 @@ fn run() -> Result<(), String> {
                                     channels.len()
                                 ));
                             }
-                            if operation == Operation::RunOneShotSaeAuth {
+                            if matches!(
+                                operation,
+                                Operation::RunOneShotSaeAuth | Operation::RunWifiService
+                            ) {
                                 let beacon_authorization = beacon_authorization
                                     .as_ref()
                                     .ok_or("target beacon did not authorize current channel")?;
@@ -7256,7 +7435,10 @@ fn run() -> Result<(), String> {
                                         "target beacon authorization is no longer live".into()
                                     );
                                 }
-                                if operation == Operation::RunOneShotSaeAuth {
+                                if matches!(
+                                    operation,
+                                    Operation::RunOneShotSaeAuth | Operation::RunWifiService
+                                ) {
                                     let selection = target_selection
                                         .take()
                                         .ok_or("target selection evidence was not retained")?;
@@ -7386,6 +7568,43 @@ fn run() -> Result<(), String> {
                                         bss.bandwidth,
                                         bss.vht_secondary_80_channel,
                                     )?;
+                                    drop(runner);
+                                    let mut client =
+                                        futures::executor::block_on(Mt7921ProductionClient::new(
+                                            device,
+                                            device_info,
+                                            security_support,
+                                            spectrum_support,
+                                            fuchsia_inspect::Inspector::default(),
+                                            32,
+                                        ))
+                                        .map_err(|_| "construct pinned SME/MLME runtime failed")?;
+                                    if operation == Operation::RunWifiService {
+                                        let endpoints = service_endpoints
+                                            .take()
+                                            .ok_or("Wi-Fi service endpoints were not retained")?;
+                                        let mut server = endpoints
+                                            .bind_runtime(MtWifiRuntime(client))
+                                            .post_lockdown_open_complete()
+                                            .map_err(|error| {
+                                                format!("open MT7921 control generation: {error}")
+                                            })?;
+                                        record_sae_stage("wifi_control_ready=true");
+                                        let result = server.run_to_terminal().map_err(|error| {
+                                            format!("MT7921 control service: {error}")
+                                        });
+                                        let mut runtime = server.into_runtime();
+                                        let stop = runtime.0.stop().map_err(|error| {
+                                            format!("stop MT7921 client runtime: {error}")
+                                        });
+                                        result?;
+                                        stop?;
+                                        record_sae_stage(
+                                            "wifi_control_terminal=true callbacks_revoked=true",
+                                        );
+                                        wifi_control_terminal = true;
+                                        return Ok(());
+                                    }
                                     let passphrase = sae_credential
                                         .take()
                                         .ok_or("SAE credential unavailable")?
@@ -7406,17 +7625,6 @@ fn run() -> Result<(), String> {
                                         },
                                         deprecated_scan_type: fidl_common::ScanType::Passive,
                                     };
-                                    drop(runner);
-                                    let mut client =
-                                        futures::executor::block_on(Mt7921ProductionClient::new(
-                                            device,
-                                            device_info,
-                                            security_support,
-                                            spectrum_support,
-                                            fuchsia_inspect::Inspector::default(),
-                                            32,
-                                        ))
-                                        .map_err(|_| "construct pinned SME/MLME runtime failed")?;
                                     let deadline =
                                         Instant::now() + std::time::Duration::from_secs(25);
                                     futures::executor::block_on(client.connect(request, deadline))
@@ -7429,14 +7637,28 @@ fn run() -> Result<(), String> {
                                     let ethernet_device = client.take_ethernet_device().ok_or(
                                         "controlled-port UP did not publish Ethernet capability",
                                     )?;
-                                    let frontend = if env::var("DRV_NETSTACK_KERNEL_PROVIDER").as_deref() == Ok("1") {
-                                        NetworkFrontend::Kernel(std::fs::OpenOptions::new()
-                                            .read(true).write(true).open("/dev/netstack3")
-                                            .map_err(|error| format!("open kernel socket registration: {error}"))?)
+                                    let frontend = if env::var("DRV_NETSTACK_KERNEL_PROVIDER")
+                                        .as_deref()
+                                        == Ok("1")
+                                    {
+                                        NetworkFrontend::Kernel(
+                                            std::fs::OpenOptions::new()
+                                                .read(true)
+                                                .write(true)
+                                                .open("/dev/netstack3")
+                                                .map_err(|error| {
+                                                    format!(
+                                                        "open kernel socket registration: {error}"
+                                                    )
+                                                })?,
+                                        )
                                     } else {
                                         let listen: SocketAddr = env::var("DRV_SOCKS5_LISTEN")
-                                            .map_err(|_| "DRV_SOCKS5_LISTEN is required")?.parse()
-                                            .map_err(|_| "DRV_SOCKS5_LISTEN is not a socket address")?;
+                                            .map_err(|_| "DRV_SOCKS5_LISTEN is required")?
+                                            .parse()
+                                            .map_err(
+                                                |_| "DRV_SOCKS5_LISTEN is not a socket address",
+                                            )?;
                                         if !listen.ip().is_loopback() {
                                             return Err("DRV_SOCKS5_LISTEN must be loopback".into());
                                         }
@@ -7450,11 +7672,11 @@ fn run() -> Result<(), String> {
                                             "DRV_DAEMON_MAX_SECONDS must be 30..=3600".into()
                                         );
                                     }
-                                    let mut netstack = spawn_netstack_child(
-                                        ethernet_device, frontend, seconds,
-                                    )?;
+                                    let mut netstack =
+                                        spawn_netstack_child(ethernet_device, frontend, seconds)?;
                                     record_sae_stage(&format!(
-                                        "internet_proxy_starting=true kernel_provider={} max_seconds={seconds} process_split=true", netstack.kernel_provider
+                                        "internet_proxy_starting=true kernel_provider={} max_seconds={seconds} process_split=true",
+                                        netstack.kernel_provider
                                     ));
                                     let service_deadline = Instant::now()
                                         + std::time::Duration::from_secs(seconds + 35);
@@ -7824,6 +8046,13 @@ fn run() -> Result<(), String> {
         {
             Ok(()) => {
                 println!("{{\"active_mcu_event\":\"post_reset_safe_state_verified\"}}");
+                if operation == Operation::RunWifiService {
+                    record_sae_stage(if wifi_control_terminal {
+                        "wifi_control_terminal=true hardware_stopped=true"
+                    } else {
+                        "wifi_control_terminal=false hardware_stopped=true"
+                    });
+                }
                 for hazard in [
                     Hazard::HostControl,
                     Hazard::DeviceIrq,
@@ -8107,6 +8336,15 @@ enum RunPhase {
     SafeReleaseError,
 }
 
+impl RunPhase {
+    const fn passive_scan_return_phase(self) -> Option<Self> {
+        match self {
+            Self::PassiveReady | Self::BeaconAuthorized => Some(self),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Hazard {
     VfioBound,
@@ -8349,7 +8587,7 @@ fn publish_mcu_bytes(
     sequence: u8,
     descriptor_index: usize,
 ) -> Result<(), String> {
-    let payload_offset = descriptor_index * MCU_COMMAND_SLOT_BYTES;
+    let payload_offset = mcu_command_payload_offset(descriptor_index)?;
     if payload_offset + bytes.len() > payload.len {
         return Err("MCU command payload arena exhausted".into());
     }
@@ -10388,7 +10626,14 @@ impl VfioFirmwareLoader<'_> {
         sequence: u8,
         descriptor_index: usize,
     ) -> Result<(), String> {
-        let payload_offset = descriptor_index * MCU_COMMAND_SLOT_BYTES;
+        if encoded.len() > MCU_COMMAND_SLOT_BYTES {
+            return Err(format!(
+                "MCU command length {} exceeded isolated payload slot {}",
+                encoded.len(),
+                MCU_COMMAND_SLOT_BYTES
+            ));
+        }
+        let payload_offset = mcu_command_payload_offset(descriptor_index)?;
         if payload_offset + encoded.len() > self.mcu.payload.len {
             return Err("MCU command payload arena exhausted".into());
         }
@@ -10749,6 +10994,13 @@ fn passive_mac_read_bar_offset(address: u32) -> Result<usize, String> {
 
 const fn next_dma_index(index: usize, count: usize) -> usize {
     (index + 1) % count
+}
+
+fn mcu_command_payload_offset(descriptor_index: usize) -> Result<usize, String> {
+    if descriptor_index >= MCU_TX_RING_COUNT {
+        return Err("MCU command descriptor escaped TX ring".into());
+    }
+    Ok((descriptor_index % MCU_COMMAND_PAYLOAD_SLOT_COUNT) * MCU_COMMAND_SLOT_BYTES)
 }
 
 const fn dma_index_completed(actual: u32, expected: u32) -> bool {
@@ -11780,7 +12032,7 @@ impl VfioFirmwareLoader<'_> {
         let published_ns = self.start.elapsed().as_nanos();
         let cidx_published = self.mcu.wfdma.read(0xd4418)?;
         let didx_published = self.mcu.wfdma.read(0xd441c)?;
-        let payload_offset = descriptor_index * MCU_COMMAND_SLOT_BYTES;
+        let payload_offset = mcu_command_payload_offset(descriptor_index)?;
         let published = self.mcu.payload.read_bytes(payload_offset, encoded.len())?;
         if published != encoded {
             return Err("rate-power DMA bytes differ from the encoded publication".into());
@@ -12175,28 +12427,28 @@ struct VfioLoaderEffects<'a, 'b> {
 impl LoaderMechanicsTransport for VfioLoaderEffects<'_, '_> {
     type Error = String;
     fn command_payload_capacity(&self, slot: u16) -> usize {
-        self.loader
-            .mcu
-            .payload
-            .len
-            .saturating_sub(usize::from(slot) * MCU_COMMAND_SLOT_BYTES)
+        mcu_command_payload_offset(usize::from(slot))
+            .map(|_| MCU_COMMAND_SLOT_BYTES)
+            .unwrap_or(0)
     }
 
     fn command_payload_address(&self, slot: u16) -> Result<u64, Self::Error> {
-        let offset = usize::from(slot) * MCU_COMMAND_SLOT_BYTES;
+        let offset = mcu_command_payload_offset(usize::from(slot))?;
         self.loader
             .mcu
             .payload
             .iova
             .checked_add(offset as u64)
-            .filter(|_| offset + MCU_COMMAND_SLOT_BYTES <= self.loader.mcu.payload.len)
-            .ok_or_else(|| "MCU command payload slot escaped arena".into())
+            .ok_or_else(|| "MCU command payload address overflowed".into())
     }
     fn write_command_payload(&mut self, slot: u16, bytes: &[u8]) -> Result<(), Self::Error> {
+        if bytes.len() > MCU_COMMAND_SLOT_BYTES {
+            return Err("MCU command exceeded isolated payload slot".into());
+        }
         self.loader
             .mcu
             .payload
-            .write_bytes_at(usize::from(slot) * MCU_COMMAND_SLOT_BYTES, bytes)
+            .write_bytes_at(mcu_command_payload_offset(usize::from(slot))?, bytes)
     }
     fn write_command_descriptor(
         &mut self,
@@ -13724,6 +13976,7 @@ struct VfioPassiveMechanics<'a, 'b, 'c> {
     active_join_roc: Option<(u8, u64)>,
     scan_started: Option<Instant>,
     pending_scan_done: Option<u8>,
+    scan_return_phase: Option<RunPhase>,
     advertisements: Vec<PrivateRawAdvertisementCarrier>,
     tx_completions: Vec<MgmtTxCompletion>,
     mgmt_tx_outstanding: MgmtTxOutstanding,
@@ -15748,6 +16001,11 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
     }
 
     fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {
+        // Offload scan RX owns the shared data ring until SCAN_DONE has been
+        // confirmed. Ordinary client RX must not dequeue scan beacons first.
+        if self.scan_started.is_some() {
+            return Ok(None);
+        }
         self.loader
             .mcu
             .handle_irq(None)
@@ -15934,25 +16192,48 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
         encoded: &[u8],
         wait_response: bool,
     ) -> Result<(), Self::Error> {
+        let reject = |stage: &str, error: String| {
+            eprintln!(
+                "physical_passive_command_rejected stage={stage} command={command:?} error={error}"
+            );
+            PhysicalPassiveError(format!("{stage}: {error}"))
+        };
         if matches!(command, PassiveMcuCommand::SetRxPath { .. }) {
             self.loader
                 .capture_patch_table_snapshot("immediately_before_rx_path")
-                .map_err(PhysicalPassiveError)?;
+                .map_err(|error| reject("capture_patch_table_snapshot", error))?;
         }
         self.loader
             .rate_power_delivery
             .before_passive_command(command)
-            .map_err(PhysicalPassiveError)?;
+            .map_err(|error| reject("rate_power_lifecycle", error))?;
         observe_passive_command_provenance(&mut self.loader.mcu.descriptor_provenance, command)
-            .map_err(PhysicalPassiveError)?;
+            .map_err(|error| reject("descriptor_provenance", error))?;
         if matches!(command, PassiveMcuCommand::StartScan { .. }) {
+            if self.scan_return_phase.is_some() {
+                return Err(reject(
+                    "run_phase",
+                    "passive scan return phase was already occupied".into(),
+                ));
+            }
+            let return_phase = self
+                .ledger
+                .phase
+                .passive_scan_return_phase()
+                .ok_or_else(|| {
+                    reject(
+                        "run_phase",
+                        format!("passive scan cannot start from {:?}", self.ledger.phase),
+                    )
+                })?;
             self.ledger
-                .transition(RunPhase::PassiveReady, RunPhase::Scanning)
-                .map_err(PhysicalPassiveError)?;
+                .transition(return_phase, RunPhase::Scanning)
+                .map_err(|error| reject("run_phase", error))?;
+            self.scan_return_phase = Some(return_phase);
         }
         self.loader
             .send_passive_command(command, encoded, wait_response)
-            .map_err(PhysicalPassiveError)?;
+            .map_err(|error| reject("mcu_transport", error))?;
         if matches!(
             command,
             PassiveMcuCommand::SetRxPath { .. } | PassiveMcuCommand::AddDevice { .. }
@@ -15960,7 +16241,7 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             self.loader
                 .rate_power_delivery
                 .passive_command_completed(command)
-                .map_err(PhysicalPassiveError)?;
+                .map_err(|error| reject("rate_power_completion", error))?;
         }
         if self
             .observe_stable_mac(&format!("passive_{command:?}"))
@@ -16090,8 +16371,12 @@ impl SourceExactPassiveMechanics for VfioPassiveMechanics<'_, '_, '_> {
             ));
         }
         self.scan_started = None;
+        let return_phase = self
+            .scan_return_phase
+            .take()
+            .ok_or_else(|| PhysicalPassiveError("scan completion omitted return phase".into()))?;
         self.ledger
-            .transition(RunPhase::Scanning, RunPhase::PassiveReady)
+            .transition(RunPhase::Scanning, return_phase)
             .map_err(PhysicalPassiveError)
     }
 }
@@ -17141,6 +17426,8 @@ enum Operation {
     RunOneShotPowerSetup,
     #[cfg(feature = "fuchsia-passive")]
     RunOneShotSaeAuth,
+    #[cfg(feature = "fuchsia-passive")]
+    RunWifiService,
 }
 
 impl Operation {
@@ -17157,7 +17444,7 @@ impl Operation {
         }
         #[cfg(feature = "fuchsia-passive")]
         {
-            self == Self::RunOneShotSaeAuth
+            matches!(self, Self::RunOneShotSaeAuth | Self::RunWifiService)
         }
         #[cfg(not(feature = "fuchsia-passive"))]
         {
@@ -17166,8 +17453,51 @@ impl Operation {
     }
 
     #[cfg(feature = "fuchsia-passive")]
+    fn uses_full_passive_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::RunOneShotPassiveChannel1
+                | Self::RunOneShotPassiveChannels1And6
+                | Self::RunOneShotPassive2Ghz
+                | Self::RunOneShotPassive5GhzNonDfs
+                | Self::RunOneShotPassive5GhzDfsLow
+                | Self::RunOneShotPassive5GhzDfsHigh
+                | Self::RunOneShotPassiveSmeFull
+                | Self::RunOneShotPowerSetup
+                | Self::RunOneShotSaeAuth
+                | Self::RunWifiService
+        )
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    fn runtime_authorized_channels(
+        self,
+        capability: NicCapability,
+        candidates: &[CandidateChannel],
+        special_unii_mask: u8,
+        initial_scan_channels: &[ChannelNumber],
+    ) -> Result<Vec<ChannelNumber>, String> {
+        if self == Self::RunWifiService {
+            allowed_passive_channels(
+                &query_from_capabilities(capability, candidates),
+                ConservativeRegulatoryPolicy {
+                    alpha2: *b"00",
+                    indoor: true,
+                    special_unii_mask,
+                },
+            )
+            .map_err(|error| format!("derive Wi-Fi service scan channels: {error:?}"))
+        } else {
+            Ok(initial_scan_channels.to_vec())
+        }
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
     fn passive_scan_attempt_limit(self) -> usize {
-        if matches!(self, Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth) {
+        if matches!(
+            self,
+            Self::RunOneShotPowerSetup | Self::RunOneShotSaeAuth | Self::RunWifiService
+        ) {
             5
         } else {
             1
@@ -17194,6 +17524,7 @@ impl Operation {
                     | Self::RunOneShotPassiveSmeFull
                     | Self::RunOneShotPowerSetup
                     | Self::RunOneShotSaeAuth
+                    | Self::RunWifiService
             )
         }
         #[cfg(not(feature = "fuchsia-passive"))]
@@ -19284,13 +19615,10 @@ mod tests {
             live_client_observer(),
         );
 
-        // The selector's scan 7 result is moved into the runtime. External BSS
-        // selection must not create a second hardware scan identity here.
+        // The selector's scan 7 result is moved into the runtime. Runtime scans
+        // get their own physical identity without authorizing another target.
         effects.prepare_runtime_handoff();
-        assert_eq!(
-            effects.begin_passive_scan(8, &[channel]),
-            Err(zx::Status::NOT_SUPPORTED)
-        );
+        assert_eq!(effects.begin_passive_scan(8, &[channel]), Ok(()));
         effects
             .set_channel(
                 channel,
@@ -20608,10 +20936,17 @@ mod tests {
     #[test]
     fn kernel_provider_descriptor_audit_accepts_only_scoped_capabilities() {
         let base: Vec<_> = [
-            ("0", "/dev/null"), ("1", "/run/log"), ("2", "/run/log"),
-            ("3", "/dev/netstack3"), ("4", "socket:[41]"),
-            ("5", "socket:[42]"), ("6", "anon_inode:[eventpoll]"),
-        ].into_iter().map(|(fd, path)| (fd.to_string(), path.to_string())).collect();
+            ("0", "/dev/null"),
+            ("1", "/run/log"),
+            ("2", "/run/log"),
+            ("3", "/dev/netstack3"),
+            ("4", "socket:[41]"),
+            ("5", "socket:[42]"),
+            ("6", "anon_inode:[eventpoll]"),
+        ]
+        .into_iter()
+        .map(|(fd, path)| (fd.to_string(), path.to_string()))
+        .collect();
         validate_netstack_bootstrap_descriptors(&base, true).unwrap();
         assert!(validate_netstack_bootstrap_descriptors(&base, false).is_err());
         let mut running = base.clone();
@@ -21239,6 +21574,74 @@ mod tests {
 
     #[cfg(feature = "fuchsia-passive")]
     #[test]
+    fn wifi_service_adopts_ipc_before_device_access_and_never_reads_driver_credential() {
+        let source = include_str!("vfio_read.rs");
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let endpoints = run.find("let mut service_endpoints").unwrap();
+        let bdf = run.find("let bdf = env::var(\"DRV_PCI_BDF\")").unwrap();
+        assert!(endpoints < bdf);
+        let service = run
+            .split("if operation == Operation::RunWifiService {")
+            .nth(1)
+            .unwrap()
+            .split("let passphrase = sae_credential")
+            .next()
+            .unwrap();
+        assert!(service.contains("bind_runtime(MtWifiRuntime(client))"));
+        assert!(service.contains("run_to_terminal()"));
+        assert!(service.contains("wifi_control_terminal=true callbacks_revoked=true"));
+        assert!(!service.contains("hardware_stopped=true"));
+        assert!(run.contains("let mut wifi_control_terminal = false"));
+        assert!(run.contains("wifi_control_terminal = true"));
+        assert!(run.contains("wifi_control_terminal=false hardware_stopped=true"));
+        let callbacks_revoked = run
+            .find("wifi_control_terminal=true callbacks_revoked=true")
+            .unwrap();
+        let containment_verified = run
+            .find(r#"active_mcu_event\":\"post_reset_safe_state_verified"#)
+            .unwrap();
+        let hardware_stopped = run
+            .find("wifi_control_terminal=true hardware_stopped=true")
+            .unwrap();
+        assert!(callbacks_revoked < containment_verified);
+        assert!(containment_verified < hardware_stopped);
+        assert!(Operation::RunWifiService.is_active_mcu());
+        assert!(Operation::RunWifiService.loads_firmware());
+        assert!(Operation::RunWifiService.records_active_transport_stages());
+        assert!(!Operation::RunWifiService.uses_contained_transport_gate());
+        assert!(Operation::RunWifiService.uses_full_passive_runtime());
+        assert!(!Operation::RunOneShotPassivePrepare.uses_full_passive_runtime());
+        assert!(!Operation::RunOneShotChannelDomain.uses_full_passive_runtime());
+        let capability = fixed_mt7921_rate_power_capability();
+        let candidates = candidate_channels(capability);
+        let initial = vec![ChannelNumber {
+            band: WlanBand::FiveGhz,
+            number: 149,
+        }];
+        let service_channels = Operation::RunWifiService
+            .runtime_authorized_channels(capability, &candidates, 0, &initial)
+            .unwrap();
+        assert!(service_channels.len() > 1);
+        assert!(service_channels.contains(&initial[0]));
+        assert_eq!(
+            Operation::RunOneShotSaeAuth
+                .runtime_authorized_channels(capability, &candidates, 0, &initial)
+                .unwrap(),
+            initial
+        );
+        assert!(
+            run.contains("} else if operation.uses_full_passive_runtime() {"),
+            "full passive operations must dispatch through the tested predicate"
+        );
+        assert!(!service.contains("read_sae_credential"));
+        assert!(!service.contains("DRV_SAE_CREDENTIAL_FD"));
+    }
+
+    #[cfg(feature = "fuchsia-passive")]
+    #[test]
     fn credential_and_native_snapshot_are_bound_before_device_access() {
         let source = include_str!("vfio_read.rs");
         let run = source
@@ -21269,7 +21672,7 @@ mod tests {
         assert!(!generic_acquisition.contains("map_dma!(mgmt_"));
 
         let sae = source
-            .split("if operation == Operation::RunOneShotSaeAuth {")
+            .split("if matches!(operation, Operation::RunOneShotSaeAuth | Operation::RunWifiService) {")
             .find(|segment| segment.contains("Mt7921ProductionClient::new"))
             .unwrap()
             .split("let transport = adapter.into_transport();")
@@ -21337,7 +21740,7 @@ mod tests {
         assert!(power < next_command);
 
         let sae = source
-            .split("if operation == Operation::RunOneShotSaeAuth {")
+            .split("if matches!(operation, Operation::RunOneShotSaeAuth | Operation::RunWifiService) {")
             .find(|segment| segment.contains("PinnedClientRuntime::new"))
             .unwrap()
             .split("let transport = adapter.into_transport();")
@@ -24948,6 +25351,60 @@ mod tests {
         assert!(ledger.must_disable(Hazard::BusMaster, false));
         ledger.confirm_inactive(Hazard::BusMaster);
         assert!(!ledger.must_disable(Hazard::BusMaster, false));
+    }
+
+    #[test]
+    fn physical_client_rx_cannot_dequeue_an_active_scan() {
+        let source = include_str!("vfio_read.rs");
+        let body = source
+            .split("fn next_client_rx(&mut self) -> Result<Option<ClientRxFrame>, zx::Status> {")
+            .nth(2)
+            .expect("physical client RX implementation")
+            .split("fn ")
+            .next()
+            .unwrap();
+        let guard = body.find("if self.scan_started.is_some()").unwrap();
+        let irq = body.find(".handle_irq(None)").unwrap();
+        assert!(guard < irq);
+    }
+
+    #[test]
+    fn command_payload_slots_isolate_the_largest_passive_command() {
+        let encoded = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channel: CandidateChannel {
+                    band: PhysicalBand::Ghz5,
+                    number: 149,
+                    frequency_mhz: 5745,
+                },
+            },
+            1,
+        )
+        .unwrap();
+        assert!(encoded.len() <= MCU_COMMAND_SLOT_BYTES);
+        assert_eq!(MCU_COMMAND_PAYLOAD_BYTES, 64 * 1024);
+        assert_eq!(MCU_COMMAND_PAYLOAD_SLOT_COUNT, 32);
+        assert_eq!(mcu_command_payload_offset(0).unwrap(), 0);
+        assert_eq!(mcu_command_payload_offset(32).unwrap(), 0);
+        assert!(mcu_command_payload_offset(MCU_TX_RING_COUNT).is_err());
+    }
+
+    #[test]
+    fn passive_scan_returns_to_the_phase_that_authorized_it() {
+        assert_eq!(
+            RunPhase::PassiveReady.passive_scan_return_phase(),
+            Some(RunPhase::PassiveReady)
+        );
+        assert_eq!(
+            RunPhase::BeaconAuthorized.passive_scan_return_phase(),
+            Some(RunPhase::BeaconAuthorized)
+        );
+        assert_eq!(RunPhase::Scanning.passive_scan_return_phase(), None);
+        assert_eq!(
+            RunPhase::PowerConfiguredNoFrame.passive_scan_return_phase(),
+            None
+        );
     }
 
     #[test]

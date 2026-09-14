@@ -18,7 +18,10 @@ self-sandboxing wlancfg daemon now owns durable saved networks and drives the
 pinned Fuchsia selector and client state machine over bounded, fd-free policy
 IPC to a separate simulated Wi-Fi service. Deterministic process tests cover
 selection, exact retry classification and timing, connection events, and
-persistence across policy restart. The WCN6750 production service now adopts
+persistence across policy restart. The bounded project-native WLAN CLI drives
+the same long-lived policy and Wi-Fi service path for scan, connection,
+association status, disconnect, and saved-network management. The WCN6750
+production service now adopts
 inert VFIO-platform, iommufd-or-broker, QRTR, interrupt, runtime-reactor,
 Ethernet, policy, network-lifecycle, and remoteproc capabilities before
 installing its fatal role-specific seccomp filter. Only then does it activate

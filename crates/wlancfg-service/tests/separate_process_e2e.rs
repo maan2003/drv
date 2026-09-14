@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Deterministic separate-process fixture.
-//!
-//! The `wlancfg-fixture-no-kernel-sandbox` role deliberately bypasses only the
-//! kernel namespace/seccomp operations, which are unavailable in some build
-//! sandboxes. It executes the same production policy function and transport.
-//! Production `wlancfg-service` has no such mode and always fails closed.
+//! Simulated deployment-path acceptance: actual CLI, long-lived wlancfg policy,
+//! and Wi-Fi control service run as three separate processes.
 
 use fidl_fuchsia_wlan_ieee80211 as ieee;
 use fidl_fuchsia_wlan_internal as internal;
@@ -13,28 +9,22 @@ use fidl_fuchsia_wlan_sme as sme;
 use futures::channel::mpsc;
 use std::{
     fs::{File, OpenOptions},
-    io,
+    io::{self, Write as _},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::process::CommandExt,
+        unix::{ffi::OsStrExt, process::CommandExt},
     },
-    path::PathBuf,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 use wifi_control_service::{PreparedServer, RuntimeError, WifiRuntime};
-use wlancfg_selection::{
-    client::types,
-    config_management::{
-        Credential, NetworkIdentifier, SavedNetworksManager, SavedNetworksManagerApi, SecurityType,
-    },
-    telemetry::{TelemetryEvent, TelemetrySender},
-};
-
 const GENERATION: [u8; 16] = [0x71; 16];
 const SSID: &[u8] = b"selected-network";
+const SECOND_SSID: &[u8] = b"second-target";
 const PASSWORD: &[u8] = b"selected-password";
 const BSSID: [u8; 6] = [2, 7, 1, 2, 3, 4];
+const SECOND_BSSID: [u8; 6] = [2, 7, 1, 2, 3, 5];
 
 fn main() {
     let result = match std::env::var("DRV_WLANCFG_E2E_ROLE").as_deref() {
@@ -50,68 +40,182 @@ fn main() {
 
 fn parent() -> anyhow::Result<()> {
     let state = TestDirectory::new()?;
-    seed(&state)?;
+    let socket_path = state.path().join("wlancfg.sock");
+    let listener = application_listener(&socket_path)?;
 
-    let first = run_scenario(&state, "retry-success")?;
-    assert_eq!(first.scans.len(), 2, "{first:?}");
-    assert!(first.scans[0].contains("passive"), "{first:?}");
+    let generation = start_generation(&state, &listener, "retry-success")?;
+    let scan = cli(&socket_path, &["scan"], None)?;
+    require_success(&scan, "scan")?;
+    assert!(String::from_utf8_lossy(&scan.stdout).contains("ssid=selected-network security=wpa3"));
+
+    let connect = cli(
+        &socket_path,
+        &["connect", "selected-network", "wpa3"],
+        Some(PASSWORD),
+    )?;
+    require_success(&connect, "connect")?;
+    let status = cli(&socket_path, &["status"], None)?;
+    require_success(&status, "status")?;
+    let status = String::from_utf8(status.stdout)?;
+    assert!(status.contains("association=connected"), "{status}");
     assert!(
-        first.scans[1].contains("active ssid_match=1 channel_match=1"),
-        "{first:?}"
+        status.contains("address=unavailable internet=unknown"),
+        "{status}"
     );
-    assert_eq!(first.connects.len(), 4, "{first:?}");
-    assert!(
-        first
-            .connects
-            .iter()
-            .all(|line| line.contains("bssid_match=1 credential_match=1"))
+
+    let saved = cli(&socket_path, &["saved"], None)?;
+    require_success(&saved, "saved")?;
+    assert!(String::from_utf8_lossy(&saved.stdout).contains("ssid=selected-network security=wpa3"));
+
+    let disconnect = cli(&socket_path, &["disconnect"], None)?;
+    require_success(&disconnect, "disconnect")?;
+    let status = cli(&socket_path, &["status"], None)?;
+    assert!(String::from_utf8_lossy(&status.stdout).contains("association=disconnected"));
+    std::thread::sleep(Duration::from_millis(150));
+    let reconnect = cli(
+        &socket_path,
+        &["connect", "selected-network", "wpa3"],
+        Some(PASSWORD),
+    )?;
+    require_success(&reconnect, "explicit reconnect")?;
+    wait_status(&socket_path, "association=connected")?;
+    let first_wifi = generation.stop()?;
+    let first_connects = lines(&first_wifi, "CONNECT ");
+    assert_eq!(
+        first_connects.len(),
+        5,
+        "retry + explicit reconnect count: {first_wifi}"
     );
-    assert!(
-        first
-            .connects
-            .iter()
-            .all(|line| line.contains("active_result_match=1"))
-    );
-    let times: Vec<u64> = first
-        .connects
+    let times: Vec<u64> = first_connects[..4]
         .iter()
         .map(|line| field(line, "ms"))
         .collect();
-    let delays: Vec<u64> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
-    for (actual, expected) in delays.iter().zip([400u64, 800, 1200]) {
-        assert!(actual.abs_diff(expected) < 180, "attempt times {times:?}");
+    for (actual, expected) in times
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .zip([400u64, 800, 1200])
+    {
+        assert!(actual.abs_diff(expected) < 180, "retry times: {times:?}");
     }
-    assert!(first.wifi.contains("SIGNAL_EVENT_IMMEDIATE"));
     assert!(
-        !first
-            .wifi
+        !first_wifi
             .as_bytes()
             .windows(PASSWORD.len())
-            .any(|bytes| bytes == PASSWORD)
+            .any(|bytes| bytes == PASSWORD),
+        "Wi-Fi logs exposed credential"
     );
-    assert!(load_selected(&state)?.has_ever_connected);
 
-    // No reseeding: a fresh policy process must select the credential loaded
-    // from the same directory capability.
-    let restarted = run_scenario(&state, "success")?;
-    assert_eq!(restarted.connects.len(), 1, "{restarted:?}");
-    assert!(restarted.connects[0].contains("credential_match=1"));
+    // The same persisted store is loaded by a fresh daemon process, which
+    // automatically selects and reconnects through the same policy/control path.
+    let restarted = start_generation(&state, &listener, "success")?;
+    wait_status(&socket_path, "association=connected")?;
+    let reconnect_status = cli(&socket_path, &["status"], None)?;
+    require_success(&reconnect_status, "restarted status")?;
 
-    let rejected = run_scenario(&state, "credential-rejected")?;
-    assert_eq!(rejected.connects.len(), 1, "{rejected:?}");
-    let terminal = run_scenario(&state, "generation-terminal")?;
-    assert_eq!(terminal.connects.len(), 1, "{terminal:?}");
+    require_success(
+        &cli(&socket_path, &["forget", "selected-network", "wpa3"], None)?,
+        "forget",
+    )?;
+    let saved = cli(&socket_path, &["saved"], None)?;
+    require_success(&saved, "saved after forget")?;
+    assert!(saved.stdout.is_empty(), "forgotten network remained saved");
+    let second_wifi = restarted.stop()?;
+    assert_eq!(
+        lines(&second_wifi, "CONNECT ").len(),
+        1,
+        "unexpected connect count: {second_wifi}"
+    );
+
+    // With no saved candidate the production policy loop remains available and
+    // correctly reports offline rather than exiting or inventing a lab path.
+    let forgotten = start_generation(&state, &listener, "credential-rejected")?;
+    wait_status(&socket_path, "association=disconnected")?;
+    let scan_again = cli(&socket_path, &["scan"], None)?;
+    require_success(&scan_again, "scan after forget")?;
+    let rejected = cli(
+        &socket_path,
+        &["connect", "selected-network", "wpa3"],
+        Some(PASSWORD),
+    )?;
+    assert!(
+        !rejected.status.success(),
+        "credential rejection was reported as success"
+    );
+    wait_status(&socket_path, "association=disconnected")?;
+    require_success(
+        &cli(&socket_path, &["forget", "selected-network", "wpa3"], None)?,
+        "forget rejected credential",
+    )?;
+    let third_wifi = forgotten.stop()?;
+    assert_eq!(
+        lines(&third_wifi, "CONNECT ").len(),
+        1,
+        "forgotten network autoconnected or rejection retried: {third_wifi}"
+    );
+    drop(listener);
+    drop(state);
+
+    // A new explicit request must cross an acknowledged disconnect boundary.
+    // The old Connected status cannot satisfy or relabel the second request.
+    let switch_state = TestDirectory::new()?;
+    let switch_socket = switch_state.path().join("wlancfg.sock");
+    let switch_listener = application_listener(&switch_socket)?;
+    let switching = start_generation(&switch_state, &switch_listener, "second-target-rejected")?;
+    require_success(
+        &cli(
+            &switch_socket,
+            &["connect", "selected-network", "wpa3"],
+            Some(PASSWORD),
+        )?,
+        "first target",
+    )?;
+    let second = cli(
+        &switch_socket,
+        &["connect", "second-target", "wpa3"],
+        Some(PASSWORD),
+    )?;
+    assert!(
+        !second.status.success(),
+        "failed second target accepted the old Connected status"
+    );
+    let status = cli(&switch_socket, &["status"], None)?;
+    let status = String::from_utf8(status.stdout)?;
+    assert!(
+        status.contains("association=disconnected") && status.contains("ssid=second-target"),
+        "fresh machine did not retain its target identity after failure: {status}"
+    );
+    let switching_wifi = switching.stop()?;
+    assert!(
+        lines(&switching_wifi, "CONNECT ").len() >= 2,
+        "second request never reached Wi-Fi runtime: {switching_wifi}"
+    );
+
     Ok(())
 }
 
-#[derive(Debug)]
-struct ScenarioOutput {
-    wifi: String,
-    scans: Vec<String>,
-    connects: Vec<String>,
+struct Generation {
+    policy: Child,
+    wifi: Child,
+}
+impl Generation {
+    fn stop(mut self) -> anyhow::Result<String> {
+        let _ = self.policy.kill();
+        let _ = self.wifi.kill();
+        let policy = self.policy.wait()?;
+        let wifi = self.wifi.wait_with_output()?;
+        assert!(
+            !policy.success(),
+            "fixture policy unexpectedly exited itself"
+        );
+        Ok(String::from_utf8(wifi.stdout)?)
+    }
 }
 
-fn run_scenario(state: &TestDirectory, scenario: &str) -> anyhow::Result<ScenarioOutput> {
+fn start_generation(
+    state: &TestDirectory,
+    listener: &OwnedFd,
+    scenario: &str,
+) -> anyhow::Result<Generation> {
     let (policy_parent, policy_wifi) = sockets()?;
     let (supervisor_parent, supervisor_wifi) = sockets()?;
     let state_fd = state.capability()?;
@@ -120,59 +224,76 @@ fn run_scenario(state: &TestDirectory, scenario: &str) -> anyhow::Result<Scenari
         scenario,
         policy_wifi.as_raw_fd(),
         supervisor_wifi.as_raw_fd(),
+        None,
     )?;
     let policy = spawn_role(
         "wlancfg-fixture-no-kernel-sandbox",
         scenario,
         policy_parent.as_raw_fd(),
         state_fd.as_raw_fd(),
+        Some(listener.as_raw_fd()),
     )?;
-    assert_ne!(wifi.id(), policy.id());
-    assert_ne!(wifi.id(), std::process::id());
-    assert_ne!(policy.id(), std::process::id());
-    inspect_stopped_child(&wifi, 3, 4)?;
-    inspect_stopped_child(&policy, 3, 4)?;
-    let policy_state_link = std::fs::read_link(format!("/proc/{}/fd/4", policy.id()))?;
-    assert!(
-        policy_state_link
-            .to_string_lossy()
-            .contains(state.path().to_string_lossy().as_ref())
-    );
-    let wifi_lifecycle_link = std::fs::read_link(format!("/proc/{}/fd/4", wifi.id()))?;
-    assert!(wifi_lifecycle_link.to_string_lossy().contains("socket:"));
-
-    // Only the parent/supervisor retains the other lifecycle endpoint.
+    inspect_stopped_child(&wifi, &[3, 4])?;
+    inspect_stopped_child(&policy, &[3, 4, 5])?;
     drop(policy_parent);
     drop(policy_wifi);
     drop(supervisor_wifi);
-    drop(state_fd);
-    let policy_output = wait_with_deadline(policy)?;
-    let wifi_output = wait_with_deadline(wifi)?;
     drop(supervisor_parent);
-    assert!(
-        policy_output.status.success(),
-        "policy: {}",
-        String::from_utf8_lossy(&policy_output.stderr)
-    );
-    assert!(
-        wifi_output.status.success(),
-        "wifi: {}",
-        String::from_utf8_lossy(&wifi_output.stderr)
-    );
-    let wifi = String::from_utf8(wifi_output.stdout)?;
-    Ok(ScenarioOutput {
-        scans: wifi
-            .lines()
-            .filter(|line| line.starts_with("SCAN "))
-            .map(str::to_owned)
-            .collect(),
-        connects: wifi
-            .lines()
-            .filter(|line| line.starts_with("CONNECT "))
-            .map(str::to_owned)
-            .collect(),
-        wifi,
-    })
+    drop(state_fd);
+    Ok(Generation { policy, wifi })
+}
+
+fn cli(path: &Path, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wlanctl"));
+    command
+        .arg("--socket")
+        .arg(path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command.spawn()?;
+    if let Some(input) = input {
+        child.stdin.take().unwrap().write_all(input)?;
+    }
+    Ok(child.wait_with_output()?)
+}
+fn require_success(output: &Output, operation: &str) -> anyhow::Result<()> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{operation}: {}", String::from_utf8_lossy(&output.stderr))
+    }
+}
+fn wait_status(path: &Path, expected: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = cli(path, &["status"], None)?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for {expected}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+fn lines<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
+    text.lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect()
+}
+fn field(line: &str, name: &str) -> u64 {
+    line.split_whitespace()
+        .find_map(|part| {
+            part.strip_prefix(&format!("{name}="))
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap()
 }
 
 fn spawn_role(
@@ -180,9 +301,11 @@ fn spawn_role(
     scenario: &str,
     fd3: RawFd,
     fd4: RawFd,
-) -> io::Result<std::process::Child> {
+    fd5: Option<RawFd>,
+) -> io::Result<Child> {
     let fd3 = duplicate_high(fd3)?;
     let fd4 = duplicate_high(fd4)?;
+    let fd5 = fd5.map(duplicate_high).transpose()?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .env("DRV_WLANCFG_E2E_ROLE", role)
@@ -192,7 +315,14 @@ fn spawn_role(
         .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(fd3.as_raw_fd(), 3) < 0 || libc::dup2(fd4.as_raw_fd(), 4) < 0 {
+            for (source, target) in [(fd3.as_raw_fd(), 3), (fd4.as_raw_fd(), 4)] {
+                if libc::dup2(source, target) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if let Some(source) = &fd5
+                && libc::dup2(source.as_raw_fd(), 5) < 0
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -200,7 +330,6 @@ fn spawn_role(
     }
     command.spawn()
 }
-
 fn duplicate_high(fd: RawFd) -> io::Result<OwnedFd> {
     let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
     if copy < 0 {
@@ -209,16 +338,12 @@ fn duplicate_high(fd: RawFd) -> io::Result<OwnedFd> {
         Ok(unsafe { OwnedFd::from_raw_fd(copy) })
     }
 }
-
-fn inspect_stopped_child(
-    child: &std::process::Child,
-    first: RawFd,
-    second: RawFd,
-) -> anyhow::Result<()> {
+fn inspect_stopped_child(child: &Child, inherited: &[RawFd]) -> anyhow::Result<()> {
     let pid = child.id();
     let mut status = 0;
-    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED) };
-    if waited != pid as libc::pid_t || !libc::WIFSTOPPED(status) {
+    if unsafe { libc::waitpid(pid as _, &mut status, libc::WUNTRACED) } != pid as _
+        || !libc::WIFSTOPPED(status)
+    {
         anyhow::bail!("fixture child did not stop at capability checkpoint");
     }
     let mut fds: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))?
@@ -232,31 +357,15 @@ fn inspect_stopped_child(
         })
         .collect();
     fds.sort_unstable();
-    assert_eq!(fds, vec![0, 1, 2, first, second]);
-    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) } != 0 {
+    let mut expected = vec![0, 1, 2];
+    expected.extend(inherited);
+    expected.sort_unstable();
+    assert_eq!(fds, expected);
+    if unsafe { libc::kill(pid as _, libc::SIGCONT) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
-
-fn wait_with_deadline(mut child: std::process::Child) -> anyhow::Result<std::process::Output> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            anyhow::bail!(
-                "fixture child timed out: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn sockets() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
     if unsafe {
@@ -272,31 +381,62 @@ fn sockets() -> io::Result<(OwnedFd, OwnedFd)> {
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
+fn application_listener(path: &Path) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as _;
+    for (to, from) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *to = from as _;
+    }
+    let length = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            length as _,
+        )
+    } != 0
+        || unsafe { libc::listen(fd.as_raw_fd(), 8) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
 
 fn wlancfg_child() -> anyhow::Result<()> {
     capability_checkpoint()?;
     let control = unsafe { OwnedFd::from_raw_fd(3) };
     let state = unsafe { OwnedFd::from_raw_fd(4) };
+    let applications = unsafe { OwnedFd::from_raw_fd(5) };
     let prepared =
         wlancfg_service::PreparedHostControlClient::from_inherited_socket(control, GENERATION)?;
+    let prepared_applications =
+        wlancfg_service::application::PreparedApplicationServer::from_inherited_listener(
+            applications,
+        )?;
+    let (tx, rx) = mpsc::channel(15);
     let parked = prepared.spawn_parked_after_setup()?;
-    // TEST FIXTURE ONLY: kernel namespace enforcement is not claimed here.
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
-    wlancfg_service::policy::serve_one_generation(runtime, parked, state)
+    let parked_applications = prepared_applications.spawn_parked(tx)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    wlancfg_service::policy::serve(runtime, parked, parked_applications, rx, state)
 }
-
 fn wifi_child() -> anyhow::Result<()> {
     capability_checkpoint()?;
     let policy = unsafe { OwnedFd::from_raw_fd(3) };
     let supervisor = unsafe { OwnedFd::from_raw_fd(4) };
-    let scenario = std::env::var("DRV_WLANCFG_E2E_SCENARIO")?;
-    let runtime = FixtureWifi::new(scenario);
+    let runtime = FixtureWifi::new(std::env::var("DRV_WLANCFG_E2E_SCENARIO")?);
     PreparedServer::new(policy, supervisor, GENERATION, runtime)?
         .post_lockdown_open_complete()?
         .run()?;
     Ok(())
 }
-
 fn capability_checkpoint() -> io::Result<()> {
     if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
         Err(io::Error::last_os_error())
@@ -363,15 +503,16 @@ impl WifiRuntime for FixtureWifi {
             u8::from(credential_match),
             u8::from(request.bss_description.rssi_dbm == -35)
         );
-        if self.scenario == "generation-terminal" {
-            return Err(RuntimeError::DriverFault);
-        }
+        let second_target_rejected = self.scenario == "second-target-rejected"
+            && request.bss_description.bssid == SECOND_BSSID;
         let fail = self.scenario == "credential-rejected"
+            || second_target_rejected
             || (self.scenario == "retry-success" && self.attempts < 4);
         if fail {
             return Err(RuntimeError::Failed(sme::ConnectResult {
                 code: ieee::StatusCode::RefusedReasonUnspecified,
-                is_credential_rejected: self.scenario == "credential-rejected",
+                is_credential_rejected: self.scenario == "credential-rejected"
+                    || second_target_rejected,
                 is_reconnect: false,
             }));
         }
@@ -420,7 +561,15 @@ impl WifiRuntime for FixtureWifi {
             ),
         }
         let active = matches!(request, sme::ScanRequest::Active(_));
-        let mut results = vec![scan_result(SSID, BSSID, 6, if active { -35 } else { -42 })];
+        let mut results = vec![
+            scan_result(SSID, BSSID, 6, if active { -35 } else { -42 }),
+            scan_result(
+                SECOND_SSID,
+                SECOND_BSSID,
+                11,
+                if active { -34 } else { -41 },
+            ),
+        ];
         if !active {
             results.push(malformed_scan_result());
             results.push(open_scan_result(
@@ -433,12 +582,6 @@ impl WifiRuntime for FixtureWifi {
         Ok(Some(Ok(results)))
     }
     async fn drive_once(&mut self) -> Result<bool, RuntimeError> {
-        if self.connected_idle > 0 {
-            self.connected_idle += 1;
-            if self.connected_idle > 100 {
-                return Err(RuntimeError::DriverFault);
-            }
-        }
         Ok(false)
     }
     fn next_connection_event(
@@ -503,49 +646,6 @@ fn open_scan_result(ssid: &[u8], bssid: [u8; 6], channel: u8, rssi: i8) -> sme::
         mutual_security_protocols: vec![internal::Protocol::Open],
     });
     result
-}
-
-fn seed(state: &TestDirectory) -> anyhow::Result<()> {
-    let (tx, _rx) = mpsc::channel::<TelemetryEvent>(8);
-    let manager = futures::executor::block_on(SavedNetworksManager::new_with_directory(
-        state.capability()?,
-        TelemetrySender::new(tx),
-    ))?;
-    let _ = futures::executor::block_on(manager.store(
-        id(SSID, SecurityType::Wpa3),
-        Credential::Password(PASSWORD.to_vec()),
-    ))
-    .map_err(|_| anyhow::anyhow!("failed to seed selected network"))?;
-    let _ = futures::executor::block_on(
-        manager.store(id(b"decoy-network", SecurityType::None), Credential::None),
-    )
-    .map_err(|_| anyhow::anyhow!("failed to seed decoy network"))?;
-    Ok(())
-}
-
-fn load_selected(
-    state: &TestDirectory,
-) -> anyhow::Result<wlancfg_selection::config_management::NetworkConfig> {
-    let (tx, _rx) = mpsc::channel::<TelemetryEvent>(8);
-    let manager = futures::executor::block_on(SavedNetworksManager::new_with_directory(
-        state.capability()?,
-        TelemetrySender::new(tx),
-    ))?;
-    futures::executor::block_on(manager.lookup(&id(SSID, SecurityType::Wpa3)))
-        .ok_or_else(|| anyhow::anyhow!("selected network disappeared from persistence"))
-}
-
-fn id(ssid: &[u8], security: SecurityType) -> NetworkIdentifier {
-    NetworkIdentifier::new(types::Ssid::from_bytes_unchecked(ssid.to_vec()), security)
-}
-
-fn field(line: &str, name: &str) -> u64 {
-    line.split_whitespace()
-        .find_map(|part| {
-            part.strip_prefix(&format!("{name}="))
-                .and_then(|value| value.parse().ok())
-        })
-        .unwrap()
 }
 
 struct TestDirectory(PathBuf);

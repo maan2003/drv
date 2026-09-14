@@ -708,6 +708,10 @@ impl<R: WifiRuntime> ControlServer<R> {
             match self.runtime.drive_scan_once().await {
                 Ok(Some(result)) => {
                     self.scan_request = None;
+                    eprintln!(
+                        "wifi_control_scan stage=completed request_id={id} result_count={}",
+                        result.as_ref().map_or(0, Vec::len)
+                    );
                     if let Err(reason) = self.queue_scan_reply(id, result) {
                         self.end_generation(reason)?;
                         return Ok(true);

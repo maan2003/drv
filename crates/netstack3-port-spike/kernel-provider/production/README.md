@@ -348,7 +348,10 @@ See [retained results and limitations](evidence/wifi.txt).
 In addition to the ordinary guest root, stage:
 - `mt7921-passive-scan`, built natively with `--no-default-features --features
   fuchsia-passive,full-firmware-production`, as `/bin/mt7921-passive-scan`;
-- curl, Busybox with `nslookup`, their transitive ELF dependencies, and
+- `wlan-stack-kvm`, `wlancfg-service`, `wlanctl`, and `netstack3-provider`;
+- `drv-dns-service`, `dns-check`, the current `loopback-test`, and
+  `/lib/libnss_drv.so.2`, with `/etc/quad9.toml`;
+- curl, Busybox, the matching ELF loader and transitive runtime libraries, and
   `/etc/ssl/certs/ca-certificates.crt`;
 - the driver's pinned compressed MT7961 patch/RAM files under
   `/run/current-system/firmware/mediatek`, plus `zstdcat` and `sha256sum` under
@@ -373,7 +376,8 @@ export DRV_SAE_CHANNEL=149
 
 Do not invoke the guarded launcher on a host until both an independent recovery
 access path and a reset-before-native-bind reboot/power-cycle contract have been
-proved for that host. The current np incident does not satisfy those prerequisites.
+proved for that host. Independent USB control is verified on np, but continuous
+containment across automatic reboot is not; physical trials remain blocked.
 
 Keep the actual host reboot watchdog armed. The runner requires over 80 seconds
 of lease remaining and limits QEMU to 75 seconds. The lab's command deadline must
@@ -387,23 +391,32 @@ and verify native connectivity plus lab idleness before disarming. Do not stop
 iwd between observing and renaming its managed netdev: that deletes/recreates it.
 
 Control SSH must remain independent of the assigned MT7921. The tested control
-path was Redwood's own Wi-Fi → restricted reverse SSH on devbox →
-Redwood USB → np. Verify the np SSH connection is from 172.16.42.1 to
+path is Redwood's own Wi-Fi/Tailscale → SSH forwarding on Redwood →
+Redwood USB → np. The older reverse-SSH relay had stale-listener recovery gaps. Verify the np SSH connection is from 172.16.42.1 to
 172.16.42.2 before handing off the device. No native runtime fallback is added
 to the guest by the host's lab recovery.
 
 ### Resolver compatibility is not faked
 
-Unsupported protocol options return `ENOPROTOOPT`. Current glibc nonetheless
-requires successful `IP_RECVERR` setup and aborts resolution without it.
-Netstack3's pending datagram-error notification is not a Linux extended-error
-queue; the binding does not pretend otherwise. The acceptance test therefore
-uses Busybox's actual UDP DNS query and passes the returned A address to curl's
-`--resolve`; TLS still validates the original hostname and CA chain. This is
-not evidence that arbitrary glibc-resolving applications work unchanged.
-Durable DNS configuration publication and the owned userspace resolver boundary
-remain integration work; parsing the provider's DHCP diagnostic is test-fixture
-plumbing, not the production configuration API.
+Unsupported protocol options still return `ENOPROTOOPT`; the binding does not
+pretend that Netstack3 datagram errors are a Linux extended-error queue.
+Instead, the guest runs the separate sandboxed `drv-dns-service`, receiving
+read-only configuration and CA capabilities on FD3/FD4. Its Quad9 DoT/DoH
+upstreams have no plaintext or native-resolver fallback. The NSS module
+uses its Unix socket through `hosts: files drv`. The fixture scopes
+`LD_LIBRARY_PATH=/lib` to `dns-check` and curl so the staged loader finds the
+matching NSS module. Curl uses ordinary hostnames and verifies TLS certificates,
+without `--resolve`. DHCP DNS is logged as diagnostic evidence, not used as a
+fallback or production configuration API.
+
+The long-lived launcher owns separate driver, policy and network processes;
+`wlanctl` drives scan, connect and status through the bounded control API.
+The guest uses a private tmpfs policy-state directory. After application gates,
+it immediately requests orderly launcher shutdown and requires both a clean
+exit and the hardware SAFE marker. The earlier physical run 44 passed
+association, DHCP, NSS DNS and both HTTPS gates but hit the VM deadline before
+safe shutdown: it is functional evidence, **not** lifecycle acceptance of this
+updated launcher.
 
 ### Core-owned names and per-socket workers
 

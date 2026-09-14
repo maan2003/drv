@@ -78,6 +78,7 @@ fn run() -> Result<(), Error> {
         "wlancfg" => setup.lockdown(Profile::Wlancfg {
             control_fd: retained_fds[0],
             persistence_dir_fd: retained_fds[1],
+            application_listener_fd: None,
         })?.run(|| {
             let retained = retained_fds[1];
             let temporary = CString::new("saved-networks.tmp").unwrap();

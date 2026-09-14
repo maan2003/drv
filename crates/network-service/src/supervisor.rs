@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
@@ -58,7 +59,10 @@ fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
-fn bootstrap(stream: &mut std::os::unix::net::UnixStream) -> Result<(), String> {
+fn bootstrap(
+    stream: &mut std::os::unix::net::UnixStream,
+    kernel_provider: bool,
+) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| format!("set network-service bootstrap timeout: {error}"))?;
@@ -72,12 +76,31 @@ fn bootstrap(stream: &mut std::os::unix::net::UnixStream) -> Result<(), String> 
     stream
         .write_all(b"GO")
         .map_err(|error| format!("network-service GO: {error}"))?;
-    let mut started = [0; 7];
-    stream
-        .read_exact(&mut started)
-        .map_err(|error| format!("network service STARTED: {error}"))?;
-    if &started != b"STARTED" {
-        return Err("invalid network-service STARTED".into());
+    if kernel_provider {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(45)))
+            .map_err(|error| format!("set network-provider readiness timeout: {error}"))?;
+        let mut ready = [0; 13];
+        stream
+            .read_exact(&mut ready)
+            .map_err(|error| format!("network provider readiness: {error}"))?;
+        if &ready != b"NETWORK_READY" {
+            return Err("invalid network-provider NETWORK_READY".into());
+        }
+        stream
+            .write_all(b"SERVE")
+            .map_err(|error| format!("network provider SERVE: {error}"))?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| format!("network provider SERVE shutdown: {error}"))?;
+    } else {
+        let mut started = [0; 7];
+        stream
+            .read_exact(&mut started)
+            .map_err(|error| format!("network service STARTED: {error}"))?;
+        if &started != b"STARTED" {
+            return Err("invalid network-service STARTED".into());
+        }
     }
     Ok(())
 }
@@ -104,10 +127,19 @@ struct InstalledGeneration {
 /// Each installed frame capability starts a fresh sandboxed process. Replacing
 /// it terminates the preceding process before transferring the new generation;
 /// no Ethernet status or control messages cross the frame-only seam.
+enum NetworkFrontend {
+    Socks {
+        listener: TcpListener,
+        listen: SocketAddr,
+    },
+    Kernel {
+        registration_path: PathBuf,
+    },
+}
+
 pub struct NetworkServiceSupervisor {
     binary: PathBuf,
-    listener: TcpListener,
-    listen: SocketAddr,
+    frontend: NetworkFrontend,
     mac_address: [u8; 6],
     next_generation: u64,
     installed: Option<InstalledGeneration>,
@@ -145,8 +177,37 @@ impl NetworkServiceSupervisor {
             .map_err(|error| format!("make network-service listener nonblocking: {error}"))?;
         Ok(Self {
             binary: binary.as_ref().to_owned(),
-            listener,
-            listen,
+            frontend: NetworkFrontend::Socks { listener, listen },
+            mac_address,
+            next_generation: 1,
+            installed: None,
+            #[cfg(test)]
+            arguments: Vec::new(),
+            #[cfg(test)]
+            fixture: false,
+            #[cfg(test)]
+            fixture_exit_after_start: false,
+            #[cfg(test)]
+            fixture_echo_frames: false,
+        })
+    }
+
+    /// Construct the production kernel-socket provider supervisor. A fresh
+    /// registration session is opened for each independently replaceable
+    /// provider generation after its predecessor has been reaped.
+    pub fn new_kernel(
+        binary: impl AsRef<Path>,
+        registration_path: impl AsRef<Path>,
+        mac_address: [u8; 6],
+    ) -> Result<Self, String> {
+        if mac_address == [0; 6] || mac_address[0] & 1 != 0 {
+            return Err("network-service MAC must be nonzero unicast".into());
+        }
+        Ok(Self {
+            binary: binary.as_ref().to_owned(),
+            frontend: NetworkFrontend::Kernel {
+                registration_path: registration_path.as_ref().to_owned(),
+            },
             mac_address,
             next_generation: 1,
             installed: None,
@@ -213,33 +274,69 @@ impl NetworkServiceSupervisor {
             .installed
             .as_ref()
             .ok_or("no network-service generation installed")?;
-        let listener = duplicate_capability(self.listener.as_raw_fd())?;
+        let (frontend, kernel_provider) = match &self.frontend {
+            NetworkFrontend::Socks { listener, .. } => {
+                (duplicate_capability(listener.as_raw_fd())?, false)
+            }
+            NetworkFrontend::Kernel { registration_path } => {
+                let registration = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(registration_path)
+                    .map_err(|error| format!("open fresh kernel registration: {error}"))?;
+                let registration_pass = duplicate_capability(registration.as_raw_fd())?;
+                drop(registration);
+                (registration_pass, true)
+            }
+        };
         let frame = duplicate_capability(installed.frame.as_raw_fd())?;
         let (mut bootstrap_parent, bootstrap_child) = std::os::unix::net::UnixStream::pair()
             .map_err(|error| format!("create network-service bootstrap: {error}"))?;
         let bootstrap_pass = duplicate_capability(bootstrap_child.as_raw_fd())?;
         let frame_fd = frame.as_raw_fd();
-        let listener_fd = listener.as_raw_fd();
+        let frontend_fd = frontend.as_raw_fd();
         let bootstrap_fd = bootstrap_pass.as_raw_fd();
+        let mac = self
+            .mac_address
+            .map(|octet| format!("{octet:02x}"))
+            .join(":");
         let mut command = Command::new(&self.binary);
         command
             .env_clear()
-            .env(
-                "DRV_SAE_CLIENT_MAC",
-                self.mac_address
-                    .map(|octet| format!("{octet:02x}"))
-                    .join(":"),
-            )
-            .env("DRV_SOCKS5_LISTEN", self.listen.to_string())
+            .env("DRV_SAE_CLIENT_MAC", &mac)
             .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        match &self.frontend {
+            NetworkFrontend::Socks { listen, .. } => {
+                command.env("DRV_SOCKS5_LISTEN", listen.to_string());
+            }
+            NetworkFrontend::Kernel { .. } => {
+                #[cfg(not(test))]
+                command.args(["--ethernet-mac", &mac, "--bootstrap"]);
+                #[cfg(test)]
+                if !self.fixture {
+                    command.args(["--ethernet-mac", &mac, "--bootstrap"]);
+                }
+            }
+        }
         #[cfg(test)]
         {
             command.args(&self.arguments);
             if self.fixture {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE", "1");
+                if kernel_provider {
+                    command
+                        .env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_KERNEL", "1")
+                        .env(
+                            "DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_REGISTRATION",
+                            match &self.frontend {
+                                NetworkFrontend::Kernel { registration_path } => registration_path,
+                                NetworkFrontend::Socks { .. } => unreachable!(),
+                            },
+                        );
+                }
             }
             if self.fixture_exit_after_start {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT", "1");
@@ -250,11 +347,20 @@ impl NetworkServiceSupervisor {
         }
         unsafe {
             command.pre_exec(move || {
-                for (source, target) in [
-                    (frame_fd, FRAME_FD),
-                    (listener_fd, LISTENER_FD),
-                    (bootstrap_fd, BOOTSTRAP_FD),
-                ] {
+                let pass = if kernel_provider {
+                    [
+                        (frontend_fd, FRAME_FD),
+                        (frame_fd, LISTENER_FD),
+                        (bootstrap_fd, BOOTSTRAP_FD),
+                    ]
+                } else {
+                    [
+                        (frame_fd, FRAME_FD),
+                        (frontend_fd, LISTENER_FD),
+                        (bootstrap_fd, BOOTSTRAP_FD),
+                    ]
+                };
+                for (source, target) in pass {
                     if dup2(source, target) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -265,9 +371,9 @@ impl NetworkServiceSupervisor {
         let child = command
             .spawn()
             .map_err(|error| format!("spawn network service: {error}"))?;
-        drop((frame, listener, bootstrap_pass, bootstrap_child));
+        drop((frame, frontend, bootstrap_pass, bootstrap_child));
         self.installed.as_mut().unwrap().running = Some(RunningProcess { child });
-        if let Err(error) = bootstrap(&mut bootstrap_parent) {
+        if let Err(error) = bootstrap(&mut bootstrap_parent, kernel_provider) {
             return match self.terminate_process() {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(format!("{error}; cleanup failed: {cleanup}")),
@@ -500,10 +606,29 @@ mod tests {
         let mut go = [0; 2];
         bootstrap.read_exact(&mut go).unwrap();
         assert_eq!(&go, b"GO");
-        bootstrap.write_all(b"STARTED").unwrap();
+        if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_KERNEL").is_some() {
+            assert_eq!(
+                std::fs::read_link("/proc/self/fd/3").unwrap(),
+                PathBuf::from(
+                    std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_REGISTRATION")
+                        .unwrap()
+                )
+            );
+            bootstrap.write_all(b"NETWORK_READY").unwrap();
+            let mut serve = [0; 5];
+            bootstrap.read_exact(&mut serve).unwrap();
+            assert_eq!(&serve, b"SERVE");
+        } else {
+            bootstrap.write_all(b"STARTED").unwrap();
+        }
         drop(bootstrap);
         if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT").is_some() {
             return;
+        }
+        if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_KERNEL").is_some() {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
 
         let mut frame = unsafe { File::from_raw_fd(FRAME_FD) };
@@ -532,7 +657,7 @@ mod tests {
             assert_eq!(&go, b"GO");
             child.write_all(b"STARTED").unwrap();
         });
-        bootstrap(&mut parent).unwrap();
+        bootstrap(&mut parent, false).unwrap();
         peer.join().unwrap();
     }
 
@@ -573,7 +698,7 @@ mod tests {
         let (mut parent, mut child) = UnixStream::pair().unwrap();
         child.write_all(b"NOPE!").unwrap();
         assert_eq!(
-            bootstrap(&mut parent),
+            bootstrap(&mut parent, false),
             Err("invalid network-service READY".into())
         );
     }
@@ -587,7 +712,7 @@ mod tests {
             child.read_exact(&mut go).unwrap();
         });
         assert!(matches!(
-            bootstrap(&mut parent),
+            bootstrap(&mut parent, false),
             Err(error) if error.contains("STARTED")
         ));
         peer.join().unwrap();
@@ -1101,5 +1226,159 @@ mod tests {
             receiver.receive(&mut supervisor),
             Err("nonmonotonic Wi-Fi lifecycle generation".into())
         );
+    }
+    #[test]
+    fn fresh_kernel_registration_survives_an_initial_fd3_open() {
+        const INNER: &str = "DRV_NETWORK_SERVICE_SUPERVISOR_FD3_INNER";
+        if std::env::var_os(INNER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::fresh_kernel_registration_survives_an_initial_fd3_open",
+                    "--nocapture",
+                ])
+                .env(INNER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        unsafe {
+            libc::close(3);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "network-supervisor-registration-{}",
+            std::process::id()
+        ));
+        let registration_guard = File::create(&path).unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new_kernel(
+            std::env::current_exe().unwrap(),
+            &path,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+
+        let (frame, _driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        let frame = frame.into_frame_fd();
+        let frame_pass = duplicate_capability(frame.as_raw_fd()).unwrap();
+        drop(frame);
+        drop(registration_guard);
+        assert_eq!(unsafe { libc::fcntl(3, 1) }, -1);
+        assert_eq!(supervisor.install_generation(frame_pass), Ok(1));
+        supervisor.terminate().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn kernel_replacement_revokes_unclaimed_socket_without_resurrection() {
+        if std::env::var_os("DRV_KERNEL_PROVIDER_ETHERNET_GUEST").is_none() {
+            return;
+        }
+        let mut supervisor = NetworkServiceSupervisor::new_kernel(
+            std::env::current_exe().unwrap(),
+            "/dev/netstack3",
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+
+        let (first, _first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        assert_eq!(supervisor.install_generation(first.into_frame_fd()), Ok(1));
+        let stale = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(
+            stale >= 0,
+            "first provider session did not own application socket"
+        );
+
+        let first_pid = supervisor
+            .installed
+            .as_ref()
+            .unwrap()
+            .running
+            .as_ref()
+            .unwrap()
+            .child
+            .id() as i32;
+        let (second, _second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
+        assert_eq!(
+            unsafe { libc::waitpid(first_pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1,
+            "kernel registration reopened before the preceding child was reaped"
+        );
+
+        let fresh = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        assert!(
+            fresh >= 0,
+            "replacement did not open a fresh provider session"
+        );
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as _;
+        for _ in 0..2 {
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        stale,
+                        (&address as *const libc::sockaddr_in).cast(),
+                        size_of::<libc::sockaddr_in>() as _,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENETDOWN),
+                "replacement resurrected an unclaimed old-session socket"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(unsafe { libc::close(stale) }, 0);
+        assert_eq!(unsafe { libc::close(fresh) }, 0);
+        supervisor.terminate().unwrap();
+    }
+
+    #[test]
+    fn kernel_provider_bootstrap_waits_for_network_and_activates_service() {
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            child.write_all(b"READY").unwrap();
+            let mut go = [0; 2];
+            child.read_exact(&mut go).unwrap();
+            assert_eq!(&go, b"GO");
+            child.write_all(b"NETWORK_READY").unwrap();
+            let mut serve = [0; 5];
+            child.read_exact(&mut serve).unwrap();
+            assert_eq!(&serve, b"SERVE");
+        });
+        bootstrap(&mut parent, true).unwrap();
+        peer.join().unwrap();
     }
 }

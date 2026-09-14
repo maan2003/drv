@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 use anyhow::{Context as _, bail};
+use futures::channel::mpsc;
 use linux_self_sandbox::{Profile, Sandbox};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-use wlancfg_service::{PreparedHostControlClient, policy::serve_one_generation};
+use wlancfg_service::{
+    PreparedHostControlClient, application::PreparedApplicationServer, policy::serve,
+};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -12,10 +15,14 @@ fn main() -> anyhow::Result<()> {
     if control_fd == state_fd {
         bail!("control and persistence capabilities must be distinct");
     }
+    let application_fd = parse_fd(args.next(), "APPLICATION_LISTENER_FD")?;
+    if application_fd == control_fd || application_fd == state_fd {
+        bail!("application, control, and persistence capabilities must be distinct");
+    }
     let generation = parse_generation(args.next())?;
     if args.next().is_some() {
         bail!(
-            "usage: wlancfg-service CONTROL_SEQPACKET_FD PERSISTENCE_DIRECTORY_FD GENERATION_HEX"
+            "usage: wlancfg-service CONTROL_SEQPACKET_FD PERSISTENCE_DIRECTORY_FD APPLICATION_LISTENER_FD GENERATION_HEX"
         );
     }
 
@@ -25,22 +32,31 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: as above; SavedNetworksManager validates directory semantics
     // after lockdown, before using the capability.
     let state_fd = unsafe { OwnedFd::from_raw_fd(state_fd) };
+    // SAFETY: as above; this is a pre-bound listening capability.
+    let application_fd = unsafe { OwnedFd::from_raw_fd(application_fd) };
     let control_raw = control_fd.as_raw_fd();
     let state_raw = state_fd.as_raw_fd();
+    let application_raw = application_fd.as_raw_fd();
     let prepared = PreparedHostControlClient::from_inherited_socket(control_fd, generation)
         .context("validate inherited WLAN control socket")?;
+    let prepared_applications = PreparedApplicationServer::from_inherited_listener(application_fd)
+        .context("validate inherited WLAN application listener")?;
+    let (application_tx, application_rx) = mpsc::channel(15);
 
     // Production has no sandbox-bypass flag: inability to establish the jail
     // is a fatal startup error. Tests that cannot unshare use a separately
     // labelled integration-test process role.
     let setup = Sandbox::new()
-        .setup(&[control_raw, state_raw], Some(state_raw))
+        .setup(&[control_raw, state_raw, application_raw], Some(state_raw))
         .context("establish wlancfg namespaces and capabilities")?;
     // Thread creation is setup-only. The owner blocks on a private start gate
     // and cannot poll or receive the policy socket before TSYNC lockdown.
     let parked = prepared
         .spawn_parked_after_setup()
         .context("park WLAN control owner before lockdown")?;
+    let parked_applications = prepared_applications
+        .spawn_parked(application_tx)
+        .context("park WLAN application owner before lockdown")?;
     // Construct the current-thread executor, including its epoll descriptor,
     // during setup so runtime confinement needs no descriptor creator.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -51,9 +67,18 @@ fn main() -> anyhow::Result<()> {
         .lockdown(Profile::Wlancfg {
             control_fd: control_raw,
             persistence_dir_fd: state_raw,
+            application_listener_fd: Some(application_raw),
         })
         .context("install wlancfg seccomp policy")?;
-    locked.run(|| serve_one_generation(runtime, parked, state_fd))
+    locked.run(|| {
+        serve(
+            runtime,
+            parked,
+            parked_applications,
+            application_rx,
+            state_fd,
+        )
+    })
 }
 
 fn parse_fd(value: Option<String>, name: &str) -> anyhow::Result<RawFd> {
