@@ -78,6 +78,24 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 }
                 self.channel_change = None;
             }
+            if let Some(join) = self.peer_join.as_mut() {
+                progressed |= join.drive(
+                    resources,
+                    &mut self.session.mcu.0,
+                    &mut self.session.receive,
+                    self.session.start,
+                    std::time::Instant::now(),
+                )?;
+                if !join.complete() {
+                    return Ok(progressed);
+                }
+                join.context.check(std::time::Instant::now())?;
+                self.joined = Some(join.bss.clone());
+                if let Some(reply) = join.reply.take() {
+                    let _ = reply.send(Ok(()));
+                }
+                self.peer_join = None;
+            }
             if let Some(scan) = self.scan.as_mut() {
                 progressed |= scan.drive(
                     resources,
@@ -105,7 +123,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
             let upcalls = self.upcalls.as_mut().ok_or(zx::Status::BAD_STATE)?;
             for route in routes {
                 if let mt7921_core::McuRxRoute::Normal(bytes) = route {
-                    deliver_raw_rx(upcalls.as_mut(), &bytes);
+                    deliver_raw_rx(upcalls.as_mut(), &mut self.observations, &bytes);
                 }
             }
             let mut event_count = 0;
@@ -116,7 +134,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 event_count += 1;
                 match event.into_route().map_err(|_| zx::Status::IO)? {
                     mt7921_core::McuRxRoute::Normal(bytes) => {
-                        deliver_raw_rx(upcalls.as_mut(), &bytes)
+                        deliver_raw_rx(upcalls.as_mut(), &mut self.observations, &bytes)
                     }
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
                         if let Ok(done) = mt7921_core::parse_passive_scan_done(&bytes.bytes) {
@@ -152,6 +170,11 @@ impl ClientRuntimeDriver for Mt7921Driver {
         if let Err(status) = result {
             if let Some(change) = self.channel_change.as_mut()
                 && let Some(reply) = change.reply.take()
+            {
+                let _ = reply.send(Err(status));
+            }
+            if let Some(join) = self.peer_join.as_mut()
+                && let Some(reply) = join.reply.take()
             {
                 let _ = reply.send(Err(status));
             }
@@ -215,7 +238,7 @@ impl WlanSoftmac for Mt7921Driver {
                         fidl_fuchsia_wlan_softmac::WlanSoftmacBandCapability {
                             band: Some(band),
                             // Non-HT OFDM rates supported by the radio (500 kbit/s).
-                            basic_rates: Some(vec![12, 18, 24, 36, 48, 72, 96, 108]),
+                            basic_rates: Some(crate::peer::OFDM_RATES.to_vec()),
                             primary_channels: Some(channels),
                             ..Default::default()
                         },
@@ -257,7 +280,7 @@ impl WlanSoftmac for Mt7921Driver {
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
                 return Err(zx::Status::BAD_STATE);
             }
-            if self.scan.is_some() || self.channel_change.is_some() {
+            if self.scan.is_some() || self.channel_change.is_some() || self.peer_join.is_some() {
                 return Err(zx::Status::SHOULD_WAIT);
             }
             let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
@@ -288,6 +311,13 @@ impl WlanSoftmac for Mt7921Driver {
                 return Err(zx::Status::NOT_SUPPORTED);
             }
             let (reply, receiver) = futures_channel::oneshot::channel();
+            if self.current_channel == Some(channel) {
+                let _ = reply.send(Ok(()));
+                return Ok(receiver);
+            }
+            if self.joined.is_some() {
+                return Err(zx::Status::BAD_STATE);
+            }
             self.channel_change = Some(crate::radio::ChannelChange::new(context, channel, reply)?);
             self.current_channel = None;
             Ok(receiver)
@@ -297,13 +327,43 @@ impl WlanSoftmac for Mt7921Driver {
     fn join_bss(
         &mut self,
         context: wlan_softmac_host::OperationContext,
-        _: JoinBssRequest,
+        request: JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        std::future::ready(
-            context
-                .check(std::time::Instant::now())
-                .and(Err(zx::Status::NOT_SUPPORTED)),
-        )
+        let result = (|| {
+            let now = std::time::Instant::now();
+            context.check(now)?;
+            if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
+                return Err(zx::Status::BAD_STATE);
+            }
+            if self.scan.is_some() || self.channel_change.is_some() || self.peer_join.is_some() {
+                return Err(zx::Status::SHOULD_WAIT);
+            }
+            if self.joined.is_some() {
+                return Err(zx::Status::BAD_STATE);
+            }
+            if request.remote != Some(true)
+                || request.bss_type != Some(fidl_fuchsia_wlan_ieee80211::BssType::Infrastructure)
+            {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let bssid = request.bssid.ok_or(zx::Status::INVALID_ARGS)?;
+            let channel = self.current_channel.ok_or(zx::Status::BAD_STATE)?;
+            let bss = self
+                .observations
+                .iter()
+                .find(|bss| {
+                    bss.bssid == bssid
+                        && bss.channel == channel
+                        && Some(bss.beacon_period) == request.beacon_period
+                        && bss.fresh(now)
+                })
+                .cloned()
+                .ok_or(zx::Status::NOT_FOUND)?;
+            let (reply, receiver) = futures_channel::oneshot::channel();
+            self.peer_join = Some(crate::peer::PeerJoin::new(context, bss, reply)?);
+            Ok(receiver)
+        })();
+        async move { result?.await.unwrap_or(Err(zx::Status::CANCELED)) }
     }
     fn install_key(
         &mut self,
@@ -322,8 +382,13 @@ impl WlanSoftmac for Mt7921Driver {
         _: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready({
-            // No join/key/TX operation can currently create association state.
-            Ok(())
+            // Firmware peer removal is not implemented yet. Never certify a
+            // programmed (or uncertain) peer as cleared; the owner must contain.
+            if self.joined.is_some() || self.peer_join.is_some() {
+                Err(zx::Status::NOT_SUPPORTED)
+            } else {
+                Ok(())
+            }
         })
     }
     fn start_passive_scan(
@@ -338,7 +403,7 @@ impl WlanSoftmac for Mt7921Driver {
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
                 return Err(zx::Status::BAD_STATE);
             }
-            if self.scan.is_some() || self.channel_change.is_some() {
+            if self.scan.is_some() || self.channel_change.is_some() || self.peer_join.is_some() {
                 return Err(zx::Status::SHOULD_WAIT);
             }
             let requested = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
@@ -418,12 +483,25 @@ impl WlanSoftmac for Mt7921Driver {
     }
 }
 
-fn deliver_raw_rx(upcalls: &mut dyn WlanSoftmacUpcalls, bytes: &[u8]) {
+fn deliver_raw_rx(
+    upcalls: &mut dyn WlanSoftmacUpcalls,
+    observations: &mut std::collections::VecDeque<crate::peer::ObservedBss>,
+    bytes: &[u8],
+) {
     use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType};
     use fidl_fuchsia_wlan_softmac::{WlanRxInfoFlags, WlanRxInfoValid};
     let Ok(frame) = mt7921_core::parse_connac2_rx_frame(bytes) else {
         return;
     };
+    if let Some(observation) = crate::peer::ObservedBss::from_rx(&frame, std::time::Instant::now())
+    {
+        observations
+            .retain(|old| old.bssid != observation.bssid || old.channel != observation.channel);
+        if observations.len() == crate::peer::OBSERVATION_CAPACITY {
+            observations.pop_front();
+        }
+        observations.push_back(observation);
+    }
     let band = match frame.band {
         mt7921_core::PhysicalBand::Ghz2 => WlanBand::TwoGhz,
         mt7921_core::PhysicalBand::Ghz5 => WlanBand::FiveGhz,
@@ -473,7 +551,8 @@ mod tests {
         bytes[32] = 0x80;
         bytes[68..].copy_from_slice(&[0, 3, b'l', b'a', b'b']);
         let mut upcalls = Upcalls::default();
-        deliver_raw_rx(&mut upcalls, &bytes);
+        let mut observations = Default::default();
+        deliver_raw_rx(&mut upcalls, &mut observations, &bytes);
         assert_eq!(upcalls.0.len(), 1);
         let (frame, info) = &upcalls.0[0];
         assert_eq!(frame, &bytes[32..]);
@@ -488,8 +567,8 @@ mod tests {
             fidl_fuchsia_wlan_softmac::WlanRxInfoValid::RSSI
         );
         bytes[4..8].copy_from_slice(&((1u32 << 13) | (1 << 28)).to_le_bytes());
-        deliver_raw_rx(&mut upcalls, &bytes);
-        deliver_raw_rx(&mut upcalls, &[0; 4]);
+        deliver_raw_rx(&mut upcalls, &mut observations, &bytes);
+        deliver_raw_rx(&mut upcalls, &mut observations, &[0; 4]);
         assert_eq!(upcalls.0.len(), 1);
     }
 }

@@ -15,6 +15,7 @@ mod active_mcu;
 mod firmware_loader;
 mod receive;
 pub use receive::ReceivedEvent;
+mod peer;
 mod radio;
 mod setup_inputs;
 mod softmac;
@@ -957,6 +958,9 @@ pub struct Mt7921Driver {
     scan: Option<radio::PassiveScan>,
     channel_change: Option<radio::ChannelChange>,
     current_channel: Option<mt7921_core::CandidateChannel>,
+    observations: std::collections::VecDeque<peer::ObservedBss>,
+    peer_join: Option<peer::PeerJoin>,
+    joined: Option<peer::ObservedBss>,
     next_scan_id: u64,
     upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
@@ -1014,6 +1018,9 @@ impl Mt7921Driver {
                     scan: None,
                     channel_change: None,
                     current_channel: None,
+                    observations: std::collections::VecDeque::new(),
+                    peer_join: None,
+                    joined: None,
                     next_scan_id: 1,
                     upcalls: None,
                 })

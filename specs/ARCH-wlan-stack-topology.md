@@ -9,9 +9,10 @@ bounded passive-scan/RX progression and containment are implemented and have
 been exercised with the assigned MT7921 inside KVM through the production CLI.
 Regulatory input is a hash-verified inherited database; the chip owner retains
 its immutable world-domain policy. Passive scan does not grant transmit
-authority. Bounded 20 MHz channel tuning is implemented and model-tested;
-physical channel tuning is not yet verified. Active scan, scan cancellation,
-peer/key configuration, association, TX and MAC override remain unavailable. Earlier Internet
+authority. Bounded 20 MHz channel tuning and preauthentication peer setup are
+implemented and model-tested; neither has physical acceptance yet. Active scan,
+scan cancellation, peer removal, key configuration, association, TX and MAC
+override remain unavailable. Earlier Internet
 demonstrations used the retired implementation and are not acceptance of this
 replacement.
 

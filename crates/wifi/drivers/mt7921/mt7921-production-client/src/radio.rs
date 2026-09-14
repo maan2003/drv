@@ -26,6 +26,15 @@ impl MacPreparation {
         }
     }
 
+    pub(super) fn for_wcid(index: u8) -> Self {
+        Self {
+            remaining: passive_mac_mmio_plan().into_iter().filter(|operation|
+                matches!(operation, PassiveMacMmioOperation::WtblClear { index: entry, .. } if *entry == index)
+            ).collect(),
+            waiting: None, failed: false,
+        }
+    }
+
     /// One source RMW, WTBL publication, or busy observation per owner turn.
     /// A failed/partially executed plan cannot be restarted without containment.
     pub fn drive<B: Backend>(
@@ -226,14 +235,14 @@ pub(super) struct RadioPreparation {
 
 /// Shared MCU transaction progression; protocol replies stay in the operation
 /// that owns this sequence, never in this transport-only state.
-struct FirmwareCommands {
+pub(super) struct FirmwareCommands {
     remaining: VecDeque<(Vec<u8>, RadioResponse)>,
     pending: Option<(RadioResponse, Instant)>,
     failed: bool,
 }
 
 #[derive(Clone, Copy)]
-enum RadioResponse {
+pub(super) enum RadioResponse {
     None,
     Ack,
     Clc,
@@ -358,12 +367,7 @@ impl RadioPreparation {
                 RadioResponse::Unified(cid),
             ));
         }
-        let station = MacPreparation {
-            remaining: passive_mac_mmio_plan().into_iter().filter(|operation|
-                matches!(operation, PassiveMacMmioOperation::WtblClear { value, .. } if value & 0x3ff == 19)
-            ).collect(),
-            waiting: None, failed: false,
-        };
+        let station = MacPreparation::for_wcid(19);
         Ok(Self {
             commands: FirmwareCommands::new(commands),
             station,
@@ -392,7 +396,7 @@ impl RadioPreparation {
 }
 
 impl FirmwareCommands {
-    fn new(remaining: VecDeque<(Vec<u8>, RadioResponse)>) -> Self {
+    pub(super) fn new(remaining: VecDeque<(Vec<u8>, RadioResponse)>) -> Self {
         Self {
             remaining,
             pending: None,
@@ -400,11 +404,11 @@ impl FirmwareCommands {
         }
     }
 
-    fn ready(&self) -> bool {
+    pub(super) fn ready(&self) -> bool {
         !self.failed && self.remaining.is_empty() && self.pending.is_none()
     }
 
-    fn drive<B: Backend>(
+    pub(super) fn drive<B: Backend>(
         &mut self,
         resources: &mut crate::OwnedHardwareResources<B>,
         mechanics: &mut mt7921_core::LoaderMechanics,

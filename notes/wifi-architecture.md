@@ -48,9 +48,9 @@ perform no host deployment or reboot as an implicit part of guest testing.
 
 
 The reduced cutover now implements the same-process typed ownership boundary
-below. Passive scanning/RX now run in that owner. Bounded channel tuning and
-original-deadline propagation pass native and no-network KVM model tests;
-physical tuning, association and TX remain pending.
+below. Passive scanning/RX now run in that owner. Bounded channel tuning, preauthentication
+peer setup and original-deadline propagation have model coverage;
+physical tuning/peer acceptance, association and TX remain pending.
 This is not a claim of Internet connectivity or complete recovery qualification.
 
 ## Advisor cadence
