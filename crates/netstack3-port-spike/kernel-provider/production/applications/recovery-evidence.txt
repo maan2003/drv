@@ -202,3 +202,39 @@ to np USB yields SSH_CONNECTION 172.16.42.1 -> 172.16.42.2:22, with both-directi
 USB ping 3/3. This closes control access, not the hardware reset contract.
 No experimental boot, watchdog deployment or physical radio release follows
 from this review. Host remains on known-good Linux 6.18.43.
+
+Integrated master no-VFIO regression gate (2026-09-14):
+Sources d7d2c6f6 + adapter-test-only 4fd11f10. Native Cargo/GCC on np.
+Authoritative #23 kernel SHA256:
+fcab8cd27d6e8e578118bba064d2816e1a39413904af58b29aa09160ff5b37f3
+Uses current master protocol/endpoint/loopback sources, including ancillary
+coverage (loopback source 2f9b06107b2e1fa5da187091f47002edf35719509945b228170d012e1097dd84).
+Staged endpoint SHA256:
+3d73d1c2740cd0450bdfcd329986faf619be30c7cf69211e19556e14170e054b
+Staged loopback SHA256:
+e175f349f5bc2355bdece021b7f70bcf40e0c1c306167da7f2a6a1993a912e7d
+Provider SHA256:
+d72316847b1ea6a4a1e911c46a5fe5efe8450fd5e4965c436b10cf8144b95136
+Network-service tests SHA256:
+2fd13bcc33344169735b8fe7fda016af6590288032d93d440bed3ab71155757b
+Initrd SHA256:
+4e2e33f96d90377bd177a0bf6c66a66edaa1ab4c6461791f461ac8620b492ba2
+Serial SHA256:
+f21a6cb556668b5207d73e765c455e8b371c88817079ba8e4e29f403a6f5e3cd
+
+PASS_KVM_PRODUCTION_LOOPBACK, runner exit0; ABI6, provider sandbox,
+backpressure/sendmmsg/ancillary, IPv4/IPv6, parallel sockets, death/restart,
+Ethernet DHCP/DNS/TCP/NSS and PROVIDER_ABSENT_NO_NATIVE_FALLBACK passed.
+No FAIL/BUG:/WARNING:/Oops:/Kernel panic. One clocksource diagnostic:
+"Watchdog remote CPU 1 read timed out" (not the host lab recovery deadline).
+Output under socket-provider-kvm/lifecycle-no-vfio-jukz/
+output-full-master-d7d2c6f6-4fd11f10.
+Full source/artifact and failed/passing log provenance under
+stage-master-d7d2c6f6/evidence/master-integration-provenance.txt,
+SHA256 af75f34f39dc42da7381a0cedc4e49418a305d6ae3949c547ce198cf3d84f45f.
+
+Separate native adapter suite: 54 unit + 3 compile-fail doctests pass after
+correcting two stale loader/runtime initialization assertions in 4fd11f10.
+Broader default passive-scan suite remains NOT GREEN: 159 pass, 20 fail,
+reproduced serially; baseline/source-contract investigation remains open.
+No radio, host boot, deployment or automatic-recovery acceptance is implied.
