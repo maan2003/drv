@@ -62,8 +62,10 @@ impl<B: Backend, P: ActivationPci> ProductionFirmwareLoader<'_, B, P> {
 impl<B: Backend, P: ActivationPci> FirmwareLoaderTransport for ProductionFirmwareLoader<'_, B, P> {
     type Error = String;
 
-    fn next_sequence(&mut self) -> u8 {
-        self.mechanics.reserve_sequence(&mut ())
+    fn next_sequence(&mut self) -> Result<u8, Self::Error> {
+        self.mechanics
+            .reserve_sequence(&mut ())
+            .map_err(|error| format!("reserve loader sequence: {error:?}"))
     }
 
     fn acpi_configuration(&self) -> u8 {
@@ -308,7 +310,7 @@ mod tests {
             receive: &mut receive,
             start: Instant::now(),
         };
-        let sequence = loader.next_sequence();
+        let sequence = loader.next_sequence().unwrap();
         loader
             .publish_scatter(FirmwareImagePart::Patch, sequence, &[0x5a; 64])
             .unwrap();

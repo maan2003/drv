@@ -4462,6 +4462,7 @@ pub enum FirmwareImagePart {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirmwareLoaderOperation {
+    ReserveSequence,
     Command(DownloadCommand),
     PublishScatter(FirmwareImagePart),
     WaitScatterCompletion(FirmwareImagePart),
@@ -4511,7 +4512,7 @@ pub trait FirmwareLoaderTransport {
 
     /// Allocate the next persistent nonzero four-bit MCU sequence. Linux keeps
     /// this counter on the device and consumes a value for scatter messages.
-    fn next_sequence(&mut self) -> u8;
+    fn next_sequence(&mut self) -> Result<u8, Self::Error>;
     fn acpi_configuration(&self) -> u8;
     fn command(
         &mut self,
@@ -4629,7 +4630,10 @@ fn loader_command<T: FirmwareLoaderTransport>(
 fn next_loader_sequence<T: FirmwareLoaderTransport>(
     transport: &mut T,
 ) -> Result<u8, FirmwareLoaderFailure<T::Error>> {
-    let sequence = transport.next_sequence();
+    let sequence = transport.next_sequence().map_err(|source| FirmwareLoaderFailure::Transport {
+        operation: FirmwareLoaderOperation::ReserveSequence,
+        source,
+    })?;
     if sequence == 0 || sequence > 15 {
         Err(FirmwareLoaderFailure::Command(
             DownloadCommandError::InvalidSequence,
@@ -15626,12 +15630,12 @@ mod tests {
     impl FirmwareLoaderTransport for FakeFirmwareLoader {
         type Error = &'static str;
 
-        fn next_sequence(&mut self) -> u8 {
+        fn next_sequence(&mut self) -> Result<u8, Self::Error> {
             self.sequence = (self.sequence + 1) & 0x0f;
             if self.sequence == 0 {
                 self.sequence = 1;
             }
-            self.sequence
+            Ok(self.sequence)
         }
 
         fn acpi_configuration(&self) -> u8 {

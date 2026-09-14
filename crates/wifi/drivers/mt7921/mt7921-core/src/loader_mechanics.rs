@@ -43,6 +43,15 @@ pub enum LoaderCompletion {
     NoResponse,
 }
 
+/// A bounded command-pump turn. Productive pending turns must be scheduled
+/// again immediately: acknowledging the IRQ may have consumed the only wakeup
+/// for descriptors left beyond this turn's budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoaderCommandProgress {
+    Pending { progressed: bool },
+    Complete(LoaderCompletion),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoaderMechanicsEvent {
     SequenceReserved {
@@ -179,6 +188,8 @@ pub enum LoaderMechanicsError<E> {
     DuplicateResponse,
     Timeout,
     CommandPending { slot: u16 },
+    NoCommandPending,
+    CommandFailed,
     ScatterPending,
     NoScatterPending,
     ScatterMismatch,
@@ -194,6 +205,7 @@ impl<E> LoaderMechanicsError<E> {
             Self::ContainmentRequired(_)
                 | Self::Timeout
                 | Self::CommandPending { .. }
+                | Self::CommandFailed
                 | Self::RxDescriptorNotDone { .. }
                 | Self::TxDescriptorNotDone { .. }
                 | Self::ScatterDescriptorNotDone { .. }
@@ -214,10 +226,19 @@ struct PendingScatter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct DeferredCommand {
+    slot: u16,
+    sequence: u8,
+    completion: Option<LoaderCompletion>,
+    failed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoaderMechanics {
     sequence: u8,
     command_producer: u16,
     pending_command: Option<u16>,
+    deferred_command: Option<DeferredCommand>,
     rx_head: [u16; 2],
     fwdl_producer: u16,
     pending_scatter: Option<PendingScatter>,
@@ -235,6 +256,7 @@ impl LoaderMechanics {
             sequence,
             command_producer: 0,
             pending_command: None,
+            deferred_command: None,
             rx_head: [0; 2],
             fwdl_producer: 0,
             pending_scatter: None,
@@ -256,6 +278,98 @@ impl LoaderMechanics {
         self.pending_scatter.is_some()
     }
 
+    fn active_command_slot(&self) -> Option<u16> {
+        self.pending_command
+            .or_else(|| self.deferred_command.as_ref().map(|command| command.slot))
+    }
+
+    /// Publish one driver-owned operation without waiting. Neither dropping a
+    /// waiter nor reaching its deadline releases this operation; drive it to
+    /// completion or contain the device before destroying its DMA resources.
+    pub fn begin_command<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+        template: &[u8],
+        completion: LoaderCommandCompletion,
+    ) -> Result<(), LoaderMechanicsError<T::Error>> {
+        if self.pending_scatter.is_some() {
+            return Err(LoaderMechanicsError::ScatterPending);
+        }
+        if let Some(slot) = self.active_command_slot() {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
+        if template.len() < 48
+            || template.len() > MT7921_LOADER_COMMAND_MAX_BYTES
+            || template.len() > t.command_payload_capacity(self.command_producer)
+        {
+            return Err(LoaderMechanicsError::InvalidCommandLength);
+        }
+        let slot = self.command_producer;
+        let sequence = self.reserve_sequence_unchecked(o);
+        self.deferred_command = Some(DeferredCommand {
+            slot,
+            sequence,
+            completion: match completion {
+                LoaderCommandCompletion::Response => None,
+                LoaderCommandCompletion::NoResponse => Some(LoaderCompletion::NoResponse),
+            },
+            failed: true,
+        });
+        self.publish_reserved_template(t, o, sequence, template, completion)?;
+        self.deferred_command.as_mut().unwrap().failed = false;
+        Ok(())
+    }
+
+    /// Pump at most one ring-minus-one batch on each MCU RX ring, and observe
+    /// TX consumption once. IRQ counts are not command-completion evidence.
+    ///
+    /// An error poisons the operation: the caller must contain the device, not
+    /// retry publication or interpret a later TX reclaim as protocol success.
+    pub fn poll_command<T: LoaderMechanicsTransport, O: LoaderMechanicsObserver>(
+        &mut self,
+        t: &mut T,
+        o: &mut O,
+    ) -> Result<LoaderCommandProgress, LoaderMechanicsError<T::Error>> {
+        let command = self
+            .deferred_command
+            .as_ref()
+            .ok_or(LoaderMechanicsError::NoCommandPending)?;
+        if command.failed {
+            return Err(LoaderMechanicsError::CommandFailed);
+        }
+        let sequence = command.sequence;
+        let expects_response = command.completion != Some(LoaderCompletion::NoResponse);
+        let before_rx = self.rx_head;
+        let before_tx = self.pending_command;
+        let result = (|| {
+            if let Some(response) = self.poll_response(
+                t,
+                o,
+                expects_response.then_some(sequence),
+                MT7921_MCU_RX_RING_COUNT - 1,
+            )? {
+                let command = self.deferred_command.as_mut().unwrap();
+                if command.completion.is_some() {
+                    return Err(LoaderMechanicsError::DuplicateResponse);
+                }
+                command.completion = Some(LoaderCompletion::Response(response));
+            }
+            let reclaimed = self.try_reclaim_command(t, o)?;
+            if reclaimed && self.deferred_command.as_ref().unwrap().completion.is_some() {
+                let command = self.deferred_command.take().unwrap();
+                return Ok(LoaderCommandProgress::Complete(command.completion.unwrap()));
+            }
+            Ok(LoaderCommandProgress::Pending {
+                progressed: before_rx != self.rx_head || before_tx != self.pending_command,
+            })
+        })();
+        if result.is_err() {
+            self.deferred_command.as_mut().unwrap().failed = true;
+        }
+        result
+    }
+
     /// Consume the shared command producer for a caller that supplies the
     /// semantic physical publication effects itself (used by post-loader
     /// command families during the staged cutover).
@@ -263,7 +377,7 @@ impl LoaderMechanics {
         &mut self,
         sequence: u8,
     ) -> Result<(u16, u16), LoaderMechanicsError<core::convert::Infallible>> {
-        if let Some(slot) = self.pending_command {
+        if let Some(slot) = self.active_command_slot() {
             return Err(LoaderMechanicsError::CommandPending { slot });
         }
         let expected = self.sequence % 15 + 1;
@@ -283,7 +397,17 @@ impl LoaderMechanics {
     /// Reserve from the sole 1..=15 cursor.  Reservation deliberately mutates
     /// state before any encoder is called, so encoding failure still consumes
     /// the sequence just like a publication attempt of uncertain outcome.
-    pub fn reserve_sequence<O: LoaderMechanicsObserver>(&mut self, observer: &mut O) -> u8 {
+    pub fn reserve_sequence<O: LoaderMechanicsObserver>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<u8, LoaderMechanicsError<core::convert::Infallible>> {
+        if let Some(slot) = self.active_command_slot() {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
+        Ok(self.reserve_sequence_unchecked(observer))
+    }
+
+    fn reserve_sequence_unchecked<O: LoaderMechanicsObserver>(&mut self, observer: &mut O) -> u8 {
         self.sequence = self.sequence % 15 + 1;
         observer.observe_loader_mechanics(LoaderMechanicsEvent::SequenceReserved {
             sequence: self.sequence,
@@ -298,7 +422,10 @@ impl LoaderMechanics {
         command: DownloadCommand,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
-        let sequence = self.reserve_sequence(observer);
+        if let Some(slot) = self.active_command_slot() {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
+        let sequence = self.reserve_sequence_unchecked(observer);
         let encoded =
             encode_download_command(command, sequence).map_err(LoaderMechanicsError::Encode)?;
         self.execute_reserved_template(
@@ -319,7 +446,7 @@ impl LoaderMechanics {
         completion: LoaderCommandCompletion,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
-        if let Some(slot) = self.pending_command {
+        if let Some(slot) = self.active_command_slot() {
             return Err(LoaderMechanicsError::CommandPending { slot });
         }
         if template.len() < 48 || template.len() > MT7921_LOADER_COMMAND_MAX_BYTES {
@@ -328,7 +455,7 @@ impl LoaderMechanics {
         if template.len() > transport.command_payload_capacity(self.command_producer) {
             return Err(LoaderMechanicsError::InvalidCommandLength);
         }
-        let sequence = self.reserve_sequence(observer);
+        let sequence = self.reserve_sequence_unchecked(observer);
         self.execute_reserved_template(
             transport, observer, sequence, template, completion, deadline,
         )
@@ -345,6 +472,9 @@ impl LoaderMechanics {
         completion: LoaderCommandCompletion,
         deadline: u64,
     ) -> Result<LoaderCompletion, LoaderMechanicsError<T::Error>> {
+        if let Some(slot) = self.active_command_slot() {
+            return Err(LoaderMechanicsError::CommandPending { slot });
+        }
         self.publish_reserved_template(t, o, sequence, template, completion)?;
 
         let result = match completion {
@@ -534,7 +664,7 @@ impl LoaderMechanics {
         t: &mut T,
         o: &mut O,
     ) -> Result<bool, LoaderMechanicsError<T::Error>> {
-        if let Some(slot) = self.pending_command {
+        if let Some(slot) = self.active_command_slot() {
             return Err(LoaderMechanicsError::CommandPending { slot });
         }
         let before = self.rx_head;
@@ -683,13 +813,16 @@ impl LoaderMechanics {
         part: FirmwareImagePart,
         chunk: &[u8],
     ) -> Result<u8, LoaderMechanicsError<T::Error>> {
+        if let Some(command) = &self.deferred_command {
+            return Err(LoaderMechanicsError::CommandPending { slot: command.slot });
+        }
         if self.pending_scatter.is_some() {
             return Err(LoaderMechanicsError::ScatterPending);
         }
         if chunk.is_empty() || chunk.len() > MT7921_FWDL_CHUNK_BYTES {
             return Err(LoaderMechanicsError::InvalidScatterLength);
         }
-        let sequence = self.reserve_sequence(o);
+        let sequence = self.reserve_sequence_unchecked(o);
         self.publish_reserved_scatter(t, o, part, sequence, chunk)?;
         Ok(sequence)
     }
@@ -703,6 +836,9 @@ impl LoaderMechanics {
         sequence: u8,
         chunk: &[u8],
     ) -> Result<(), LoaderMechanicsError<T::Error>> {
+        if let Some(command) = &self.deferred_command {
+            return Err(LoaderMechanicsError::CommandPending { slot: command.slot });
+        }
         if sequence == 0 || sequence != self.sequence {
             return Err(LoaderMechanicsError::InvalidReservedSequence {
                 reserved: sequence,
@@ -1113,10 +1249,274 @@ mod tests {
     }
 
     #[test]
+    fn deferred_command_retains_both_completion_orders_across_moves() {
+        for response_first in [false, true] {
+            let mut engine = LoaderMechanics::default();
+            let mut io = Fake::default();
+            engine
+                .begin_command(
+                    &mut io,
+                    &mut (),
+                    &[0; 48],
+                    LoaderCommandCompletion::Response,
+                )
+                .unwrap();
+            io.command_didx = VecDeque::from([if response_first { 0 } else { 1 }, 1]);
+            if response_first {
+                io.push_rx(McuRxIrqRing::Wm, firmware(1, 1, 0));
+            }
+            assert_eq!(
+                engine.poll_command(&mut io, &mut ()),
+                Ok(LoaderCommandProgress::Pending { progressed: true })
+            );
+            assert_eq!(engine.pending_command.is_some(), response_first);
+            // A completed TX alone must not permit slot/sequence reuse, nor
+            // may a retained response permit overwriting a still-owned TX.
+            let before = io.ops.clone();
+            assert_eq!(
+                engine.begin_command(
+                    &mut io,
+                    &mut (),
+                    &[0; 48],
+                    LoaderCommandCompletion::Response
+                ),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.execute_download(&mut io, &mut (), DownloadCommand::FirmwareLogToHost, 1),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.commit_candidate_command(2),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.poll_events(&mut io, &mut ()),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.reserve_sequence(&mut ()),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.publish_scatter(&mut io, &mut (), FirmwareImagePart::Ram, &[1]),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(
+                engine.publish_reserved_scatter(&mut io, &mut (), FirmwareImagePart::Ram, 1, &[1]),
+                Err(LoaderMechanicsError::CommandPending { slot: 0 })
+            );
+            assert_eq!(engine.sequence(), 1);
+            assert_eq!(io.ops, before);
+
+            let mut moved = engine;
+            if !response_first {
+                io.push_rx(McuRxIrqRing::Wm2, firmware(1, 1, 0));
+            }
+            assert!(matches!(
+                moved.poll_command(&mut io, &mut ()).unwrap(),
+                LoaderCommandProgress::Complete(LoaderCompletion::Response(rx))
+                    if rx.response.sequence == 1
+            ));
+            assert!(moved.deferred_command.is_none());
+            assert!(moved.pending_command.is_none());
+            assert!(!io.ops.contains(&Op::Wait));
+            assert_eq!(
+                io.ops
+                    .iter()
+                    .filter(|op| **op == Op::ReclaimCommand(0))
+                    .count(),
+                1
+            );
+            moved
+                .begin_command(
+                    &mut io,
+                    &mut (),
+                    &[0; 48],
+                    LoaderCommandCompletion::NoResponse,
+                )
+                .unwrap();
+            assert_eq!(moved.sequence(), 2);
+        }
+    }
+
+    #[test]
+    fn deferred_command_publication_failure_retains_a_poisoned_operation() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake {
+            fail_publish_command: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            engine.begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::Response
+            ),
+            Err(LoaderMechanicsError::ContainmentRequired("command publish"))
+        );
+        assert_eq!(engine.pending_command, Some(0));
+        assert!(engine.deferred_command.as_ref().unwrap().failed);
+        let before = io.ops.clone();
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Err(LoaderMechanicsError::CommandFailed)
+        );
+        assert_eq!(io.ops, before);
+    }
+
+    #[test]
+    fn deferred_response_duplicate_across_turns_poisoned_before_reclaim() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake::default();
+        engine
+            .begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::Response,
+            )
+            .unwrap();
+        io.command_didx = VecDeque::from([0, 1]);
+        io.push_rx(McuRxIrqRing::Wm, firmware(1, 1, 0));
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Ok(LoaderCommandProgress::Pending { progressed: true })
+        );
+        io.push_rx(McuRxIrqRing::Wm2, firmware(1, 1, 0));
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Err(LoaderMechanicsError::DuplicateResponse)
+        );
+        assert_eq!(engine.pending_command, Some(0));
+        let before = io.ops.clone();
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Err(LoaderMechanicsError::CommandFailed)
+        );
+        assert_eq!(io.ops, before);
+        assert_eq!(io.command_wipe_bytes, 0);
+    }
+
+    #[test]
+    fn deferred_no_response_still_drains_bounded_unsolicited_work() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake {
+            refill_rx: true,
+            ..Fake::default()
+        };
+        engine
+            .begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::NoResponse,
+            )
+            .unwrap();
+        io.command_didx = VecDeque::from([0, 0]);
+        for ring in [McuRxIrqRing::Wm, McuRxIrqRing::Wm2] {
+            for _ in 0..MT7921_MCU_RX_RING_COUNT {
+                io.push_rx(ring, firmware(0, 0x13, 0));
+            }
+        }
+        for _ in 0..2 {
+            io.ops.clear();
+            assert_eq!(
+                engine.poll_command(&mut io, &mut ()),
+                Ok(LoaderCommandProgress::Pending { progressed: true })
+            );
+            assert_eq!(
+                io.ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::Repost(..)))
+                    .count(),
+                2 * (MT7921_MCU_RX_RING_COUNT - 1)
+            );
+            assert!(!io.ops.contains(&Op::Wait));
+        }
+    }
+
+    #[test]
+    fn deferred_idle_turn_is_not_progress_and_rx_error_survives_tx_reclaim() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake::default();
+        engine
+            .begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::Response,
+            )
+            .unwrap();
+        io.command_didx = VecDeque::from([1]);
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Ok(LoaderCommandProgress::Pending { progressed: true })
+        );
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Ok(LoaderCommandProgress::Pending { progressed: false })
+        );
+        io.push_rx(McuRxIrqRing::Wm, vec![0; 1]);
+        assert!(engine.poll_command(&mut io, &mut ()).is_err());
+        assert!(engine.pending_command.is_none());
+        let before = io.ops.clone();
+        assert_eq!(
+            engine.reserve_sequence(&mut ()),
+            Err(LoaderMechanicsError::CommandPending { slot: 0 })
+        );
+        assert_eq!(
+            engine.publish_scatter(&mut io, &mut (), FirmwareImagePart::Ram, &[1]),
+            Err(LoaderMechanicsError::CommandPending { slot: 0 })
+        );
+        assert_eq!(
+            engine.publish_reserved_scatter(&mut io, &mut (), FirmwareImagePart::Ram, 1, &[1]),
+            Err(LoaderMechanicsError::CommandPending { slot: 0 })
+        );
+        assert_eq!(io.ops, before);
+        assert_eq!(engine.sequence(), 1);
+        assert_eq!(
+            engine.poll_command(&mut io, &mut ()),
+            Err(LoaderMechanicsError::CommandFailed)
+        );
+        assert_eq!(
+            engine.begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::NoResponse
+            ),
+            Err(LoaderMechanicsError::CommandPending { slot: 0 })
+        );
+    }
+
+    #[test]
+    fn deferred_command_cannot_overlap_pending_scatter() {
+        let mut engine = LoaderMechanics::default();
+        let mut io = Fake::default();
+        engine
+            .publish_scatter(&mut io, &mut (), FirmwareImagePart::Ram, &[1])
+            .unwrap();
+        let before = io.ops.clone();
+        assert_eq!(
+            engine.begin_command(
+                &mut io,
+                &mut (),
+                &[0; 48],
+                LoaderCommandCompletion::Response
+            ),
+            Err(LoaderMechanicsError::ScatterPending)
+        );
+        assert_eq!(io.ops, before);
+        assert_eq!(engine.sequence(), 1);
+    }
+
+    #[test]
     fn deferred_publication_and_reclaim_never_wait_and_retain_ownership_on_failure() {
         let mut engine = LoaderMechanics::default();
         let mut io = Fake::default();
-        let sequence = engine.reserve_sequence(&mut ());
+        let sequence = engine.reserve_sequence(&mut ()).unwrap();
         engine
             .publish_reserved_template(
                 &mut io,
