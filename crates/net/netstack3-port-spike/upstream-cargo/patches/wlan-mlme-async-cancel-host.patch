@@ -1,0 +1,18 @@
+--- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
+@@ -132,3 +132,15 @@
+         match req {
++            wlan_sme::MlmeRequest::Deauthenticate(req) if self.sta.is_none() => {
++                // A join can fail before Client is constructed, including when
++                // an async driver continuation is rejected after cancellation.
++                // Acknowledge the absent protocol station; the host must still
++                // establish driver quiescence before admitting another attempt.
++                self.ctx.device.send_mlme_event(fidl_mlme::MlmeEvent::DeauthenticateConf {
++                    resp: fidl_mlme::DeauthenticateConfirm {
++                        peer_sta_address: req.peer_sta_address,
++                    },
++                })?;
++                Ok(())
++            }
+             wlan_sme::MlmeRequest::Scan(req) => {
+                 self.on_sme_scan(req).await;

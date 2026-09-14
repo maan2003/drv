@@ -2164,6 +2164,33 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_without_a_station_acknowledges_without_hardware_effects() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let mut runtime = runtime(fake).await;
+            let before = effects.lock().unwrap().calls.clone();
+            let peer = [2, 0, 0, 0, 0, 2];
+            runtime
+                .mlme
+                .enqueue(MlmeInput::Request(wlan_sme::MlmeRequest::Deauthenticate(
+                    fidl_mlme::DeauthenticateRequest {
+                        peer_sta_address: peer,
+                        reason_code: fidl_ieee80211::ReasonCode::LeavingNetworkDeauth,
+                    },
+                )))
+                .unwrap();
+            drain_mlme(&mut runtime).await;
+            runtime.mlme.check().unwrap();
+            assert!(matches!(
+                runtime.events.try_recv().unwrap(),
+                fidl_mlme::MlmeEvent::DeauthenticateConf { resp } if resp.peer_sta_address == peer
+            ));
+            assert_eq!(effects.lock().unwrap().calls, before);
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn terminal_shutdown_joins_mlme_without_running_queued_downcalls() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);

@@ -56,6 +56,7 @@ let
     "wlan-sme-connect-event-conversion-host.patch"
     "wlan-sme-scan-conversion-host.patch"
     "wlan-mlme-connection-monitor-offload-host.patch"
+    "wlan-mlme-async-cancel-host.patch"
   ];
   patchRows = map (file: {
     name = builtins.baseNameOf file;
