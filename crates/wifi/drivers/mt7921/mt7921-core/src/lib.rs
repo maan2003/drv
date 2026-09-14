@@ -4055,6 +4055,9 @@ pub fn encode_passive_mcu_command(
             payload[160] = scan_band;
             payload[161] = channel.number as u8;
             payload[6] = 1 << 5;
+            // Linux mt76_connac_mcu_hw_scan copies cfg80211's wildcard
+            // BSSID, not the zero-initialized address, for an unfiltered scan.
+            payload[1110..1116].fill(0xff);
             encode_legacy_mcu(0x03, 0, &payload, sequence)
         }
         PassiveMcuCommand::CancelScan { scan_sequence } => {
@@ -15189,6 +15192,11 @@ mod tests {
         assert_eq!(&request[160..162], &[1, 1]);
         assert_eq!(request[224..826].iter().copied().sum::<u8>(), 0);
         assert_eq!(request[826], 0);
+        // Packed Linux mt76_connac_hw_scan_req: 600 IE bytes, two
+        // extension counts, minimum dwell, 32 channels, then six SSIDs.
+        assert!(request[826..1110].iter().all(|byte| *byte == 0));
+        assert_eq!(&request[1110..1116], &[0xff; 6]);
+        assert!(request[1116..].iter().all(|byte| *byte == 0));
         assert_eq!(request[1185], 0);
         assert!(
             !PassiveMcuCommand::StartScan {
