@@ -35,15 +35,7 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
     let device = unsafe {
         ServiceEthernetDevice::from_frame_fd(device_capability.into_frame_fd(), CLIENT_MAC)
     };
-    let mut service = BoundedNetstackProof::new(
-        device,
-        NetstackProofConfig {
-            dns_name: "unused.invalid.".into(),
-            server_port: NonZeroU16::new(80).unwrap(),
-        },
-    )
-    .unwrap();
-    assert!(!service.network_ready());
+    let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let listen = listener.local_addr().unwrap();
@@ -89,7 +81,6 @@ fn offline_service_returns_socks_network_unreachable_and_keeps_serving() {
             5, 4, 0, 1, 0, 0, 0, 0, 0, 0, // host unreachable
         ]
     );
-    assert!(!service.network_ready());
 }
 
 #[test]
@@ -99,14 +90,7 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
     let frame = device_capability.into_frame_fd();
     let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
-    let mut service = BoundedNetstackProof::new(
-        device,
-        NetstackProofConfig {
-            dns_name: "unused.invalid.".into(),
-            server_port: NonZeroU16::new(80).unwrap(),
-        },
-    )
-    .unwrap();
+    let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let listen = listener.local_addr().unwrap();
@@ -166,14 +150,7 @@ fn idle_epoll_waits_for_deadline_without_busy_polling() {
     let frame = device_capability.into_frame_fd();
     let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
-    let mut service = BoundedNetstackProof::new(
-        device,
-        NetstackProofConfig {
-            dns_name: "unused.invalid.".into(),
-            server_port: NonZeroU16::new(80).unwrap(),
-        },
-    )
-    .unwrap();
+    let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let listen = listener.local_addr().unwrap();
@@ -251,14 +228,7 @@ fn revoked_frame_generation_exits_and_replacement_starts() {
         let (capability, driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
         let device =
             unsafe { ServiceEthernetDevice::from_frame_fd(capability.into_frame_fd(), CLIENT_MAC) };
-        let service = BoundedNetstackProof::new(
-            device,
-            NetstackProofConfig {
-                dns_name: "unused.invalid.".into(),
-                server_port: NonZeroU16::new(80).unwrap(),
-            },
-        )
-        .unwrap();
+        let service = Socks5Service::new(device).unwrap();
         (service, driver)
     };
 
@@ -289,7 +259,6 @@ fn revoked_frame_generation_exits_and_replacement_starts() {
             || false,
         )
         .unwrap();
-    assert!(!replacement.network_ready());
 }
 use wlan_softmac_host::ethernet::{
     AssociatedSoftmacTx, DriverEthernetPort, EthernetIngressError, ethernet_port,
@@ -552,14 +521,7 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
     let frame = device_capability.into_frame_fd();
     let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
-    let mut service = BoundedNetstackProof::new(
-        device,
-        NetstackProofConfig {
-            dns_name: "unused.invalid.".into(),
-            server_port: NonZeroU16::new(8080).unwrap(),
-        },
-    )
-    .unwrap();
+    let mut service = Socks5Service::new(device).unwrap();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
     let (request_tx, request_rx) = std::sync::mpsc::channel();
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -617,9 +579,10 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
         }
     });
     ready_rx.recv().unwrap();
-    service
-        .prove_dhcp(std::time::Instant::now() + Duration::from_secs(1))
-        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while service.runner.stack().status() != DhcpStatus::Bound {
+        service.drive(Some(deadline)).unwrap();
+    }
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

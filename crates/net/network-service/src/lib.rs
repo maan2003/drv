@@ -30,7 +30,7 @@ mod ethernet_device;
 mod lifecycle;
 mod supervisor;
 
-pub use child::{run, run_lab};
+pub use child::run;
 use ethernet_device::ServiceEthernetDevice;
 pub use lifecycle::{WifiLifecycleReceiver, WifiLifecycleUpdate};
 pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor};
@@ -40,22 +40,13 @@ pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;
 #[cfg(test)]
 mod integration_test;
 
-#[derive(Clone)]
-pub struct NetstackProofConfig {
-    pub dns_name: String,
-    pub server_port: NonZeroU16,
-}
-
 /// The existing Netstack3 DHCP/DNS/socket stack wired to the SoftMAC Ethernet
-/// port. This is a bounded driver, not a DHCP, DNS, or TCP implementation.
-struct BoundedNetstackProof {
+/// port with a SOCKS frontend; protocol behavior stays in Netstack3.
+struct Socks5Service {
     runner: EthernetRunner<DhcpService, ServiceEthernetDevice>,
     poller: NetworkPoller,
-    config: NetstackProofConfig,
     now: Duration,
     anchor: Option<std::time::Instant>,
-    resolved: Option<[u8; 4]>,
-    socket: Option<TcpSocket>,
     admission_capacity: usize,
     frame_events: u32,
 }
@@ -363,10 +354,10 @@ impl Socks5Client {
             stream,
             peer,
             phase: Socks5Phase::Greeting(Vec::new()),
+            socket: None,
             host_out: VecDeque::new(),
             host_to_remote: VecDeque::new(),
             remote_to_host: VecDeque::new(),
-            socket: None,
             idle_deadline: std::time::Instant::now() + Duration::from_secs(30),
             registered_events: CLIENT_BASE_EVENTS | libc::EPOLLIN as u32,
             peer_half_closed: false,
@@ -400,7 +391,7 @@ impl Socks5Client {
     }
 }
 
-impl BoundedNetstackProof {
+impl Socks5Service {
     #[cfg(test)]
     fn poller_fd(&self) -> RawFd {
         self.poller.raw_fd()
@@ -412,13 +403,9 @@ impl BoundedNetstackProof {
     }
 
     #[cfg(test)]
-    fn new(
-        device: ServiceEthernetDevice,
-        config: NetstackProofConfig,
-    ) -> Result<Self, &'static str> {
+    fn new(device: ServiceEthernetDevice) -> Result<Self, &'static str> {
         Self::new_with_poller(
             device,
-            config,
             NetworkPoller::new()?,
             Socks5ResourceBudget::from_process_limit()?,
         )
@@ -426,7 +413,6 @@ impl BoundedNetstackProof {
 
     fn new_with_poller(
         device: ServiceEthernetDevice,
-        config: NetstackProofConfig,
         poller: NetworkPoller,
         resources: Socks5ResourceBudget,
     ) -> Result<Self, &'static str> {
@@ -455,21 +441,18 @@ impl BoundedNetstackProof {
             ),
             device,
         );
-        let proof = Self {
+        let service = Self {
             runner,
             poller,
-            config,
             now: Duration::ZERO,
             anchor: None,
-            resolved: None,
-            socket: None,
             admission_capacity: resources.admission_capacity,
             frame_events: BASE_EVENTS | libc::EPOLLIN as u32,
         };
-        proof
+        service
             .poller
             .add(frame_fd, FRAME_TOKEN, BASE_EVENTS | libc::EPOLLIN as u32)?;
-        Ok(proof)
+        Ok(service)
     }
 
     fn drive_once(&mut self, deadline: Option<Instant>) -> Result<(bool, bool), &'static str> {
@@ -484,8 +467,6 @@ impl BoundedNetstackProof {
             };
             if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
                 self.runner.discard_pending();
-                self.resolved = None;
-                self.socket = None;
                 return Err("Ethernet frame seam closed");
             }
             self.runner.stack_mut().on_device_event(event);
@@ -509,8 +490,6 @@ impl BoundedNetstackProof {
             };
             if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
                 self.runner.discard_pending();
-                self.resolved = None;
-                self.socket = None;
                 return Err("Ethernet frame seam closed");
             }
             self.runner.stack_mut().on_device_event(event);
@@ -568,64 +547,6 @@ impl BoundedNetstackProof {
         }
         let _ = self.drive_once(deadline)?;
         Ok(())
-    }
-
-    pub fn prove_dhcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
-        while self.runner.stack().status() != DhcpStatus::Bound {
-            self.drive(Some(deadline))?;
-        }
-        Ok(())
-    }
-
-    pub fn prove_dns(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
-        if self.runner.stack().status() != DhcpStatus::Bound {
-            return Err("DNS requires DHCP");
-        }
-        let lookup = self
-            .runner
-            .stack_mut()
-            .lookup_ip(self.config.dns_name.clone())
-            .map_err(|_| "DNS start failed")?;
-        loop {
-            self.drive(Some(deadline))?;
-            if let Some(result) = self.runner.stack_mut().take_lookup(lookup) {
-                let addresses = result.map_err(|_| "DNS lookup failed")?;
-                self.resolved = addresses.into_iter().find_map(|address| match address {
-                    IpAddr::V4(v4) => Some(v4.octets()),
-                    _ => None,
-                });
-                return self
-                    .resolved
-                    .map(|_| ())
-                    .ok_or("DNS returned no IPv4 address");
-            }
-        }
-    }
-
-    pub fn prove_tcp(&mut self, deadline: std::time::Instant) -> Result<(), &'static str> {
-        let address = self.resolved.ok_or("TCP requires DNS")?;
-        let mut socket = self.runner.stack().sockets().tcp(IpVersion::V4)
-            .map_err(|_| "TCP socket failed")?;
-        socket.connect(NativeSocketAddress {
-            address: NativeIpAddress::V4(address), port: self.config.server_port.get(),
-        }).map_err(|_| "TCP connect failed")?;
-        loop {
-            self.drive(Some(deadline))?;
-            match socket.connection().map_err(|_| "TCP state failed")? {
-                Connection::Finished(Ok(_)) => { self.socket = Some(socket); return Ok(()); }
-                Connection::Finished(Err(_)) => return Err("TCP connect failed"),
-                _ => {}
-            }
-        }
-    }
-
-    /// True only after the bounded product-readiness proof has completed.
-    /// HTTP is deliberately not part of product readiness: it is an optional
-    /// lab assertion over an already-proven TCP path.
-    pub fn network_ready(&self) -> bool {
-        self.runner.stack().status() == DhcpStatus::Bound
-            && self.resolved.is_some()
-            && self.socket.is_some()
     }
 
     pub fn serve_socks5_listener<F>(

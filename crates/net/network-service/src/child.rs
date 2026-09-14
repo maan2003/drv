@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use crate::{BoundedNetstackProof, NetstackProofConfig, NetworkPoller, ServiceEthernetDevice};
+use crate::{Socks5Service, NetworkPoller, ServiceEthernetDevice};
 use std::env;
 use std::ffi::{c_char, c_void};
 use std::net::{SocketAddr, TcpListener};
-use std::num::NonZeroU16;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 const FRAME_FD: i32 = 3;
@@ -498,16 +498,6 @@ fn read_exact_fd(fd: i32, mut bytes: &mut [u8], operation: &'static str) -> Resu
 /// Starts the production service without gating availability on external
 /// reachability and without imposing a lab lifetime.
 pub fn run() -> Result<(), String> {
-    run_inner(false)
-}
-
-/// Preserves the bounded physical-lab startup proof and bootstrap protocol.
-pub fn run_lab() -> Result<(), String> {
-    run_inner(true)
-}
-
-fn run_inner(lab_proof: bool) -> Result<(), String> {
-    let sandbox_only = env::var_os("DRV_NETSTACK_SANDBOX_SELF_TEST").is_some();
     let expected_parent = env::var("DRV_NETSTACK_PARENT_PID")
         .map_err(|_| "missing expected parent PID")?
         .parse::<i32>()
@@ -524,14 +514,6 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
         .map_err(|_| "missing listen address")?
         .parse()
         .map_err(|_| "invalid listen address")?;
-    let seconds = lab_proof
-        .then(|| {
-            env::var("DRV_DAEMON_MAX_SECONDS")
-                .map_err(|_| "missing daemon deadline")?
-                .parse::<u64>()
-                .map_err(|_| "invalid daemon deadline")
-        })
-        .transpose()?;
     let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
     let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
     setup(expected_parent, 6)?;
@@ -557,61 +539,20 @@ fn run_inner(lab_proof: bool) -> Result<(), String> {
     if &go != b"GO" {
         return Err("invalid bootstrap GO".into());
     }
-    if sandbox_only {
-        unsafe {
-            close(5);
-        }
-        println!("netstack_sandbox_self_test=true");
-        return Ok(());
-    }
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, mac) };
-    let mut proof = BoundedNetstackProof::new_with_poller(
+    let mut service = Socks5Service::new_with_poller(
         device,
-        NetstackProofConfig {
-            dns_name: "example.com.".into(),
-            server_port: NonZeroU16::new(80).unwrap(),
-        },
         poller,
         resources,
     )
     .map_err(str::to_string)?;
-    if !lab_proof {
-        write_all_fd(5, b"STARTED", "bootstrap STARTED failed")?;
-        unsafe {
-            close(5);
-        }
-        println!("network_service_ready=true reachability=acquiring");
-        return proof
-            .serve_socks5_listener(listener, listen, None, || false)
-            .map_err(str::to_string);
-    }
-    let initial_deadline = Instant::now() + Duration::from_secs(45);
-    proof.prove_dhcp(initial_deadline).map_err(str::to_string)?;
-    println!("internet_proof_dhcp=true");
-    proof.prove_dns(initial_deadline).map_err(str::to_string)?;
-    println!("internet_proof_dns=true");
-    proof.prove_tcp(initial_deadline).map_err(str::to_string)?;
-    println!("internet_proof_tcp=true");
-    if !proof.network_ready() {
-        return Err("network readiness proof incomplete".into());
-    }
-    write_all_fd(5, b"NETWORK_READY", "network-ready signal failed")?;
-    let mut serve = [0u8; 5];
-    read_exact_fd(5, &mut serve, "listener activation acknowledgment failed")?;
-    if &serve != b"SERVE" {
-        return Err("invalid listener activation acknowledgment".into());
-    }
+    write_all_fd(5, b"STARTED", "bootstrap STARTED failed")?;
     unsafe {
         close(5);
     }
-    println!("internet_network_ready=true");
-    proof
-        .serve_socks5_listener(
-            listener,
-            listen,
-            Some(Instant::now() + Duration::from_secs(seconds.expect("lab deadline was parsed"))),
-            || false,
-        )
+    println!("network_service_ready=true reachability=acquiring");
+    service
+        .serve_socks5_listener(listener, listen, None, || false)
         .map_err(str::to_string)
 }
 
@@ -812,12 +753,8 @@ mod tests {
         let frame = unsafe { OwnedFd::from_raw_fd(FRAME_FD) };
         let listener = unsafe { TcpListener::from_raw_fd(LISTENER_FD) };
         let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };
-        let mut service = match BoundedNetstackProof::new_with_poller(
+        let mut service = match Socks5Service::new_with_poller(
             device,
-            NetstackProofConfig {
-                dns_name: "unused.invalid.".into(),
-                server_port: NonZeroU16::new(80).unwrap(),
-            },
             poller,
             resources,
         ) {
@@ -873,12 +810,8 @@ mod tests {
         crate::bound_listener_socket_memory(&listener).unwrap();
         let listen = listener.local_addr().unwrap();
         let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, [2, 0, 0, 0, 0, 1]) };
-        let mut service = BoundedNetstackProof::new_with_poller(
+        let mut service = Socks5Service::new_with_poller(
             device,
-            NetstackProofConfig {
-                dns_name: "unused.invalid.".into(),
-                server_port: NonZeroU16::new(80).unwrap(),
-            },
             poller,
             resources,
         )
