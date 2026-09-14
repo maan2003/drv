@@ -2535,6 +2535,10 @@ where
 }
 
 pub const MT7921_TX_RING_SLOTS: usize = 18;
+/// Pinned Linux mt7921.h: MT7921_TX_RING_SIZE for band 0.
+pub const MT7921_BAND0_TX_RING_COUNT: u32 = 2048;
+pub const MT7921_BAND0_TX_RING_BYTES: usize =
+    MT7921_BAND0_TX_RING_COUNT as usize * DMA_DESCRIPTOR_LEN;
 pub const MT7921_FWDL_RING_INDEX: usize = 16;
 pub const MT7921_MCU_TX_RING_INDEX: usize = 17;
 pub const MT7921_MCU_TX_RING_COUNT: u32 = 256;
@@ -2910,7 +2914,7 @@ pub enum GlobalTxRingError<E> {
 ///
 /// TX DMA remains disabled throughout this transition. All eighteen hardware
 /// ring slots are inspected, must be idle, and are then pointed either at the
-/// target firmware ring or a page-sized guard ring. Linux's all-ring DTX reset
+/// band-0/firmware ring or a page-sized guard ring. Linux's all-ring DTX reset
 /// is issued only after every base/count/CPU index is safe, then every DIDX is
 /// required to read zero. Old kernel DMA bases are deliberately not restored.
 pub fn prepare_global_tx_rings<T, F>(
@@ -2918,32 +2922,29 @@ pub fn prepare_global_tx_rings<T, F>(
     guard_iova: u64,
     fwdl_iova: u64,
     mcu_iova: u64,
+    band0_iova: u64,
     mut event: F,
 ) -> Result<[TxRingState; MT7921_TX_RING_SLOTS], GlobalTxRingError<T::Error>>
 where
     T: GlobalTxRingTransport,
     F: FnMut(GlobalTxRingEvent),
 {
-    let page_end = |iova: u64| {
-        iova.is_multiple_of(4096)
-            .then(|| iova.checked_add(4095))
-            .flatten()
-            .filter(|end| *end <= u64::from(u32::MAX))
-    };
-    let Some(guard_end) = page_end(guard_iova) else {
-        return Err(GlobalTxRingError::InvalidArena);
-    };
-    let Some(fwdl_end) = page_end(fwdl_iova) else {
-        return Err(GlobalTxRingError::InvalidArena);
-    };
-    let Some(mcu_end) = page_end(mcu_iova) else {
-        return Err(GlobalTxRingError::InvalidArena);
-    };
-    if (guard_iova <= fwdl_end && fwdl_iova <= guard_end)
-        || (guard_iova <= mcu_end && mcu_iova <= guard_end)
-        || (fwdl_iova <= mcu_end && mcu_iova <= fwdl_end)
-    {
-        return Err(GlobalTxRingError::InvalidArena);
+    let arenas = [
+        (guard_iova, 4096u64),
+        (fwdl_iova, 4096),
+        (mcu_iova, 4096),
+        (band0_iova, MT7921_BAND0_TX_RING_BYTES as u64),
+    ];
+    for (index, &(base, bytes)) in arenas.iter().enumerate() {
+        let end = base.checked_add(bytes - 1);
+        if !base.is_multiple_of(4096) || end.is_none_or(|end| end > u64::from(u32::MAX)) {
+            return Err(GlobalTxRingError::InvalidArena);
+        }
+        for &(other, other_bytes) in &arenas[..index] {
+            if base <= other + other_bytes - 1 && other <= end.unwrap() {
+                return Err(GlobalTxRingError::InvalidArena);
+            }
+        }
     }
     let global_config = transport
         .read_global_config()
@@ -2980,14 +2981,18 @@ where
         }
     }
     for index in 0..MT7921_TX_RING_SLOTS {
-        let descriptor_base = if index == MT7921_FWDL_RING_INDEX {
+        let descriptor_base = if index == 0 {
+            band0_iova as u32
+        } else if index == MT7921_FWDL_RING_INDEX {
             fwdl_iova as u32
         } else if index == MT7921_MCU_TX_RING_INDEX {
             mcu_iova as u32
         } else {
             guard_iova as u32
         };
-        let descriptor_count = if index == MT7921_MCU_TX_RING_INDEX {
+        let descriptor_count = if index == 0 {
+            MT7921_BAND0_TX_RING_COUNT
+        } else if index == MT7921_MCU_TX_RING_INDEX {
             MT7921_MCU_TX_RING_COUNT
         } else {
             MT7921_FWDL_RING_COUNT
@@ -3014,14 +3019,18 @@ where
         *state = transport
             .read_tx_ring(index)
             .map_err(GlobalTxRingError::Transport)?;
-        let expected_base = if index == MT7921_FWDL_RING_INDEX {
+        let expected_base = if index == 0 {
+            band0_iova as u32
+        } else if index == MT7921_FWDL_RING_INDEX {
             fwdl_iova as u32
         } else if index == MT7921_MCU_TX_RING_INDEX {
             mcu_iova as u32
         } else {
             guard_iova as u32
         };
-        let expected_count = if index == MT7921_MCU_TX_RING_INDEX {
+        let expected_count = if index == 0 {
+            MT7921_BAND0_TX_RING_COUNT
+        } else if index == MT7921_MCU_TX_RING_INDEX {
             MT7921_MCU_TX_RING_COUNT
         } else {
             MT7921_FWDL_RING_COUNT
@@ -4748,10 +4757,13 @@ fn loader_command<T: FirmwareLoaderTransport>(
 fn next_loader_sequence<T: FirmwareLoaderTransport>(
     transport: &mut T,
 ) -> Result<u8, FirmwareLoaderFailure<T::Error>> {
-    let sequence = transport.next_sequence().map_err(|source| FirmwareLoaderFailure::Transport {
-        operation: FirmwareLoaderOperation::ReserveSequence,
-        source,
-    })?;
+    let sequence =
+        transport
+            .next_sequence()
+            .map_err(|source| FirmwareLoaderFailure::Transport {
+                operation: FirmwareLoaderOperation::ReserveSequence,
+                source,
+            })?;
     if sequence == 0 || sequence > 15 {
         Err(FirmwareLoaderFailure::Command(
             DownloadCommandError::InvalidSequence,
@@ -14378,6 +14390,7 @@ mod tests {
             0x0100_0000,
             0x0100_1000,
             0x0100_2000,
+            0x0100_8000,
             |event| events.push(event),
         )
         .unwrap();
@@ -14386,7 +14399,9 @@ mod tests {
         for (index, state) in owned.into_iter().enumerate() {
             assert_eq!(
                 state.descriptor_base,
-                if index == MT7921_FWDL_RING_INDEX {
+                if index == 0 {
+                    0x0100_8000
+                } else if index == MT7921_FWDL_RING_INDEX {
                     0x0100_1000
                 } else if index == MT7921_MCU_TX_RING_INDEX {
                     0x0100_2000
@@ -14396,7 +14411,9 @@ mod tests {
             );
             assert_eq!(
                 state.descriptor_count,
-                if index == MT7921_MCU_TX_RING_INDEX {
+                if index == 0 {
+                    MT7921_BAND0_TX_RING_COUNT
+                } else if index == MT7921_MCU_TX_RING_INDEX {
                     MT7921_MCU_TX_RING_COUNT
                 } else {
                     MT7921_FWDL_RING_COUNT
@@ -14416,17 +14433,56 @@ mod tests {
         let mut dirty = FakeGlobalTx::new();
         dirty.rings[7].cpu_index += 1;
         assert!(matches!(
-            prepare_global_tx_rings(&mut dirty, 0x0100_0000, 0x0100_1000, 0x0100_2000, |_| {}),
+            prepare_global_tx_rings(
+                &mut dirty,
+                0x0100_0000,
+                0x0100_1000,
+                0x0100_2000,
+                0x0100_8000,
+                |_| {}
+            ),
             Err(GlobalTxRingError::DirtyRing { index: 7, .. })
         ));
         assert!(dirty.writes.is_empty());
 
         let mut overlap = FakeGlobalTx::new();
         assert_eq!(
-            prepare_global_tx_rings(&mut overlap, 0x0100_0000, 0x0100_0000, 0x0100_2000, |_| {}),
+            prepare_global_tx_rings(
+                &mut overlap,
+                0x0100_0000,
+                0x0100_0000,
+                0x0100_2000,
+                0x0100_8000,
+                |_| {}
+            ),
             Err(GlobalTxRingError::InvalidArena)
         );
         assert!(overlap.writes.is_empty());
+    }
+
+    #[test]
+    fn global_tx_preparation_validates_entire_band0_extent_before_mmio() {
+        for (guard, band0) in [
+            (0x0100_7000, 0x0100_0000), // Last page overlaps the guard.
+            (0x0100_0000, 0xffff_9000), // Ring crosses the 32-bit DMA limit.
+            (0x0100_0000, 0x0100_8001), // Unaligned base.
+            (0x0100_0000, u64::MAX - 4095),
+        ] {
+            let mut transport = FakeGlobalTx::new();
+            assert_eq!(
+                prepare_global_tx_rings(
+                    &mut transport,
+                    guard,
+                    0x0200_0000,
+                    0x0300_0000,
+                    band0,
+                    |_| {}
+                ),
+                Err(GlobalTxRingError::InvalidArena)
+            );
+            assert!(transport.writes.is_empty());
+            assert!(transport.resets.is_empty());
+        }
     }
 
     #[test]

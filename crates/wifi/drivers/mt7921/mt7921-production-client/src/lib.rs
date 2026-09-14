@@ -513,7 +513,11 @@ impl<B: Backend> OwnedHardwareResources<B> {
             ),
             management_txwi: dma!(ManagementTxwi, ToDevice, PAGE),
             management_frame: dma!(ManagementFrame, ToDevice, PAGE),
-            management_tx_ring: dma!(ManagementTxRing, Bidirectional, PAGE),
+            management_tx_ring: dma!(
+                ManagementTxRing,
+                Bidirectional,
+                mt7921_core::MT7921_BAND0_TX_RING_BYTES
+            ),
         };
         Ok((
             Self {

@@ -528,11 +528,19 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
             .device_address(0)
             .map_err(|e| format!("WM2 ring: {e:?}"))?
             .bits() as u32;
+        let band0 = self
+            .resources
+            .dma
+            .management_tx_ring
+            .device_address(0)
+            .map_err(|e| format!("band0 TX ring: {e:?}"))?
+            .bits();
         prepare_global_tx_rings(
             &mut TxIo(self.region(0xd4000)?),
             tx_guard,
             fwdl,
             mcu_tx,
+            band0,
             |_| {},
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -597,7 +605,16 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
             (0x2f0, 0),
             (0x680, 4),
             (0x688, 0x0040_0004),
+            (0x68c, 0x0080_0004),
             (0x690, 0x00c0_0004),
+            (0x694, 0x0100_0004),
+            (0x600, 0x0140_0004),
+            (0x604, 0x0180_0004),
+            (0x608, 0x01c0_0004),
+            (0x60c, 0x0200_0004),
+            (0x610, 0x0240_0004),
+            (0x614, 0x0280_0004),
+            (0x618, 0x02c0_0004),
             (0x640, 0x0340_0004),
             (0x644, 0x0380_0004),
         ] {
@@ -927,6 +944,45 @@ mod tests {
                 )
             })
             .unwrap();
+        let band0_base = resources
+            .dma
+            .management_tx_ring
+            .device_address(0)
+            .unwrap()
+            .bits() as u32;
+        assert_eq!(
+            resources.dma.management_tx_ring.len(),
+            mt7921_core::MT7921_BAND0_TX_RING_BYTES
+        );
+        for (offset, expected) in [
+            (0xd4300, band0_base),
+            (0xd4304, mt7921_core::MT7921_BAND0_TX_RING_COUNT),
+            (0xd4308, 0),
+            (0xd4600, 0x0140_0004),
+            (0xd468c, 0x0080_0004),
+            (0xd4694, 0x0100_0004),
+        ] {
+            let write = operations
+                .iter()
+                .position(|op| {
+                    matches!(op,
+                        drv_hardware_backends::Operation::WriteU32 { offset: actual, value, .. }
+                            if *actual == offset && *value == expected
+                    )
+                })
+                .unwrap();
+            assert!(host_mask < write && write < dma_enable);
+        }
+        let mut last_descriptor = [0; DMA_DESCRIPTOR_LEN];
+        resources
+            .dma
+            .management_tx_ring
+            .read(
+                mt7921_core::MT7921_BAND0_TX_RING_BYTES - DMA_DESCRIPTOR_LEN,
+                &mut last_descriptor,
+            )
+            .unwrap();
+        assert_eq!(last_descriptor, DmaDescriptor::reset().to_le_bytes());
         let data_base = resources.dma.data_rx_ring.device_address(0).unwrap().bits() as u32;
         for (offset, expected) in [
             (0xd4520, data_base),
