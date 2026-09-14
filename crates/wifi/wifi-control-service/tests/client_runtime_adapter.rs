@@ -62,6 +62,13 @@ impl ClientRuntimeDriver for FakeSoftmac {
     fn reset(&mut self) -> Result<(), zx::Status> {
         self.stop()
     }
+
+    fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
+        // All fake completions are synchronous; queued RX is the only
+        // remaining source of callbacks from the preceding association.
+        self.0.lock().unwrap().pending_rx.clear();
+        Ok(())
+    }
 }
 
 impl WlanSoftmac for FakeSoftmac {
