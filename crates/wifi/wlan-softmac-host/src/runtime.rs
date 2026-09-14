@@ -495,6 +495,13 @@ pub enum ConnectError {
     Containment,
 }
 
+/// Terminal cleanup evidence; queue admission is not a successful disconnect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisconnectOutcome {
+    Disconnected,
+    ConnectCanceled(fidl_sme::ConnectResult),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DriverError {
     MlmeRequest {
@@ -1496,9 +1503,113 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         Ok(deadline)
     }
 
-    /// Request a policy-owned disconnect and drive the pinned SME/MLME until
-    /// it reaches Idle and the driver certifies drain. The reply is the
-    /// terminal acknowledgment; no second disconnect event is emitted.
+    /// Admit cleanup once. The owner retains its original deadline and
+    /// transaction evidence while the service continues accepting commands.
+    pub fn begin_disconnect(
+        &mut self,
+        reason: fidl_sme::UserDisconnectReason,
+        deadline: std::time::Instant,
+    ) -> Result<(), ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        if self.connect_attempt.is_none()
+            && self.connection.is_none()
+            && self.cleanup.is_none()
+            && sme_is_retry_quiescent(&self.sme.status())
+            && self.mlme.is_idle()
+        {
+            return Ok(());
+        }
+        self.begin_cleanup(reason, deadline)?;
+        Ok(())
+    }
+
+    /// One bounded actor turn. Pending cleanup never borrows the runtime
+    /// across a hardware completion wait.
+    pub async fn drive_disconnect_once(
+        &mut self,
+    ) -> Result<Option<DisconnectOutcome>, ConnectError> {
+        if self.revoked {
+            return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        match self.drive_disconnect_once_inner().await {
+            Err(error) if !self.revoked => Err(self.contain_error(error)),
+            result => result,
+        }
+    }
+
+    async fn drive_disconnect_once_inner(
+        &mut self,
+    ) -> Result<Option<DisconnectOutcome>, ConnectError> {
+        let Some(cleanup) = &self.cleanup else {
+            return Ok(Some(DisconnectOutcome::Disconnected));
+        };
+        if std::time::Instant::now() >= cleanup.deadline {
+            return Err(ConnectError::Timeout);
+        }
+        self.pump_once().await?;
+        if let Some(attempt) = self.connect_attempt.as_mut() {
+            let mut drained = false;
+            for _ in 0..64 {
+                match attempt.transaction.try_recv() {
+                    Ok(
+                        event @ wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
+                            ..
+                        },
+                    ) => {
+                        self.cleanup.as_mut().unwrap().terminal = Some(event.into_fidl());
+                    }
+                    Ok(_) => {}
+                    Err(mpsc::TryRecvError::Empty) => {
+                        drained = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Closed) => {
+                        self.cleanup.as_mut().unwrap().transaction_closed = true;
+                        drained = true;
+                        break;
+                    }
+                }
+            }
+            let cleanup = self.cleanup.as_ref().unwrap();
+            if !drained || (cleanup.terminal.is_none() && !cleanup.transaction_closed) {
+                return Ok(None);
+            }
+        }
+        if !sme_is_retry_quiescent(&self.sme.status()) || !self.mlme.is_idle() {
+            return Ok(None);
+        }
+        let outcome = if self.connect_attempt.is_some() {
+            let terminal = self.cleanup.as_mut().unwrap().terminal.take().unwrap_or(
+                fidl_sme::ConnectTransactionEvent::OnConnectResult {
+                    result: fidl_sme::ConnectResult {
+                        code: fidl_ieee80211::StatusCode::Canceled,
+                        is_credential_rejected: false,
+                        is_reconnect: false,
+                    },
+                },
+            );
+            let fidl_sme::ConnectTransactionEvent::OnConnectResult { result } = terminal else {
+                unreachable!("only connect results are retained as terminal")
+            };
+            DisconnectOutcome::ConnectCanceled(result)
+        } else {
+            DisconnectOutcome::Disconnected
+        };
+        if !self.finish_failed_attempt_cleanup() {
+            return Err(ConnectError::Driver(DriverError::RetryCleanup));
+        }
+        if matches!(outcome, DisconnectOutcome::ConnectCanceled(_)) {
+            self.connect_attempt = None;
+            self.scan_attempt = None;
+        }
+        // Preserve already-retained events, but do not emit a second terminal
+        // event from the explicit disconnect's completed transaction.
+        self.connection = None;
+        Ok(Some(outcome))
+    }
+
     pub async fn disconnect(
         &mut self,
         reason: fidl_sme::UserDisconnectReason,
@@ -1510,44 +1621,15 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.connect_attempt.is_some() {
             return Err(ConnectError::Driver(DriverError::ConnectInProgress));
         }
-        if self.connection.is_none()
-            && self.cleanup.is_none()
-            && sme_is_retry_quiescent(&self.sme.status())
-            && self.mlme.is_idle()
-        {
-            return Ok(());
-        }
-        let deadline = self.begin_cleanup(reason, deadline)?;
-        let result = loop {
-            if std::time::Instant::now() >= deadline {
-                break Err(ConnectError::Timeout);
+        self.begin_disconnect(reason, deadline)?;
+        loop {
+            if self.drive_disconnect_once().await?.is_some() {
+                return Ok(());
             }
-            let progressed = match self.pump_once().await {
-                Ok(progressed) => progressed,
-                Err(error) => break Err(error),
-            };
-            if sme_is_retry_quiescent(&self.sme.status()) && self.mlme.is_idle() {
-                break Ok(());
-            }
-            if !progressed {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        };
-        match result {
-            Ok(()) if self.finish_failed_attempt_cleanup() => {
-                self.connection = None;
-                Ok(())
-            }
-            Ok(()) => Err(self.contain_error(ConnectError::Driver(DriverError::RetryCleanup))),
-            Err(error) if !self.revoked => Err(self.contain_error(error)),
-            Err(error) => Err(error),
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
-    /// Cancel an in-flight connect without dropping its transaction. Success
-    /// is acknowledged only after SME Idle and either its terminal result or
-    /// the transaction closure used by SME for command cancellation are
-    /// observed; ambiguous termination is contained.
     pub async fn cancel_connect(
         &mut self,
         reason: fidl_sme::UserDisconnectReason,
@@ -1559,79 +1641,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.connect_attempt.is_none() {
             return Err(ConnectError::Driver(DriverError::NoConnectInProgress));
         }
-        let deadline = self.begin_cleanup(reason, deadline)?;
-        let result = loop {
-            if std::time::Instant::now() >= deadline {
-                break Err(ConnectError::Timeout);
+        self.begin_disconnect(reason, deadline)?;
+        loop {
+            if let Some(outcome) = self.drive_disconnect_once().await? {
+                let DisconnectOutcome::ConnectCanceled(result) = outcome else {
+                    unreachable!("connect attempt retained until cleanup")
+                };
+                return Ok(result);
             }
-            let progressed = match self.pump_once().await {
-                Ok(progressed) => progressed,
-                Err(error) => break Err(error),
-            };
-            loop {
-                let event = self
-                    .connect_attempt
-                    .as_mut()
-                    .expect("connect attempt checked above")
-                    .transaction
-                    .try_recv();
-                match event {
-                    Ok(wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
-                        result,
-                        is_reconnect,
-                    }) => {
-                        self.cleanup.as_mut().unwrap().terminal = Some(
-                            wlan_sme::client::ConnectTransactionEvent::OnConnectResult {
-                                result,
-                                is_reconnect,
-                            }
-                            .into_fidl(),
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Closed) => {
-                        self.cleanup.as_mut().unwrap().transaction_closed = true;
-                        break;
-                    }
-                }
-            }
-            let cleanup = self.cleanup.as_ref().unwrap();
-            if (cleanup.terminal.is_some() || cleanup.transaction_closed)
-                && sme_is_retry_quiescent(&self.sme.status())
-                && self.mlme.is_idle()
-            {
-                break Ok(());
-            }
-            if !progressed {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        };
-        if let Err(error) = result {
-            return Err(if self.revoked {
-                error
-            } else {
-                self.contain_error(error)
-            });
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        self.connect_attempt = None;
-        self.scan_attempt = None;
-        self.io.lock().unwrap().ethernet.set_link(false);
-        let terminal = self.cleanup.as_mut().unwrap().terminal.take();
-        if !self.finish_failed_attempt_cleanup() {
-            return Err(self.contain_error(ConnectError::Driver(DriverError::RetryCleanup)));
-        }
-        let terminal = terminal.unwrap_or(fidl_sme::ConnectTransactionEvent::OnConnectResult {
-            result: fidl_sme::ConnectResult {
-                code: fidl_ieee80211::StatusCode::Canceled,
-                is_credential_rejected: false,
-                is_reconnect: false,
-            },
-        });
-        let fidl_sme::ConnectTransactionEvent::OnConnectResult { result } = terminal else {
-            unreachable!("only connect results are retained as terminal")
-        };
-        Ok(result)
     }
 
     async fn drive_connect_once_inner(
@@ -1752,6 +1771,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     }
 
     fn drain_connection_events(&mut self) -> Result<(), ConnectError> {
+        // Cleanup owns the old transaction until certification. Polling its
+        // explicit OnDisconnect here would revoke the cleanup epoch itself.
+        // Events retained before cleanup remain available to the service.
+        if self.cleanup.is_some() {
+            return Ok(());
+        }
         loop {
             if self.connection_events.len() >= 64 {
                 return Err(self.contain_error(ConnectError::Driver(DriverError::UpcallOverflow)));

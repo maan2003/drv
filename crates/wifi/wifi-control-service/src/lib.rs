@@ -20,6 +20,8 @@ use wlan_control_wire::{
     SessionValidator, decode, encode, required_fd_count,
 };
 
+pub use wlan_softmac_host::runtime::DisconnectOutcome;
+
 pub const MAX_OUTBOUND_PACKETS: usize = 64;
 pub const MAX_OUTBOUND_BYTES: usize = 64 * 1024;
 const NORMAL_PACKET_LIMIT: usize = MAX_OUTBOUND_PACKETS - 1;
@@ -51,11 +53,6 @@ pub trait WifiRuntime {
         deadline: Instant,
     ) -> Result<(), RuntimeError>;
     async fn drive_connect_once(&mut self) -> Result<Option<sme::ConnectResult>, RuntimeError>;
-    async fn cancel_connect(
-        &mut self,
-        reason: sme::UserDisconnectReason,
-        deadline: Instant,
-    ) -> Result<sme::ConnectResult, RuntimeError>;
     fn roam(&mut self, request: sme::RoamRequest) -> Result<(), RuntimeError>;
     async fn begin_scan(
         &mut self,
@@ -69,11 +66,12 @@ pub trait WifiRuntime {
     fn next_connection_event(
         &mut self,
     ) -> Result<Option<sme::ConnectTransactionEvent>, RuntimeError>;
-    async fn disconnect(
+    fn begin_disconnect(
         &mut self,
         reason: sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Result<(), RuntimeError>;
+    async fn drive_disconnect_once(&mut self) -> Result<Option<DisconnectOutcome>, RuntimeError>;
 }
 
 fn host_runtime_error(error: wlan_softmac_host::runtime::ConnectError) -> RuntimeError {
@@ -117,16 +115,6 @@ where
         self.drive_connect_once().await.map_err(host_runtime_error)
     }
 
-    async fn cancel_connect(
-        &mut self,
-        reason: sme::UserDisconnectReason,
-        deadline: Instant,
-    ) -> Result<sme::ConnectResult, RuntimeError> {
-        self.cancel_connect(reason, deadline)
-            .await
-            .map_err(host_runtime_error)
-    }
-
     fn roam(&mut self, request: sme::RoamRequest) -> Result<(), RuntimeError> {
         self.roam(request).map_err(host_runtime_error)
     }
@@ -157,12 +145,16 @@ where
         self.next_connection_event().map_err(host_runtime_error)
     }
 
-    async fn disconnect(
+    fn begin_disconnect(
         &mut self,
         reason: sme::UserDisconnectReason,
         deadline: Instant,
     ) -> Result<(), RuntimeError> {
-        self.disconnect(reason, deadline)
+        self.begin_disconnect(reason, deadline)
+            .map_err(host_runtime_error)
+    }
+    async fn drive_disconnect_once(&mut self) -> Result<Option<DisconnectOutcome>, RuntimeError> {
+        self.drive_disconnect_once()
             .await
             .map_err(host_runtime_error)
     }
@@ -502,6 +494,7 @@ impl<R: WifiRuntime> PreparedServer<R> {
             supervisor_outbound_bytes: 0,
             connect_request: None,
             scan_request: None,
+            disconnect_request: None,
             ethernet_generation: 0,
             terminal: false,
         };
@@ -510,6 +503,11 @@ impl<R: WifiRuntime> PreparedServer<R> {
             .map_err(terminal_service)?;
         Ok(server)
     }
+}
+
+struct PendingDisconnect {
+    requests: Vec<(u64, Instant)>,
+    connect_request: Option<u64>,
 }
 
 pub struct ControlServer<R> {
@@ -525,6 +523,7 @@ pub struct ControlServer<R> {
     supervisor_outbound_bytes: usize,
     connect_request: Option<u64>,
     scan_request: Option<u64>,
+    disconnect_request: Option<PendingDisconnect>,
     ethernet_generation: u64,
     terminal: bool,
 }
@@ -572,7 +571,7 @@ impl<R: WifiRuntime> ControlServer<R> {
     pub async fn run_to_terminal(&mut self) -> Result<(), ServiceError> {
         while !self.is_terminal() {
             if !self.drive_once().await? {
-                std::thread::sleep(Duration::from_millis(1));
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
             tokio::task::yield_now().await;
         }
@@ -610,7 +609,7 @@ impl<R: WifiRuntime> ControlServer<R> {
         };
         match packet.message {
             Message::Scan { request, .. } => {
-                if self.scan_request.is_some() {
+                if self.scan_request.is_some() || self.disconnect_request.is_some() {
                     self.queue_scan_reply(id, Err(sme::ScanErrorCode::ShouldWait))?;
                 } else {
                     match self
@@ -627,7 +626,7 @@ impl<R: WifiRuntime> ControlServer<R> {
                 }
             }
             Message::Connect { request, .. } => {
-                if self.connect_request.is_some() {
+                if self.connect_request.is_some() || self.disconnect_request.is_some() {
                     return Err(GenerationEndReason::ProtocolViolation);
                 } else {
                     match self
@@ -644,50 +643,33 @@ impl<R: WifiRuntime> ControlServer<R> {
                 }
             }
             Message::Disconnect { reason, .. } => {
-                let result = if let Some(connect_id) = self.connect_request.take() {
-                    match self
-                        .runtime
-                        .cancel_connect(
-                            reason,
-                            admitted_deadline.expect("command deadline admitted"),
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            self.queue_connect_result(connect_id, result)?;
-                            CommandReply::Success
-                        }
-                        Err(error) => return Err(runtime_end(error)),
+                let deadline = admitted_deadline.expect("command deadline admitted");
+                if let Some(pending) = &mut self.disconnect_request {
+                    if pending.requests.len() == NORMAL_PACKET_LIMIT {
+                        return Err(GenerationEndReason::Backpressure);
                     }
+                    // Additional waiters do not reissue cleanup or renew its
+                    // original deadline. All replies remain owned and bounded.
+                    pending.requests.push((id, deadline));
                 } else {
-                    match self
-                        .runtime
-                        .disconnect(
-                            reason,
-                            admitted_deadline.expect("command deadline admitted"),
-                        )
-                        .await
-                    {
-                        Ok(()) => CommandReply::Success,
-                        Err(error) => return Err(runtime_end(error)),
-                    }
-                };
-                // An abandoned admission may retain old terminal events.
-                // They must precede the reply that closes the client route.
-                self.queue_connection_events()?;
-                self.queue(
-                    Message::DisconnectReply(Reply {
-                        in_reply_to: id,
-                        result,
-                    }),
-                    None,
-                )?;
+                    self.runtime
+                        .begin_disconnect(reason, deadline)
+                        .map_err(runtime_end)?;
+                    self.disconnect_request = Some(PendingDisconnect {
+                        requests: vec![(id, deadline)],
+                        connect_request: self.connect_request.take(),
+                    });
+                }
             }
             Message::Roam { request, .. } => {
-                let reply = match self.runtime.roam(request) {
-                    Ok(()) => CommandReply::Success,
-                    Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
-                    Err(error) => return Err(runtime_end(error)),
+                let reply = if self.disconnect_request.is_some() {
+                    CommandReply::Busy
+                } else {
+                    match self.runtime.roam(request) {
+                        Ok(()) => CommandReply::Success,
+                        Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
+                        Err(error) => return Err(runtime_end(error)),
+                    }
                 };
                 self.queue(
                     Message::RoamReply(Reply {
@@ -719,6 +701,49 @@ impl<R: WifiRuntime> ControlServer<R> {
                 self.end_generation(reason)?;
                 return Ok(true);
             }
+        }
+        if let Some(pending) = &self.disconnect_request {
+            if pending
+                .requests
+                .iter()
+                .any(|(_, deadline)| Instant::now() >= *deadline)
+            {
+                self.end_generation(GenerationEndReason::Timeout)?;
+                return Ok(true);
+            }
+            let outcome = match self.runtime.drive_disconnect_once().await {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => return Ok(progressed),
+                Err(error) => {
+                    self.end_generation(runtime_end(error))?;
+                    return Ok(true);
+                }
+            };
+            let pending = self.disconnect_request.take().expect("pending disconnect");
+            let result = (|| {
+                match (pending.connect_request, outcome) {
+                    (Some(id), DisconnectOutcome::ConnectCanceled(result)) => {
+                        self.queue_connect_result(id, result)?;
+                    }
+                    (None, DisconnectOutcome::Disconnected) => {}
+                    _ => return Err(GenerationEndReason::DriverFault),
+                }
+                self.queue_connection_events()?;
+                for (id, _) in pending.requests {
+                    self.queue(
+                        Message::DisconnectReply(Reply {
+                            in_reply_to: id,
+                            result: CommandReply::Success,
+                        }),
+                        None,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(reason) = result {
+                self.end_generation(reason)?;
+            }
+            return Ok(true);
         }
         if let Some(id) = self.connect_request {
             match self.runtime.drive_connect_once().await {
@@ -980,6 +1005,7 @@ pub struct SimulatedWifiRuntime {
     ethernet: Option<OwnedFd>,
     ethernet_after_connect: Option<OwnedFd>,
     connect_mode: SimulatedConnectMode,
+    disconnect: Option<DisconnectOutcome>,
 }
 
 #[derive(Clone, Copy)]
@@ -1005,6 +1031,7 @@ impl SimulatedWifiRuntime {
             ethernet: None,
             ethernet_after_connect: None,
             connect_mode: SimulatedConnectMode::None,
+            disconnect: None,
         }
     }
     pub fn publish_ethernet(&mut self, fd: OwnedFd) {
@@ -1087,19 +1114,6 @@ impl WifiRuntime for SimulatedWifiRuntime {
         self.ethernet = self.ethernet_after_connect.take();
         Ok(Some(result))
     }
-    async fn cancel_connect(
-        &mut self,
-        _: sme::UserDisconnectReason,
-        _: Instant,
-    ) -> Result<sme::ConnectResult, RuntimeError> {
-        self.connect = false;
-        self.connect_mode = SimulatedConnectMode::None;
-        Ok(sme::ConnectResult {
-            code: fidl_fuchsia_wlan_ieee80211::StatusCode::Canceled,
-            is_credential_rejected: false,
-            is_reconnect: false,
-        })
-    }
     fn roam(&mut self, _: sme::RoamRequest) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -1137,12 +1151,25 @@ impl WifiRuntime for SimulatedWifiRuntime {
     ) -> Result<Option<sme::ConnectTransactionEvent>, RuntimeError> {
         Ok(self.events.pop_front())
     }
-    async fn disconnect(
+    fn begin_disconnect(
         &mut self,
         _: sme::UserDisconnectReason,
         _: Instant,
     ) -> Result<(), RuntimeError> {
+        self.disconnect = Some(if std::mem::take(&mut self.connect) {
+            self.connect_mode = SimulatedConnectMode::None;
+            DisconnectOutcome::ConnectCanceled(sme::ConnectResult {
+                code: fidl_fuchsia_wlan_ieee80211::StatusCode::Canceled,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            })
+        } else {
+            DisconnectOutcome::Disconnected
+        });
         Ok(())
+    }
+    async fn drive_disconnect_once(&mut self) -> Result<Option<DisconnectOutcome>, RuntimeError> {
+        Ok(self.disconnect.take())
     }
 }
 
@@ -1165,6 +1192,88 @@ mod deadline_tests {
             0
         );
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn held_cleanup_keeps_mailbox_live_and_preserves_all_terminal_replies() {
+        for expire in [false, true] {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&executor, async {
+                let (policy, policy_peer) = pair();
+                let peer = UnixSeqpacketEndpoint::from_inherited_fd(policy_peer).unwrap();
+                let (supervisor, _supervisor_peer) = pair();
+                let mut runtime = SimulatedWifiRuntime::new([2; 6]);
+                runtime.connect = true;
+                runtime.connect_mode = SimulatedConnectMode::Hold;
+                let mut server = PreparedServer::new(policy, supervisor, [1; 16], runtime)
+                    .unwrap().post_lockdown_open_complete().unwrap();
+                server.connect_request = Some(77);
+                let deadline = wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(2)).unwrap();
+                server.dispatch(Packet {
+                    generation: [1; 16],
+                    request_id: 1,
+                    message: Message::Disconnect {
+                        deadline,
+                        reason: sme::UserDisconnectReason::FailedToConnect,
+                    },
+                }).await.unwrap();
+                let original_deadline = server.disconnect_request.as_ref().unwrap().requests[0].1;
+                // Hold the admitted completion, not the request handler.
+                let completion = server.runtime.disconnect.take();
+                server.drive_once().await.unwrap();
+                assert!(matches!(peer.try_receive_packet().unwrap().unwrap().packet.message, Message::Ready));
+                assert!(peer.try_receive_packet().unwrap().is_none());
+                peer.try_send_packet(&Packet {
+                    generation: [1; 16],
+                    request_id: 2,
+                    message: Message::Scan {
+                        deadline,
+                        request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+                    },
+                }, None).unwrap();
+                server.drive_once().await.unwrap();
+                assert!(matches!(peer.try_receive_packet().unwrap().unwrap().packet.message,
+                    Message::ScanReply(Reply { in_reply_to: 2, result: Err(sme::ScanErrorCode::ShouldWait) })));
+                peer.try_send_packet(&Packet {
+                    generation: [1; 16],
+                    request_id: 3,
+                    message: Message::Disconnect {
+                        deadline: deadline.checked_add(Duration::from_secs(1)).unwrap(),
+                        reason: sme::UserDisconnectReason::FailedToConnect,
+                    },
+                }, None).unwrap();
+                server.drive_once().await.unwrap();
+                assert!(server.runtime.disconnect.is_none(), "duplicate restarted cleanup");
+                let pending = server.disconnect_request.as_ref().unwrap();
+                assert_eq!(pending.requests.len(), 2);
+                assert_eq!(pending.requests[0].1, original_deadline);
+                assert_eq!(pending.connect_request, Some(77));
+                assert!(peer.try_receive_packet().unwrap().is_none());
+                if expire {
+                    server.disconnect_request.as_mut().unwrap().requests[0].1 = Instant::now();
+                    server.drive_once().await.unwrap();
+                    assert!(matches!(peer.try_receive_packet().unwrap().unwrap().packet.message,
+                        Message::GenerationEnd(GenerationEndReason::Timeout)));
+                    assert!(server.terminal);
+                } else {
+                    server.runtime.disconnect = completion;
+                    server.drive_once().await.unwrap();
+                    assert!(matches!(peer.try_receive_packet().unwrap().unwrap().packet.message,
+                        Message::ConnectReply(Reply { in_reply_to: 77, .. })));
+                    for id in [1, 3] {
+                        assert!(matches!(peer.try_receive_packet().unwrap().unwrap().packet.message,
+                            Message::DisconnectReply(Reply { in_reply_to, result: CommandReply::Success })
+                            if in_reply_to == id));
+                    }
+                    assert!(server.disconnect_request.is_none());
+                    server.drive_once().await.unwrap();
+                }
+                assert!(peer.try_receive_packet().unwrap().is_none());
+            });
+        }
     }
 
     #[test]
@@ -1203,6 +1312,7 @@ mod deadline_tests {
                 })
                 .await
                 .unwrap();
+            server.drive_runtime().await.unwrap();
             let messages: Vec<_> = server
                 .outbound
                 .iter()

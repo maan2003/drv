@@ -165,7 +165,10 @@ hardware work is pending. Queue admission and completed effects are distinct;
 mailbox ordering alone is not cancellation or hardware-completion evidence.
 
 Migration is incomplete: MLME already has an owning task, but shared driver
-access, inline awaited control cleanup and manual progress polling remain.
+access, inline admission cleanup and manual progress polling remain.
+Explicit disconnect/cancel cleanup and its replies are retained and advanced
+in bounded service turns; driver cleanup certification can still block in
+legacy adapters.
 These are transitional implementation details, not the selected actor model.
 
 SoftMAC mutations return owned futures without borrowing the driver. Existing

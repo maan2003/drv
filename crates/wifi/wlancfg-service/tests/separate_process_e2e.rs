@@ -514,6 +514,7 @@ struct FixtureWifi {
     started: Instant,
     connected_idle: usize,
     needs_cleanup: bool,
+    disconnect: Option<wifi_control_service::DisconnectOutcome>,
 }
 
 impl FixtureWifi {
@@ -528,6 +529,7 @@ impl FixtureWifi {
             started: Instant::now(),
             connected_idle: 0,
             needs_cleanup: false,
+            disconnect: None,
         }
     }
 }
@@ -595,20 +597,6 @@ impl WifiRuntime for FixtureWifi {
             is_credential_rejected: false,
             is_reconnect: false,
         }))
-    }
-    async fn cancel_connect(
-        &mut self,
-        _: sme::UserDisconnectReason,
-        _: Instant,
-    ) -> Result<sme::ConnectResult, RuntimeError> {
-        assert_eq!(self.scenario, "pending-until-cancelled");
-        assert!(self.pending_connect.take().is_some());
-        println!("CONNECT_CANCELLED_AND_QUIESCENT");
-        Ok(sme::ConnectResult {
-            code: ieee::StatusCode::RefusedReasonUnspecified,
-            is_credential_rejected: false,
-            is_reconnect: false,
-        })
     }
     fn roam(&mut self, _: sme::RoamRequest) -> Result<(), RuntimeError> {
         Ok(())
@@ -685,11 +673,22 @@ impl WifiRuntime for FixtureWifi {
     ) -> Result<Option<sme::ConnectTransactionEvent>, RuntimeError> {
         Ok(self.events.pop_front())
     }
-    async fn disconnect(
+    fn begin_disconnect(
         &mut self,
         _: sme::UserDisconnectReason,
         _: Instant,
     ) -> Result<(), RuntimeError> {
+        self.disconnect = Some(if self.pending_connect.take().is_some() {
+            assert_eq!(self.scenario, "pending-until-cancelled");
+            println!("CONNECT_CANCELLED_AND_QUIESCENT");
+            wifi_control_service::DisconnectOutcome::ConnectCanceled(sme::ConnectResult {
+                code: ieee::StatusCode::RefusedReasonUnspecified,
+                is_credential_rejected: false,
+                is_reconnect: false,
+            })
+        } else {
+            wifi_control_service::DisconnectOutcome::Disconnected
+        });
         if self.needs_cleanup {
             println!("TERMINAL_CLEANUP");
         }
@@ -697,6 +696,10 @@ impl WifiRuntime for FixtureWifi {
         self.events.clear();
         Ok(())
     }
+    async fn drive_disconnect_once(&mut self) -> Result<Option<wifi_control_service::DisconnectOutcome>, RuntimeError> {
+        Ok(self.disconnect.take())
+    }
+
 }
 
 fn scan_result(ssid: &[u8], bssid: [u8; 6], channel: u8, rssi: i8) -> sme::ScanResult {
