@@ -110,7 +110,7 @@ fn child() -> anyhow::Result<()> {
             .await
             .ok_or_else(|| anyhow::anyhow!("liveness ended"))??;
         let result = client
-            .scan(&fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+            .scan(wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30)).unwrap(), &fidl_fuchsia_wlan_sme::ScanRequest::Passive(
                 fidl_fuchsia_wlan_sme::PassiveScanRequest { channels: vec![] },
             ))
             .await?;

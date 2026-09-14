@@ -3559,6 +3559,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-control-wire"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-internal",
+ "fidl-fuchsia-wlan-sme",
+ "libc",
+]
+
+[[package]]
 name = "wlan-fcg-crypto"
 version = "0.1.0"
 dependencies = [
@@ -3756,6 +3767,7 @@ dependencies = [
  "rand 0.9.4",
  "tokio",
  "wlan-common",
+ "wlan-control-wire",
  "wlan-sme",
  "zx",
 ]

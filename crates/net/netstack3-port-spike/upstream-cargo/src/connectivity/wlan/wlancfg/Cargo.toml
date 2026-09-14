@@ -24,6 +24,7 @@ name = "host-saved-networks"
 path = "host_tests/saved_networks.rs"
 
 [dependencies]
+wlan-control-wire = { path = "../../../../../../crates/wifi/wlan-control-wire" }
 directory-capability = { path = "../../../lib/directory-capability" }
 anyhow.workspace = true
 arbitrary.workspace = true

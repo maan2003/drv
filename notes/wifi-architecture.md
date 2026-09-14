@@ -112,14 +112,17 @@ remain distinct. Status/disconnect must not wait behind a blocking connect
 handler. Slow observers may resynchronize from a snapshot; safety-critical
 completion must not silently disappear.
 
-The deadline migration is partial: WLCP v2 carries checked absolute Linux
-CLOCK_MONOTONIC deadlines on commands, rejects expired commands before runtime
-admission, and bounds pending reply drain and outbound delivery. Both peers
-must share the same monotonic time namespace. The current transport still
-creates per-submission budgets; policy selection, persistence and retries
-must be changed to consume one original operation budget before this contract
-is complete. Active runtime timeout remains terminal, not a reusable timeout
-without proved quiescence. No architecture-wide KVM acceptance is claimed yet.
+WLCP v2 carries checked absolute Linux CLOCK_MONOTONIC deadlines on commands,
+rejects expired commands before runtime admission, and bounds pending reply
+drain and outbound delivery. Both peers must share the same monotonic time
+namespace. Application admission starts the policy budget before queueing and
+persistence; selection scans, augmentation and connection retries receive that
+same deadline explicitly. Repeated cancellation does not renew its original
+cleanup deadline. Active runtime timeout remains terminal, not a reusable
+timeout without proved quiescence. Autonomous SME recovery without a prior
+policy budget is cancelled; policy-authorized subsequent recovery and roaming
+still need complete operation/intent identity integration. No architecture-wide
+KVM acceptance is claimed yet.
 
 Device, connection and Ethernet attachment lifetimes are distinct. Replace
 the finite boot-time inventory of Ethernet generations with reusable
@@ -132,6 +135,15 @@ preserve DHCP/TCP state across arbitrary network changes.
 The production MT7921 executable currently imports `vfio_read.rs`, which owns
 physical initialization, target preparation and service construction. Remove
 that ownership, not just the filename.
+
+The owner explicitly accepts removing old functionality to complete this
+cutover. Do not retain a compatibility owner or make full feature parity a
+prerequisite. Unsupported operations must fail explicitly, without falling
+back to the lab implementation. Scheduled recovery, comprehensive roaming
+budgets and reusable Ethernet attachments may remain documented future work.
+Acceptance for this cutover is the direct typed owner in the same-process
+protocol runtime, the old production owner removed, KVM verification, and
+the same advisor's final gap review.
 
 Keep the generic hardware API/backends and MT76/MT7921 codecs and verified
 sequencing. Extend the existing typed resource owner in
@@ -157,9 +169,10 @@ already prepared for one peer.
 2. Port firmware/bootstrap-and-contain operations to the typed owning session.
    Preserve descriptor bytes, effect ordering, completion routing, generation
    invalidation and partial-acquisition cleanup through traces/fault injection.
-3. Move scan/peer/key/TX/RX operations onto that owner in bounded increments;
-   retire the matching binary-local implementations. Use a thin dedicated
-   executable, never a wrapper calling or spawning `vfio_read`.
+3. Replace the production entrypoint with the typed driver and retire the
+   binary-local owner. Port only coherent operations now; mark remaining
+   scan/peer/key/TX/RX functionality unavailable rather than retaining a second
+   owner. Never call or spawn `vfio_read` as a compatibility path.
 4. Collapse redundant façades into the single Wi-Fi runtime and driver seam.
 5. Establish surviving containment before unattended restart; separately
    implement cancellable policy, unlimited reconnect lifetimes, general target

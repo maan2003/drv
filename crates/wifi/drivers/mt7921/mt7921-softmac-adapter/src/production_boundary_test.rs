@@ -134,6 +134,7 @@ struct ScanSource {
 impl ScanRequestApi for ScanSource {
     async fn perform_scan(
         &self,
+        _deadline: wlan_control_wire::MonotonicDeadline,
         reason: ScanReason,
         _: Vec<types::Ssid>,
         _: Vec<types::WlanChan>,
@@ -605,7 +606,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             TelemetrySender::new(telemetry),
         );
         let selected = selector
-            .find_and_select_connection_candidate(Some(network), ConnectReason::FidlConnectRequest)
+            .find_and_select_connection_candidate(wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30)).unwrap(), Some(network), ConnectReason::FidlConnectRequest)
             .await
             .expect("pinned selector must select the physical WPA3 BSS");
 

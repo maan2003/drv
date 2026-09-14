@@ -219,15 +219,10 @@ impl HostControlClient {
         })
     }
 
-    fn submit(&self, command: OwnerCommand) -> anyhow::Result<()> {
+    fn submit(&self, deadline: wire::MonotonicDeadline, command: OwnerCommand) -> anyhow::Result<()> {
         if self.0.force_terminal.load(Ordering::Acquire) {
             return Err(anyhow!("WLAN control generation ended"));
         }
-        let budget = match &command {
-            OwnerCommand::Connect { .. } | OwnerCommand::Scan { .. } => 30,
-            OwnerCommand::Disconnect { .. } | OwnerCommand::Roam { .. } => 10,
-        };
-        let deadline = wire::MonotonicDeadline::after(std::time::Duration::from_secs(budget))?;
         match self.0.commands.try_send(QueuedCommand { command, deadline }) {
             Ok(()) => {
                 wake(self.0.wake.as_raw_fd());
@@ -249,30 +244,31 @@ impl HostControlClient {
 impl ClientSmeTransport for HostControlClient {
     async fn connect(
         &self,
+        deadline: wire::MonotonicDeadline,
         request: &sme::ConnectRequest,
     ) -> anyhow::Result<(sme::ConnectResult, ConnectTransactionEventStream)> {
         let (tx, rx) = oneshot::channel();
-        self.submit(OwnerCommand::Connect { request: request.clone(), reply: tx })?;
+        self.submit(deadline, OwnerCommand::Connect { request: request.clone(), reply: tx })?;
         let (result, events) = rx.await.context("control generation ended during connect")??;
         Ok((result, events.boxed_local().fuse()))
     }
 
-    async fn disconnect(&self, reason: sme::UserDisconnectReason) -> anyhow::Result<()> {
+    async fn disconnect(&self, deadline: wire::MonotonicDeadline, reason: sme::UserDisconnectReason) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.submit(OwnerCommand::Disconnect { reason, reply: tx })?;
+        self.submit(deadline, OwnerCommand::Disconnect { reason, reply: tx })?;
         rx.await.context("control generation ended during disconnect")?
     }
 
-    fn roam(&self, request: &sme::RoamRequest) -> anyhow::Result<()> {
+    fn roam(&self, deadline: wire::MonotonicDeadline, request: &sme::RoamRequest) -> anyhow::Result<()> {
         // The pinned interface defines acceptance synchronously. The bounded
         // owner accepts the command here; its wire acknowledgement is still
         // correlated and a rejection ends the liveness stream.
-        self.submit(OwnerCommand::Roam { request: request.clone() })
+        self.submit(deadline, OwnerCommand::Roam { request: request.clone() })
     }
 
-    async fn scan(&self, request: &sme::ScanRequest) -> anyhow::Result<ClientSmeScanResult> {
+    async fn scan(&self, deadline: wire::MonotonicDeadline, request: &sme::ScanRequest) -> anyhow::Result<ClientSmeScanResult> {
         let (tx, rx) = oneshot::channel();
-        self.submit(OwnerCommand::Scan { request: request.clone(), reply: tx })?;
+        self.submit(deadline, OwnerCommand::Scan { request: request.clone(), reply: tx })?;
         rx.await.context("control generation ended during scan")?
     }
 
@@ -639,6 +635,10 @@ mod tests {
     use std::ptr;
     use wlan_control_wire::Reply;
 
+    fn deadline() -> wire::MonotonicDeadline {
+        wire::MonotonicDeadline::after(std::time::Duration::from_secs(30)).unwrap()
+    }
+
     const GENERATION: [u8; 16] = [7; 16];
 
     fn sockets() -> (OwnedFd, OwnedFd) {
@@ -788,8 +788,8 @@ mod tests {
             (event, result)
         });
         let request = connect_request();
-        let connect = client.connect(&request);
-        let disconnect = client.disconnect(sme::UserDisconnectReason::WlanstackUnitTesting);
+        let connect = client.connect(deadline(), &request);
+        let disconnect = client.disconnect(deadline(), sme::UserDisconnectReason::WlanstackUnitTesting);
         let ((result, mut events), disconnected) = futures::executor::block_on(async {
             let (connected, disconnected) = futures::join!(connect, disconnect);
             (connected.unwrap(), disconnected)
@@ -812,7 +812,7 @@ mod tests {
             send_packet(server_fd.as_raw_fd(), 2, Message::Event(event.clone()), &[]);
             event
         });
-        let (_result, mut events) = futures::executor::block_on(client.connect(&connect_request())).unwrap();
+        let (_result, mut events) = futures::executor::block_on(client.connect(deadline(), &connect_request())).unwrap();
         assert_eq!(futures::executor::block_on(events.next()).unwrap().unwrap(), server.join().unwrap());
     }
 
@@ -826,7 +826,7 @@ mod tests {
             send_packet(server_fd.as_raw_fd(), 1, Message::ScanReply(Reply { in_reply_to: request.request_id, result: Err(sme::ScanErrorCode::ShouldWait) }), &[]);
         });
         let request = sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![1, 6, 11] });
-        assert_eq!(futures::executor::block_on(client.scan(&request)).unwrap(), Err(sme::ScanErrorCode::ShouldWait));
+        assert_eq!(futures::executor::block_on(client.scan(deadline(), &request)).unwrap(), Err(sme::ScanErrorCode::ShouldWait));
         server.join().unwrap();
     }
 
@@ -835,11 +835,11 @@ mod tests {
         let (client_fd, server_fd) = sockets();
         let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
         let request = connect_request();
-        let mut cancelled = Box::pin(client.connect(&request));
+        let mut cancelled = Box::pin(client.connect(deadline(), &request));
         assert!(cancelled.as_mut().now_or_never().is_none());
         drop(cancelled);
         // Dropping the future is not quiescence and must not admit a replacement.
-        assert!(futures::executor::block_on(client.connect(&request)).is_err());
+        assert!(futures::executor::block_on(client.connect(deadline(), &request)).is_err());
         let server = thread::spawn(move || {
             let connect = receive(server_fd.as_raw_fd());
             let disconnect = receive(server_fd.as_raw_fd());
@@ -857,8 +857,8 @@ mod tests {
                 in_reply_to: replacement.request_id, result: ConnectReply::Completed(result),
             }), &[]);
         });
-        futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::WlanstackUnitTesting)).unwrap();
-        assert!(futures::executor::block_on(client.connect(&request)).is_ok());
+        futures::executor::block_on(client.disconnect(deadline(), sme::UserDisconnectReason::WlanstackUnitTesting)).unwrap();
+        assert!(futures::executor::block_on(client.connect(deadline(), &request)).is_ok());
         server.join().unwrap();
     }
 
@@ -877,9 +877,9 @@ mod tests {
             send_packet(server_fd.as_raw_fd(), 3, Message::ConnectReply(Reply { in_reply_to: second.request_id, result: ConnectReply::Completed(success) }), &[]);
         });
         let request = connect_request();
-        let (_result, _first_events) = futures::executor::block_on(client.connect(&request)).unwrap();
-        futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::Startup)).unwrap();
-        let (_result, _second_events) = futures::executor::block_on(client.connect(&request)).unwrap();
+        let (_result, _first_events) = futures::executor::block_on(client.connect(deadline(), &request)).unwrap();
+        futures::executor::block_on(client.disconnect(deadline(), sme::UserDisconnectReason::Startup)).unwrap();
+        let (_result, _second_events) = futures::executor::block_on(client.connect(deadline(), &request)).unwrap();
         server.join().unwrap();
     }
 
@@ -895,8 +895,8 @@ mod tests {
             assert!(matches!(disconnect.message, Message::Disconnect { .. }));
             send_packet(server_fd.as_raw_fd(), 2, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
         });
-        client.roam(&sme::RoamRequest { bss_description: connect_request().bss_description }).unwrap();
-        futures::executor::block_on(client.disconnect(sme::UserDisconnectReason::Startup)).unwrap();
+        client.roam(deadline(), &sme::RoamRequest { bss_description: connect_request().bss_description }).unwrap();
+        futures::executor::block_on(client.disconnect(deadline(), sme::UserDisconnectReason::Startup)).unwrap();
         server.join().unwrap();
     }
 
@@ -912,11 +912,11 @@ mod tests {
             send_packet(server_fd.as_raw_fd(), 2, Message::Event(sme::ConnectTransactionEvent::OnSignalReport { ind: internal::SignalReportIndication { rssi_dbm: -50, snr_db: 20 } }), &[]);
             failed
         });
-        let (result, mut events) = futures::executor::block_on(client.connect(&connect_request())).unwrap();
+        let (result, mut events) = futures::executor::block_on(client.connect(deadline(), &connect_request())).unwrap();
         assert_eq!(result, server.join().unwrap());
         assert!(futures::executor::block_on(events.next()).is_none());
         assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
-        assert!(client.roam(&sme::RoamRequest { bss_description: connect_request().bss_description }).is_err());
+        assert!(client.roam(deadline(), &sme::RoamRequest { bss_description: connect_request().bss_description }).is_err());
     }
 
     fn terminal_after(send_bad: impl FnOnce(RawFd)) {
@@ -967,7 +967,7 @@ mod tests {
             }).unwrap();
             assert_eq!(unsafe { libc::send(server_fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) }, bytes.len() as isize);
         });
-        assert!(futures::executor::block_on(client.scan(&request)).is_err());
+        assert!(futures::executor::block_on(client.scan(deadline(), &request)).is_err());
         assert!(futures::executor::block_on(liveness.next()).unwrap().is_err());
         server.join().unwrap();
     }

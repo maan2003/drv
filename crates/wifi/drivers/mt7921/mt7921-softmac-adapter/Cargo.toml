@@ -36,6 +36,7 @@ wlan-softmac-host = { path = "../../../wlan-softmac-host" }
 zx = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 
 [dev-dependencies]
+wlan-control-wire = { path = "../../../wlan-control-wire" }
 async-trait = "=0.1.89"
 dhcp-protocol = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/dhcpv4/protocol" }
 net_types = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/net-types" }

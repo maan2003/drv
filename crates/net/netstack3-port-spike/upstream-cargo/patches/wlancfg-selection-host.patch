@@ -1,29 +1,3 @@
-diff -ruN a/src/connectivity/wlan/wlancfg/src/client/types.rs b/src/connectivity/wlan/wlancfg/src/client/types.rs
---- a/src/connectivity/wlan/wlancfg/src/client/types.rs	2026-08-09 22:11:17.637528745 +0000
-+++ b/src/connectivity/wlan/wlancfg/src/client/types.rs	2026-08-09 22:11:17.659700262 +0000
-@@ -5,6 +5,9 @@
- use crate::config_management::{self};
- use crate::util::historical_list::Timestamped;
- use fidl_fuchsia_wlan_internal as fidl_internal;
-+#[cfg(feature = "host-selection")]
-+use crate::fidl_fuchsia_wlan_policy as fidl_policy;
-+#[cfg(not(feature = "host-selection"))]
- use fidl_fuchsia_wlan_policy as fidl_policy;
- use fidl_fuchsia_wlan_sme as fidl_sme;
- use fuchsia_async::MonotonicInstant;
-@@ -12,6 +15,12 @@
- use wlan_common::channel::Channel;
- use wlan_common::security::SecurityAuthenticator;
- use wlan_common::sequestered::Sequestered;
-+#[cfg(feature = "host-selection")]
-+use crate::wlan_metrics_registry::{
-+    PolicyConnectionAttemptMigratedMetricDimensionReason,
-+    PolicyDisconnectionMigratedMetricDimensionReason,
-+};
-+#[cfg(not(feature = "host-selection"))]
- use wlan_metrics_registry::{
-     PolicyConnectionAttemptMigratedMetricDimensionReason,
-     PolicyDisconnectionMigratedMetricDimensionReason,
 diff -ruN a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs b/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
 --- a/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
 +++ b/src/connectivity/wlan/wlancfg/src/config_management/config_manager.rs
@@ -433,6 +407,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
  fn log_metric_for_scan_error(reason: &fidl_sme::ScanErrorCode, scan_defects: &mut Vec<ScanIssue>) {
      let metric_type = match *reason {
          fidl_sme::ScanErrorCode::NotSupported
+diff --git a/src/connectivity/wlan/wlancfg/src/client/state_machine.rs b/src/connectivity/wlan/wlancfg/src/client/state_machine.rs
 --- a/src/connectivity/wlan/wlancfg/src/client/state_machine.rs
 +++ b/src/connectivity/wlan/wlancfg/src/client/state_machine.rs
 @@ -20,8 +20,15 @@
@@ -451,7 +426,38 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
  use fuchsia_async::{self as fasync, DurationExt};
  use fuchsia_inspect::Node as InspectNode;
  use fuchsia_inspect_contrib::inspect_insert;
-@@ -167,7 +174,7 @@
+@@ -60,6 +67,7 @@
+     fn connect(&mut self, selection: types::ConnectSelection) -> Result<(), anyhow::Error>;
+     fn disconnect(
+         &mut self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         reason: types::DisconnectReason,
+         responder: oneshot::Sender<()>,
+     ) -> Result<(), anyhow::Error>;
+@@ -88,11 +96,12 @@
+
+     fn disconnect(
+         &mut self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         reason: types::DisconnectReason,
+         responder: oneshot::Sender<()>,
+     ) -> Result<(), anyhow::Error> {
+         self.req_sender
+-            .try_send(ManualRequest::Disconnect((reason, responder)))
++            .try_send(ManualRequest::Disconnect((deadline, reason, responder)))
+             .map_err(|e| format_err!("failed to send disconnect request: {:?}", e))
+     }
+
+@@ -104,7 +113,7 @@
+ // TODO(https://fxbug.dev/324167674): fix.
+ pub enum ManualRequest {
+     Connect(Box<types::ConnectSelection>),
+-    Disconnect((types::DisconnectReason, oneshot::Sender<()>)),
++    Disconnect((wlan_control_wire::MonotonicDeadline, types::DisconnectReason, oneshot::Sender<()>)),
+ }
+
+ #[derive(Clone, Debug, Default, PartialEq)]
+@@ -167,7 +176,7 @@
  pub async fn serve(
      iface_id: u16,
      proxy: SmeForClientStateMachine,
@@ -460,7 +466,78 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
      req_stream: mpsc::Receiver<ManualRequest>,
      update_sender: ClientListenerMessageSender,
      saved_networks_manager: Arc<dyn SavedNetworksManagerApi>,
-@@ -449,11 +456,70 @@
+@@ -177,9 +186,19 @@
+     roam_manager: RoamManager,
+     status_publisher: StateMachineStatusPublisher<Status>,
+ ) {
++    let deadline = match connect_selection.as_ref().map(|selection| Ok(selection.deadline))
++        .unwrap_or_else(|| wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10))) {
++        Ok(deadline) => deadline,
++        Err(error) => {
++            error!("Cannot establish startup deadline: {error}");
++            status_publisher.publish_status(Status::Disconnected);
++            return;
++        }
++    };
+     let next_network = connect_selection
+         .map(|selection| ConnectingOptions { connect_selection: selection, attempt_counter: 0 });
+     let disconnect_options = DisconnectingOptions {
++        deadline,
+         disconnect_responder: None,
+         previous_network: None,
+         next_network,
+@@ -286,6 +305,7 @@
+ }
+
+ struct DisconnectingOptions {
++    deadline: wlan_control_wire::MonotonicDeadline,
+     disconnect_responder: Option<oneshot::Sender<()>>,
+     /// Information about the previously connected network, if there was one. Used to send out
+     /// listener updates.
+@@ -321,7 +341,7 @@
+     // so we don't block on it
+     common_options
+         .proxy
+-        .disconnect(types::convert_to_sme_disconnect_reason(options.reason))
++        .disconnect(options.deadline, types::convert_to_sme_disconnect_reason(options.reason))
+         .await
+         .map_err(|e| ExitReason(Err(e)))?;
+
+@@ -392,6 +412,13 @@
+         // Limit not exceeded, retry after backing off.
+         let backoff_time = 400_i64 * i64::from(new_attempt_count);
+         info!("Will attempt to reconnect after {}ms backoff", backoff_time);
++        let remaining = options.connect_selection.deadline.remaining(
++            wlan_control_wire::monotonic_time_ns().map_err(|e| ExitReason(Err(e.into())))?
++        ).ok_or_else(|| ExitReason(Err(format_err!("connection operation deadline exceeded"))))?;
++        let backoff = std::time::Duration::from_millis(backoff_time as u64);
++        if remaining <= backoff {
++            return Err(ExitReason(Err(format_err!("connection budget cannot accommodate retry"))));
++        }
+         fasync::Timer::new(zx::MonotonicDuration::from_millis(backoff_time).after_now()).await;
+
+         let next_connecting_options = ConnectingOptions {
+@@ -402,6 +429,7 @@
+             attempt_counter: new_attempt_count,
+         };
+         let disconnecting_options = DisconnectingOptions {
++            deadline: next_connecting_options.connect_selection.deadline,
+             disconnect_responder: None,
+             previous_network: None,
+             next_network: Some(next_connecting_options),
+@@ -425,6 +453,11 @@
+     mut common_options: CommonStateOptions,
+     options: ConnectingOptions,
+ ) -> Result<State, ExitReason> {
++    if options.connect_selection.deadline.remaining(
++        wlan_control_wire::monotonic_time_ns().map_err(|e| ExitReason(Err(e.into())))?
++    ).is_none() {
++        return Err(ExitReason(Err(format_err!("connection operation deadline exceeded"))));
++    }
+     debug!("Entering connecting state");
+     notify_on_connection_attempt(&common_options, &options);
+
+@@ -449,11 +482,93 @@
          authentication: options.connect_selection.target.authenticator.clone().into(),
          deprecated_scan_type: fidl_fuchsia_wlan_common::ScanType::Active,
      };
@@ -472,7 +549,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 +    // Keep the transport transaction alive while servicing policy cancellation.
 +    // Dropping the connect future alone does not quiesce the underlying SME.
 +    let connected = {
-+        let connect = common_options.proxy.connect(&sme_connect_request).fuse();
++        let connect = common_options.proxy.connect(options.connect_selection.deadline, &sme_connect_request).fuse();
 +        futures::pin_mut!(connect);
 +        // The host transport submits only when polled. Establish Connect
 +        // submission before an already-queued Disconnect can be observed.
@@ -494,6 +571,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 +                            let reason = convert_manual_connect_to_disconnect_reason(&selection.reason)
 +                                .unwrap_or(types::DisconnectReason::Unknown);
 +                            DisconnectingOptions {
++                                deadline: selection.deadline,
 +                                disconnect_responder: None,
 +                                previous_network: None,
 +                                next_network: Some(ConnectingOptions {
@@ -503,13 +581,15 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 +                                reason,
 +                            }
 +                        }
-+                        Some(ManualRequest::Disconnect((reason, responder))) => DisconnectingOptions {
++                        Some(ManualRequest::Disconnect((deadline, reason, responder))) => DisconnectingOptions {
++                            deadline,
 +                            disconnect_responder: Some(responder),
 +                            previous_network: None,
 +                            next_network: None,
 +                            reason,
 +                        },
 +                        None => DisconnectingOptions {
++                            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10)).map_err(|e| ExitReason(Err(e.into())))?,
 +                            disconnect_responder: None,
 +                            previous_network: None,
 +                            next_network: None,
@@ -521,6 +601,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 +                    let _drained = futures::try_join!(
 +                        connect,
 +                        common_options.proxy.disconnect(
++                            disconnecting.deadline,
 +                            types::convert_to_sme_disconnect_reason(disconnecting.reason)
 +                        )
 +                    ).map_err(|e| ExitReason(Err(format_err!("{:?}", e))))?;
@@ -533,10 +614,29 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 +        Ok(connected) => connected,
 +        Err(disconnecting) => return Ok(to_disconnecting_state(common_options, disconnecting)),
 +    };
++
++    if options.connect_selection.deadline.remaining(
++        wlan_control_wire::monotonic_time_ns().map_err(|e| ExitReason(Err(e.into())))?
++    ).is_none() {
++        // A late success is not an on-time completion. Revoke it through
++        // acknowledged teardown before allowing policy to reuse this session.
++        // Anchor cleanup to expiry, not to when this task was scheduled.
++        let deadline = options.connect_selection.deadline
++            .checked_add(std::time::Duration::from_secs(2))
++            .map_err(|e| ExitReason(Err(e.into())))?;
++        let disconnecting = DisconnectingOptions {
++            deadline,
++            disconnect_responder: None,
++            previous_network: None,
++            next_network: None,
++            reason: types::DisconnectReason::FailedToConnect,
++        };
++        return Ok(to_disconnecting_state(common_options, disconnecting));
++    }
 
      notify_on_connection_result(&mut common_options, &options, ap_state.clone(), sme_result).await;
 
-@@ -513,7 +579,9 @@
+@@ -513,7 +628,9 @@
      ap_state: types::ApState,
      sme_result: fidl_sme::ConnectResult,
  ) {
@@ -547,7 +647,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
 
      // Report the connect result to the saved networks manager.
      common_options
-@@ -575,7 +643,7 @@
+@@ -575,7 +692,7 @@
      network_identifier: types::NetworkIdentifier,
      credential: Credential,
      ess_connect_reason: types::ConnectReason,
@@ -556,7 +656,7 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
      network_is_likely_hidden: bool,
      ess_connect_start_time: fasync::MonotonicInstant,
      bss_connect_start_time: fasync::MonotonicInstant,
-@@ -596,7 +664,7 @@
+@@ -596,7 +713,7 @@
          network_identifier: types::NetworkIdentifier,
          credential: Credential,
          ess_connect_reason: types::ConnectReason,
@@ -565,3 +665,344 @@ diff -ruN a/src/lib/diagnostics/inspect/contrib/rust/host/src/lib.rs b/src/lib/d
          network_is_likely_hidden: bool,
      ) -> Self {
          // Tracked signals
+@@ -667,7 +784,10 @@
+                                 fidl_info,
+                             ).await;
+
+-                            !fidl_info.is_sme_reconnecting
++                            // Recovery already started inside SME has no policy-issued
++                            // budget. Cancel it through the same quiescent teardown;
++                            // later recovery must be a new policy operation.
++                            true
+                         }
+                         fidl_sme::ConnectTransactionEvent::OnConnectResult { result } => {
+                             let connected = result.code == fidl_ieee80211::StatusCode::Success;
+@@ -747,6 +867,7 @@
+                     if is_sme_idle {
+                         info!("Idle sme detected.");
+                         let options = DisconnectingOptions {
++                            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10)).map_err(|e| ExitReason(Err(e.into())))?,
+                             disconnect_responder: None,
+                             previous_network: Some((
+                                 options.network_identifier.clone(),
+@@ -765,7 +886,7 @@
+             },
+             req = common_options.req_stream.next() => {
+                 match req {
+-                    Some(ManualRequest::Disconnect((reason, responder))) => {
++                    Some(ManualRequest::Disconnect((deadline, reason, responder))) => {
+                         debug!("Disconnect requested");
+                         notify_on_manual_disconnect_request_received(
+                             &common_options,
+@@ -774,6 +895,7 @@
+                         ).await;
+
+                         let options = DisconnectingOptions {
++                            deadline,
+                             disconnect_responder: Some(responder),
+                             previous_network: Some((
+                                 options.network_identifier.clone(),
+@@ -806,6 +928,7 @@
+                         ).await;
+
+                         let options = DisconnectingOptions {
++                            deadline: new_connect_selection.deadline,
+                             disconnect_responder: None,
+                             previous_network: Some((
+                                 options.network_identifier,
+@@ -840,6 +963,7 @@
+                 error!("Pending roam request has timed out without a response from SME, cannot proceed with connection");
+                 notify_on_roam_error_and_exit(&common_options, &options).await;
+                 let options = DisconnectingOptions {
++                    deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10)).map_err(|e| ExitReason(Err(e.into())))?,
+                     disconnect_responder: None,
+                     previous_network: Some((
+                         options.network_identifier.clone(),
+@@ -857,7 +981,7 @@
+                 } else {
+                     let _ = common_options
+                     .proxy
+-                    .roam(&roam_request.clone().into())
++                    .roam(wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10)).map_err(|e| ExitReason(Err(e.into())))?, &roam_request.clone().into())
+                     .inspect_err(|e| {
+                         error!("Error sending sme roam request: {}", e);
+                     });
+diff --git a/src/connectivity/wlan/wlancfg/src/client/types.rs b/src/connectivity/wlan/wlancfg/src/client/types.rs
+--- a/src/connectivity/wlan/wlancfg/src/client/types.rs
++++ b/src/connectivity/wlan/wlancfg/src/client/types.rs
+@@ -5,6 +5,9 @@
+ use crate::config_management::{self};
+ use crate::util::historical_list::Timestamped;
+ use fidl_fuchsia_wlan_internal as fidl_internal;
++#[cfg(feature = "host-selection")]
++use crate::fidl_fuchsia_wlan_policy as fidl_policy;
++#[cfg(not(feature = "host-selection"))]
+ use fidl_fuchsia_wlan_policy as fidl_policy;
+ use fidl_fuchsia_wlan_sme as fidl_sme;
+ use fuchsia_async::MonotonicInstant;
+@@ -12,6 +15,12 @@
+ use wlan_common::channel::Channel;
+ use wlan_common::security::SecurityAuthenticator;
+ use wlan_common::sequestered::Sequestered;
++#[cfg(feature = "host-selection")]
++use crate::wlan_metrics_registry::{
++    PolicyConnectionAttemptMigratedMetricDimensionReason,
++    PolicyDisconnectionMigratedMetricDimensionReason,
++};
++#[cfg(not(feature = "host-selection"))]
+ use wlan_metrics_registry::{
+     PolicyConnectionAttemptMigratedMetricDimensionReason,
+     PolicyDisconnectionMigratedMetricDimensionReason,
+@@ -239,6 +248,7 @@
+ #[cfg_attr(test, derive(Debug))]
+ #[cfg_attr(test, derive(PartialEq))]
+ pub struct ConnectSelection {
++    pub deadline: wlan_control_wire::MonotonicDeadline,
+     pub target: ScannedCandidate,
+     pub reason: ConnectReason,
+ }
+diff --git a/src/connectivity/wlan/wlancfg/src/client/connection_selection/mod.rs b/src/connectivity/wlan/wlancfg/src/client/connection_selection/mod.rs
+--- a/src/connectivity/wlan/wlancfg/src/client/connection_selection/mod.rs
++++ b/src/connectivity/wlan/wlancfg/src/client/connection_selection/mod.rs
+@@ -56,6 +56,7 @@
+
+     pub async fn do_connection_selection(
+         &mut self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         // None if no specific SSID is requested.
+         network_id: Option<types::NetworkIdentifier>,
+         reason: types::ConnectReason,
+@@ -63,6 +64,7 @@
+         let (sender, receiver) = oneshot::channel();
+         self.sender
+             .try_send(ConnectionSelectionRequest::NewConnectionSelection {
++                deadline,
+                 network_id,
+                 reason,
+                 responder: sender,
+@@ -72,6 +74,7 @@
+     }
+     pub async fn do_roam_selection(
+         &mut self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scan_type: fidl_common::ScanType,
+         network_id: types::NetworkIdentifier,
+         credential: network_config::Credential,
+@@ -80,6 +83,7 @@
+         let (sender, receiver) = oneshot::channel();
+         self.sender
+             .try_send(ConnectionSelectionRequest::RoamSelection {
++                deadline,
+                 scan_type,
+                 network_id,
+                 credential,
+@@ -94,11 +98,13 @@
+ #[cfg_attr(test, derive(Debug))]
+ pub enum ConnectionSelectionRequest {
+     NewConnectionSelection {
++        deadline: wlan_control_wire::MonotonicDeadline,
+         network_id: Option<types::NetworkIdentifier>,
+         reason: types::ConnectReason,
+         responder: oneshot::Sender<Option<types::ScannedCandidate>>,
+     },
+     RoamSelection {
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scan_type: fidl_common::ScanType,
+         network_id: types::NetworkIdentifier,
+         credential: network_config::Credential,
+@@ -113,12 +119,14 @@
+     // Find best connection candidate to initialize a connection.
+     async fn find_and_select_connection_candidate(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         network: Option<types::NetworkIdentifier>,
+         reason: types::ConnectReason,
+     ) -> Option<types::ScannedCandidate>;
+     // Find best roam candidate.
+     async fn find_and_select_roam_candidate(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scan_type: fidl_common::ScanType,
+         network: types::NetworkIdentifier,
+         credential: &network_config::Credential,
+@@ -135,14 +143,14 @@
+         select! {
+             request = request_channel.select_next_some() => {
+                 match request {
+-                    ConnectionSelectionRequest::NewConnectionSelection { network_id, reason, responder} => {
+-                        let selected = connection_selector.find_and_select_connection_candidate(network_id, reason).await;
++                    ConnectionSelectionRequest::NewConnectionSelection { deadline, network_id, reason, responder} => {
++                        let selected = connection_selector.find_and_select_connection_candidate(deadline, network_id, reason).await;
+                         // It's acceptable for the receiver to close the channel, preventing this
+                         // sender from responding.
+                         let _ = responder.send(selected);
+                     }
+-                    ConnectionSelectionRequest::RoamSelection { scan_type, network_id, credential, current_security, responder } => {
+-                        let selected = connection_selector.find_and_select_roam_candidate(scan_type, network_id, &credential, current_security).await;
++                    ConnectionSelectionRequest::RoamSelection { deadline, scan_type, network_id, credential, current_security, responder } => {
++                        let selected = connection_selector.find_and_select_roam_candidate(deadline, scan_type, network_id, &credential, current_security).await;
+                         // It's acceptable for the receiver to close the channel, preventing this
+                         // sender from responding.
+                         let _ = responder.send(selected);
+@@ -189,12 +197,13 @@
+     /// saved networks.
+     async fn find_available_bss_candidate_list(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         network: Option<types::NetworkIdentifier>,
+     ) -> Vec<types::ScannedCandidate> {
+         let scan_for_candidates = || async {
+             if let Some(network) = &network {
+                 self.scan_requester
+-                    .perform_scan(ScanReason::BssSelection, vec![network.ssid.clone()], vec![])
++                    .perform_scan(deadline, ScanReason::BssSelection, vec![network.ssid.clone()], vec![])
+                     .await
+             } else {
+                 let last_scan_result_time = *self.last_scan_result_time.lock().await;
+@@ -207,7 +216,7 @@
+                 }
+                 let passive_scan_results = match self
+                     .scan_requester
+-                    .perform_scan(ScanReason::NetworkSelection, vec![], vec![])
++                    .perform_scan(deadline, ScanReason::NetworkSelection, vec![], vec![])
+                     .await
+                 {
+                     Ok(scan_results) => scan_results,
+@@ -233,7 +242,7 @@
+                     Ok(passive_scan_results)
+                 } else {
+                     self.scan_requester
+-                        .perform_scan(
++                        .perform_scan(deadline,
+                             ScanReason::NetworkSelection,
+                             requested_active_scan_ssids,
+                             vec![],
+@@ -271,11 +280,13 @@
+     /// discover all the information potentially needed by the SME layer.
+     async fn augment_bss_candidate_with_active_scan(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scanned_candidate: types::ScannedCandidate,
+     ) -> types::ScannedCandidate {
+         // This internal function encapsulates all the logic and has a Result<> return type,
+         // allowing us to use the `?` operator inside it to reduce nesting.
+         async fn get_enhanced_bss_description(
++            deadline: wlan_control_wire::MonotonicDeadline,
+             scanned_candidate: &types::ScannedCandidate,
+             scan_requester: Arc<dyn scan::ScanRequestApi>,
+         ) -> Result<Sequestered<fidl_fuchsia_wlan_ieee80211::BssDescription>, ()> {
+@@ -295,7 +306,7 @@
+
+             // Perform the scan
+             let mut directed_scan_result = scan_requester
+-                .perform_scan(
++                .perform_scan(deadline,
+                     ScanReason::BssSelectionAugmentation,
+                     vec![scanned_candidate.network.ssid.clone()],
+                     vec![scanned_candidate.bss.channel],
+@@ -325,7 +336,7 @@
+             Ok(bss_description)
+         }
+
+-        match get_enhanced_bss_description(&scanned_candidate, self.scan_requester.clone()).await {
++        match get_enhanced_bss_description(deadline, &scanned_candidate, self.scan_requester.clone()).await {
+             Ok(new_bss_description) => {
+                 let updated_scanned_bss =
+                     Bss { bss_description: new_bss_description, ..scanned_candidate.bss.clone() };
+@@ -338,6 +349,7 @@
+     // Find scan results in provided network
+     async fn roam_scan(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scan_type: fidl_common::ScanType,
+         network: types::NetworkIdentifier,
+         current_security: types::SecurityTypeDetailed,
+@@ -347,7 +359,7 @@
+             fidl_common::ScanType::Active => vec![network.ssid.clone()],
+         };
+         self.scan_requester
+-            .perform_scan(ScanReason::RoamSearch, ssids, vec![])
++            .perform_scan(deadline, ScanReason::RoamSearch, ssids, vec![])
+             .await
+             .unwrap_or_else(|e| {
+                 error!("{}", format_err!("Error scanning: {:?}", e));
+@@ -370,12 +382,17 @@
+     /// bss info with an active scan.
+     async fn find_and_select_connection_candidate(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         network: Option<types::NetworkIdentifier>,
+         reason: types::ConnectReason,
+     ) -> Option<types::ScannedCandidate> {
++        if deadline.remaining(wlan_control_wire::monotonic_time_ns().ok()?).is_none() {
++            return None;
++        }
++
+         // Scan for BSSs belonging to saved networks.
+         let available_candidate_list =
+-            self.find_available_bss_candidate_list(network.clone()).await;
++            self.find_available_bss_candidate_list(deadline, network.clone()).await;
+
+         // Network selection.
+         let available_networks: HashSet<types::NetworkIdentifier> =
+@@ -421,7 +438,7 @@
+                 // If it was observed passively, augment with active scan.
+                 match candidate.bss.observation {
+                     types::ScanObservation::Passive => {
+-                        Some(self.augment_bss_candidate_with_active_scan(candidate.clone()).await)
++                        Some(self.augment_bss_candidate_with_active_scan(deadline, candidate.clone()).await)
+                     }
+                     _ => Some(candidate),
+                 }
+@@ -435,18 +452,23 @@
+     /// to ensure the network config matches.
+     async fn find_and_select_roam_candidate(
+         &self,
++        deadline: wlan_control_wire::MonotonicDeadline,
+         scan_type: fidl_common::ScanType,
+         network: types::NetworkIdentifier,
+         credential: &network_config::Credential,
+         current_security: types::SecurityTypeDetailed,
+     ) -> Option<types::ScannedCandidate> {
++        if deadline.remaining(wlan_control_wire::monotonic_time_ns().ok()?).is_none() {
++            return None;
++        }
++
+         // Scan for APs in the provided network.
+         let mut matching_scan_results =
+-            self.roam_scan(scan_type, network.clone(), current_security).await;
++            self.roam_scan(deadline, scan_type, network.clone(), current_security).await;
+         if matching_scan_results.is_empty() && scan_type == fidl_common::ScanType::Passive {
+             info!("No scan results seen in passive roam scan. Active scanning.");
+             matching_scan_results = self
+-                .roam_scan(fidl_common::ScanType::Active, network.clone(), current_security)
++                .roam_scan(deadline, fidl_common::ScanType::Active, network.clone(), current_security)
+                 .await;
+         }
+
+diff --git a/src/connectivity/wlan/wlancfg/src/client/connection_selection/fut_manager.rs b/src/connectivity/wlan/wlancfg/src/client/connection_selection/fut_manager.rs
+--- a/src/connectivity/wlan/wlancfg/src/client/connection_selection/fut_manager.rs
++++ b/src/connectivity/wlan/wlancfg/src/client/connection_selection/fut_manager.rs
+@@ -92,11 +92,11 @@
+         self.cancellation_handles.keys().cloned().collect()
+     }
+
+-    pub fn initiate_automatic_connection_selection(&mut self) {
++    pub fn initiate_automatic_connection_selection(&mut self, deadline: wlan_control_wire::MonotonicDeadline) {
+         let mut requester = self.requester.clone();
+         let fut = async move {
+             requester
+-                .do_connection_selection(None, types::ConnectReason::IdleInterfaceAutoconnect)
++                .do_connection_selection(deadline, None, types::ConnectReason::IdleInterfaceAutoconnect)
+                 .await
+                 .map_err(|e| format_err!("Error sending connection selection request: {}.", e))
+                 .map(ConnectionSelectionResponse::Autoconnect)
+@@ -112,7 +112,7 @@
+         let network = request.network.clone();
+         let fut = async move {
+             requester
+-                .do_connection_selection(Some(request.network.clone()), request.reason)
++                .do_connection_selection(request.deadline, Some(request.network.clone()), request.reason)
+                 .await
+                 .map_err(|e| format_err!("Error sending connection selection request: {}.", e))
+                 .map(move |candidate| ConnectionSelectionResponse::ConnectRequest {

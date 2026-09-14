@@ -25,6 +25,7 @@ use std::{
 };
 
 pub struct ApplicationCommand {
+    pub deadline: wlan_control_wire::MonotonicDeadline,
     pub request: Request,
     pub responder: sync_mpsc::SyncSender<Reply>,
 }
@@ -165,7 +166,21 @@ impl ApplicationClient {
                 // The policy executor must never block on the socket owner
                 // being scheduled; each one-shot reply has one reserved slot.
                 let (reply_tx, reply_rx) = sync_mpsc::sync_channel(1);
+                let budget = if matches!(request, Request::Disconnect) {
+                    10
+                } else {
+                    30
+                };
+                let deadline = match wlan_control_wire::MonotonicDeadline::after(
+                    Duration::from_secs(budget),
+                ) {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        return self.reply(Reply::Error("operation clock unavailable".into()));
+                    }
+                };
                 match commands.try_send(ApplicationCommand {
+                    deadline,
                     request,
                     responder: reply_tx,
                 }) {

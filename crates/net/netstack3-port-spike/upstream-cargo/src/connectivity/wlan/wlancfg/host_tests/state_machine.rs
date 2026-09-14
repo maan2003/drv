@@ -108,6 +108,7 @@ impl SavedNetworksManagerApi for Saved {
 }
 
 struct Sim {
+    connect_delay: std::time::Duration,
     defer_connect: Cell<bool>,
     pending_connect: RefCell<
         Option<(
@@ -116,7 +117,13 @@ struct Sim {
         )>,
     >,
     results: RefCell<VecDeque<fidl_sme::ConnectResult>>,
-    attempts: RefCell<Vec<(Instant, fidl_sme::ConnectRequest)>>,
+    attempts: RefCell<
+        Vec<(
+            Instant,
+            fidl_sme::ConnectRequest,
+            wlan_control_wire::MonotonicDeadline,
+        )>,
+    >,
     events: RefCell<
         Vec<mpsc::UnboundedSender<Result<fidl_sme::ConnectTransactionEvent, anyhow::Error>>>,
     >,
@@ -125,6 +132,7 @@ struct Sim {
 impl Sim {
     fn new(results: impl IntoIterator<Item = fidl_sme::ConnectResult>) -> Rc<Self> {
         Rc::new(Self {
+            connect_delay: std::time::Duration::ZERO,
             defer_connect: Cell::new(false),
             pending_connect: RefCell::new(None),
             results: RefCell::new(results.into_iter().collect()),
@@ -138,11 +146,12 @@ impl Sim {
 impl ClientSmeTransport for Sim {
     async fn connect(
         &self,
+        deadline: wlan_control_wire::MonotonicDeadline,
         request: &fidl_sme::ConnectRequest,
     ) -> Result<(fidl_sme::ConnectResult, ConnectTransactionEventStream), anyhow::Error> {
         self.attempts
             .borrow_mut()
-            .push((Instant::now(), request.clone()));
+            .push((Instant::now(), request.clone(), deadline));
         let (tx, rx) = mpsc::unbounded();
         self.events.borrow_mut().push(tx);
         let result = self
@@ -157,10 +166,14 @@ impl ClientSmeTransport for Sim {
         } else {
             result
         };
+        if !self.connect_delay.is_zero() {
+            tokio::time::sleep(self.connect_delay).await;
+        }
         Ok((result, rx.boxed_local().fuse()))
     }
     async fn disconnect(
         &self,
+        _deadline: wlan_control_wire::MonotonicDeadline,
         reason: fidl_sme::UserDisconnectReason,
     ) -> Result<(), anyhow::Error> {
         self.disconnects.borrow_mut().push(reason);
@@ -171,10 +184,18 @@ impl ClientSmeTransport for Sim {
         }
         Ok(())
     }
-    fn roam(&self, _: &fidl_sme::RoamRequest) -> Result<(), anyhow::Error> {
+    fn roam(
+        &self,
+        _deadline: wlan_control_wire::MonotonicDeadline,
+        _: &fidl_sme::RoamRequest,
+    ) -> Result<(), anyhow::Error> {
         Ok(())
     }
-    async fn scan(&self, _: &fidl_sme::ScanRequest) -> Result<ClientSmeScanResult, anyhow::Error> {
+    async fn scan(
+        &self,
+        _deadline: wlan_control_wire::MonotonicDeadline,
+        _: &fidl_sme::ScanRequest,
+    ) -> Result<ClientSmeScanResult, anyhow::Error> {
         unreachable!()
     }
     fn take_event_stream(&self) -> ClientSmeEventStream {
@@ -243,6 +264,10 @@ fn selection() -> (ConnectSelection, NetworkConfig) {
     let config = NetworkConfig::new(id, Credential::None, true, Some(0.0)).unwrap();
     (
         ConnectSelection {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
             target: candidate,
             reason: ConnectReason::FidlConnectRequest,
         },
@@ -293,6 +318,7 @@ fn exact_four_attempt_linear_backoff() {
     execute(async {
         let sim = Sim::new([result(StatusCode::RefusedReasonUnspecified, false); 4]);
         let (selected, saved) = selection();
+        let deadline = selected.deadline;
         let started = Instant::now();
         run(sim.clone(), selected, saved, |status| async move {
             for _ in 0..100 {
@@ -309,9 +335,13 @@ fn exact_four_attempt_linear_backoff() {
         .await;
         let calls = sim.attempts.borrow();
         assert_eq!(calls.len(), 4);
+        assert!(
+            calls.iter().all(|call| call.2 == deadline),
+            "retries renewed the budget"
+        );
         let elapsed: Vec<_> = calls
             .iter()
-            .map(|(t, _)| t.duration_since(started).as_millis())
+            .map(|(t, _, _)| t.duration_since(started).as_millis())
             .collect();
         let delays: Vec<_> = elapsed.windows(2).map(|pair| pair[1] - pair[0]).collect();
         for (actual, expected) in delays.iter().zip([400, 800, 1200]) {
@@ -388,6 +418,8 @@ fn connected_events_progress_and_manual_disconnect_cancels() {
             let (done_tx, done_rx) = oneshot::channel();
             client
                 .disconnect(
+                    wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10))
+                        .unwrap(),
                     types::DisconnectReason::FidlStopClientConnectionsRequest,
                     done_tx,
                 )
@@ -420,6 +452,8 @@ fn already_queued_disconnect_submits_connect_first_and_drains_late_success() {
         let (ack, completed) = oneshot::channel();
         client
             .disconnect(
+                wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(10))
+                    .unwrap(),
                 types::DisconnectReason::FidlStopClientConnectionsRequest,
                 ack,
             )
@@ -451,6 +485,57 @@ fn already_queued_disconnect_submits_connect_first_and_drains_late_success() {
             sim.disconnects.borrow().len(),
             3,
             "startup, cancellation, final teardown"
+        );
+    });
+}
+
+#[test]
+fn exhausted_selection_budget_cannot_start_an_attempt() {
+    execute(async {
+        let sim = Sim::new([]);
+        let (mut selected, saved) = selection();
+        selected.deadline = wlan_control_wire::MonotonicDeadline::from_nanos(1).unwrap();
+        run(sim.clone(), selected, saved, |_| async {}).await;
+        assert!(sim.attempts.borrow().is_empty());
+    });
+}
+
+#[test]
+fn retry_backoff_cannot_renew_an_insufficient_budget() {
+    execute(async {
+        let sim = Sim::new([result(StatusCode::RefusedReasonUnspecified, false)]);
+        let (mut selected, saved) = selection();
+        selected.deadline =
+            wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_millis(100))
+                .unwrap();
+        run(sim.clone(), selected, saved, |_| async {}).await;
+        assert_eq!(sim.attempts.borrow().len(), 1);
+    });
+}
+
+#[test]
+fn late_success_is_disconnected_instead_of_published_connected() {
+    execute(async {
+        let mut sim = Sim::new([result(StatusCode::Success, false)]);
+        Rc::get_mut(&mut sim).unwrap().connect_delay = std::time::Duration::from_millis(50);
+        let (mut selected, saved) = selection();
+        selected.deadline =
+            wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_millis(20))
+                .unwrap();
+        run(sim.clone(), selected, saved, |status| async move {
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                assert!(!matches!(
+                    status.read_status(),
+                    Ok(state_machine::Status::Connected { .. })
+                ));
+            }
+        })
+        .await;
+        assert_eq!(sim.attempts.borrow().len(), 1);
+        assert_eq!(
+            sim.disconnects.borrow().last(),
+            Some(&fidl_sme::UserDisconnectReason::FailedToConnect)
         );
     });
 }

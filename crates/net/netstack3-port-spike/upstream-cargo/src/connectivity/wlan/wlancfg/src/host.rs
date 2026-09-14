@@ -262,7 +262,6 @@ pub mod telemetry {
             saved_network_count: usize,
             config_count_per_saved_network: Vec<usize>,
         },
-
     }
 }
 
@@ -300,6 +299,7 @@ pub mod client {
         pub trait ScanRequestApi {
             async fn perform_scan(
                 &self,
+                deadline: wlan_control_wire::MonotonicDeadline,
                 scan_reason: ScanReason,
                 ssids: Vec<types::Ssid>,
                 channels: Vec<types::WlanChan>,
@@ -447,6 +447,7 @@ pub mod mode_management {
     pub trait ClientSmeTransport {
         async fn connect(
             &self,
+            deadline: wlan_control_wire::MonotonicDeadline,
             request: &fidl_fuchsia_wlan_sme::ConnectRequest,
         ) -> Result<
             (
@@ -457,11 +458,17 @@ pub mod mode_management {
         >;
         async fn disconnect(
             &self,
+            deadline: wlan_control_wire::MonotonicDeadline,
             reason: fidl_fuchsia_wlan_sme::UserDisconnectReason,
         ) -> Result<(), anyhow::Error>;
-        fn roam(&self, request: &fidl_fuchsia_wlan_sme::RoamRequest) -> Result<(), anyhow::Error>;
+        fn roam(
+            &self,
+            deadline: wlan_control_wire::MonotonicDeadline,
+            request: &fidl_fuchsia_wlan_sme::RoamRequest,
+        ) -> Result<(), anyhow::Error>;
         async fn scan(
             &self,
+            deadline: wlan_control_wire::MonotonicDeadline,
             request: &fidl_fuchsia_wlan_sme::ScanRequest,
         ) -> Result<ClientSmeScanResult, anyhow::Error>;
         fn take_event_stream(&self) -> ClientSmeEventStream;
@@ -487,6 +494,7 @@ pub mod mode_management {
 
         #[derive(Clone)]
         pub struct ConnectAttemptRequest {
+            pub deadline: wlan_control_wire::MonotonicDeadline,
             pub network: types::NetworkIdentifier,
             pub credential: Credential,
             pub reason: types::ConnectReason,
@@ -502,6 +510,7 @@ pub mod mode_management {
             }
             pub async fn connect(
                 &self,
+                deadline: wlan_control_wire::MonotonicDeadline,
                 request: &fidl_fuchsia_wlan_sme::ConnectRequest,
             ) -> Result<
                 (
@@ -510,19 +519,21 @@ pub mod mode_management {
                 ),
                 anyhow::Error,
             > {
-                self.0.connect(request).await
+                self.0.connect(deadline, request).await
             }
             pub async fn disconnect(
                 &self,
+                deadline: wlan_control_wire::MonotonicDeadline,
                 reason: fidl_fuchsia_wlan_sme::UserDisconnectReason,
             ) -> Result<(), anyhow::Error> {
-                self.0.disconnect(reason).await
+                self.0.disconnect(deadline, reason).await
             }
             pub fn roam(
                 &self,
+                deadline: wlan_control_wire::MonotonicDeadline,
                 request: &fidl_fuchsia_wlan_sme::RoamRequest,
             ) -> Result<(), anyhow::Error> {
-                self.0.roam(request)
+                self.0.roam(deadline, request)
             }
             pub fn take_event_stream(&self) -> ClientSmeEventStream {
                 self.0.take_event_stream()
@@ -537,9 +548,10 @@ pub mod mode_management {
         impl SmeForScan {
             pub async fn scan(
                 &self,
+                deadline: wlan_control_wire::MonotonicDeadline,
                 request: &fidl_fuchsia_wlan_sme::ScanRequest,
             ) -> Result<ClientSmeScanResult, anyhow::Error> {
-                self.0.scan(request).await
+                self.0.scan(deadline, request).await
             }
             pub fn log_aborted_scan_defect(&self) {}
             pub fn log_failed_scan_defect(&self) {}

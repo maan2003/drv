@@ -42,6 +42,7 @@ use wlancfg_selection::wlan_metrics_registry::PolicyConnectionAttemptMigratedMet
 
 #[derive(Clone)]
 struct ScanCall {
+    deadline: wlan_control_wire::MonotonicDeadline,
     reason: ScanReason,
     ssids: Vec<types::Ssid>,
     channels: Vec<types::WlanChan>,
@@ -65,11 +66,13 @@ impl SpyScan {
 impl ScanRequestApi for SpyScan {
     async fn perform_scan(
         &self,
+        deadline: wlan_control_wire::MonotonicDeadline,
         reason: ScanReason,
         ssids: Vec<types::Ssid>,
         channels: Vec<types::WlanChan>,
     ) -> Result<Vec<ScanResult>, types::ScanError> {
         self.calls.lock().await.push(ScanCall {
+            deadline,
             reason,
             ssids,
             channels,
@@ -328,7 +331,12 @@ fn directed_selection_uses_pinned_filter_and_score_order() {
         );
 
         let selected = selector
-            .find_and_select_connection_candidate(Some(target), ConnectReason::FidlConnectRequest)
+            .find_and_select_connection_candidate(
+                wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                    .unwrap(),
+                Some(target),
+                ConnectReason::FidlConnectRequest,
+            )
             .await
             .expect("pinned selector should choose a compatible BSS");
 
@@ -369,7 +377,12 @@ fn wifi_command_contains_only_the_selected_active_credential() {
         );
 
         let selected = selector
-            .find_and_select_connection_candidate(Some(target), ConnectReason::FidlConnectRequest)
+            .find_and_select_connection_candidate(
+                wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                    .unwrap(),
+                Some(target),
+                ConnectReason::FidlConnectRequest,
+            )
             .await
             .expect("pinned selector should choose the saved WPA3 network");
         let request = WifiConnectCommand::from_selected(selected).into_sme_request();
@@ -401,14 +414,25 @@ fn passive_winner_is_augmented_by_the_pinned_active_scan() {
         let saved = Arc::new(SpySavedNetworks::new(vec![open_config(ssid)]));
         let (selector, _telemetry) = selector(scan.clone(), saved);
 
+        let deadline =
+            wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                .unwrap();
         let selected = selector
-            .find_and_select_connection_candidate(None, ConnectReason::IdleInterfaceAutoconnect)
+            .find_and_select_connection_candidate(
+                deadline,
+                None,
+                ConnectReason::IdleInterfaceAutoconnect,
+            )
             .await
             .expect("pinned selector should return its augmented candidate");
 
         assert_eq!(selected.bss.bss_description, augmented_description);
         let calls = scan.calls.lock().await;
         assert_eq!(calls.len(), 2);
+        assert!(
+            calls.iter().all(|call| call.deadline == deadline),
+            "augmentation renewed budget"
+        );
         assert_eq!(calls[0].reason, ScanReason::NetworkSelection);
         assert_eq!(calls[1].reason, ScanReason::BssSelectionAugmentation);
         assert_eq!(calls[1].ssids[0].to_vec(), ssid);
@@ -436,7 +460,12 @@ fn equal_scores_preserve_the_pinned_input_order() {
             SecurityType::None,
         );
         let selected = selector
-            .find_and_select_connection_candidate(Some(target), ConnectReason::FidlConnectRequest)
+            .find_and_select_connection_candidate(
+                wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                    .unwrap(),
+                Some(target),
+                ConnectReason::FidlConnectRequest,
+            )
             .await
             .unwrap();
         assert_eq!(selected.bss.bssid, first.into());
@@ -452,6 +481,8 @@ fn no_candidates_returns_none_without_local_fallback() {
         assert!(
             selector
                 .find_and_select_connection_candidate(
+                    wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                        .unwrap(),
                     None,
                     ConnectReason::IdleInterfaceAutoconnect,
                 )
@@ -473,7 +504,10 @@ fn pinned_selection_manager_cancellation_discards_the_result() {
         let (sender, mut requests) = mpsc::channel(1);
         let mut manager =
             ConnectionSelectionManager::new(ConnectionSelectionRequester::new(sender));
-        manager.initiate_automatic_connection_selection();
+        manager.initiate_automatic_connection_selection(
+            wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                .unwrap(),
+        );
         assert!(manager.active_selections() == vec![SelectionIdentifier::Automatic]);
 
         // Keep the production request's responder alive so only the pinned

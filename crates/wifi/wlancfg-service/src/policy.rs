@@ -55,6 +55,7 @@ struct ControlScan {
 impl ScanRequestApi for ControlScan {
     async fn perform_scan(
         &self,
+        deadline: wlan_control_wire::MonotonicDeadline,
         _reason: ScanReason,
         ssids: Vec<types::Ssid>,
         channels: Vec<types::WlanChan>,
@@ -76,7 +77,7 @@ impl ScanRequestApi for ControlScan {
         let request = sme::ScanRequest::Passive(sme::PassiveScanRequest { channels });
         let results =
             self.control
-                .scan(&request)
+                .scan(deadline, &request)
                 .await
                 .map_err(|_| types::ScanError::GeneralError)?
                 .map_err(|error| match error {
@@ -189,12 +190,18 @@ pub fn serve(
             telemetry.clone(),
         );
         let state = RefCell::new(PolicyState::default());
-        let cancelled = Cell::new(false);
+        let cancelled = Cell::new(None);
+        let startup_deadline =
+            wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30))?;
         let startup = async {
             if let Some(target) = selector
-                .find_and_select_connection_candidate(None, ConnectReason::IdleInterfaceAutoconnect)
+                .find_and_select_connection_candidate(
+                    startup_deadline,
+                    None,
+                    ConnectReason::IdleInterfaceAutoconnect,
+                )
                 .await
-                && !cancelled.get()
+                && cancelled.get().is_none()
             {
                 state.borrow_mut().desired = Some(target.network.clone());
                 state.borrow_mut().machine = Some(start_machine(
@@ -202,6 +209,7 @@ pub fn serve(
                     saved.clone(),
                     telemetry.clone(),
                     ConnectSelection {
+                        deadline: startup_deadline,
                         target,
                         reason: ConnectReason::IdleInterfaceAutoconnect,
                     },
@@ -209,7 +217,8 @@ pub fn serve(
             }
             Reply::Ok
         };
-        let (_, mut queued) = drive_operation(startup, &mut commands, &state, &cancelled).await;
+        let (_, mut queued) =
+            drive_operation(startup, startup_deadline, &mut commands, &state, &cancelled).await;
         loop {
             let command = match queued.take() {
                 Some(command) => command,
@@ -218,9 +227,10 @@ pub fn serve(
                     None => break,
                 },
             };
-            cancelled.set(false);
+            cancelled.set(None);
             let operation = handle(
                 command.request,
+                command.deadline,
                 &control,
                 scan.as_ref(),
                 &selector,
@@ -229,7 +239,14 @@ pub fn serve(
                 &state,
                 &cancelled,
             );
-            let (reply, next) = drive_operation(operation, &mut commands, &state, &cancelled).await;
+            let (reply, next) = drive_operation(
+                operation,
+                command.deadline,
+                &mut commands,
+                &state,
+                &cancelled,
+            )
+            .await;
             let _ = command.responder.send(reply);
             queued = next;
         }
@@ -241,9 +258,10 @@ pub fn serve(
 /// not drop its transport future: scan/connect replies must still be drained.
 async fn drive_operation(
     operation: impl std::future::Future<Output = Reply>,
+    deadline: wlan_control_wire::MonotonicDeadline,
     commands: &mut mpsc::Receiver<ApplicationCommand>,
     state: &RefCell<PolicyState>,
-    cancelled: &Cell<bool>,
+    cancelled: &Cell<Option<wlan_control_wire::MonotonicDeadline>>,
 ) -> (Reply, Option<ApplicationCommand>) {
     let operation = operation.fuse();
     futures::pin_mut!(operation);
@@ -257,7 +275,9 @@ async fn drive_operation(
                         let _ = command.responder.send(Reply::Status(policy_status(&state.borrow())));
                     }
                     Request::Disconnect => {
-                        cancelled.set(true);
+                        if cancelled.get().is_none() {
+                            cancelled.set(Some(command.deadline));
+                        }
                         state.borrow_mut().desired = None;
                         if let Some(previous) = queued.replace(command) {
                             let _ = previous.responder.send(Reply::Error("superseded by disconnect".into()));
@@ -269,7 +289,9 @@ async fn drive_operation(
                     }
                 },
                 None => {
-                    cancelled.set(true);
+                    if cancelled.get().is_none() {
+                        cancelled.set(Some(deadline));
+                    }
                     return (operation.await, queued);
                 }
             },
@@ -279,6 +301,7 @@ async fn drive_operation(
 
 async fn disconnect_machine(
     state: &RefCell<PolicyState>,
+    deadline: wlan_control_wire::MonotonicDeadline,
     reason: types::DisconnectReason,
 ) -> Reply {
     let receiver = {
@@ -291,7 +314,7 @@ async fn disconnect_machine(
             return Reply::Ok;
         };
         let (tx, rx) = oneshot::channel();
-        if active.client.disconnect(reason, tx).is_err() {
+        if active.client.disconnect(deadline, reason, tx).is_err() {
             return Reply::Error("disconnect policy unavailable".into());
         }
         rx
@@ -304,17 +327,24 @@ async fn disconnect_machine(
 
 async fn handle(
     request: Request,
+    deadline: wlan_control_wire::MonotonicDeadline,
     control: &HostControlClient,
     scan: &ControlScan,
     selector: &ConnectionSelector,
     saved: Arc<dyn SavedNetworksManagerApi>,
     telemetry: TelemetrySender,
     state: &RefCell<PolicyState>,
-    cancelled: &Cell<bool>,
+    cancelled: &Cell<Option<wlan_control_wire::MonotonicDeadline>>,
 ) -> Reply {
+    if deadline
+        .remaining(wlan_control_wire::monotonic_time_ns().unwrap_or(u64::MAX))
+        .is_none()
+    {
+        return Reply::Error("policy operation deadline exceeded".into());
+    }
     match request {
         Request::Scan => match scan
-            .perform_scan(ScanReason::ClientRequest, vec![], vec![])
+            .perform_scan(deadline, ScanReason::ClientRequest, vec![], vec![])
             .await
         {
             Ok(results) => {
@@ -356,6 +386,7 @@ async fn handle(
             }
             let Some(target) = selector
                 .find_and_select_connection_candidate(
+                    deadline,
                     Some(id.clone()),
                     ConnectReason::FidlConnectRequest,
                 )
@@ -364,18 +395,20 @@ async fn handle(
                 return Reply::Error("saved network is not visible".into());
             };
             let selection = ConnectSelection {
+                deadline,
                 target,
                 reason: ConnectReason::FidlConnectRequest,
             };
-            if cancelled.get() {
+            if cancelled.get().is_some() {
                 return Reply::Error("connection cancelled".into());
             }
             let disconnected =
-                disconnect_machine(state, types::DisconnectReason::FidlConnectRequest).await;
+                disconnect_machine(state, deadline, types::DisconnectReason::FidlConnectRequest)
+                    .await;
             if disconnected != Reply::Ok {
                 return disconnected;
             }
-            if cancelled.get() {
+            if cancelled.get().is_some() {
                 return Reply::Error("connection cancelled".into());
             }
             state.borrow_mut().machine = Some(start_machine(
@@ -391,6 +424,7 @@ async fn handle(
             state.borrow_mut().desired = None;
             disconnect_machine(
                 state,
+                deadline,
                 types::DisconnectReason::FidlStopClientConnectionsRequest,
             )
             .await
@@ -421,7 +455,8 @@ async fn handle(
             if is_current {
                 state.borrow_mut().desired = None;
                 let disconnected =
-                    disconnect_machine(state, types::DisconnectReason::NetworkUnsaved).await;
+                    disconnect_machine(state, deadline, types::DisconnectReason::NetworkUnsaved)
+                        .await;
                 if disconnected != Reply::Ok {
                     return disconnected;
                 }
@@ -435,13 +470,17 @@ async fn handle(
     }
 }
 
-async fn wait_for_connection(state: &RefCell<PolicyState>, cancelled: &Cell<bool>) -> Reply {
+async fn wait_for_connection(
+    state: &RefCell<PolicyState>,
+    cancelled: &Cell<Option<wlan_control_wire::MonotonicDeadline>>,
+) -> Reply {
     loop {
-        if cancelled.get() {
+        if let Some(cancel_deadline) = cancelled.get() {
             // Keep the state machine and transport/event consumer alive until
             // disconnect acknowledges quiescence, before completing Connect.
             let disconnected = disconnect_machine(
                 state,
+                cancel_deadline,
                 types::DisconnectReason::FidlStopClientConnectionsRequest,
             )
             .await;
@@ -533,12 +572,13 @@ mod tests {
     #[test]
     fn status_and_disconnect_progress_without_dropping_the_active_operation() {
         let state = RefCell::new(PolicyState::default());
-        let cancelled = Cell::new(false);
+        let cancelled = Cell::new(None);
         let (mut commands, mut incoming) = mpsc::channel(4);
         let (complete, completion) = oneshot::channel();
         let operation = async { completion.await.unwrap() };
         let mut driving = Box::pin(drive_operation(
             operation,
+            wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30)).unwrap(),
             &mut incoming,
             &state,
             &cancelled,
@@ -546,6 +586,8 @@ mod tests {
         let (status_tx, status_rx) = sync_mpsc::sync_channel(1);
         commands
             .try_send(ApplicationCommand {
+                deadline: wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30))
+                    .unwrap(),
                 request: Request::Status,
                 responder: status_tx,
             })
@@ -556,15 +598,34 @@ mod tests {
         let (disconnect_tx, disconnect_rx) = sync_mpsc::sync_channel(1);
         commands
             .try_send(ApplicationCommand {
+                deadline: wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30))
+                    .unwrap(),
                 request: Request::Disconnect,
                 responder: disconnect_tx,
             })
             .unwrap();
         assert!(driving.as_mut().now_or_never().is_none());
-        assert!(cancelled.get());
+        assert!(cancelled.get().is_some());
         assert!(
             disconnect_rx.try_recv().is_err(),
             "receipt is not quiescence"
+        );
+        let first_cancel_deadline = cancelled.get().unwrap();
+        let (repeat_tx, _repeat_rx) = sync_mpsc::sync_channel(1);
+        commands
+            .try_send(ApplicationCommand {
+                deadline: first_cancel_deadline
+                    .checked_add(Duration::from_secs(5))
+                    .unwrap(),
+                request: Request::Disconnect,
+                responder: repeat_tx,
+            })
+            .unwrap();
+        assert!(driving.as_mut().now_or_never().is_none());
+        assert_eq!(
+            cancelled.get(),
+            Some(first_cancel_deadline),
+            "repeated cancel extended cleanup"
         );
         complete.send(Reply::Ok).unwrap();
         let (reply, queued) = futures::executor::block_on(driving);
@@ -607,10 +668,12 @@ mod tests {
                 network: network_id(b"ap".to_vec(), Security::Wpa3),
             }),
         });
-        let cancelled = Cell::new(true);
+        let cancelled = Cell::new(Some(
+            wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30)).unwrap(),
+        ));
         let mut waiting = Box::pin(wait_for_connection(&state, &cancelled));
         assert!(waiting.as_mut().now_or_never().is_none());
-        let state_machine::ManualRequest::Disconnect((_, ack)) = requests.try_recv().unwrap()
+        let state_machine::ManualRequest::Disconnect((_, _, ack)) = requests.try_recv().unwrap()
         else {
             panic!("cancellation must explicitly disconnect");
         };

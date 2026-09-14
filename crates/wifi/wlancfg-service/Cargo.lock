@@ -2865,6 +2865,7 @@ dependencies = [
  "rand 0.9.4",
  "tokio",
  "wlan-common",
+ "wlan-control-wire",
  "wlan-sme",
  "zx",
 ]
