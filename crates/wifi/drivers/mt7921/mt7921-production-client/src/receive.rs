@@ -269,9 +269,197 @@ impl Drop for RxRouting {
     }
 }
 
+/// Ring 2 uses the same one-vacant-slot DMA contract as the MCU rings.
+/// No route escapes before its replacement descriptor and CIDX publication.
+/// An error requires session containment before this cursor can be used again.
+/// Fragmented frames are currently drained and dropped, never delivered piecemeal.
+#[derive(Default)]
+pub(super) struct DataRx {
+    head: usize,
+    discard_until_last: bool,
+}
+
+impl DataRx {
+    pub fn poll<B: drv_hardware::Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+    ) -> Result<(bool, Vec<McuRxRoute>)> {
+        use mt7921_core::{
+            DMA_DESCRIPTOR_LEN, DmaDescriptor, DmaSegment, MT7921_DATA_RX_RING_COUNT,
+            MT7921_MCU_RX_BUFFER_BYTES, route_mcu_rx_descriptor,
+        };
+        const TURN_BUDGET: usize = 8;
+        let mut progressed = false;
+        let mut routes = Vec::new();
+        for _ in 0..TURN_BUDGET {
+            let consumed = self.head;
+            let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+            resources
+                .dma
+                .data_rx_ring
+                .read(consumed * DMA_DESCRIPTOR_LEN, &mut descriptor)?;
+            let control = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+            if control & (1 << 31) == 0 {
+                break;
+            }
+            std::sync::atomic::fence(Ordering::Acquire);
+            let length = ((control >> 16) & 0x3fff) as usize;
+            if length > MT7921_MCU_RX_BUFFER_BYTES {
+                return Err(Error::DeviceFault);
+            }
+            let mut bytes = vec![0; length];
+            resources
+                .dma
+                .data_rx_buffers
+                .read(consumed * MT7921_MCU_RX_BUFFER_BYTES, &mut bytes)?;
+            let last = control & (1 << 30) != 0;
+            let route = if self.discard_until_last || !last {
+                None
+            } else {
+                // Invalid air/firmware payloads are drops, not ownership release.
+                route_mcu_rx_descriptor(2, consumed as u16, control, &bytes).ok()
+            };
+            self.discard_until_last = !last;
+            let posted = (consumed + MT7921_DATA_RX_RING_COUNT - 1) % MT7921_DATA_RX_RING_COUNT;
+            let fresh = DmaDescriptor::rx(DmaSegment {
+                iova: resources
+                    .dma
+                    .data_rx_buffers
+                    .device_address(posted * MT7921_MCU_RX_BUFFER_BYTES)?
+                    .bits(),
+                len: MT7921_MCU_RX_BUFFER_BYTES as u16,
+            })
+            .map_err(|_| Error::Invalid)?;
+            resources
+                .dma
+                .data_rx_ring
+                .write(posted * DMA_DESCRIPTOR_LEN, &fresh.to_le_bytes())?;
+            std::sync::atomic::fence(Ordering::Release);
+            resources.bar0.write_u32(0xd4528, consumed as u32)?;
+            self.head = (consumed + 1) % MT7921_DATA_RX_RING_COUNT;
+            progressed = true;
+            if let Some(route) = route {
+                routes.push(route);
+            }
+        }
+        Ok((progressed, routes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_rx_reposts_before_returning_and_wraps_without_duplicate_routes() {
+        use drv_hardware_backends::{DeterministicBackend, Operation};
+        use mt7921_core::{
+            DMA_DESCRIPTOR_LEN, DmaDescriptor, MT7921_DATA_RX_RING_COUNT,
+            MT7921_MCU_RX_BUFFER_BYTES,
+        };
+        let (device, log, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        let mut rx = DataRx::default();
+        for ordinal in 0..MT7921_DATA_RX_RING_COUNT + 3 {
+            let slot = ordinal % MT7921_DATA_RX_RING_COUNT;
+            let mut bytes = vec![0; 40];
+            bytes[..4].copy_from_slice(&((2u32 << 27) | 40).to_le_bytes());
+            bytes[39] = ordinal as u8;
+            model.write_dma(
+                resources
+                    .dma
+                    .data_rx_buffers
+                    .device_address(slot * MT7921_MCU_RX_BUFFER_BYTES)
+                    .unwrap()
+                    .bits(),
+                bytes.clone(),
+            );
+            let done = DmaDescriptor {
+                buf0: 0,
+                ctrl: (1 << 31) | (1 << 30) | (40 << 16),
+                buf1: 0,
+                info: 0,
+            };
+            model.write_dma(
+                resources
+                    .dma
+                    .data_rx_ring
+                    .device_address(slot * DMA_DESCRIPTOR_LEN)
+                    .unwrap()
+                    .bits(),
+                done.to_le_bytes().to_vec(),
+            );
+            let (progress, routes) = rx.poll(&mut resources).unwrap();
+            assert!(progress);
+            assert_eq!(routes, vec![McuRxRoute::Normal(bytes)]);
+            assert!(
+                matches!(log.borrow().last(), Some(Operation::WriteU32 { offset: 0xd4528, value, .. }) if *value == slot as u32)
+            );
+            let posted = (slot + MT7921_DATA_RX_RING_COUNT - 1) % MT7921_DATA_RX_RING_COUNT;
+            let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+            resources
+                .dma
+                .data_rx_ring
+                .read(posted * DMA_DESCRIPTOR_LEN, &mut descriptor)
+                .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) & (1 << 31),
+                0
+            );
+            assert_eq!(rx.poll(&mut resources).unwrap(), (false, vec![]));
+        }
+    }
+
+    #[test]
+    fn data_rx_discards_fragment_chains_and_bounds_each_turn() {
+        use drv_hardware_backends::DeterministicBackend;
+        use mt7921_core::{DMA_DESCRIPTOR_LEN, DmaDescriptor, MT7921_MCU_RX_BUFFER_BYTES};
+        let (device, _, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        for slot in 0..10 {
+            let mut bytes = vec![0; 40];
+            bytes[..4].copy_from_slice(&((2u32 << 27) | 40).to_le_bytes());
+            model.write_dma(
+                resources
+                    .dma
+                    .data_rx_buffers
+                    .device_address(slot * MT7921_MCU_RX_BUFFER_BYTES)
+                    .unwrap()
+                    .bits(),
+                bytes,
+            );
+            let done = DmaDescriptor {
+                buf0: 0,
+                ctrl: (1 << 31) | if slot == 0 { 0 } else { 1 << 30 } | (40 << 16),
+                buf1: 0,
+                info: 0,
+            };
+            model.write_dma(
+                resources
+                    .dma
+                    .data_rx_ring
+                    .device_address(slot * DMA_DESCRIPTOR_LEN)
+                    .unwrap()
+                    .bits(),
+                done.to_le_bytes().to_vec(),
+            );
+        }
+        let mut rx = DataRx::default();
+        let (progress, routes) = rx.poll(&mut resources).unwrap();
+        assert!(progress);
+        assert_eq!(rx.head, 8);
+        assert_eq!(
+            routes.len(),
+            6,
+            "both fragments are dropped, not parsed as independent frames"
+        );
+        let (progress, routes) = rx.poll(&mut resources).unwrap();
+        assert!(progress);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(rx.head, 10);
+    }
 
     fn stage(routing: &mut RxRouting, slot: u16, route: &McuRxRoute) {
         let posted = (slot + MT7921_MCU_RX_RING_COUNT as u16 - 1) % MT7921_MCU_RX_RING_COUNT as u16;

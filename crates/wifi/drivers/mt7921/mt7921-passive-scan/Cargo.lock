@@ -605,6 +605,8 @@ version = "0.1.0"
 dependencies = [
  "drv-hardware",
  "drv-hardware-backends",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-softmac",
  "linux-self-sandbox",
  "mt7921-core",
  "sha2",

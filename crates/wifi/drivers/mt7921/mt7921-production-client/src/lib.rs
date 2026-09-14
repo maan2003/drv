@@ -913,6 +913,8 @@ pub struct Mt7921Driver {
     session: Mt7921HardwareSession,
     firmware: FirmwareLoaderReport,
     mac_initialization: radio::MacInitialization,
+    data_rx: receive::DataRx,
+    upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
 
 impl Mt7921Driver {
@@ -934,6 +936,8 @@ impl Mt7921Driver {
                     session,
                     firmware,
                     mac_initialization: radio::MacInitialization::new(),
+                    data_rx: receive::DataRx::default(),
+                    upcalls: None,
                 })
             }
             Err(source) => {

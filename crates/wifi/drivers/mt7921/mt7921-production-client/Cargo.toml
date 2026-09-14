@@ -9,6 +9,8 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
+fidl-fuchsia-wlan-softmac = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
 wlan-softmac-host = { path = "../../../wlan-softmac-host" }
 zx = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 drv-hardware = { path = "../../../../platform/hardware-api" }

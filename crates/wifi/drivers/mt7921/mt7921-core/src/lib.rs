@@ -411,7 +411,9 @@ mod mcu_rx {
                 McuRxParserKind::DescriptorLength,
             ));
         }
-        if packet_type == 7 && packet_flag == 1 {
+        // Linux mt7921_queue_rx_skb accepts both normal ring-2 frames
+        // and RX_EVENT/flag=1 frames routed through an MCU ring.
+        if packet_type == 2 || (packet_type == 7 && packet_flag == 1) {
             return Ok(McuRxRoute::Normal(bytes.to_vec()));
         }
         let sequence = bytes[29];

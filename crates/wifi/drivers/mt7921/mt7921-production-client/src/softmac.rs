@@ -8,15 +8,17 @@ use crate::{Mt7921Driver, SessionLifecycle};
 use wlan_softmac_host::*;
 
 impl WlanSoftmacLifecycle for Mt7921Driver {
-    fn start(&mut self, _upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status> {
+    fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status> {
         if self.session.lifecycle != SessionLifecycle::FirmwareInitialized {
             return Err(zx::Status::BAD_STATE);
         }
+        self.upcalls = Some(upcalls);
         self.session.lifecycle = SessionLifecycle::ProtocolStarted;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), zx::Status> {
+        self.upcalls = None;
         self.session
             .contain()
             .map(|_| ())
@@ -34,21 +36,55 @@ impl ClientRuntimeDriver for Mt7921Driver {
             .resources
             .as_mut()
             .ok_or(zx::Status::BAD_STATE)?;
-        match self.mac_initialization.drive(
-            resources,
-            &mut self.session.mcu.0,
-            &mut self.session.receive,
-            self.session.start,
-            std::time::Instant::now(),
-        ) {
-            Ok(progress) => Ok(progress),
-            Err(status) => {
-                // Block all further operational turns. The owner retains DMA
-                // resources until stop/reset completes containment.
-                self.session.lifecycle = SessionLifecycle::Closing;
-                Err(status)
+        let result = (|| {
+            let mut progressed = self.mac_initialization.drive(
+                resources,
+                &mut self.session.mcu.0,
+                &mut self.session.receive,
+                self.session.start,
+                std::time::Instant::now(),
+            )?;
+            if !matches!(
+                self.mac_initialization,
+                crate::radio::MacInitialization::Ready
+            ) {
+                return Ok(progressed);
             }
+            let mut views = resources
+                .active_mcu_views(&mut self.session.receive, self.session.start)
+                .map_err(|_| zx::Status::IO)?;
+            progressed |= self
+                .session
+                .mcu
+                .0
+                .poll_events(&mut views, &mut ())
+                .map_err(|_| zx::Status::IO)?;
+            let (data_progress, routes) =
+                self.data_rx.poll(resources).map_err(|_| zx::Status::IO)?;
+            progressed |= data_progress;
+            let upcalls = self.upcalls.as_mut().ok_or(zx::Status::BAD_STATE)?;
+            for route in routes {
+                if let mt7921_core::McuRxRoute::Normal(bytes) = route {
+                    deliver_raw_rx(upcalls.as_mut(), &bytes);
+                }
+            }
+            for _ in 0..64 {
+                let Some(event) = self.session.receive.take_event() else {
+                    break;
+                };
+                if let mt7921_core::McuRxRoute::Normal(bytes) =
+                    event.into_route().map_err(|_| zx::Status::IO)?
+                {
+                    deliver_raw_rx(upcalls.as_mut(), &bytes);
+                }
+            }
+            Ok(progressed)
+        })();
+        if result.is_err() {
+            self.session.lifecycle = SessionLifecycle::Closing;
+            self.upcalls = None;
         }
+        result
     }
 
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
@@ -60,6 +96,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
     }
 
     fn reset(&mut self) -> Result<(), zx::Status> {
+        self.upcalls = None;
         self.session
             .contain()
             .map(|_| ())
@@ -171,5 +208,81 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn queue_tx(&mut self, _: &[u8], _: WlanTxInfoFlags) -> Result<(), zx::Status> {
         Err(zx::Status::NOT_SUPPORTED)
+    }
+}
+
+fn deliver_raw_rx(upcalls: &mut dyn WlanSoftmacUpcalls, bytes: &[u8]) {
+    use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType};
+    use fidl_fuchsia_wlan_softmac::{WlanRxInfoFlags, WlanRxInfoValid};
+    let Ok(frame) = mt7921_core::parse_connac2_rx_frame(bytes) else {
+        return;
+    };
+    let band = match frame.band {
+        mt7921_core::PhysicalBand::Ghz2 => WlanBand::TwoGhz,
+        mt7921_core::PhysicalBand::Ghz5 => WlanBand::FiveGhz,
+        mt7921_core::PhysicalBand::Ghz6 => return,
+    };
+    upcalls.recv(
+        frame.bytes,
+        WlanRxInfo {
+            rx_flags: WlanRxInfoFlags::empty(),
+            valid_fields: WlanRxInfoValid::RSSI,
+            phy: WlanPhyType::Ofdm,
+            data_rate: 0,
+            primary: ChannelNumber {
+                band,
+                number: frame.channel,
+            },
+            bandwidth: ChannelBandwidth::Cbw20,
+            vht_secondary_80_channel: ChannelNumber { band, number: 0 },
+            mcs: 0,
+            rssi_dbm: frame.rssi_dbm,
+            snr_dbh: 0,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Default)]
+    struct Upcalls(Vec<(Vec<u8>, WlanRxInfo)>);
+    impl WlanSoftmacUpcalls for Upcalls {
+        fn recv(&mut self, bytes: Vec<u8>, info: WlanRxInfo) {
+            self.0.push((bytes, info));
+        }
+        fn report_tx_result(&mut self, _: WlanTxResult) {}
+        fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
+    }
+
+    #[test]
+    fn raw_rx_preserves_beacon_and_only_marks_observed_signal_valid() {
+        let mut bytes = vec![0; 24 + 8 + 36 + 5];
+        let length = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&((2 << 27) | length).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+        bytes[12..16].copy_from_slice(&(36u32 << 8).to_le_bytes());
+        bytes[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
+        bytes[32] = 0x80;
+        bytes[68..].copy_from_slice(&[0, 3, b'l', b'a', b'b']);
+        let mut upcalls = Upcalls::default();
+        deliver_raw_rx(&mut upcalls, &bytes);
+        assert_eq!(upcalls.0.len(), 1);
+        let (frame, info) = &upcalls.0[0];
+        assert_eq!(frame, &bytes[32..]);
+        assert_eq!(info.primary.number, 36);
+        assert_eq!(
+            info.primary.band,
+            fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz
+        );
+        assert_eq!(info.rssi_dbm, -50);
+        assert_eq!(
+            info.valid_fields,
+            fidl_fuchsia_wlan_softmac::WlanRxInfoValid::RSSI
+        );
+        bytes[4..8].copy_from_slice(&((1u32 << 13) | (1 << 28)).to_le_bytes());
+        deliver_raw_rx(&mut upcalls, &bytes);
+        deliver_raw_rx(&mut upcalls, &[0; 4]);
+        assert_eq!(upcalls.0.len(), 1);
     }
 }
