@@ -47,10 +47,12 @@ pub(crate) enum Command {
         oneshot::Sender<Result<(), zx::Status>>,
     ),
     PassiveScan(
+        OperationContext,
         WlanSoftmacBaseStartPassiveScanRequest,
         oneshot::Sender<Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>>,
     ),
     ActiveScan(
+        OperationContext,
         WlanSoftmacStartActiveScanRequest,
         oneshot::Sender<Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>>,
     ),
@@ -67,6 +69,13 @@ pub(crate) enum Command {
 }
 
 impl Command {
+    fn scan_context(&self) -> Option<&OperationContext> {
+        match self {
+            Self::PassiveScan(context, ..) | Self::ActiveScan(context, ..) => Some(context),
+            _ => None,
+        }
+    }
+
     fn reject(self, status: zx::Status) {
         match self {
             Self::Query(_, reply) => {
@@ -99,10 +108,10 @@ impl Command {
             Self::ClearAssociation(_, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::PassiveScan(_, reply) => {
+            Self::PassiveScan(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::ActiveScan(_, reply) => {
+            Self::ActiveScan(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
             Self::CancelScan(_, reply) => {
@@ -140,9 +149,18 @@ impl DriverHandle {
         if !epoch.is_live() {
             return Err(zx::Status::CANCELED);
         }
+        if let Some(context) = command.scan_context() {
+            context.check(std::time::Instant::now())?;
+        }
         // Revocation discards only unpublished work. This also reserves space
         // for cleanup without a second priority queue or unbounded capacity.
-        mailbox.queue.retain_mut(|message| message.epoch.is_live());
+        mailbox.queue.retain_mut(|message| {
+            message.epoch.is_live()
+                && message
+                    .command
+                    .scan_context()
+                    .is_none_or(OperationContext::is_live)
+        });
         if mailbox.queue.len() == COMMAND_CAPACITY {
             return Err(zx::Status::NO_RESOURCES);
         }
@@ -272,6 +290,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             message.command.reject(zx::Status::CANCELED);
             return Ok(true);
         }
+        if let Some(context) = message.command.scan_context()
+            && let Err(status) = context.check(std::time::Instant::now())
+        {
+            message.command.reject(status);
+            return Ok(true);
+        }
         // No await between authority validation and the device call.
         match message.command {
             Command::Query((), reply) => {
@@ -319,14 +343,14 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::PassiveScan(request, reply) => {
-                let completion = self.device.start_passive_scan(request);
+            Command::PassiveScan(context, request, reply) => {
+                let completion = self.device.start_passive_scan(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::ActiveScan(request, reply) => {
-                let completion = self.device.start_active_scan(request);
+            Command::ActiveScan(context, request, reply) => {
+                let completion = self.device.start_active_scan(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));

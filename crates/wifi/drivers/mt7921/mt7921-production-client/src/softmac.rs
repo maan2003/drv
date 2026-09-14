@@ -132,18 +132,26 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn start_passive_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         _: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn start_active_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         _: WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn cancel_scan(

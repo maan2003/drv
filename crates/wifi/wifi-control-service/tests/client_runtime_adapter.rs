@@ -133,6 +133,7 @@ impl WlanSoftmac for FakeSoftmac {
     }
     fn start_passive_scan(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -141,6 +142,7 @@ impl WlanSoftmac for FakeSoftmac {
     }
     fn start_active_scan(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,

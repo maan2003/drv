@@ -178,6 +178,13 @@ legacy adapters still perform synchronous work before returning ready futures;
 that behavior and manual driver-turn polling remain transitional, not the
 completed async lifecycle.
 
+Scan-start commands carry an immutable absolute deadline and independently
+revocable scan authority beneath the connection lifetime. Protocol continuations
+retain that same authority across scan segments. The mailbox validates admission
+and dispatch; drivers must also validate before each deferred publication.
+Legacy adapters currently check only at entry, so their internal synchronous
+scan sequences are not evidence of deferred-publication safety.
+
 The driver owns submitted operations and their hardware-visible resources
 independently of waiting futures. Dropping a waiter or reaching its deadline
 does not authorize DMA reclamation. Resources remain owned until terminal

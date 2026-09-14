@@ -1258,10 +1258,14 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn start_passive_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             eprintln!("ath11k_softmac_scan=PASSIVE_ENTRY");
             self.trace_runtime("passive_scan_enter", 0);
@@ -1307,10 +1311,14 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn start_active_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             if self.active_scan.is_some() {
                 return Err(zx::Status::BAD_STATE);
@@ -1507,6 +1515,13 @@ mod tests {
     use ath11k_core::Operation;
     use std::sync::{Arc, Mutex};
     use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
+
+    fn scan_context() -> wlan_softmac_host::OperationContext {
+        wlan_softmac_host::conformance::operation_context(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .0
+    }
 
     const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
 
@@ -1815,7 +1830,7 @@ mod tests {
         let vdev = adapter.vdev.unwrap();
 
         let response = futures::executor::block_on(
-            adapter.start_active_scan(active_scan_request(&[b"redwood", b"lab"])),
+            adapter.start_active_scan(scan_context(), active_scan_request(&[b"redwood", b"lab"])),
         )
         .unwrap();
 
@@ -1838,9 +1853,10 @@ mod tests {
         let mut adapter = Ath11kClientDevice::deterministic(CLIENT);
         adapter.start(Box::new(NoopUpcalls)).unwrap();
         adapter.next_scan_id = HOST_SCAN_ID_END;
-        let scan =
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
-                .unwrap();
+        let scan = futures::executor::block_on(
+            adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"])),
+        )
+        .unwrap();
         assert_eq!(scan.scan_id, Some(u64::from(HOST_SCAN_ID_END)));
         futures::executor::block_on(adapter.cancel_scan(WlanSoftmacBaseCancelScanRequest {
             scan_id: scan.scan_id,
@@ -1848,7 +1864,9 @@ mod tests {
         .unwrap();
         adapter.device.backend_mut().clear();
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"]))),
+            futures::executor::block_on(
+                adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"]))
+            ),
             Err(zx::Status::NO_RESOURCES)
         );
         assert!(adapter.device.backend().operations().is_empty());
@@ -1863,51 +1881,59 @@ mod tests {
         let mut missing_channels = active_scan_request(&[b"lab"]);
         missing_channels.channels = None;
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(missing_channels)),
+            futures::executor::block_on(
+                adapter.start_active_scan(scan_context(), missing_channels)
+            ),
             Err(zx::Status::INVALID_ARGS)
         );
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[]))),
+            futures::executor::block_on(
+                adapter.start_active_scan(scan_context(), active_scan_request(&[]))
+            ),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut empty_ssid = active_scan_request(&[b"lab"]);
         empty_ssid.ssids.as_mut().unwrap()[0].len = 0;
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(empty_ssid)),
+            futures::executor::block_on(adapter.start_active_scan(scan_context(), empty_ssid)),
             Err(zx::Status::INVALID_ARGS)
         );
         let too_many_ssids = vec![b"lab".as_slice(); ACTIVE_SCAN_SSID_MAX + 1];
         assert_eq!(
             futures::executor::block_on(
-                adapter.start_active_scan(active_scan_request(&too_many_ssids))
+                adapter.start_active_scan(scan_context(), active_scan_request(&too_many_ssids))
             ),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut oversized_ssid = active_scan_request(&[b"lab"]);
         oversized_ssid.ssids.as_mut().unwrap()[0].len = (SSID_BYTE_MAX + 1) as u8;
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(oversized_ssid)),
+            futures::executor::block_on(adapter.start_active_scan(scan_context(), oversized_ssid)),
             Err(zx::Status::INVALID_ARGS)
         );
         let mut out_of_domain = active_scan_request(&[b"lab"]);
         out_of_domain.channels.as_mut().unwrap()[0].number = 11;
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(out_of_domain)),
+            futures::executor::block_on(adapter.start_active_scan(scan_context(), out_of_domain)),
             Err(zx::Status::INVALID_ARGS)
         );
         adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = true;
         assert_eq!(
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"]))),
+            futures::executor::block_on(
+                adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"]))
+            ),
             Err(zx::Status::INVALID_ARGS)
         );
         adapter.regulatory_domain.as_mut().unwrap().channels[0].passive = false;
         assert!(adapter.device.backend().operations().is_empty());
 
-        futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
-            .unwrap();
+        futures::executor::block_on(
+            adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"])),
+        )
+        .unwrap();
         assert_eq!(
             futures::executor::block_on(
-                adapter.start_active_scan(active_scan_request(&[b"other"]))
+                adapter.start_active_scan(scan_context(), active_scan_request(&[b"other"]))
             ),
             Err(zx::Status::BAD_STATE)
         );
@@ -1921,20 +1947,22 @@ mod tests {
         adapter.start(Box::new(Recorder(records.clone()))).unwrap();
         adapter.device.backend_mut().clear();
 
-        let first =
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
-                .unwrap()
-                .scan_id
-                .unwrap();
+        let first = futures::executor::block_on(
+            adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"])),
+        )
+        .unwrap()
+        .scan_id
+        .unwrap();
         assert!(adapter.drive().unwrap());
         assert_eq!(records.lock().unwrap().scans, vec![(zx::Status::OK, first)]);
         assert_eq!(adapter.active_scan, None);
 
-        let second =
-            futures::executor::block_on(adapter.start_active_scan(active_scan_request(&[b"lab"])))
-                .unwrap()
-                .scan_id
-                .unwrap();
+        let second = futures::executor::block_on(
+            adapter.start_active_scan(scan_context(), active_scan_request(&[b"lab"])),
+        )
+        .unwrap()
+        .scan_id
+        .unwrap();
         futures::executor::block_on(adapter.cancel_scan(WlanSoftmacBaseCancelScanRequest {
             scan_id: Some(second),
         }))

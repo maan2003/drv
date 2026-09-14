@@ -290,17 +290,23 @@ fn exercise(input: DeviceResponseInput) {
         return;
     }
 
-    let scan = futures::executor::block_on(adapter.start_passive_scan(
-        WlanSoftmacBaseStartPassiveScanRequest {
-            channels: Some(vec![ChannelNumber {
-                band: WlanBand::TwoGhz,
-                number: 6,
-            }]),
-            min_channel_time: Some(10),
-            max_channel_time: Some(20),
-            min_home_time: Some(0),
-        },
-    ));
+    let scan = futures::executor::block_on(
+        adapter.start_passive_scan(
+            wlan_softmac_host::conformance::operation_context(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .0,
+            WlanSoftmacBaseStartPassiveScanRequest {
+                channels: Some(vec![ChannelNumber {
+                    band: WlanBand::TwoGhz,
+                    number: 6,
+                }]),
+                min_channel_time: Some(10),
+                max_channel_time: Some(20),
+                min_home_time: Some(0),
+            },
+        ),
+    );
     if scan.is_err() {
         let _ = adapter.stop();
         adapter.into_device().backend().check_accounting();

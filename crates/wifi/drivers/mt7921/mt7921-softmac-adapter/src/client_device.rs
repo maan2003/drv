@@ -1568,10 +1568,14 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn start_passive_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             let mut backend = self.backend.lock().unwrap();
             backend.authorization.invalidate_scan();
@@ -1600,10 +1604,14 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn start_active_scan(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: fidl_softmac::WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
     > + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready({
             let _ = request;
             Err(zx::Status::NOT_SUPPORTED)

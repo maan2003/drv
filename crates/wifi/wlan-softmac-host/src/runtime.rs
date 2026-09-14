@@ -7,7 +7,8 @@ use crate::ethernet::{
     DriverEthernetPort, EthernetIngressError, HostEthernetDevice, ethernet_port,
 };
 use crate::{
-    ClientRuntimeDriver, OperationEpoch, WlanSoftmac, WlanSoftmacLifecycle, WlanSoftmacUpcalls,
+    ClientRuntimeDriver, OperationContext, OperationEpoch, WlanSoftmac, WlanSoftmacLifecycle,
+    WlanSoftmacUpcalls,
 };
 use fdf::ArenaStaticBox;
 use fidl_fuchsia_wlan_common as fidl_common;
@@ -34,7 +35,14 @@ const ETHERNET_QUEUE_CAPACITY: usize = 256;
 /// terminates the runtime cleanly rather than creating a descriptor post-lock.
 pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
 
+struct ScanOperation {
+    transaction_id: u64,
+    device_scan_id: Option<u64>,
+    context: OperationContext,
+}
+
 struct MlmeExecution {
+    scan: RefCell<Option<ScanOperation>>,
     epoch: RefCell<OperationEpoch>,
     rejected: Cell<bool>,
 }
@@ -167,6 +175,7 @@ impl HostMlmeDevice {
         let (event_sink, event_stream) = mpsc::unbounded();
         Self {
             execution: Rc::new(MlmeExecution {
+                scan: RefCell::new(None),
                 epoch: RefCell::new(OperationEpoch::new()),
                 rejected: Cell::new(false),
             }),
@@ -313,6 +322,15 @@ impl DeviceOps for HostMlmeDevice {
         request: &fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status> {
         self.execution.admit()?;
+        let context = self
+            .execution
+            .scan
+            .borrow()
+            .as_ref()
+            .ok_or(zx::Status::BAD_STATE)?
+            .context
+            .clone();
+        context.check(std::time::Instant::now())?;
         eprintln!(
             "client_softmac_scan stage=bridge_enter kind=passive channel_count={} min_channel_time={:?} max_channel_time={:?} min_home_time={:?}",
             request.channels.as_ref().map_or(0, Vec::len),
@@ -321,12 +339,20 @@ impl DeviceOps for HostMlmeDevice {
             request.min_home_time,
         );
         let response = self
-            .request(|reply| Command::PassiveScan(request.clone(), reply))
+            .request(|reply| Command::PassiveScan(context, request.clone(), reply))
             .await;
         eprintln!(
             "client_softmac_scan stage=bridge_complete kind=passive status={}",
             if response.is_ok() { "ok" } else { "error" }
         );
+        if let Ok(response) = &response {
+            self.execution
+                .scan
+                .borrow_mut()
+                .as_mut()
+                .ok_or(zx::Status::BAD_STATE)?
+                .device_scan_id = response.scan_id;
+        }
         response
     }
     async fn start_active_scan(
@@ -334,14 +360,37 @@ impl DeviceOps for HostMlmeDevice {
         request: &fidl_softmac::WlanSoftmacStartActiveScanRequest,
     ) -> Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status> {
         self.execution.admit()?;
-        self.request(|reply| Command::ActiveScan(request.clone(), reply))
-            .await
+        let context = self
+            .execution
+            .scan
+            .borrow()
+            .as_ref()
+            .ok_or(zx::Status::BAD_STATE)?
+            .context
+            .clone();
+        context.check(std::time::Instant::now())?;
+        let response = self
+            .request(|reply| Command::ActiveScan(context, request.clone(), reply))
+            .await?;
+        self.execution
+            .scan
+            .borrow_mut()
+            .as_mut()
+            .ok_or(zx::Status::BAD_STATE)?
+            .device_scan_id = response.scan_id;
+        Ok(response)
     }
     async fn cancel_scan(
         &mut self,
         request: &fidl_softmac::WlanSoftmacBaseCancelScanRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
+        if let Some(scan) = self.execution.scan.borrow().as_ref()
+            && scan.device_scan_id.is_some()
+            && scan.device_scan_id == request.scan_id
+        {
+            scan.context.revoke();
+        }
         self.request(|reply| Command::CancelScan(request.clone(), reply))
             .await
     }
@@ -400,6 +449,15 @@ impl DeviceOps for HostMlmeDevice {
         None
     }
     fn send_mlme_event(&mut self, event: fidl_mlme::MlmeEvent) -> Result<(), anyhow::Error> {
+        if let fidl_mlme::MlmeEvent::OnScanEnd { end } = &event {
+            let mut scan = self.execution.scan.borrow_mut();
+            if scan
+                .as_ref()
+                .is_some_and(|scan| scan.transaction_id == end.txn_id)
+            {
+                scan.take().unwrap().context.revoke();
+            }
+        }
         if !self.execution.epoch.borrow().is_live() {
             return Ok(());
         }
@@ -471,7 +529,7 @@ pub enum DriverError {
 }
 
 enum MlmeInput {
-    Request(wlan_sme::MlmeRequest),
+    Request(wlan_sme::MlmeRequest, Option<OperationContext>),
     Upcall(Upcall),
     Timeout(wlan_mlme::client::TimedEvent),
     Ethernet(Vec<u8>),
@@ -515,7 +573,22 @@ impl MlmeTask {
                 {
                     let handler = async {
                         match input {
-                            MlmeInput::Request(request) => {
+                            MlmeInput::Request(request, context) => {
+                                if let wlan_sme::MlmeRequest::Scan(request) = &request {
+                                    let context = context.ok_or(ConnectError::Driver(
+                                        DriverError::NoScanInProgress,
+                                    ))?;
+                                    if execution.scan.borrow().is_some() {
+                                        return Err(ConnectError::Driver(
+                                            DriverError::ScanInProgress,
+                                        ));
+                                    }
+                                    execution.scan.replace(Some(ScanOperation {
+                                        transaction_id: request.txn_id,
+                                        device_scan_id: None,
+                                        context,
+                                    }));
+                                }
                                 let sae_frame_tx =
                                     matches!(&request, wlan_sme::MlmeRequest::SaeFrameTx(_));
                                 let eapol_tx = matches!(&request, wlan_sme::MlmeRequest::Eapol(_));
@@ -737,6 +810,7 @@ struct Cleanup {
 }
 
 struct ScanAttempt {
+    context: OperationContext,
     receiver:
         oneshot::Receiver<Result<Vec<wlan_common::scan::ScanResult>, fidl_mlme::ScanResultCode>>,
     deadline: std::time::Instant,
@@ -1051,7 +1125,19 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             let epoch = epoch
                 .clone()
                 .ok_or(ConnectError::Driver(DriverError::RequestStreamClosed))?;
-            self.mlme.enqueue_for(epoch, MlmeInput::Request(request))?;
+            let context = if matches!(&request, wlan_sme::MlmeRequest::Scan(_)) {
+                Some(
+                    self.scan_attempt
+                        .as_ref()
+                        .ok_or(ConnectError::Driver(DriverError::NoScanInProgress))?
+                        .context
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            self.mlme
+                .enqueue_for(epoch, MlmeInput::Request(request, context))?;
         }
         while let Some((deadline, event, handle)) = self
             .sme_timer_source
@@ -1346,6 +1432,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             self.begin_epoch();
         }
         self.scan_attempt = Some(ScanAttempt {
+            context: OperationContext::child(self.mlme.epoch.clone(), deadline),
             receiver: self.sme.on_scan_command(request),
             deadline,
         });
@@ -1811,6 +1898,8 @@ mod tests {
         link_failure: bool,
         scan_id: u64,
         scan_offload: bool,
+        scan_contexts: Vec<OperationContext>,
+        extra_band: Option<fidl_softmac::WlanSoftmacBandCapability>,
         empty_bands: bool,
         channel_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
         clear_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
@@ -1910,6 +1999,7 @@ mod tests {
                 self.0.lock().unwrap().calls.push("query");
                 return Err(zx::Status::IO);
             }
+            let extra_band = self.0.lock().unwrap().extra_band.clone();
             record!(
                 self,
                 "query",
@@ -1921,12 +2011,14 @@ mod tests {
                     band_caps: Some(if self.0.lock().unwrap().empty_bands {
                         vec![]
                     } else {
-                        vec![fidl_softmac::WlanSoftmacBandCapability {
+                        let mut bands = vec![fidl_softmac::WlanSoftmacBandCapability {
                             band: Some(fidl_ieee80211::WlanBand::TwoGhz),
                             basic_rates: Some(vec![0x82, 0x84]),
                             primary_channels: Some(vec![wlan_channel()]),
                             ..Default::default()
-                        }]
+                        }];
+                        bands.extend(extra_band);
+                        bands
                     }),
                     ..Default::default()
                 }
@@ -2013,6 +2105,7 @@ mod tests {
         }
         fn start_passive_scan(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -2020,6 +2113,7 @@ mod tests {
             std::future::ready({
                 let mut effects = self.0.lock().unwrap();
                 effects.calls.push("passive");
+                effects.scan_contexts.push(context);
                 effects.scan_id = effects.scan_id.checked_add(1).unwrap();
                 Ok(fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse {
                     scan_id: Some(effects.scan_id),
@@ -2028,11 +2122,20 @@ mod tests {
         }
         fn start_active_scan(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_softmac::WlanSoftmacStartActiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
         > + 'static {
-            std::future::ready(record!(self, "active", Default::default()))
+            std::future::ready({
+                let mut effects = self.0.lock().unwrap();
+                effects.calls.push("active");
+                effects.scan_contexts.push(context);
+                effects.scan_id += 1;
+                Ok(fidl_softmac::WlanSoftmacBaseStartActiveScanResponse {
+                    scan_id: Some(effects.scan_id),
+                })
+            })
         }
         fn cancel_scan(
             &mut self,
@@ -2224,6 +2327,43 @@ mod tests {
     }
 
     #[test]
+    fn scan_queue_checks_child_revocation_and_never_replaces_an_expired_budget() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut actor, handle) = DriverActor::new(fake);
+            let parent = OperationEpoch::new();
+            let now = std::time::Instant::now();
+            let expired = OperationContext::child(parent.clone(), now);
+            let (reply, _) = oneshot::channel();
+            assert_eq!(
+                handle.send(
+                    parent.clone(),
+                    Command::PassiveScan(expired, Default::default(), reply)
+                ),
+                Err(zx::Status::TIMED_OUT)
+            );
+            let context =
+                OperationContext::child(parent.clone(), now + std::time::Duration::from_secs(1));
+            for _ in 0..256 {
+                let (reply, _) = oneshot::channel();
+                handle
+                    .send(
+                        parent.clone(),
+                        Command::PassiveScan(context.clone(), Default::default(), reply),
+                    )
+                    .unwrap();
+            }
+            context.revoke();
+            assert!(parent.is_live());
+            let (reply, receiver) = oneshot::channel();
+            handle.send(parent, Command::ClearAssociation(Default::default(), reply)).unwrap();
+            actor.drive_once().await.unwrap();
+            assert_eq!(receiver.await.unwrap(), Ok(()));
+            assert_eq!(effects.lock().unwrap().calls, ["clear"]);
+        });
+    }
+
+    #[test]
     fn revoked_link_completion_cannot_publish_an_ethernet_attachment() {
         run_local_test(async {
             let (fake, _) = Fake::new(0);
@@ -2297,6 +2437,19 @@ mod tests {
         run_local_test(async {
             let (fake, _) = Fake::new(0);
             let (mut device, mut actor, effects) = parts(fake);
+            assert_eq!(
+                device.start_passive_scan(&Default::default()).await,
+                Err(zx::Status::BAD_STATE)
+            );
+            let context = OperationContext::child(
+                device.execution.epoch.borrow().clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            device.execution.scan.replace(Some(ScanOperation {
+                transaction_id: 1,
+                device_scan_id: None,
+                context,
+            }));
             actor
                 .run_until(async {
                     device.wlan_softmac_query_response().await.unwrap();
@@ -2633,12 +2786,13 @@ mod tests {
             let peer = [2, 0, 0, 0, 0, 2];
             runtime
                 .mlme
-                .enqueue(MlmeInput::Request(wlan_sme::MlmeRequest::Deauthenticate(
-                    fidl_mlme::DeauthenticateRequest {
+                .enqueue(MlmeInput::Request(
+                    wlan_sme::MlmeRequest::Deauthenticate(fidl_mlme::DeauthenticateRequest {
                         peer_sta_address: peer,
                         reason_code: fidl_ieee80211::ReasonCode::LeavingNetworkDeauth,
-                    },
-                )))
+                    }),
+                    None,
+                ))
                 .unwrap();
             drain_mlme(&mut runtime).await;
             runtime.mlme.check().unwrap();
@@ -3357,6 +3511,107 @@ mod tests {
             runtime.io.lock().unwrap().ethernet.set_link(false);
             assert_eq!((runtime.drive_service_once()).await, Ok(false));
         });
+    }
+
+    #[test]
+    fn active_scan_segments_keep_original_authority_and_cancellation_blocks_followup() {
+        for cancel in [false, true] {
+            run_local_test(async {
+                let (fake, effects) = Fake::new(0);
+                let five = fidl_ieee80211::ChannelNumber {
+                    band: fidl_ieee80211::WlanBand::FiveGhz,
+                    number: 36,
+                };
+                effects.lock().unwrap().extra_band =
+                    Some(fidl_softmac::WlanSoftmacBandCapability {
+                        band: Some(five.band),
+                        basic_rates: Some(vec![12, 24, 48]),
+                        primary_channels: Some(vec![five]),
+                        ..Default::default()
+                    });
+                let mut info = retry_device_info();
+                info.bands.push(fidl_mlme::BandCapability {
+                    band: five.band,
+                    basic_rates: vec![12, 24, 48],
+                    ht_cap: None,
+                    vht_cap: None,
+                    primary_channels: vec![five],
+                });
+                // Pinned SME filters every 5GHz active channel unless DFS
+                // support is present, including non-DFS channel 36.
+                let mut spectrum = fidl_common::SpectrumManagementSupport::default();
+                spectrum.dfs.get_or_insert_default().supported = Some(true);
+                let mut runtime = ClientRuntime::new(
+                    fake,
+                    Default::default(),
+                    info,
+                    Default::default(),
+                    spectrum,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                runtime
+                    .begin_scan(
+                        fidl_sme::ScanRequest::Active(fidl_sme::ActiveScanRequest {
+                            ssids: vec![],
+                            channels: vec![wlan_channel().number, five.number],
+                        }),
+                        deadline,
+                    )
+                    .await
+                    .unwrap();
+                drain_mlme(&mut runtime).await;
+                assert_eq!({ effects.lock().unwrap().scan_contexts.len() }, 1);
+                let context = runtime.scan_attempt.as_ref().unwrap().context.clone();
+                if cancel {
+                    context.revoke();
+                }
+                let first = effects.lock().unwrap().scan_id;
+                effects
+                    .lock()
+                    .unwrap()
+                    .upcalls
+                    .as_mut()
+                    .unwrap()
+                    .notify_scan_complete(zx::Status::OK, first);
+                runtime.drive_scan_once().await.unwrap();
+                drain_mlme(&mut runtime).await;
+                assert!(
+                    runtime.mlme.epoch.is_live(),
+                    "scan cancellation must not revoke connection"
+                );
+                if !cancel {
+                    assert_eq!({ effects.lock().unwrap().scan_contexts.len() }, 2);
+                    let second = effects.lock().unwrap().scan_id;
+                    assert_ne!(first, second);
+                    effects
+                        .lock()
+                        .unwrap()
+                        .upcalls
+                        .as_mut()
+                        .unwrap()
+                        .notify_scan_complete(zx::Status::OK, second);
+                }
+                let result = loop {
+                    if let Some(result) = runtime.drive_scan_once().await.unwrap() {
+                        break result;
+                    }
+                    drain_mlme(&mut runtime).await;
+                };
+                assert_eq!(result.is_ok(), !cancel);
+                let effects = effects.lock().unwrap();
+                assert_eq!(effects.scan_contexts.len(), if cancel { 1 } else { 2 });
+                for context in &effects.scan_contexts {
+                    assert_eq!(context.deadline(), deadline);
+                    assert!(
+                        !context.is_live(),
+                        "terminal scan revokes all retained segments"
+                    );
+                }
+            });
+        }
     }
 
     #[test]

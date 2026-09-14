@@ -75,6 +75,7 @@ pub fn run_client_conformance<D>(
 where
     D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver,
 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let events = Arc::new(Mutex::new(Vec::new()));
     device.start(Box::new(Recorder(events.clone())))?;
     events.lock().unwrap().push(ConformanceEvent::Started);
@@ -104,12 +105,15 @@ where
     drive_operation(&mut device, completion)?;
     events.lock().unwrap().push(ConformanceEvent::ChannelSet);
 
-    let completion = device.start_passive_scan(WlanSoftmacBaseStartPassiveScanRequest {
-        channels: Some(vec![channel]),
-        min_channel_time: Some(10),
-        max_channel_time: Some(20),
-        min_home_time: Some(0),
-    });
+    let completion = device.start_passive_scan(
+        crate::OperationContext::new(deadline),
+        WlanSoftmacBaseStartPassiveScanRequest {
+            channels: Some(vec![channel]),
+            min_channel_time: Some(10),
+            max_channel_time: Some(20),
+            min_home_time: Some(0),
+        },
+    );
     let scan_id = drive_operation(&mut device, completion)?
         .scan_id
         .ok_or(zx::Status::BAD_STATE)?;
@@ -265,6 +269,7 @@ mod tests {
         }
         fn start_passive_scan(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseStartPassiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<crate::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -276,6 +281,7 @@ mod tests {
         }
         fn start_active_scan(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacStartActiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,

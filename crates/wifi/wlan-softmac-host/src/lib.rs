@@ -35,6 +35,7 @@ pub use fidl_fuchsia_wlan_softmac::{
 #[derive(Clone)]
 pub struct OperationContext {
     epoch: OperationEpoch,
+    parent: Option<OperationEpoch>,
     deadline: std::time::Instant,
 }
 
@@ -42,6 +43,7 @@ impl OperationContext {
     pub(crate) fn new(deadline: std::time::Instant) -> Self {
         Self {
             epoch: OperationEpoch::new(),
+            parent: None,
             deadline,
         }
     }
@@ -49,6 +51,15 @@ impl OperationContext {
     pub(crate) fn for_deadline(&self, deadline: std::time::Instant) -> Self {
         Self {
             epoch: self.epoch.clone(),
+            parent: self.parent.clone(),
+            deadline,
+        }
+    }
+
+    pub(crate) fn child(parent: OperationEpoch, deadline: std::time::Instant) -> Self {
+        Self {
+            epoch: OperationEpoch::new(),
+            parent: Some(parent),
             deadline,
         }
     }
@@ -58,7 +69,7 @@ impl OperationContext {
     }
 
     pub fn check(&self, now: std::time::Instant) -> Result<(), zx::Status> {
-        if !self.epoch.is_live() {
+        if !self.is_live() {
             Err(zx::Status::CANCELED)
         } else if now >= self.deadline {
             Err(zx::Status::TIMED_OUT)
@@ -72,7 +83,7 @@ impl OperationContext {
     }
 
     pub(crate) fn is_live(&self) -> bool {
-        self.epoch.is_live()
+        self.epoch.is_live() && self.parent.as_ref().is_none_or(OperationEpoch::is_live)
     }
 }
 
@@ -168,14 +179,19 @@ pub trait WlanSoftmac {
         request: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
 
+    /// Retain this authority across every deferred publication and segment.
+    /// Dropping the returned waiter does not cancel or release submitted work.
     fn start_passive_scan(
         &mut self,
+        context: OperationContext,
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
     > + 'static;
+    /// MLME supplies the same scan authority for subsequent band segments.
     fn start_active_scan(
         &mut self,
+        context: OperationContext,
         request: WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
@@ -194,6 +210,23 @@ pub trait WlanSoftmac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_revocation_is_independent_but_parent_revocation_still_dominates() {
+        let now = std::time::Instant::now();
+        let parent = OperationEpoch::new();
+        let scan = OperationContext::child(parent.clone(), now + std::time::Duration::from_secs(1));
+        let other =
+            OperationContext::child(parent.clone(), now + std::time::Duration::from_secs(2));
+        scan.revoke();
+        assert_eq!(scan.check(now), Err(zx::Status::CANCELED));
+        assert!(parent.is_live());
+        assert_eq!(other.check(now), Ok(()));
+        let derived = other.for_deadline(now + std::time::Duration::from_secs(3));
+        parent.revoke();
+        assert_eq!(other.check(now), Err(zx::Status::CANCELED));
+        assert_eq!(derived.check(now), Err(zx::Status::CANCELED));
+    }
 
     #[test]
     fn context_deadline_is_absolute_and_revocation_spans_later_work() {
@@ -303,6 +336,7 @@ mod tests {
         }
         fn start_passive_scan(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseStartPassiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -314,6 +348,7 @@ mod tests {
         }
         fn start_active_scan(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacStartActiveScanRequest,
         ) -> impl std::future::Future<
             Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
@@ -349,6 +384,8 @@ mod tests {
     }
 
     async fn forward_every_downcall<D: WlanSoftmac>(device: &mut D) -> Result<(), zx::Status> {
+        let context =
+            OperationContext::new(std::time::Instant::now() + std::time::Duration::from_secs(1));
         device.query()?;
         device.query_discovery_support()?;
         device.query_mac_sublayer_support()?;
@@ -361,8 +398,12 @@ mod tests {
             .notify_association_complete(Default::default())
             .await?;
         device.clear_association(Default::default()).await?;
-        device.start_passive_scan(Default::default()).await?;
-        device.start_active_scan(Default::default()).await?;
+        device
+            .start_passive_scan(context.clone(), Default::default())
+            .await?;
+        device
+            .start_active_scan(context, Default::default())
+            .await?;
         device.cancel_scan(Default::default()).await?;
         device.update_wmm_parameters(Default::default()).await?;
         device.queue_tx(&[1, 2, 3], WlanTxInfoFlags::PROTECTED)
