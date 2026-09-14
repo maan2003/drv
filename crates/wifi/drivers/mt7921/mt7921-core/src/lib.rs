@@ -4318,10 +4318,13 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     if packet_type != 2 && !(packet_type == 7 && packet_flag == 1) {
         return Err(PassiveRxError::WrongPacketType);
     }
-    // Bit 28 is BAND_IDX on Connac2, not an RX error. Pinned Linux also
-    // ignores HDR_TRANS_ERROR (RXD2 bit 25): when HDR_TRANS below is clear,
-    // the payload is still the raw 802.11 frame.
-    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27)) != 0 || rxd2 & ((1 << 23) | (1 << 24)) != 0 {
+    // Linux mt7921_mac_fill_rx rejects BAND_IDX (bit 28): this device owner
+    // handles hardware band 0. FCS/MIC failures are dropped rather than exposed
+    // as monitor-only frames. HDR_TRANS_ERROR (RXD2 bit 25) alone is not fatal
+    // when the payload remains raw 802.11.
+    if rxd1 & ((1 << 25) | (1 << 26) | (1 << 27) | (1 << 28)) != 0
+        || rxd2 & ((1 << 23) | (1 << 24)) != 0
+    {
         return Err(PassiveRxError::RxError);
     }
     if rxd2 & (1 << 13) != 0 {
@@ -4377,6 +4380,8 @@ pub fn parse_connac2_rx_frame(bytes: &[u8]) -> Result<Connac2RxFrame, PassiveRxE
     let rssi_dbm = (0..2)
         .map(|chain| ((rcpi >> (chain * 8)) & 0xff) as i16)
         .map(|value| (value - 220).div_euclid(2))
+        // Linux excludes non-negative chain signals from status->signal.
+        .filter(|signal| *signal < 0)
         .max()
         .unwrap_or(-128)
         .clamp(i8::MIN as i16, i8::MAX as i16) as i8;
@@ -15259,8 +15264,7 @@ mod tests {
         let mut rx = vec![0; 24 + 8 + 36 + 5];
         let rxd0 = (2u32 << 27) | rx.len() as u32;
         rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
-        // Connac2 BAND_IDX is bit 28 and must not be classified as an RX error.
-        rx[4..8].copy_from_slice(&((1u32 << 13) | (1 << 28)).to_le_bytes());
+        rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
         rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
         rx[28..32].copy_from_slice(&0x7878u32.to_le_bytes());
         let frame = &mut rx[32..];
@@ -15281,6 +15285,12 @@ mod tests {
                 channel: 1,
                 rssi_dbm: -50,
             })
+        );
+        let mut secondary_band = rx.clone();
+        secondary_band[4..8].copy_from_slice(&((1u32 << 13) | (1 << 28)).to_le_bytes());
+        assert_eq!(
+            parse_connac2_rx_frame(&secondary_band),
+            Err(PassiveRxError::RxError)
         );
         let mut normal_mcu = rx.clone();
         let rxd0 = (7u32 << 27) | (1 << 16) | normal_mcu.len() as u32;
@@ -15361,14 +15371,23 @@ mod tests {
     }
 
     #[test]
-    fn connac2_rssi_floors_negative_half_dbm_values_like_linux() {
-        for (rcpi, expected_rssi) in [(220u8, 0i8), (219, -1), (100, -60), (101, -60)] {
+    fn connac2_rssi_uses_linux_negative_chain_selection_and_rounding() {
+        for (first, second, expected_rssi) in [
+            (220u8, 220u8, -128i8),
+            (255, 255, -128),
+            (219, 219, -1),
+            (100, 100, -60),
+            (101, 101, -60),
+            (255, 100, -60),
+            (100, 255, -60),
+        ] {
             let mut rx = vec![0u8; 24 + 8 + 2];
             let rxd0 = (2u32 << 27) | rx.len() as u32;
             rx[0..4].copy_from_slice(&rxd0.to_le_bytes());
             rx[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
             rx[12..16].copy_from_slice(&(1u32 << 8).to_le_bytes());
-            rx[28..32].copy_from_slice(&u32::from(rcpi).wrapping_mul(0x0101).to_le_bytes());
+            rx[28..32]
+                .copy_from_slice(&(u32::from(first) | (u32::from(second) << 8)).to_le_bytes());
 
             assert_eq!(parse_connac2_rx_frame(&rx).unwrap().rssi_dbm, expected_rssi);
         }
