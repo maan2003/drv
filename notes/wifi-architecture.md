@@ -1,5 +1,44 @@
 # Wi-Fi target architecture
 
+## Current stopping point: real Wi-Fi Internet inside KVM
+
+The owner has superseded the reduced architecture-only stopping point below.
+Completion now requires the production CLI and services to provide working
+Internet through the assigned MT7921 inside KVM, not a fake radio, host NAT,
+SOCKS-only proof, or the retired one-shot implementation. KVM orchestration,
+AP controls, fault injection and proof commands belong in the external test
+harness, not special production modes or fixed-target policy overrides.
+
+Acceptance must distinguish physically exercised cases from deterministic
+fault coverage; no finite test suite proves every possible Wi-Fi environment.
+The concrete matrix is:
+
+- CLI scan, save/list/forget credentials, select/connect, status/watch, cancel,
+  disconnect, disable/enable, and persistence across policy restart.
+- Open/WPA2/WPA3 supported modes, wrong credentials, absent network, rejected
+  authentication/association, deadline expiry, duplicate/stale events, and
+  cancellation while scanning/authenticating/associating. Unsupported security
+  and channel modes must fail explicitly, never silently weaken security.
+- Real firmware-backed channel/peer/key programming and TX/RX, controlled-port
+  enforcement, replay/key-generation isolation and cleanup after failure.
+- DHCP, DNS/NSS and ordinary application TCP/UDP/verified HTTPS through the
+  sandboxed network service and Linux socket provider; no native INET fallback
+  or alternate guest Internet interface. Repeated transfers and idle periods.
+- AP/link loss, retry/backoff, repeated reconnect beyond the current finite
+  Ethernet inventory, service death/restart, resource exhaustion and shutdown.
+  Roaming, rekey and power transitions require explicit tests and capability
+  claims rather than inference from one successful association.
+- Negative/fault cases use deterministic tests when safe physical injection or
+  an appropriately controllable AP is unavailable; those rows remain physically
+  unverified. Available AP/security/control coverage must be recorded before
+  claiming the complete matrix.
+
+Physical handoff requires a verified independent USB management path and an
+agreed recovery window. USB link presence alone does not prove reboot-time
+recovery or authorize host boot/security changes. Keep the known-good host;
+perform no host deployment or reboot as an implicit part of guest testing.
+
+
 The reduced cutover now implements the same-process typed ownership boundary
 below. Radio operations are deliberately unavailable until ported to that owner;
 this is not a claim of Wi-Fi connectivity or physical recovery qualification.

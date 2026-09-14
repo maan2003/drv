@@ -48,7 +48,6 @@ use wlancfg_selection::{
 #[derive(Clone)]
 struct ControlScan {
     control: HostControlClient,
-    fixed_target_channel: Option<u8>,
 }
 
 #[async_trait(?Send)]
@@ -60,16 +59,10 @@ impl ScanRequestApi for ControlScan {
         ssids: Vec<types::Ssid>,
         channels: Vec<types::WlanChan>,
     ) -> Result<Vec<types::ScanResult>, types::ScanError> {
-        let mut channels = channels
+        let channels = channels
             .into_iter()
             .map(|channel| channel.primary)
             .collect::<Vec<_>>();
-        if !ssids.is_empty()
-            && channels.is_empty()
-            && let Some(channel) = self.fixed_target_channel
-        {
-            channels.push(channel);
-        }
         let target_ssids = ssids;
         // The production MT7921 boundary advertises passive offload only.
         // Preserve directed-selection semantics by filtering the returned
@@ -176,11 +169,6 @@ pub fn serve(
 
         let scan = Arc::new(ControlScan {
             control: control.clone(),
-            // This service launch is deliberately fixed-target. General
-            // network selection/roaming owns a separate future design.
-            fixed_target_channel: std::env::var("DRV_SAE_CHANNEL")
-                .ok()
-                .and_then(|channel| channel.parse().ok()),
         });
         let inspector = fuchsia_inspect::Inspector::default();
         let selector = ConnectionSelector::new(

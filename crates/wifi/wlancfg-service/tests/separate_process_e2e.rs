@@ -347,6 +347,8 @@ fn spawn_role(
     command
         .env("DRV_WLANCFG_E2E_ROLE", role)
         .env("DRV_WLANCFG_E2E_SCENARIO", scenario)
+        // Legacy lab configuration must not override production selection.
+        .env("DRV_SAE_CHANNEL", "149")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -625,6 +627,12 @@ impl WifiRuntime for FixtureWifi {
                 11,
                 -80,
             ));
+        }
+        if let sme::ScanRequest::Passive(scan) = &request {
+            results.retain(|result| {
+                scan.channels.is_empty()
+                    || scan.channels.contains(&result.bss_description.primary.number)
+            });
         }
         Ok(Some(Ok(results)))
     }

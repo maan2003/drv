@@ -95,42 +95,6 @@ fn run() -> Result<(), String> {
     if !(30..=300).contains(&max_seconds) {
         return Err("DRV_STACK_MAX_SECONDS must be 30..=300".into());
     }
-    let fixed_target_channel = std::env::var("DRV_SAE_CHANNEL")
-        .map_err(|_| "DRV_SAE_CHANNEL is required".to_string())?
-        .parse::<u8>()
-        .map_err(|_| "DRV_SAE_CHANNEL is invalid".to_string())?;
-    if !matches!(
-        fixed_target_channel,
-        1..=14
-            | 36
-            | 40
-            | 44
-            | 48
-            | 52
-            | 56
-            | 60
-            | 64
-            | 100
-            | 104
-            | 108
-            | 112
-            | 116
-            | 120
-            | 124
-            | 128
-            | 132
-            | 136
-            | 140
-            | 144
-            | 149
-            | 153
-            | 157
-            | 161
-            | 165
-    ) {
-        return Err("DRV_SAE_CHANNEL is outside the bounded channel set".into());
-    }
-
     std::fs::create_dir_all("/run/drv").map_err(|error| format!("create /run/drv: {error}"))?;
     std::fs::create_dir_all(&state_directory)
         .map_err(|error| format!("create saved-network directory: {error}"))?;
@@ -165,7 +129,6 @@ fn run() -> Result<(), String> {
         &policy,
         &state,
         &application,
-        fixed_target_channel,
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -528,7 +491,6 @@ fn spawn_policy(
     policy: &OwnedFd,
     state: &File,
     application: &OwnedFd,
-    fixed_target_channel: u8,
 ) -> Result<Child, String> {
     let policy = duplicate(policy.as_raw_fd())?;
     let state = duplicate(state.as_raw_fd())?;
@@ -547,7 +509,6 @@ fn spawn_policy(
             generation.to_string(),
         ])
         .env_clear()
-        .env("DRV_SAE_CHANNEL", fixed_target_channel.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -589,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_child_inherits_only_the_validated_fixed_channel_contract() {
+    fn policy_child_has_no_ambient_target_or_credentials() {
         let source = include_str!("wlan-stack-kvm.rs");
         let spawn = source
             .split("fn spawn_policy(")
@@ -599,11 +560,9 @@ mod tests {
             .next()
             .unwrap();
         let clear = spawn.find(".env_clear()").unwrap();
-        let channel = spawn
-            .find(".env(\"DRV_SAE_CHANNEL\", fixed_target_channel.to_string())")
-            .unwrap();
         let start = spawn.find(".stdin(Stdio::null())").unwrap();
-        assert!(clear < channel && channel < start);
+        assert!(clear < start);
+        assert!(!spawn.contains("DRV_SAE_CHANNEL"));
         assert!(!spawn.contains("DRV_SAE_BSSID"));
         assert!(!spawn.contains("credential"));
     }
