@@ -150,6 +150,24 @@ or receive general filesystem, host-network, or unrelated device access.
 The selected Linux execution model is one Tokio current-thread runtime with a
 LocalSet and readiness-driven descriptor integration. Portable driver contracts
 remain executor-neutral. Entrypoints own that executor; protocol state does not own a nested runtime.
+The selected ownership model is a small number of explicit actors, not an
+actor framework: protocol ownership (SME/MLME/RSN) and exclusive driver ownership
+(hardware state, DMA, IRQ and pending operations), within the same Wi-Fi process.
+Typed bounded command/completion routes connect these owners; they are not
+additional process IPC. Do not create an actor per mutation or add mailbox
+wrappers around otherwise unchanged shared mutable driver access.
+
+State transitions and hardware mechanics are synchronous and bounded.
+Waiting for readiness, completion or deadlines is asynchronous. Long-running
+operations and their terminal replies belong to the owner, not to transient
+request-handler futures. Control dispatch remains available while cleanup or
+hardware work is pending. Queue admission and completed effects are distinct;
+mailbox ordering alone is not cancellation or hardware-completion evidence.
+
+Migration is incomplete: MLME already has an owning task, but shared driver
+access, inline awaited control cleanup and manual progress polling remain.
+These are transitional implementation details, not the selected actor model.
+
 SoftMAC mutations return owned futures without borrowing the driver. Existing
 legacy adapters still perform synchronous work before returning ready futures;
 that behavior and manual driver-turn polling remain transitional, not the

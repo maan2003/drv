@@ -117,6 +117,35 @@ Source evidence retained at `/src/kernel-6.18.43-review/`:
 and `drivers/iommu/iommu.c` (detach/default domain/IOTLB sync).
 No physical kill/reset experiment was performed for this review.
 
+## Agreed actor-model implementation direction
+
+The owner selected explicit actor-style ownership without an actor framework:
+**synchronous bounded state transitions, asynchronous waiting, exclusive owners**.
+The durable boundaries are described in
+[ARCH-wlan-stack-topology](../specs/ARCH-wlan-stack-topology.md#async-execution-and-fault-recovery).
+Keep protocol and driver actors in the existing Wi-Fi process and Tokio LocalSet;
+do not multiply actors per operation or wrap the existing shared driver mutex
+in another forwarding layer.
+
+Next implementation order:
+1. Retain pending cleanup and terminal replies in the service owner instead of
+   blocking control dispatch while awaiting them.
+2. Establish exclusive driver ownership with bounded commands and completion
+   delivery, reusing the existing bounded MCU begin/poll mechanics.
+3. Port firmware-backed scan through the real CLI/service path using the old
+   working MT7921 implementation as the behavioral reference, then association
+   and bidirectional Ethernet, Netstack Internet, security and recovery coverage.
+   Preserve command bytes, ordering, completion correlation and proven fixes;
+   do not restore the retired resource owner or one-shot production path.
+
+Use an advisor at the final implementation review to check architectural fit:
+exclusive ownership rather than extra wrappers; responsive control during held
+hardware completion; bounded queues; owner-held pending work and replies;
+stale-authority rejection before publication; DMA retained after waiter loss;
+exactly one correctly ordered terminal reply; and actual radio progress.
+Report remaining deviations explicitly. Actor organization does not supersede
+the real KVM Internet acceptance matrix or authorize physical handoff.
+
 ## Types establish ownership boundaries
 
 Constructors must establish the invariant represented by their return type.
