@@ -248,14 +248,18 @@ impl RadioPreparation {
             report.special_unii_mask,
         )
         .map_err(|_| zx::Status::NOT_SUPPORTED)?;
-        domain.channels.retain(|channel| {
-            regulatory.channels().iter().any(|rule| {
+        domain.channels.retain_mut(|channel| {
+            let Some(rule) = regulatory.channels().iter().find(|rule| {
                 rule.band == channel.band
                     && rule.channel == channel.number
                     && rule.present
                     && !rule.disabled
                     && rule.max_reg_power_dbm.is_some()
-            })
+            }) else {
+                return false;
+            };
+            channel.flags |= rule.regulatory_flags;
+            true
         });
         let first = candidate_channels(report.nic_capability)
             .into_iter()
@@ -458,6 +462,155 @@ impl RadioPreparation {
             return Ok(true);
         }
         self.station.drive(&resources.bar0, now)
+    }
+}
+
+/// One admitted channel effect. The reply and plan survive waiter loss.
+/// Channel state is committed only after MCU response + TX reclaim + timing.
+pub(super) struct ChannelChange {
+    pub context: wlan_softmac_host::OperationContext,
+    pub channel: mt7921_core::CandidateChannel,
+    command: Option<Vec<u8>>,
+    response_deadline: Option<Instant>,
+    operations: VecDeque<mt7921_core::ChannelMacOperation>,
+    delay_until: Option<Instant>,
+    pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
+}
+
+impl ChannelChange {
+    pub fn new(
+        context: wlan_softmac_host::OperationContext,
+        channel: mt7921_core::CandidateChannel,
+        reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
+    ) -> Result<Self, zx::Status> {
+        use mt7921_core::*;
+        // The installed world-domain table retains NO_IR on every channel.
+        // Linux therefore selects DFS form even on non-radar channels.
+        let command = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel,
+                center_channel: channel.number as u8,
+                bandwidth: 0,
+                center_channel2: 0,
+                antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::Dfs,
+            },
+            1,
+        )
+        .map_err(|_| zx::Status::NOT_SUPPORTED)?;
+        Ok(Self {
+            context,
+            channel,
+            command: Some(command),
+            response_deadline: None,
+            operations: channel_mac_mmio_plan(channel.band).into(),
+            delay_until: None,
+            reply: Some(reply),
+        })
+    }
+
+    pub fn complete(&self) -> bool {
+        self.command.is_none()
+            && self.response_deadline.is_none()
+            && self.operations.is_empty()
+            && self.delay_until.is_none()
+    }
+
+    pub fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        start: Instant,
+        now: Instant,
+    ) -> Result<bool, zx::Status> {
+        use mt7921_core::*;
+        self.context.check(now)?;
+        if let Some(command) = self.command.take() {
+            let mut views = resources
+                .active_mcu_views(receive, start)
+                .map_err(|_| zx::Status::IO)?;
+            // This is the final authority check immediately before publication.
+            self.context.check(Instant::now())?;
+            mechanics
+                .begin_command(
+                    &mut views,
+                    &mut (),
+                    &command,
+                    LoaderCommandCompletion::Response,
+                )
+                .map_err(|_| zx::Status::IO)?;
+            self.response_deadline = Some(now + Duration::from_secs(3));
+            return Ok(true);
+        }
+        if let Some(deadline) = self.response_deadline {
+            if now >= deadline {
+                return Err(zx::Status::TIMED_OUT);
+            }
+            let mut views = resources
+                .active_mcu_views(receive, start)
+                .map_err(|_| zx::Status::IO)?;
+            match mechanics
+                .poll_command(&mut views, &mut ())
+                .map_err(|_| zx::Status::IO)?
+            {
+                LoaderCommandProgress::Pending { progressed } => return Ok(progressed),
+                LoaderCommandProgress::Complete(LoaderCompletion::Response(_)) => {
+                    // Pinned mt7921_mcu_parse_response has no CHANNEL_SWITCH
+                    // payload status; its sequence-correlated response is ACK.
+                    self.response_deadline = None;
+                    return Ok(true);
+                }
+                _ => return Err(zx::Status::IO_DATA_INTEGRITY),
+            }
+        }
+        if let Some(until) = self.delay_until {
+            if now < until {
+                return Ok(false);
+            }
+            self.delay_until = None;
+            return Ok(true);
+        }
+        let Some(operation) = self.operations.pop_front() else {
+            return Ok(false);
+        };
+        match operation {
+            ChannelMacOperation::DelayMicros(us) => {
+                self.delay_until = Some(now + Duration::from_micros(u64::from(us)));
+            }
+            ChannelMacOperation::Read { address } => {
+                let offset = passive_mac_bar_offset(address).map_err(|_| zx::Status::INTERNAL)?;
+                let _ = resources
+                    .bar0
+                    .read_u32(offset)
+                    .map_err(|_| zx::Status::IO)?;
+            }
+            ChannelMacOperation::Write { address, value } => {
+                let offset = passive_mac_bar_offset(address).map_err(|_| zx::Status::INTERNAL)?;
+                resources
+                    .bar0
+                    .write_u32(offset, value)
+                    .map_err(|_| zx::Status::IO)?;
+            }
+            ChannelMacOperation::Rmw {
+                address,
+                mask,
+                value,
+            } => {
+                let offset = passive_mac_bar_offset(address).map_err(|_| zx::Status::INTERNAL)?;
+                let initial = resources
+                    .bar0
+                    .read_u32(offset)
+                    .map_err(|_| zx::Status::IO)?;
+                validate_passive_mac_bar_read(address, initial)
+                    .map_err(|_| zx::Status::IO_DATA_INTEGRITY)?;
+                resources
+                    .bar0
+                    .write_u32(offset, passive_mac_source_rmw_value(initial, mask, value))
+                    .map_err(|_| zx::Status::IO)?;
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -685,6 +838,142 @@ mod tests {
         );
         assert_eq!(log.borrow().len(), before);
         assert_eq!(preparation.commands.len(), 1);
+    }
+
+    #[test]
+    fn channel_effect_waits_for_ack_reclaim_and_bounded_timing() {
+        use mt7921_core::*;
+        for response_first in [true, false] {
+            let (device, log, model) =
+                DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+            let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+            resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+            let now = Instant::now();
+            let (context, revoke) =
+                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(1));
+            let (reply, _receiver) = futures_channel::oneshot::channel();
+            let channel = CandidateChannel {
+                band: PhysicalBand::Ghz5,
+                number: 149,
+                frequency_mhz: 5745,
+            };
+            let mut change = ChannelChange::new(context, channel, reply).unwrap();
+            let mut mechanics = LoaderMechanics::default();
+            let mut receive = crate::receive::RxRouting::default();
+            change
+                .drive(&mut resources, &mut mechanics, &mut receive, now, now)
+                .unwrap();
+            assert!(!change.complete());
+            let mut tx = [0; DMA_DESCRIPTOR_LEN];
+            resources.dma.mcu_tx_ring.read(0, &mut tx).unwrap();
+            let control = u32::from_le_bytes(tx[4..8].try_into().unwrap()) | (1 << 31);
+            tx[4..8].copy_from_slice(&control.to_le_bytes());
+            let mut response = vec![0; 36];
+            response[24..26].copy_from_slice(&12u16.to_le_bytes());
+            response[28] = 1;
+            response[29] = mechanics.sequence();
+            let rx = DmaDescriptor {
+                buf0: resources
+                    .dma
+                    .mcu_rx_buffers
+                    .device_address(0)
+                    .unwrap()
+                    .bits() as u32,
+                ctrl: (1 << 31) | (1 << 30) | (36 << 16),
+                buf1: 0,
+                info: 0,
+            };
+            for deliver_response in [response_first, !response_first] {
+                if deliver_response {
+                    model.write_dma(
+                        resources
+                            .dma
+                            .mcu_rx_buffers
+                            .device_address(0)
+                            .unwrap()
+                            .bits(),
+                        response.clone(),
+                    );
+                    model.write_dma(
+                        resources.dma.mcu_rx_ring.device_address(0).unwrap().bits(),
+                        rx.to_le_bytes().to_vec(),
+                    );
+                } else {
+                    model.write_dma(
+                        resources.dma.mcu_tx_ring.device_address(0).unwrap().bits(),
+                        tx.to_vec(),
+                    );
+                    resources.bar0.write_u32(0xd441c, 1).unwrap();
+                }
+                change
+                    .drive(&mut resources, &mut mechanics, &mut receive, now, now)
+                    .unwrap();
+                assert!(!change.complete());
+                assert_eq!(
+                    change.operations.len(),
+                    channel_mac_mmio_plan(channel.band).len()
+                );
+                if deliver_response == response_first {
+                    assert!(change.response_deadline.is_some());
+                }
+            }
+            assert!(change.response_deadline.is_none());
+            let before = log.borrow().len();
+            for step in 0..24 {
+                let time = now + Duration::from_micros(step * 2);
+                let before_turn = log.borrow().len();
+                change
+                    .drive(&mut resources, &mut mechanics, &mut receive, now, time)
+                    .unwrap();
+                assert!(log.borrow().len() - before_turn <= 2);
+            }
+            assert!(change.complete());
+            assert!(log.borrow().len() > before);
+            assert_eq!(
+                resources.bar0.read_u32(0x210a4).unwrap(),
+                360 | (2 << 10) | (16 << 16) | (9 << 24)
+            );
+            assert_eq!(resources.bar0.read_u32(0x20c80).unwrap() & 0x300, 0);
+            revoke();
+            let before = log.borrow().len();
+            assert_eq!(
+                change.drive(&mut resources, &mut mechanics, &mut receive, now, now),
+                Err(zx::Status::CANCELED)
+            );
+            assert_eq!(log.borrow().len(), before);
+        }
+    }
+
+    #[test]
+    fn expired_channel_effect_never_touches_hardware() {
+        let (device, log) = DeterministicBackend::recording_mt7921_activation_device();
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, _) = wlan_softmac_host::conformance::operation_context(now);
+        let (reply, _) = futures_channel::oneshot::channel();
+        let mut change = ChannelChange::new(
+            context,
+            mt7921_core::CandidateChannel {
+                band: mt7921_core::PhysicalBand::Ghz5,
+                number: 149,
+                frequency_mhz: 5745,
+            },
+            reply,
+        )
+        .unwrap();
+        let before = log.borrow().len();
+        assert_eq!(
+            change.drive(
+                &mut resources,
+                &mut Default::default(),
+                &mut Default::default(),
+                now,
+                now
+            ),
+            Err(zx::Status::TIMED_OUT)
+        );
+        assert_eq!(log.borrow().len(), before);
+        assert!(change.command.is_some());
     }
 
     #[test]

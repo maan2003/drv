@@ -955,6 +955,8 @@ pub struct Mt7921Driver {
     radio_preparation: radio::RadioPreparation,
     data_rx: receive::DataRx,
     scan: Option<radio::PassiveScan>,
+    channel_change: Option<radio::ChannelChange>,
+    current_channel: Option<mt7921_core::CandidateChannel>,
     next_scan_id: u64,
     upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
@@ -1010,6 +1012,8 @@ impl Mt7921Driver {
                     radio_preparation,
                     data_rx: receive::DataRx::default(),
                     scan: None,
+                    channel_change: None,
+                    current_channel: None,
                     next_scan_id: 1,
                     upcalls: None,
                 })

@@ -60,6 +60,24 @@ impl ClientRuntimeDriver for Mt7921Driver {
             if !self.radio_preparation.ready() {
                 return Ok(progressed);
             }
+            if let Some(change) = self.channel_change.as_mut() {
+                progressed |= change.drive(
+                    resources,
+                    &mut self.session.mcu.0,
+                    &mut self.session.receive,
+                    self.session.start,
+                    std::time::Instant::now(),
+                )?;
+                if !change.complete() {
+                    return Ok(progressed);
+                }
+                change.context.check(std::time::Instant::now())?;
+                self.current_channel = Some(change.channel);
+                if let Some(reply) = change.reply.take() {
+                    let _ = reply.send(Ok(()));
+                }
+                self.channel_change = None;
+            }
             if let Some(scan) = self.scan.as_mut() {
                 progressed |= scan.drive(
                     resources,
@@ -131,7 +149,13 @@ impl ClientRuntimeDriver for Mt7921Driver {
             }
             Ok(progressed)
         })();
-        if result.is_err() {
+        if let Err(status) = result {
+            if let Some(change) = self.channel_change.as_mut()
+                && let Some(reply) = change.reply.take()
+            {
+                let _ = reply.send(Err(status));
+            }
+            self.current_channel = None;
             self.session.lifecycle = SessionLifecycle::Closing;
             self.upcalls = None;
         }
@@ -221,13 +245,49 @@ impl WlanSoftmac for Mt7921Driver {
     fn set_channel(
         &mut self,
         context: wlan_softmac_host::OperationContext,
-        _: WlanSoftmacBaseSetChannelRequest,
+        request: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        std::future::ready(
-            context
-                .check(std::time::Instant::now())
-                .and(Err(zx::Status::NOT_SUPPORTED)),
-        )
+        let result = (|| {
+            context.check(std::time::Instant::now())?;
+            if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
+                return Err(zx::Status::BAD_STATE);
+            }
+            if self.scan.is_some() || self.channel_change.is_some() {
+                return Err(zx::Status::SHOULD_WAIT);
+            }
+            let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
+            if request.bandwidth != Some(fidl_fuchsia_wlan_ieee80211::ChannelBandwidth::Cbw20)
+                || request
+                    .vht_secondary_80_channel
+                    .is_none_or(|channel| channel.number != 0)
+            {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let band = match primary.band {
+                fidl_fuchsia_wlan_ieee80211::WlanBand::TwoGhz => mt7921_core::PhysicalBand::Ghz2,
+                fidl_fuchsia_wlan_ieee80211::WlanBand::FiveGhz => mt7921_core::PhysicalBand::Ghz5,
+                _ => return Err(zx::Status::NOT_SUPPORTED),
+            };
+            let channel = self
+                .passive_channels()
+                .into_iter()
+                .find(|channel| channel.band == band && channel.number == u16::from(primary.number))
+                .ok_or(zx::Status::NOT_SUPPORTED)?;
+            // This client currently advertises OFDM only; do not tune for
+            // association on the regdb's NO_OFDM channel 14.
+            if self.regulatory.channels().iter().any(|rule| {
+                rule.band == band
+                    && rule.channel == channel.number
+                    && rule.regulatory_flags & (1 << 6) != 0
+            }) {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+            let (reply, receiver) = futures_channel::oneshot::channel();
+            self.channel_change = Some(crate::radio::ChannelChange::new(context, channel, reply)?);
+            self.current_channel = None;
+            Ok(receiver)
+        })();
+        async move { result?.await.unwrap_or(Err(zx::Status::CANCELED)) }
     }
     fn join_bss(
         &mut self,
@@ -268,7 +328,7 @@ impl WlanSoftmac for Mt7921Driver {
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
                 return Err(zx::Status::BAD_STATE);
             }
-            if self.scan.is_some() {
+            if self.scan.is_some() || self.channel_change.is_some() {
                 return Err(zx::Status::SHOULD_WAIT);
             }
             let requested = request.channels.ok_or(zx::Status::INVALID_ARGS)?;

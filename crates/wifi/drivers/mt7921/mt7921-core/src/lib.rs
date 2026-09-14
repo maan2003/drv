@@ -3551,7 +3551,13 @@ pub fn encode_channel_domain_command(
             PhysicalBand::Ghz5 => 256 + channel.number,
             PhysicalBand::Ghz6 => u16::MAX,
         };
-        if !valid || channel.flags != 1 << 1 || previous.is_some_and(|value| value >= order) {
+        // Keep NO_IR mandatory while permitting additional pinned restrictions.
+        let allowed_flags = (1 << 1) | (1 << 3) | (1 << 6) | (1 << 9);
+        if !valid
+            || channel.flags & (1 << 1) == 0
+            || channel.flags & !allowed_flags != 0
+            || previous.is_some_and(|value| value >= order)
+        {
             return Err(ChannelDomainError::InvalidChannelSet);
         }
         previous = Some(order);
@@ -3589,12 +3595,15 @@ pub fn encode_channel_domain_command(
 /// `switch_reason` of Linux `mt7921_mcu_set_chan_info`.
 ///
 /// `CH_SWITCH_SCAN_BYPASS_DPD` (9) is the off-channel/scan form; the connected
-/// chandef is programmed by `mt7921_set_channel` with `CH_SWITCH_NORMAL` (0),
-/// which is also what runs the per-channel calibration.
+/// chandef uses `CH_SWITCH_DFS` (5) when AP beaconing is prohibited and
+/// `CH_SWITCH_NORMAL` (0) otherwise; SET_RX_PATH always uses NORMAL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ChannelSwitchReason {
     Normal = 0,
+    /// Linux uses DFS form whenever cfg80211_reg_can_beacon(AP) is false,
+    /// including NO_IR channels without radar detection requirements.
+    Dfs = 5,
     ScanBypassDpd = 9,
 }
 
@@ -4235,17 +4244,83 @@ pub fn passive_mac_mmio_plan() -> Vec<PassiveMacMmioOperation> {
     plan
 }
 
+/// Source primitives from mt792x_mac_set_timeing + reset_counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelMacOperation {
+    Rmw { address: u32, mask: u32, value: u32 },
+    Write { address: u32, value: u32 },
+    Read { address: u32 },
+    DelayMicros(u32),
+}
+
+/// Client's initial 20 MHz timing, coverage class zero and Linux's initial
+/// short slot (9 us, mt792x_init_wiphy). Association's ERP slot update is separate.
+pub fn channel_mac_mmio_plan(band: PhysicalBand) -> Vec<ChannelMacOperation> {
+    use ChannelMacOperation::*;
+    let is_2ghz = band == PhysicalBand::Ghz2;
+    let mut plan = vec![
+        Rmw {
+            address: 0x820e_3080,
+            mask: 0x300,
+            value: 0x300,
+        },
+        DelayMicros(1),
+        Write {
+            address: 0x820e_4090,
+            value: 231 | (48 << 16),
+        },
+        Write {
+            address: 0x820e_4094,
+            value: 60 | (28 << 16),
+        },
+        Write {
+            address: 0x820e_40a4,
+            value: 360 | (2 << 10) | ((if is_2ghz { 10 } else { 16 }) << 16) | (9 << 24),
+        },
+        Rmw {
+            address: 0x820e_2084,
+            mask: 0x3fff,
+            value: 0x49,
+        },
+        Rmw {
+            address: 0x820e_3080,
+            mask: 0x300,
+            value: 0,
+        },
+    ];
+    for index in 0..4 {
+        plan.push(Read {
+            address: 0x820e_d7dc + index * 4,
+        });
+        plan.push(Read {
+            address: 0x820e_d7ec + index * 4,
+        });
+    }
+    for address in [0x820e_d02c, 0x820e_d054, 0x820e_d058] {
+        plan.push(Read { address });
+    }
+    for address in [0x820e_53c4, 0x820e_5380] {
+        plan.push(Rmw {
+            address,
+            mask: 1 << 31,
+            value: 1 << 31,
+        });
+    }
+    plan
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PassiveMacBarError {
     UnsupportedAddress(u32),
     AllOnes { address: u32 },
 }
 
-/// Translate only the fixed-map regions touched by the mandatory passive MAC
-/// plan. Pinned `__mt7921_reg_addr` resolves these before its L1-remap fallback;
+/// Translate only the fixed-map regions touched by MAC startup/channel plans. Pinned `__mt7921_reg_addr` resolves these before its L1-remap fallback;
 /// callers must not mutate `MT_HIF_REMAP_L1` for any address accepted here.
 pub fn passive_mac_bar_offset(address: u32) -> Result<usize, PassiveMacBarError> {
-    const FIXED: [(u32, u32, u32); 12] = [
+    const FIXED: [(u32, u32, u32); 14] = [
+        (0x820e_2000, 0x0002_0800, 0x0000_0400),
+        (0x820e_3000, 0x0002_0c00, 0x0000_0400),
         (0x820d_0000, 0x0003_0000, 0x0001_0000),
         (0x820e_d000, 0x0002_4800, 0x0000_0800),
         (0x820e_4000, 0x0002_1000, 0x0000_0400),
@@ -4260,7 +4335,20 @@ pub fn passive_mac_bar_offset(address: u32) -> Result<usize, PassiveMacBarError>
         (0x820f_d000, 0x000a_4800, 0x0000_0800),
     ];
     let wtbl_peer_readback = matches!(address, 0x820d_8700 | 0x820d_8704);
+    let channel_register = channel_mac_mmio_plan(PhysicalBand::Ghz2)
+        .iter()
+        .any(|op| match op {
+            ChannelMacOperation::Rmw {
+                address: expected, ..
+            }
+            | ChannelMacOperation::Write {
+                address: expected, ..
+            }
+            | ChannelMacOperation::Read { address: expected } => *expected == address,
+            ChannelMacOperation::DelayMicros(_) => false,
+        });
     if !wtbl_peer_readback
+        && !channel_register
         && !passive_mac_mmio_plan()
             .iter()
             .any(|operation| match operation {
@@ -5544,6 +5632,9 @@ pub struct RegulatoryRatePowerChannel {
     pub disabled: bool,
     /// None is only valid for a missing or disabled channel.
     pub max_reg_power_dbm: Option<i8>,
+    /// Linux ieee80211_channel_flags from the matched regdb rule. Width
+    /// capabilities remain a separate intersection owned by the caller.
+    pub regulatory_flags: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5916,6 +6007,7 @@ pub fn regulatory_rate_power_channel_skeleton(
         .into_iter()
         .map(|(band, channel)| {
             Ok(RegulatoryRatePowerChannel {
+                regulatory_flags: 0,
                 band,
                 channel,
                 frequency_mhz: rate_power_frequency(band, channel)
@@ -6043,7 +6135,16 @@ pub fn regulatory_rate_power_snapshot_from_regdb_v20(
         {
             return Err(RateTxPowerError::InvalidRegulatoryDatabase);
         }
-        rules.push((start_khz, end_khz, max_bandwidth_khz, max_eirp_mbm));
+        // Pinned net/wireless/reg.c fwdb_flags -> ieee80211_channel_flags.
+        // AUTO_BW affects width calculation, not the 20 MHz intersection here.
+        if rule[1] & !0x1f != 0 {
+            return Err(RateTxPowerError::InvalidRegulatoryDatabase);
+        }
+        let flags = (u32::from(rule[1] & 1 != 0) << 6)
+            | (u32::from(rule[1] & 2 != 0) << 9)
+            | (u32::from(rule[1] & 4 != 0) << 3)
+            | (u32::from(rule[1] & 8 != 0) << 1);
+        rules.push((start_khz, end_khz, max_bandwidth_khz, max_eirp_mbm, flags));
     }
 
     let candidates = candidate_channels(capability);
@@ -6059,15 +6160,16 @@ pub fn regulatory_rate_power_snapshot_from_regdb_v20(
         let center_khz = u32::from(channel.frequency_mhz) * 1_000;
         let lower_khz = center_khz.saturating_sub(10_000);
         let upper_khz = center_khz.saturating_add(10_000);
-        let power_mbm = rules
+        let rule = rules
             .iter()
-            .filter(|(start, end, bandwidth, _)| {
+            .filter(|(start, end, bandwidth, _, _)| {
                 *start <= lower_khz && upper_khz <= *end && *bandwidth >= 20_000
             })
-            .map(|(_, _, _, power)| *power)
+            .map(|(_, _, _, power, flags)| (*power, *flags))
             .next();
         channel.present = true;
-        if let Some(power_mbm) = power_mbm {
+        if let Some((power_mbm, flags)) = rule {
+            channel.regulatory_flags = flags;
             let power_dbm = i8::try_from(power_mbm / 100)
                 .map_err(|_| RateTxPowerError::InvalidRegulatoryLimit)?;
             if !(0..=63).contains(&power_dbm) {
@@ -11336,6 +11438,7 @@ mod tests {
             .map(|(band, channel)| {
                 let present = band == PhysicalBand::Ghz2 || !ABSENT_5GHZ.contains(&(channel as u8));
                 RegulatoryRatePowerChannel {
+                    regulatory_flags: 0,
                     band,
                     channel,
                     frequency_mhz: rate_power_frequency(band, channel).unwrap(),
@@ -11443,6 +11546,17 @@ mod tests {
                 .find(|channel| channel.band == band && channel.channel == number)
                 .unwrap()
         };
+        assert_eq!(channel(PhysicalBand::Ghz2, 1).regulatory_flags, 0);
+        assert_eq!(channel(PhysicalBand::Ghz2, 12).regulatory_flags, 1 << 1);
+        assert_eq!(
+            channel(PhysicalBand::Ghz2, 14).regulatory_flags,
+            (1 << 1) | (1 << 6)
+        );
+        assert_eq!(
+            channel(PhysicalBand::Ghz5, 52).regulatory_flags,
+            (1 << 1) | (1 << 3)
+        );
+        assert_eq!(channel(PhysicalBand::Ghz5, 149).regulatory_flags, 1 << 1);
         assert_eq!(channel(PhysicalBand::Ghz2, 1).max_reg_power_dbm, Some(20));
         assert_eq!(channel(PhysicalBand::Ghz5, 36).max_reg_power_dbm, Some(20));
         assert!(!channel(PhysicalBand::Ghz5, 38).present);
@@ -11574,6 +11688,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|(band, channel)| RegulatoryRatePowerChannel {
+                regulatory_flags: 0,
                 band,
                 channel,
                 frequency_mhz: rate_power_frequency(band, channel).unwrap(),
@@ -15108,6 +15223,17 @@ mod tests {
             Err(ChannelDomainError::InvalidChannelSet)
         );
         let mut command = conservative_channel_domain(capability, *b"00", true, 0).unwrap();
+        command.channels[0].flags = (1 << 1) | (1 << 3) | (1 << 6) | (1 << 9);
+        let encoded = encode_channel_domain_command(&command, 1).unwrap();
+        assert_eq!(
+            &encoded[CONNAC2_MCU_TXD_BYTES + 16..CONNAC2_MCU_TXD_BYTES + 20],
+            &command.channels[0].flags.to_le_bytes()
+        );
+        command.channels[0].flags |= 1 << 31;
+        assert_eq!(
+            encode_channel_domain_command(&command, 1),
+            Err(ChannelDomainError::InvalidChannelSet)
+        );
         command.channels[0].flags = 0;
         assert_eq!(
             encode_channel_domain_command(&command, 1),
@@ -15629,6 +15755,60 @@ mod tests {
                 mask: (3 << 30) | (3 << 24),
                 value: 3 << 24,
             })
+        );
+    }
+
+    #[test]
+    fn channel_timing_matches_pinned_initial_short_slot_and_fixed_map() {
+        use ChannelMacOperation::*;
+        for (band, sifs) in [(PhysicalBand::Ghz2, 10), (PhysicalBand::Ghz5, 16)] {
+            let plan = channel_mac_mmio_plan(band);
+            assert_eq!(plan.len(), 20);
+            assert_eq!(plan[1], DelayMicros(1));
+            assert_eq!(
+                plan[4],
+                Write {
+                    address: 0x820e_40a4,
+                    value: 360 | (2 << 10) | (sifs << 16) | (9 << 24),
+                }
+            );
+            assert_eq!(
+                plan[5],
+                Rmw {
+                    address: 0x820e_2084,
+                    mask: 0x3fff,
+                    value: 0x49
+                }
+            );
+            for operation in plan {
+                let address = match operation {
+                    Rmw { address, .. } | Write { address, .. } | Read { address } => address,
+                    DelayMicros(_) => continue,
+                };
+                assert!(passive_mac_bar_offset(address).is_ok());
+            }
+        }
+        assert_eq!(passive_mac_bar_offset(0x820e_2084), Ok(0x20884));
+        assert_eq!(passive_mac_bar_offset(0x820e_3080), Ok(0x20c80));
+        let command = encode_passive_mcu_command(
+            &PassiveMcuCommand::ChannelSwitch {
+                channel: CandidateChannel {
+                    band: PhysicalBand::Ghz5,
+                    number: 149,
+                    frequency_mhz: 5745,
+                },
+                center_channel: 149,
+                bandwidth: 0,
+                center_channel2: 0,
+                antenna_mask: 3,
+                switch_reason: ChannelSwitchReason::Dfs,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            &command[CONNAC2_MCU_TXD_BYTES..][..8],
+            &[149, 149, 0, 2, 2, 5, 0, 0]
         );
     }
 

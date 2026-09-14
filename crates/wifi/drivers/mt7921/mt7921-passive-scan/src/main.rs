@@ -90,7 +90,7 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args == ["--describe"] {
         println!(
-            "mt7921-service owner=typed-driver protocol=mlme+sme process=single radio_operations=passive-scan-only old_owner=removed"
+            "mt7921-service owner=typed-driver protocol=mlme+sme process=single radio_operations=passive-scan+channel20 old_owner=removed"
         );
         return Ok(());
     }
@@ -256,7 +256,7 @@ fn run() -> Result<(), String> {
             .bind_runtime(runtime)
             .post_lockdown_open_complete()
             .map_err(|error| format!("open control generation: {error}"))?;
-        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=passive-scan-only");
+        eprintln!("mt7921_service=READY owner=typed-driver radio_operations=passive-scan+channel20");
         let result = server.run_to_terminal().await;
         let mut runtime = server.into_runtime();
         let stopped = runtime.shutdown().await;
