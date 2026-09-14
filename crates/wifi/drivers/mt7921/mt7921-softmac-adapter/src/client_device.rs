@@ -1291,9 +1291,10 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     /// contract without exposing the host crate to binary-only consumers.
     pub fn set_runtime_channel(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        wlan_softmac_host::WlanSoftmac::set_channel(self, request)
+        wlan_softmac_host::WlanSoftmac::set_channel(self, context, request)
     }
 }
 
@@ -1490,9 +1491,11 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn set_channel(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
+            context.check(std::time::Instant::now())?;
             let primary = request.primary.ok_or(zx::Status::INVALID_ARGS)?;
             let bandwidth = request.bandwidth.ok_or(zx::Status::INVALID_ARGS)?;
             let secondary = request
