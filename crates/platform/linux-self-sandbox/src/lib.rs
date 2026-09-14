@@ -504,213 +504,413 @@ fn reopen_state_capability(inherited_fd: RawFd) -> Result<(), Error> {
     syscall_ok(close_result, "close temporary jailed state capability")
 }
 
-const LD_W_ABS: u16 = 0x20;
-const JMP_JEQ_K: u16 = 0x15;
-const RET_K: u16 = 0x06;
-const ALLOW: u32 = 0x7fff_0000;
-const KILL_PROCESS: u32 = 0x8000_0000;
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule,
+};
+use std::collections::BTreeMap;
 
-#[cfg(target_arch = "x86_64")]
-const AUDIT_ARCH: u32 = 0xc000_003e;
-#[cfg(target_arch = "aarch64")]
-const AUDIT_ARCH: u32 = 0xc000_00b7;
+type Rules = BTreeMap<i64, Vec<SeccompRule>>;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Filter {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
+fn condition(index: u8, width: SeccompCmpArgLen, op: SeccompCmpOp, value: u64) -> SeccompCondition {
+    SeccompCondition::new(index, width, op, value).expect("valid static argument index")
 }
-#[repr(C)]
-struct Program {
-    len: u16,
-    filter: *const Filter,
+fn eq(index: u8, value: u64) -> SeccompCondition {
+    condition(index, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, value)
 }
-
-fn stmt(code: u16, k: u32) -> Filter {
-    Filter {
-        code,
-        jt: 0,
-        jf: 0,
-        k,
+fn low_eq(index: u8, value: u32) -> SeccompCondition {
+    condition(
+        index,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        value.into(),
+    )
+}
+fn allow(rules: &mut Rules, syscall: libc::c_long, conditions: Vec<SeccompCondition>) {
+    assert!(
+        !conditions.is_empty(),
+        "conditional rules must not become unconditional"
+    );
+    rules
+        .entry(syscall)
+        .or_default()
+        .push(SeccompRule::new(conditions).expect("nonempty rule"));
+}
+fn allow_fds(rules: &mut Rules, syscall: libc::c_long, fds: &[RawFd]) {
+    for &fd in fds {
+        allow(rules, syscall, vec![eq(0, fd as u64)]);
     }
 }
-fn jump(k: u32, jt: u8, jf: u8) -> Filter {
-    Filter {
-        code: JMP_JEQ_K,
-        jt,
-        jf,
-        k,
+fn allow_ioctl(rules: &mut Rules, fd: RawFd, requests: &[u64]) {
+    for &request in requests {
+        allow(
+            rules,
+            libc::SYS_ioctl,
+            vec![eq(0, fd as u64), eq(1, request)],
+        );
     }
 }
-fn arg(index: usize) -> Filter {
-    stmt(LD_W_ABS, 16 + (index * 8) as u32)
+fn allow_service_messages(rules: &mut Rules, control: RawFd, supervisor: RawFd) {
+    for fd in [control, supervisor] {
+        allow(
+            rules,
+            libc::SYS_sendmsg,
+            vec![
+                eq(0, fd as u64),
+                eq(2, (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64),
+            ],
+        );
+    }
+    allow(
+        rules,
+        libc::SYS_recvmsg,
+        vec![
+            eq(0, control as u64),
+            eq(2, (libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) as u64),
+        ],
+    );
 }
+fn allow_frames(rules: &mut Rules, fds: &[RawFd]) {
+    for &fd in fds {
+        for (syscall, flags) in [
+            (libc::SYS_sendto, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL),
+            (libc::SYS_recvfrom, libc::MSG_DONTWAIT | libc::MSG_TRUNC),
+        ] {
+            allow(rules, syscall, vec![eq(0, fd as u64), eq(3, flags as u64)]);
+        }
+    }
+}
+fn allow_runtime_wait(rules: &mut Rules, fds: &[RawFd]) {
+    #[cfg(target_arch = "x86_64")]
+    allow_fds(rules, libc::SYS_epoll_wait, fds);
+    for &fd in fds {
+        for size in [0, 8] {
+            allow(
+                rules,
+                libc::SYS_epoll_pwait,
+                vec![eq(0, fd as u64), eq(4, 0), eq(5, size)],
+            );
+        }
+    }
+}
+fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
+    use SeccompCmpArgLen::{Dword, Qword};
+    use SeccompCmpOp::{Ge, Le, MaskedEq, Ne};
+    let mut rules = Rules::new();
 
-fn arg_high(index: usize) -> Filter {
-    stmt(LD_W_ABS, 20 + (index * 8) as u32)
+    // Preserve the existing syscall ABI widths. Qword comparisons constrain
+    // upper words too; Dword comparisons intentionally retain low-word checks.
+    allow(
+        &mut rules,
+        libc::SYS_mprotect,
+        vec![condition(2, Dword, MaskedEq(libc::PROT_EXEC as u64), 0)],
+    );
+    allow(
+        &mut rules,
+        libc::SYS_clock_gettime,
+        vec![eq(0, libc::CLOCK_MONOTONIC as u64)],
+    );
+    allow(
+        &mut rules,
+        libc::SYS_clock_nanosleep,
+        vec![eq(0, libc::CLOCK_MONOTONIC as u64), low_eq(1, 0)],
+    );
+    for advice in [
+        libc::MADV_DONTNEED,
+        libc::MADV_DONTDUMP,
+        libc::MADV_FREE,
+        libc::MADV_NOHUGEPAGE,
+    ] {
+        allow(
+            &mut rules,
+            libc::SYS_madvise,
+            vec![low_eq(2, advice as u32)],
+        );
+    }
+    for flags in [0, libc::GRND_NONBLOCK] {
+        allow(&mut rules, libc::SYS_getrandom, vec![eq(2, flags as u64)]);
+    }
+    // Seccomp cannot inspect SS_DISABLE, but excludes querying the old stack.
+    allow(
+        &mut rules,
+        libc::SYS_sigaltstack,
+        vec![condition(0, Qword, Ne, 0), eq(1, 0)],
+    );
+    // libc supplies mmap's 32-bit -1 with an otherwise zero upper word.
+    allow(
+        &mut rules,
+        libc::SYS_mmap,
+        vec![
+            eq(2, (libc::PROT_READ | libc::PROT_WRITE) as u64),
+            eq(3, (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64),
+            eq(4, u32::MAX as u64),
+            eq(5, 0),
+        ],
+    );
+
+    match profile {
+        Profile::Wlancfg {
+            control_fd,
+            persistence_dir_fd,
+            application_listener_fd,
+        } => {
+            let fd = *persistence_dir_fd as u32;
+            // The sealed filesystem, not seccomp, confines pointed-to names.
+            allow(
+                &mut rules,
+                libc::SYS_statx,
+                vec![eq(2, libc::AT_EMPTY_PATH as u64)],
+            );
+            for flags in [
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+            ] {
+                allow(
+                    &mut rules,
+                    libc::SYS_openat,
+                    vec![low_eq(0, fd), low_eq(2, flags as u32)],
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            let renameat = libc::SYS_renameat;
+            // The aarch64 libc constant is omitted, but Linux's ABI is syscall 38.
+            #[cfg(target_arch = "aarch64")]
+            let renameat = 38;
+            allow(&mut rules, renameat, vec![low_eq(0, fd), low_eq(2, fd)]);
+            allow(
+                &mut rules,
+                libc::SYS_unlinkat,
+                vec![low_eq(0, fd), low_eq(2, 0)],
+            );
+            for (syscall, flags) in [
+                (libc::SYS_sendto, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL),
+                (libc::SYS_recvfrom, libc::MSG_DONTWAIT | libc::MSG_TRUNC),
+            ] {
+                allow(
+                    &mut rules,
+                    syscall,
+                    vec![
+                        eq(0, *control_fd as u64),
+                        condition(2, Qword, Le, 8192),
+                        eq(3, flags as u64),
+                        eq(4, 0),
+                        eq(5, 0),
+                    ],
+                );
+            }
+            if let Some(listener) = application_listener_fd {
+                allow(
+                    &mut rules,
+                    libc::SYS_accept4,
+                    vec![
+                        low_eq(0, *listener as u32),
+                        eq(1, 0),
+                        low_eq(2, 0),
+                        low_eq(3, (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32),
+                    ],
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            allow(&mut rules, libc::SYS_poll, vec![eq(1, 2)]);
+            #[cfg(target_arch = "aarch64")]
+            allow(
+                &mut rules,
+                libc::SYS_ppoll,
+                vec![eq(1, 2), eq(2, 0), eq(3, 0)],
+            );
+            allow(&mut rules, libc::SYS_epoll_pwait, vec![eq(4, 0)]);
+            allow(
+                &mut rules,
+                libc::SYS_epoll_ctl,
+                vec![condition(1, Qword, Ge, 1), condition(1, Qword, Le, 3)],
+            );
+            allow(
+                &mut rules,
+                libc::SYS_rt_sigprocmask,
+                vec![
+                    eq(0, libc::SIG_BLOCK as u64),
+                    condition(1, Qword, Ne, 0),
+                    eq(2, 0),
+                    eq(3, 8),
+                ],
+            );
+        }
+        Profile::WifiSimulated => {}
+        Profile::Mt7921Vfio {
+            pci_config_fd,
+            vfio_fd,
+            iommufd,
+            irq_eventfd,
+            service,
+        } => {
+            allow_ioctl(
+                &mut rules,
+                *vfio_fd,
+                userspace_vfio::mt7921_seccomp::VFIO_REQUESTS,
+            );
+            allow_ioctl(
+                &mut rules,
+                *iommufd,
+                userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS,
+            );
+            allow_fds(&mut rules, libc::SYS_lseek, &[*pci_config_fd]);
+            allow(
+                &mut rules,
+                libc::SYS_ppoll,
+                vec![condition(1, Qword, Le, 1), eq(3, 0)],
+            );
+            let mut readable = vec![*pci_config_fd, *irq_eventfd];
+            let mut writable = vec![*pci_config_fd, 1, 2];
+            if let Some(service) = service {
+                allow_service_messages(&mut rules, service.control_fd, service.supervisor_fd);
+                allow_frames(&mut rules, &service.ethernet_fds);
+                allow_runtime_wait(&mut rules, &service.runtime_fds);
+                let mut readiness = vec![*irq_eventfd, service.control_fd, service.supervisor_fd];
+                readiness.extend(&service.ethernet_fds);
+                readiness.extend(&service.runtime_fds);
+                for &target in &readiness {
+                    // Read-only OwnedFd debug-drop validity check, not duplication.
+                    allow(
+                        &mut rules,
+                        libc::SYS_fcntl,
+                        vec![eq(0, target as u64), eq(1, libc::F_GETFD as u64)],
+                    );
+                    for &reactor in &service.runtime_fds {
+                        allow(
+                            &mut rules,
+                            libc::SYS_epoll_ctl,
+                            vec![
+                                eq(0, reactor as u64),
+                                eq(2, target as u64),
+                                condition(1, Qword, Ge, 1),
+                                condition(1, Qword, Le, 3),
+                            ],
+                        );
+                    }
+                }
+                readable.extend(&service.runtime_fds);
+                writable.extend(&service.runtime_fds);
+            }
+            allow_fds(&mut rules, libc::SYS_read, &readable);
+            allow_fds(&mut rules, libc::SYS_write, &writable);
+        }
+        Profile::Ath11kWcn6750 {
+            control_fd,
+            supervisor_fd,
+            vfio_fd,
+            dma,
+            qrtr_fd,
+            irq_eventfds,
+            ethernet_fds,
+            runtime_fds,
+            remoteproc_state_fd,
+        } => {
+            match dma {
+                Wcn6750Dma::Coherent { iommufd } => {
+                    allow_ioctl(
+                        &mut rules,
+                        *vfio_fd,
+                        userspace_vfio::wcn6750_seccomp::COHERENT_VFIO_REQUESTS,
+                    );
+                    allow_ioctl(
+                        &mut rules,
+                        *iommufd,
+                        userspace_vfio::wcn6750_seccomp::COHERENT_IOMMUFD_REQUESTS,
+                    );
+                }
+                Wcn6750Dma::Broker => allow_ioctl(
+                    &mut rules,
+                    *vfio_fd,
+                    userspace_vfio::wcn6750_seccomp::BROKER_VFIO_REQUESTS,
+                ),
+            }
+            allow_service_messages(&mut rules, *control_fd, *supervisor_fd);
+            for syscall in [
+                libc::SYS_bind,
+                libc::SYS_connect,
+                libc::SYS_getsockname,
+                libc::SYS_getpeername,
+            ] {
+                allow_fds(&mut rules, syscall, &[*qrtr_fd]);
+            }
+            allow_frames(&mut rules, ethernet_fds);
+            for flags in [0, libc::MSG_DONTWAIT] {
+                allow(
+                    &mut rules,
+                    libc::SYS_sendto,
+                    vec![eq(0, *qrtr_fd as u64), eq(3, flags as u64)],
+                );
+            }
+            allow(
+                &mut rules,
+                libc::SYS_recvfrom,
+                vec![
+                    eq(0, *qrtr_fd as u64),
+                    eq(3, (libc::MSG_TRUNC | libc::MSG_DONTWAIT) as u64),
+                ],
+            );
+            allow_runtime_wait(&mut rules, runtime_fds);
+            let mut readable = irq_eventfds.to_vec();
+            readable.extend(runtime_fds);
+            let mut writable = vec![1, 2];
+            writable.extend(runtime_fds);
+            if let Some(fd) = remoteproc_state_fd {
+                allow_fds(&mut rules, libc::SYS_lseek, &[*fd]);
+                readable.push(*fd);
+                writable.push(*fd);
+            }
+            allow_fds(&mut rules, libc::SYS_read, &readable);
+            allow_fds(&mut rules, libc::SYS_write, &writable);
+            allow(
+                &mut rules,
+                libc::SYS_ppoll,
+                vec![
+                    condition(1, Qword, Le, (WCN6750_IRQ_EVENTFD_COUNT + 1) as u64),
+                    eq(3, 0),
+                ],
+            );
+        }
+    }
+    if let Profile::Mt7921Vfio { vfio_fd, .. } | Profile::Ath11kWcn6750 { vfio_fd, .. } = profile {
+        allow(
+            &mut rules,
+            libc::SYS_mmap,
+            vec![
+                eq(2, (libc::PROT_READ | libc::PROT_WRITE) as u64),
+                eq(3, libc::MAP_SHARED as u64),
+                eq(4, *vfio_fd as u64),
+            ],
+        );
+    }
+    for number in allowed(profile) {
+        // An empty rule list means unconditional ALLOW, not deny.
+        assert!(
+            rules.insert(number, Vec::new()).is_none(),
+            "unconditional syscall overlaps constrained rule"
+        );
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        std::env::consts::ARCH
+            .try_into()
+            .expect("supported target architecture"),
+    )
+    .map_err(|error| system("construct seccomp policy", io::Error::other(error)))?;
+    filter
+        .try_into()
+        .map_err(|error| system("compile seccomp policy", io::Error::other(error)))
 }
 
 fn install_filter(profile: &Profile) -> Result<(), Error> {
-    let mut f = vec![
-        stmt(LD_W_ABS, 4),
-        jump(AUDIT_ARCH, 1, 0),
-        stmt(RET_K, KILL_PROCESS),
-        stmt(LD_W_ABS, 0),
-    ];
-    if let Profile::Wlancfg {
-        control_fd,
-        persistence_dir_fd: fd,
-        application_listener_fd,
-    } = profile
-    {
-        append_empty_path_statx(&mut f);
-        append_openat(&mut f, *fd);
-        append_renameat(&mut f, *fd);
-        append_unlinkat(&mut f, *fd);
-        append_wlancfg_packet_io(&mut f, *control_fd);
-        if let Some(listener) = application_listener_fd {
-            append_wlancfg_accept(&mut f, *listener);
-        }
-    }
-    if let Profile::Mt7921Vfio {
-        pci_config_fd,
-        vfio_fd,
-        iommufd,
-        irq_eventfd,
-        service,
-    } = profile
-    {
-        append_mt7921_ioctl(&mut f, *vfio_fd, *iommufd);
-        append_fd_only(&mut f, libc::SYS_lseek, *pci_config_fd);
-        let mut readable = vec![*pci_config_fd, *irq_eventfd];
-        let mut writable = vec![*pci_config_fd, 1, 2];
-        append_mt_ppoll(&mut f);
-        if let Some(service) = service {
-            append_fd_sendmsg(&mut f, &[service.control_fd, service.supervisor_fd]);
-            append_fd_recvmsg(&mut f, service.control_fd);
-            append_runtime_poller(&mut f, &service.runtime_fds);
-            let mut readiness_fds = vec![*irq_eventfd, service.control_fd, service.supervisor_fd];
-            readiness_fds.extend(&service.ethernet_fds);
-            readiness_fds.extend(&service.runtime_fds);
-            append_runtime_registration(&mut f, &service.runtime_fds, &readiness_fds);
-            append_getfd(&mut f, &readiness_fds);
-            readable.extend(&service.runtime_fds);
-            writable.extend(&service.runtime_fds);
-            let send_flags = [(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32];
-            let recv_flags = [(libc::MSG_DONTWAIT | libc::MSG_TRUNC) as u32];
-            append_fd_flag_pairs(
-                &mut f,
-                libc::SYS_sendto,
-                &service
-                    .ethernet_fds
-                    .iter()
-                    .map(|fd| (*fd, &send_flags[..]))
-                    .collect::<Vec<_>>(),
-            );
-            append_fd_flag_pairs(
-                &mut f,
-                libc::SYS_recvfrom,
-                &service
-                    .ethernet_fds
-                    .iter()
-                    .map(|fd| (*fd, &recv_flags[..]))
-                    .collect::<Vec<_>>(),
-            );
-        }
-        append_fd_set(&mut f, libc::SYS_read, &readable);
-        append_fd_set(&mut f, libc::SYS_write, &writable);
-    }
-    if let Profile::Ath11kWcn6750 {
-        control_fd,
-        supervisor_fd,
-        vfio_fd,
-        dma,
-        qrtr_fd,
-        irq_eventfds,
-        ethernet_fds,
-        runtime_fds,
-        remoteproc_state_fd,
-    } = profile
-    {
-        append_wcn6750_ioctl(&mut f, *vfio_fd, *dma);
-        append_fd_sendmsg(&mut f, &[*control_fd, *supervisor_fd]);
-        append_fd_recvmsg(&mut f, *control_fd);
-        append_qrtr_and_ethernet_io(&mut f, *qrtr_fd, ethernet_fds);
-        append_runtime_poller(&mut f, runtime_fds);
-        let mut readable = irq_eventfds.to_vec();
-        readable.extend(runtime_fds);
-        let mut writable = vec![1, 2];
-        writable.extend(runtime_fds);
-        if let Some(fd) = *remoteproc_state_fd {
-            append_fd_only(&mut f, libc::SYS_lseek, fd);
-            readable.push(fd);
-            writable.push(fd);
-        }
-        append_fd_set(&mut f, libc::SYS_read, &readable);
-        append_fd_set(&mut f, libc::SYS_write, &writable);
-        append_bounded_ppoll(&mut f, WCN6750_IRQ_EVENTFD_COUNT + 1);
-    }
-    append_runtime_mmap(
-        &mut f,
-        match profile {
-            Profile::Mt7921Vfio { vfio_fd, .. } | Profile::Ath11kWcn6750 { vfio_fd, .. } => {
-                Some(*vfio_fd)
-            }
-            _ => None,
-        },
-    );
-    append_no_exec_mprotect(&mut f);
-    append_monotonic_clock(&mut f);
-    append_monotonic_sleep(&mut f);
-    append_madvise(&mut f);
-    append_getrandom(&mut f);
-    append_sigaltstack_teardown(&mut f);
-    #[cfg(target_arch = "x86_64")]
-    if matches!(profile, Profile::Wlancfg { .. }) {
-        append_wlancfg_poll(&mut f);
-    }
-    if matches!(profile, Profile::Wlancfg { .. }) {
-        append_epoll_pwait(&mut f);
-        append_wlancfg_thread_exit_sigmask(&mut f);
-    }
-    #[cfg(target_arch = "aarch64")]
-    if matches!(profile, Profile::Wlancfg { .. }) {
-        append_wlancfg_ppoll(&mut f);
-    }
-    match profile {
-        Profile::Wlancfg { .. } => {
-            append_epoll_ctl(&mut f);
-        }
-        Profile::WifiSimulated | Profile::Mt7921Vfio { .. } | Profile::Ath11kWcn6750 { .. } => {}
-    }
-    for number in allowed(profile) {
-        f.push(jump(number as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-    }
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let program = Program {
-        len: f.len().try_into().expect("small seccomp program"),
-        filter: f.as_ptr(),
-    };
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_TSYNC,
-            &program,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(system(
-            "install synchronized seccomp",
-            io::Error::last_os_error(),
-        ))
-    }
+    seccompiler::apply_filter_all_threads(&compile_filter(profile)?)
+        .map_err(|error| system("install synchronized seccomp", io::Error::other(error)))
 }
 
 /// Installs only the runtime filter for cross-crate integration tests.
@@ -727,913 +927,6 @@ pub fn install_runtime_filter_for_integration_test(profile: Profile) -> Result<(
         "set integration-test no_new_privs",
     )?;
     install_filter(&profile)
-}
-
-fn append_mt7921_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, iommufd: RawFd) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_ioctl as u32, 0, 0));
-    f.push(arg_high(0));
-    let fd_high = f.len();
-    f.push(jump(0, 0, 0));
-    append_ioctl_fd_requests(f, vfio_fd, userspace_vfio::mt7921_seccomp::VFIO_REQUESTS);
-    append_ioctl_fd_requests(f, iommufd, userspace_vfio::mt7921_seccomp::IOMMUFD_REQUESTS);
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small ioctl filter");
-    f[fd_high].jf = (denied - fd_high - 1)
-        .try_into()
-        .expect("small ioctl filter");
-}
-
-fn append_wcn6750_ioctl(f: &mut Vec<Filter>, vfio_fd: RawFd, dma: Wcn6750Dma) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_ioctl as u32, 0, 0));
-    f.push(arg_high(0));
-    let fd_high = f.len();
-    f.push(jump(0, 0, 0));
-    match dma {
-        Wcn6750Dma::Coherent { iommufd } => {
-            append_ioctl_fd_requests(
-                f,
-                vfio_fd,
-                userspace_vfio::wcn6750_seccomp::COHERENT_VFIO_REQUESTS,
-            );
-            append_ioctl_fd_requests(
-                f,
-                iommufd,
-                userspace_vfio::wcn6750_seccomp::COHERENT_IOMMUFD_REQUESTS,
-            );
-        }
-        Wcn6750Dma::Broker => append_ioctl_fd_requests(
-            f,
-            vfio_fd,
-            userspace_vfio::wcn6750_seccomp::BROKER_VFIO_REQUESTS,
-        ),
-    }
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small ioctl filter");
-    f[fd_high].jf = (denied - fd_high - 1)
-        .try_into()
-        .expect("small ioctl filter");
-}
-
-fn append_ioctl_fd_requests(f: &mut Vec<Filter>, fd: RawFd, requests: &[u64]) {
-    for &request in requests {
-        f.push(arg(0));
-        f.push(jump(fd as u32, 0, 5));
-        f.push(arg_high(1));
-        f.push(jump(0, 0, 3));
-        f.push(arg(1));
-        f.push(jump(request as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-    }
-}
-
-fn append_runtime_mmap(f: &mut Vec<Filter>, device_fd: Option<RawFd>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_mmap as u32, 0, 0));
-
-    // Linux's mmap ABI consumes a 32-bit fd and libc leaves the seccomp
-    // argument's upper word zero, including for fd -1.
-    f.push(arg_high(4));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(arg(4));
-    let anonymous_fd = f.len();
-    f.push(jump(u32::MAX, 0, 0));
-    let device_fd_check = device_fd.map(|fd| {
-        let check = f.len();
-        f.push(jump(fd as u32, 0, 0));
-        check
-    });
-    f.push(stmt(RET_K, KILL_PROCESS));
-
-    let anonymous = f.len();
-    let mut anonymous_failures = Vec::new();
-    for (argument, expected) in [
-        (2, (libc::PROT_READ | libc::PROT_WRITE) as u32),
-        (3, (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u32),
-        (5, 0),
-    ] {
-        f.push(arg_high(argument));
-        anonymous_failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        anonymous_failures.push(f.len());
-        f.push(jump(expected, 0, 0));
-    }
-    f.push(stmt(RET_K, ALLOW));
-    let anonymous_denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-
-    let device = f.len();
-    let mut device_failures = Vec::new();
-    for (argument, expected) in [
-        (2, (libc::PROT_READ | libc::PROT_WRITE) as u32),
-        (3, libc::MAP_SHARED as u32),
-    ] {
-        f.push(arg_high(argument));
-        device_failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        device_failures.push(f.len());
-        f.push(jump(expected, 0, 0));
-    }
-    f.push(stmt(RET_K, ALLOW));
-    let device_denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small mmap filter");
-    f[anonymous_fd].jt = (anonymous - anonymous_fd - 1)
-        .try_into()
-        .expect("small mmap filter");
-    for failure in anonymous_failures {
-        f[failure].jf = (anonymous_denied - failure - 1)
-            .try_into()
-            .expect("small mmap filter");
-    }
-    if let Some(check) = device_fd_check {
-        f[check].jt = (device - check - 1).try_into().expect("small mmap filter");
-    }
-    for failure in device_failures {
-        f[failure].jf = (device_denied - failure - 1)
-            .try_into()
-            .expect("small mmap filter");
-    }
-}
-
-fn append_no_exec_mprotect(f: &mut Vec<Filter>) {
-    f.push(jump(libc::SYS_mprotect as u32, 0, 4));
-    f.push(arg(2));
-    f.push(Filter {
-        code: 0x45,
-        jt: 0,
-        jf: 1,
-        k: libc::PROT_EXEC as u32,
-    });
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_monotonic_clock(f: &mut Vec<Filter>) {
-    f.push(jump(libc::SYS_clock_gettime as u32, 0, 6));
-    f.push(arg_high(0));
-    f.push(jump(0, 0, 2));
-    f.push(arg(0));
-    f.push(jump(libc::CLOCK_MONOTONIC as u32, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_monotonic_sleep(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_clock_nanosleep as u32, 0, 0));
-    f.push(arg_high(0));
-    f.push(jump(0, 0, 4));
-    f.push(arg(0));
-    f.push(jump(libc::CLOCK_MONOTONIC as u32, 0, 2));
-    f.push(arg(1));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small sleep filter");
-}
-
-fn append_madvise(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_madvise as u32, 0, 0));
-    f.push(arg(2));
-    for advice in [
-        libc::MADV_DONTNEED,
-        libc::MADV_DONTDUMP,
-        libc::MADV_FREE,
-        libc::MADV_NOHUGEPAGE,
-    ] {
-        f.push(jump(advice as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-    }
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small madvise filter");
-}
-
-fn append_getrandom(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_getrandom as u32, 0, 0));
-    f.push(arg_high(2));
-    f.push(jump(0, 0, 4));
-    f.push(arg(2));
-    f.push(jump(0, 1, 0));
-    f.push(jump(libc::GRND_NONBLOCK, 0, 1));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small getrandom filter");
-}
-
-#[cfg(target_arch = "x86_64")]
-fn append_wlancfg_poll(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_poll as u32, 0, 0));
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 2));
-    f.push(arg(1));
-    f.push(jump(2, 1, 0));
-    // Timeout changes no descriptor authority: permit both idle infinite
-    // waits and bounded waits for pending operation drain.
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small poll filter");
-}
-
-fn append_fd_set(f: &mut Vec<Filter>, syscall: libc::c_long, fds: &[RawFd]) {
-    let dispatch = f.len();
-    f.push(jump(syscall as u32, 0, 0));
-    f.push(arg_high(0));
-    f.push(jump(0, 0, (fds.len() * 2 + 1) as u8));
-    f.push(arg(0));
-    for &fd in fds {
-        f.push(jump(fd as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-    }
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1).try_into().expect("small fd filter");
-}
-
-fn append_fd_sendmsg(f: &mut Vec<Filter>, fds: &[RawFd]) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_sendmsg as u32, 0, 0));
-    let mut failures = Vec::new();
-    f.push(arg_high(0));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(0));
-    let mut fd_matches = Vec::new();
-    for &fd in fds {
-        fd_matches.push(f.len());
-        f.push(jump(fd as u32, 0, 0));
-    }
-    let wrong_fd = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let flags_start = f.len();
-    for matched in fd_matches {
-        f[matched].jt = (flags_start - matched - 1)
-            .try_into()
-            .expect("small sendmsg fd inventory");
-    }
-    f.push(arg_high(2));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(2));
-    failures.push(f.len());
-    f.push(jump((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32, 0, 0));
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small sendmsg filter");
-    }
-    debug_assert!(wrong_fd < denied);
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small sendmsg filter");
-}
-
-fn append_fd_recvmsg(f: &mut Vec<Filter>, fd: RawFd) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_recvmsg as u32, 0, 0));
-    let mut failures = Vec::new();
-    for (argument, expected) in [
-        (0, fd as u32),
-        (2, (libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) as u32),
-    ] {
-        f.push(arg_high(argument));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        failures.push(f.len());
-        f.push(jump(expected, 0, 0));
-    }
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small recvmsg filter");
-    }
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small recvmsg filter");
-}
-
-fn append_qrtr_and_ethernet_io(f: &mut Vec<Filter>, qrtr_fd: RawFd, ethernet_fds: &[RawFd]) {
-    for syscall in [
-        libc::SYS_bind,
-        libc::SYS_connect,
-        libc::SYS_getsockname,
-        libc::SYS_getpeername,
-    ] {
-        append_fd_only(f, syscall, qrtr_fd);
-    }
-    let ethernet_send_flags = (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32;
-    let qrtr_send_flags = [0, libc::MSG_DONTWAIT as u32];
-    let ethernet_send_flags = [ethernet_send_flags];
-    let mut send_pairs = vec![(qrtr_fd, &qrtr_send_flags[..])];
-    send_pairs.extend(
-        ethernet_fds
-            .iter()
-            .map(|fd| (*fd, &ethernet_send_flags[..])),
-    );
-    append_fd_flag_pairs(f, libc::SYS_sendto, &send_pairs);
-    let receive_flags = (libc::MSG_TRUNC | libc::MSG_DONTWAIT) as u32;
-    let receive_flags = [receive_flags];
-    let mut receive_pairs = vec![(qrtr_fd, &receive_flags[..])];
-    receive_pairs.extend(ethernet_fds.iter().map(|fd| (*fd, &receive_flags[..])));
-    append_fd_flag_pairs(f, libc::SYS_recvfrom, &receive_pairs);
-}
-
-fn append_fd_flag_pairs(f: &mut Vec<Filter>, syscall: libc::c_long, pairs: &[(RawFd, &[u32])]) {
-    let dispatch = f.len();
-    f.push(jump(syscall as u32, 0, 0));
-    f.push(arg_high(0));
-    let fd_high = f.len();
-    f.push(jump(0, 0, 0));
-    f.push(arg(0));
-    let mut fd_dispatches = Vec::new();
-    for &(fd, _) in pairs {
-        fd_dispatches.push(f.len());
-        f.push(jump(fd as u32, 0, 0));
-    }
-    let wrong_fd = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    for ((_, flags), fd_dispatch) in pairs.iter().zip(fd_dispatches) {
-        let branch = f.len();
-        f[fd_dispatch].jt = (branch - fd_dispatch - 1)
-            .try_into()
-            .expect("small fd/flags inventory");
-        f.push(arg_high(3));
-        f.push(jump(0, 1, 0));
-        f.push(stmt(RET_K, KILL_PROCESS));
-        f.push(arg(3));
-        for &value in *flags {
-            f.push(jump(value, 0, 1));
-            f.push(stmt(RET_K, ALLOW));
-        }
-        f.push(stmt(RET_K, KILL_PROCESS));
-    }
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[fd_high].jf = (wrong_fd - fd_high - 1)
-        .try_into()
-        .expect("small fd/flags filter");
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small fd/flags filter");
-}
-
-fn append_bounded_ppoll(f: &mut Vec<Filter>, maximum_fds: usize) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
-    let mut failures = Vec::new();
-    // The monotonic timeout pointer is runtime data. The optional signal-mask
-    // pointer must remain null so ppoll cannot mutate signal handling.
-    f.push(arg_high(3));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(3));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg_high(1));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(1));
-    let oversized = f.len();
-    f.push(Filter {
-        code: 0x25, // BPF_JMP | BPF_JGT | BPF_K
-        jt: 0,
-        jf: 1,
-        k: maximum_fds.try_into().expect("small descriptor inventory"),
-    });
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small ppoll filter");
-    }
-    f[oversized].jt = 0;
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small ppoll filter");
-}
-
-fn append_runtime_poller(f: &mut Vec<Filter>, runtime_fds: &[RawFd]) {
-    if runtime_fds.is_empty() {
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    append_fd_set(f, libc::SYS_epoll_wait, runtime_fds);
-    append_epoll_pwait_fds(f, runtime_fds);
-}
-
-// Rust's debug OwnedFd drop checks validity with F_GETFD before close.
-// This read-only query must not admit duplication or flag mutation.
-fn append_getfd(f: &mut Vec<Filter>, fds: &[RawFd]) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_fcntl as u32, 0, 0));
-    f.push(arg_high(1));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(arg(1));
-    f.push(jump(libc::F_GETFD as u32, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(arg_high(0));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(arg(0));
-    for &fd in fds {
-        f.push(jump(fd as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-    }
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small getfd filter");
-}
-
-// Unlike the policy reactor's ambient registration, driver registrations may
-// reference only the pre-lockdown reactor and its exact readiness inventory.
-fn append_runtime_registration(f: &mut Vec<Filter>, reactors: &[RawFd], targets: &[RawFd]) {
-    if reactors.is_empty() {
-        return;
-    }
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_epoll_ctl as u32, 0, 0));
-    for (argument, values) in [
-        (0, reactors),
-        (
-            1,
-            &[
-                libc::EPOLL_CTL_ADD,
-                libc::EPOLL_CTL_MOD,
-                libc::EPOLL_CTL_DEL,
-            ][..],
-        ),
-        (2, targets),
-    ] {
-        f.push(arg_high(argument));
-        f.push(jump(0, 1, 0));
-        f.push(stmt(RET_K, KILL_PROCESS));
-        f.push(arg(argument));
-        for (index, &value) in values.iter().enumerate() {
-            f.push(jump(
-                value as u32,
-                (values.len() - index)
-                    .try_into()
-                    .expect("small registration inventory"),
-                0,
-            ));
-        }
-        f.push(stmt(RET_K, KILL_PROCESS));
-    }
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small registration filter");
-}
-
-fn append_epoll_pwait_fds(f: &mut Vec<Filter>, fds: &[RawFd]) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_epoll_pwait as u32, 0, 0));
-    let mut failures = Vec::new();
-    f.push(arg_high(0));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(0));
-    let mut matches = Vec::new();
-    for &fd in fds {
-        matches.push(f.len());
-        f.push(jump(fd as u32, 0, 0));
-    }
-    let wrong_fd = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let mask_check = f.len();
-    for matched in matches {
-        f[matched].jt = (mask_check - matched - 1)
-            .try_into()
-            .expect("small runtime fd inventory");
-    }
-    for argument in [4] {
-        f.push(arg_high(argument));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-    }
-    // The signal mask is NULL. libc passes the kernel sigset width, while
-    // direct reactor syscalls may pass zero; neither changes signal authority.
-    f.push(arg_high(5));
-    failures.push(f.len());
-    f.push(jump(0, 0, 0));
-    f.push(arg(5));
-    f.push(jump(0, 1, 0));
-    failures.push(f.len());
-    f.push(jump(8, 0, 0));
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small runtime epoll filter");
-    }
-    debug_assert!(wrong_fd < denied);
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small runtime epoll filter");
-}
-
-fn append_mt_ppoll(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 6));
-    f.push(arg(1));
-    // One precreated IRQ eventfd is the complete MT interrupt inventory.
-    f.push(Filter {
-        code: 0x25,
-        jt: 4,
-        jf: 0,
-        k: 1,
-    });
-    f.push(arg_high(3));
-    f.push(jump(0, 0, 2));
-    f.push(arg(3));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small ppoll filter");
-}
-
-fn append_epoll_ctl(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_epoll_ctl as u32, 0, 0));
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 4));
-    f.push(arg(1));
-    f.push(jump(libc::EPOLL_CTL_ADD as u32, 3, 0));
-    f.push(jump(libc::EPOLL_CTL_MOD as u32, 2, 0));
-    f.push(jump(libc::EPOLL_CTL_DEL as u32, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small epoll_ctl filter");
-}
-
-fn append_epoll_pwait(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_epoll_pwait as u32, 0, 0));
-    f.push(arg_high(4));
-    f.push(jump(0, 0, 2));
-    f.push(arg(4));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small epoll_pwait filter");
-}
-
-fn append_wlancfg_packet_io(f: &mut Vec<Filter>, control_fd: RawFd) {
-    // The policy protocol is capped at MAX_PACKET=8192. Connected seqpacket
-    // transport needs no address and deliberately supplies no ancillary buffer.
-    for (syscall, flags) in [
-        (
-            libc::SYS_sendto,
-            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32,
-        ),
-        (
-            libc::SYS_recvfrom,
-            (libc::MSG_DONTWAIT | libc::MSG_TRUNC) as u32,
-        ),
-    ] {
-        let dispatch = f.len();
-        f.push(jump(syscall as u32, 0, 0));
-        let mut failures = Vec::new();
-        for (argument, expected) in [(0, control_fd as u32), (3, flags), (4, 0), (5, 0)] {
-            f.push(arg_high(argument));
-            failures.push(f.len());
-            f.push(jump(0, 0, 0));
-            f.push(arg(argument));
-            failures.push(f.len());
-            f.push(jump(expected, 0, 0));
-        }
-        f.push(arg_high(2));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(2));
-        let oversized = f.len();
-        f.push(Filter {
-            code: 0x25,
-            jt: 0,
-            jf: 1,
-            k: 8192,
-        });
-        f.push(stmt(RET_K, KILL_PROCESS));
-        f.push(stmt(RET_K, ALLOW));
-        let denied = f.len();
-        f.push(stmt(RET_K, KILL_PROCESS));
-        let reload = f.len();
-        f.push(stmt(LD_W_ABS, 0));
-        for failure in failures {
-            f[failure].jf = (denied - failure - 1)
-                .try_into()
-                .expect("small packet I/O filter");
-        }
-        f[oversized].jt = 0;
-        f[dispatch].jf = (reload - dispatch - 1)
-            .try_into()
-            .expect("small packet I/O filter");
-    }
-}
-
-fn append_sigaltstack_teardown(f: &mut Vec<Filter>) {
-    // Rust's stack-overflow guard removes its alternate stack while returning
-    // from main. Classic seccomp cannot inspect the pointed-to SS_DISABLE
-    // structure, but it can require a new-stack pointer and forbid querying
-    // the old stack. Handler installation and signal delivery remain denied.
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_sigaltstack as u32, 0, 0));
-    f.push(arg_high(0));
-    let new_high = f.len();
-    f.push(jump(0, 0, 0));
-    let old_stack = f.len();
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 2));
-    f.push(arg(1));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let check_new_low = f.len();
-    f.push(arg(0));
-    f.push(jump(0, 0, 1));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 2));
-    f.push(arg(1));
-    f.push(jump(0, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    f[new_high].jt = (check_new_low - new_high - 1)
-        .try_into()
-        .expect("small sigaltstack filter");
-    f[new_high].jf = (old_stack - new_high - 1)
-        .try_into()
-        .expect("small sigaltstack filter");
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small sigaltstack filter");
-}
-
-fn append_wlancfg_thread_exit_sigmask(f: &mut Vec<Filter>) {
-    // glibc blocks all signals except its internal cancellation signal while
-    // the pre-lockdown owner thread exits. Seccomp cannot inspect the mask's
-    // pointee, but every scalar and pointer direction remains constrained.
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_rt_sigprocmask as u32, 0, 0));
-    let mut failures = Vec::new();
-    for (argument, expected) in [(0, libc::SIG_BLOCK as u32), (2, 0), (3, 8)] {
-        f.push(arg_high(argument));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        failures.push(f.len());
-        f.push(jump(expected, 0, 0));
-    }
-    // arg1 is the one required non-null pointer. Either half may carry it.
-    f.push(arg_high(1));
-    let set_high = f.len();
-    f.push(jump(0, 0, 0));
-    f.push(stmt(RET_K, ALLOW));
-    let set_low = f.len();
-    f.push(arg(1));
-    f.push(jump(0, 0, 1));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small sigprocmask filter");
-    }
-    f[set_high].jt = (set_low - set_high - 1)
-        .try_into()
-        .expect("small sigprocmask filter");
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small sigprocmask filter");
-}
-
-#[cfg(target_arch = "aarch64")]
-fn append_wlancfg_ppoll(f: &mut Vec<Filter>) {
-    let dispatch = f.len();
-    f.push(jump(libc::SYS_ppoll as u32, 0, 0));
-    let mut failures = Vec::new();
-    for (argument, expected) in [(1, 2_u32), (2, 0), (3, 0)] {
-        f.push(arg_high(argument));
-        failures.push(f.len());
-        f.push(jump(0, 0, 0));
-        f.push(arg(argument));
-        failures.push(f.len());
-        f.push(jump(expected, 0, 0));
-    }
-    f.push(stmt(RET_K, ALLOW));
-    let denied = f.len();
-    f.push(stmt(RET_K, KILL_PROCESS));
-    let reload = f.len();
-    f.push(stmt(LD_W_ABS, 0));
-    for failure in failures {
-        f[failure].jf = (denied - failure - 1)
-            .try_into()
-            .expect("small ppoll filter");
-    }
-    f[dispatch].jf = (reload - dispatch - 1)
-        .try_into()
-        .expect("small ppoll filter");
-}
-
-fn append_fd_only(f: &mut Vec<Filter>, syscall: libc::c_long, fd: RawFd) {
-    f.push(jump(syscall as u32, 0, 6));
-    f.push(arg_high(0));
-    f.push(jump(0, 0, 2));
-    f.push(arg(0));
-    f.push(jump(fd as u32, 1, 0));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_empty_path_statx(f: &mut Vec<Filter>) {
-    // File::metadata uses statx on descriptors returned by the constrained
-    // state-directory openat path. Seccomp cannot prove the path is empty, but
-    // setup has already closed every unretained descriptor and made the state
-    // directory the process root, so even a nonempty path cannot escape it.
-    f.push(jump(libc::SYS_statx as u32, 0, 7));
-    f.push(arg_high(2));
-    f.push(jump(0, 0, 4));
-    f.push(arg(2));
-    f.push(jump(0x1000, 0, 2));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_openat(f: &mut Vec<Filter>, fd: RawFd) {
-    // Exactly the read and atomic-create flag sets used by HostPolicyStorage at
-    // revision 96e37e09. O_NOFOLLOW is mandatory and excludes symlink-following
-    // and O_PATH/device-style expansion. Absolute paths remain confined by the
-    // sealed filesystem namespace; seccomp cannot inspect pathname contents.
-    const READ_FLAGS: u32 =
-        (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u32;
-    const CREATE_FLAGS: u32 = (libc::O_WRONLY
-        | libc::O_CREAT
-        | libc::O_EXCL
-        | libc::O_CLOEXEC
-        | libc::O_NOFOLLOW
-        | libc::O_NONBLOCK) as u32;
-    f.push(jump(libc::SYS_openat as u32, 0, 7));
-    f.push(arg(0));
-    f.push(jump(fd as u32, 0, 4));
-    f.push(arg(2));
-    f.push(jump(READ_FLAGS, 1, 0));
-    f.push(jump(CREATE_FLAGS, 0, 1));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_renameat(f: &mut Vec<Filter>, fd: RawFd) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        f.push(jump(libc::SYS_renameat as u32, 0, 7));
-        f.push(arg(0));
-        f.push(jump(fd as u32, 0, 4));
-        f.push(arg(2));
-        f.push(jump(fd as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-        f.push(stmt(RET_K, KILL_PROCESS));
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // libc renameat uses generic Linux syscall 38 on LP64 aarch64. The
-        // libc Rust constant is omitted even though the kernel ABI has it.
-        const SYS_RENAMEAT: u32 = 38;
-        f.push(jump(SYS_RENAMEAT, 0, 7));
-        f.push(arg(0));
-        f.push(jump(fd as u32, 0, 4));
-        f.push(arg(2));
-        f.push(jump(fd as u32, 0, 1));
-        f.push(stmt(RET_K, ALLOW));
-        f.push(stmt(RET_K, KILL_PROCESS));
-    }
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_unlinkat(f: &mut Vec<Filter>, fd: RawFd) {
-    f.push(jump(libc::SYS_unlinkat as u32, 0, 7));
-    f.push(arg(0));
-    f.push(jump(fd as u32, 0, 4));
-    f.push(arg(2));
-    f.push(jump(0, 0, 1));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(LD_W_ABS, 0));
-}
-
-fn append_wlancfg_accept(f: &mut Vec<Filter>, listener: RawFd) {
-    // The listener was validated before setup. Only accept4 on that exact
-    // capability with CLOEXEC|NONBLOCK and null address outputs may create a runtime fd.
-    f.push(jump(libc::SYS_accept4 as u32, 0, 12));
-    f.push(arg(0));
-    f.push(jump(listener as u32, 0, 9));
-    f.push(arg(1));
-    f.push(jump(0, 0, 7));
-    f.push(arg_high(1));
-    f.push(jump(0, 0, 5));
-    f.push(arg(2));
-    f.push(jump(0, 0, 3));
-    f.push(arg(3));
-    f.push(jump(
-        (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32,
-        0,
-        1,
-    ));
-    f.push(stmt(RET_K, ALLOW));
-    f.push(stmt(RET_K, KILL_PROCESS));
-    f.push(stmt(LD_W_ABS, 0));
 }
 
 fn allowed(profile: &Profile) -> Vec<libc::c_long> {
@@ -1682,6 +975,71 @@ mod filter_tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
+
+    #[test]
+    fn compiled_profiles_retain_instruction_headroom() {
+        // Current maximum: four Ethernet generations and the three Tokio
+        // reactor descriptors observed on Linux. Dynamic inventories remain
+        // exact sets; oversized future profiles must fail compilation closed.
+        let profiles = [
+            Profile::WifiSimulated,
+            Profile::Wlancfg {
+                control_fd: 3,
+                persistence_dir_fd: 4,
+                application_listener_fd: Some(5),
+            },
+            Profile::Mt7921Vfio {
+                pci_config_fd: 3,
+                vfio_fd: 4,
+                iommufd: 5,
+                irq_eventfd: 6,
+                service: None,
+            },
+            Profile::Mt7921Vfio {
+                pci_config_fd: 3,
+                vfio_fd: 4,
+                iommufd: 5,
+                irq_eventfd: 6,
+                service: Some(WifiServiceFds {
+                    control_fd: 7,
+                    supervisor_fd: 8,
+                    ethernet_fds: (9..17).collect(),
+                    runtime_fds: vec![17, 18, 19],
+                }),
+            },
+            Profile::Ath11kWcn6750 {
+                control_fd: 3,
+                supervisor_fd: 4,
+                vfio_fd: 5,
+                dma: Wcn6750Dma::Coherent { iommufd: 6 },
+                qrtr_fd: 7,
+                irq_eventfds: std::array::from_fn(|n| n as RawFd + 8),
+                ethernet_fds: (24..32).collect(),
+                runtime_fds: vec![32, 33, 34],
+                remoteproc_state_fd: Some(35),
+            },
+            Profile::Ath11kWcn6750 {
+                control_fd: 3,
+                supervisor_fd: 4,
+                vfio_fd: 5,
+                dma: Wcn6750Dma::Broker,
+                qrtr_fd: 7,
+                irq_eventfds: std::array::from_fn(|n| n as RawFd + 8),
+                ethernet_fds: (24..32).collect(),
+                runtime_fds: vec![32, 33, 34],
+                remoteproc_state_fd: None,
+            },
+        ];
+        for (index, profile) in profiles.iter().enumerate() {
+            let program = compile_filter(profile).unwrap();
+            println!("profile={index} instructions={}", program.len());
+            assert!(
+                program.len() < 3072,
+                "profile {index} needs instruction-budget review: {}",
+                program.len()
+            );
+        }
+    }
 
     #[test]
     fn mt7921_service_io_is_fd_scoped() {
