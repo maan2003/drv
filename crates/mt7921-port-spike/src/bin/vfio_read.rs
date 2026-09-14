@@ -21671,10 +21671,12 @@ mod tests {
             .unwrap();
         assert!(!generic_acquisition.contains("map_dma!(mgmt_"));
 
-        let sae = source
-            .split("if matches!(operation, Operation::RunOneShotSaeAuth | Operation::RunWifiService) {")
-            .find(|segment| segment.contains("Mt7921ProductionClient::new"))
-            .unwrap()
+        let run = source
+            .split("fn run() -> Result<(), String>")
+            .nth(1)
+            .unwrap();
+        let sae = &run[run.find("acquire_sae_tx_resources(").unwrap()..];
+        let sae = sae
             .split("let transport = adapter.into_transport();")
             .next()
             .unwrap();
