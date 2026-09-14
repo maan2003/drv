@@ -238,3 +238,15 @@ correcting two stale loader/runtime initialization assertions in 4fd11f10.
 Broader default passive-scan suite remains NOT GREEN: 159 pass, 20 fail,
 reproduced serially; baseline/source-contract investigation remains open.
 No radio, host boot, deployment or automatic-recovery acceptance is implied.
+
+Passive-suite baseline attribution (same native default manifest, separate
+source and target): dc44f9a7 has 156 pass / 19 fail; integrated sources have
+159 pass / 20 fail, including all the same 19 failures. Baseline log:
+lifecycle-no-vfio-jukz/baseline-dc44f9a7/evidence/native-passive-full-complete.log
+SHA256 f3e12556c86ac2ddd6be658b06f942392582784718483704acc095ce83f0354c.
+The sole new failure, sae_tx_dma_authority_is_lazy_and_revoked_before_reset,
+searches for a one-line source substring that rustfmt splits over multiple
+lines. Narrow assertion repair is pending; production behavior is unchanged.
+The preexisting failures are not waived: descriptor/initialization fixtures,
+encoding/parser/page expectations, EAPOL M1 classification and readiness
+ordering require individual contract validation before correction.
