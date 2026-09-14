@@ -37,6 +37,14 @@ use wlancfg_selection::mode_management::{
 
 const QUEUE_PACKETS: usize = 64;
 const QUEUE_BYTES: usize = 64 * 1024;
+// This is a transport drain bound, not additional operation time. Missing
+// replies revoke the entire generation; late replies cannot authorize reuse.
+const REPLY_DRAIN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct QueuedCommand {
+    command: OwnerCommand,
+    deadline: wire::MonotonicDeadline,
+}
 
 enum OwnerCommand {
     Connect {
@@ -76,7 +84,7 @@ enum Pending {
 }
 
 struct ClientInner {
-    commands: sync_mpsc::SyncSender<OwnerCommand>,
+    commands: sync_mpsc::SyncSender<QueuedCommand>,
     wake: Arc<OwnedFd>,
     force_terminal: Arc<AtomicBool>,
     event_stream: Mutex<Option<mpsc::Receiver<anyhow::Result<()>>>>,
@@ -215,7 +223,12 @@ impl HostControlClient {
         if self.0.force_terminal.load(Ordering::Acquire) {
             return Err(anyhow!("WLAN control generation ended"));
         }
-        match self.0.commands.try_send(command) {
+        let budget = match &command {
+            OwnerCommand::Connect { .. } | OwnerCommand::Scan { .. } => 30,
+            OwnerCommand::Disconnect { .. } | OwnerCommand::Roam { .. } => 10,
+        };
+        let deadline = wire::MonotonicDeadline::after(std::time::Duration::from_secs(budget))?;
+        match self.0.commands.try_send(QueuedCommand { command, deadline }) {
             Ok(()) => {
                 wake(self.0.wake.as_raw_fd());
                 Ok(())
@@ -289,8 +302,8 @@ struct Owner {
     generation: [u8; 16],
     validator: SessionValidator,
     next_sequence: u64,
-    commands: sync_mpsc::Receiver<OwnerCommand>,
-    pending: HashMap<u64, Pending>,
+    commands: sync_mpsc::Receiver<QueuedCommand>,
+    pending: HashMap<u64, (Pending, wire::MonotonicDeadline)>,
     outgoing: VecDeque<Outgoing>,
     outgoing_bytes: usize,
     transaction: Option<Transaction>,
@@ -302,7 +315,7 @@ impl Owner {
         socket: OwnedFd,
         wake: Arc<OwnedFd>,
         generation: [u8; 16],
-        commands: sync_mpsc::Receiver<OwnerCommand>,
+        commands: sync_mpsc::Receiver<QueuedCommand>,
         liveness: Arc<Mutex<Vec<mpsc::Sender<anyhow::Result<()>>>>>,
     ) -> Self {
         Self {
@@ -336,7 +349,8 @@ impl Owner {
                 libc::pollfd { fd: self.socket.as_raw_fd(), events: libc::POLLIN | if self.outgoing.is_empty() { 0 } else { libc::POLLOUT }, revents: 0 },
                 libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             ];
-            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+            let timeout = self.poll_timeout(wire::monotonic_time_ns().map_err(|e| e.to_string())?)?;
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
             if rc < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted { continue; }
@@ -348,7 +362,10 @@ impl Owner {
             }
             if fds[0].revents & libc::POLLOUT != 0 { self.flush_outgoing()?; }
             if fds[0].revents & libc::POLLIN != 0 {
-                loop {
+                // Bound each turn so a continuously readable peer cannot
+                // starve cancellation or deadline checks.
+                for _ in 0..QUEUE_PACKETS {
+                    self.poll_timeout(wire::monotonic_time_ns().map_err(|e| e.to_string())?)?;
                     match recv_packet(self.socket.as_raw_fd()) {
                         Ok(Some(received)) => self.handle_received(received)?,
                         Ok(None) => break,
@@ -362,17 +379,31 @@ impl Owner {
         }
     }
 
+    fn poll_timeout(&self, now: u64) -> Result<i32, String> {
+        let Some(deadline) = self.pending.values().map(|(_, deadline)| *deadline).min() else {
+            return Ok(-1);
+        };
+        let remaining = deadline.remaining(now).ok_or("control reply drain deadline exceeded")?;
+        // Round up: poll's millisecond granularity must not cause a busy loop.
+        Ok(remaining.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
+    }
+
     fn drain_commands(&mut self) -> Result<(), String> {
-        loop {
+        for _ in 0..QUEUE_PACKETS {
             match self.commands.try_recv() {
                 Ok(command) => self.queue_command(command)?,
                 Err(sync_mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(sync_mpsc::TryRecvError::Disconnected) => return Err("control client dropped".into()),
             }
         }
+        // If producers refilled while this turn drained, preserve a wakeup
+        // without letting them postpone the pending deadline checks forever.
+        wake(self.wake.as_raw_fd());
+        Ok(())
     }
 
-    fn queue_command(&mut self, command: OwnerCommand) -> Result<(), String> {
+    fn queue_command(&mut self, queued: QueuedCommand) -> Result<(), String> {
+        let QueuedCommand { command, deadline } = queued;
         if self.pending.len() >= QUEUE_PACKETS { return Err("pending request backpressure".into()); }
         let id = self.next_sequence;
         self.next_sequence = self.next_sequence.checked_add(1).ok_or("outgoing sequence exhausted")?;
@@ -381,11 +412,11 @@ impl Owner {
                 if self.transaction.is_some() { let _ = reply.send(Err(anyhow!("connect transaction already active"))); return Ok(()); }
                 let (tx, rx) = mpsc::channel(QUEUE_PACKETS - 1);
                 self.transaction = Some(Transaction::Deliver(tx));
-                (Message::Connect(request), Pending::Connect { reply, events: rx })
+                (Message::Connect { deadline, request }, Pending::Connect { reply, events: rx })
             }
-            OwnerCommand::Disconnect { reason, reply } => (Message::Disconnect(reason), Pending::Disconnect(reply)),
-            OwnerCommand::Roam { request } => (Message::Roam(request), Pending::Roam),
-            OwnerCommand::Scan { request, reply } => (Message::Scan(request), Pending::Scan(reply)),
+            OwnerCommand::Disconnect { reason, reply } => (Message::Disconnect { deadline, reason }, Pending::Disconnect(reply)),
+            OwnerCommand::Roam { request } => (Message::Roam { deadline, request }, Pending::Roam),
+            OwnerCommand::Scan { request, reply } => (Message::Scan { deadline, request }, Pending::Scan(reply)),
         };
         let bytes = wire::encode(&Packet { generation: self.generation, request_id: id, message })
             .map_err(|e| format!("cannot encode control request: {e}"))?;
@@ -394,7 +425,8 @@ impl Owner {
         }
         self.outgoing_bytes += bytes.len();
         self.outgoing.push_back(Outgoing { bytes });
-        self.pending.insert(id, pending);
+        let drain_deadline = deadline.checked_add(REPLY_DRAIN_ALLOWANCE).map_err(|e| e.to_string())?;
+        self.pending.insert(id, (pending, drain_deadline));
         self.flush_outgoing()
     }
 
@@ -447,7 +479,21 @@ impl Owner {
 
     fn handle_reply(&mut self, message: Message) -> Result<(), String> {
         let id = message.in_reply_to().expect("reply checked");
-        let pending = self.pending.remove(&id).ok_or("reply for unknown request")?;
+        let (pending, _) = self.pending.remove(&id).ok_or("reply for unknown request")?;
+        if matches!(message, Message::DeadlineExceeded(_)) {
+            match pending {
+                Pending::Connect { reply, .. } => {
+                    self.transaction = None;
+                    let _ = reply.send(Err(anyhow!("connect deadline exceeded before execution")));
+                }
+                Pending::Scan(reply) => {
+                    let _ = reply.send(Err(anyhow!("scan deadline exceeded before execution")));
+                }
+                Pending::Disconnect(_) => return Err("disconnect deadline exceeded without quiescence".into()),
+                Pending::Roam => return Err("roam deadline exceeded".into()),
+            }
+            return Ok(());
+        }
         match (pending, message) {
             (Pending::Connect { reply, events }, Message::ConnectReply(reply_body)) => {
                 let ConnectReply::Completed(result) = reply_body.result;
@@ -492,7 +538,7 @@ impl Owner {
     }
 
     fn finish(&mut self, reason: String) {
-        for (_, pending) in self.pending.drain() {
+        for (_, (pending, _)) in self.pending.drain() {
             match pending {
                 Pending::Connect { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
                 Pending::Disconnect(reply) => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
@@ -625,6 +671,43 @@ mod tests {
     }
 
     #[test]
+    fn reply_drain_bound_is_absolute_and_revokes_all_pending() {
+        let (client_fd, _server_fd) = sockets();
+        set_nonblocking(&client_fd).unwrap();
+        let (_commands, receiver) = sync_mpsc::sync_channel(QUEUE_PACKETS);
+        let mut owner = Owner::new(
+            client_fd, wake_event().unwrap(), GENERATION, receiver,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let deadline = wire::MonotonicDeadline::from_nanos(123).unwrap();
+        owner.queue_command(QueuedCommand {
+            command: OwnerCommand::Scan {
+                request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+                reply: first_tx,
+            },
+            deadline,
+        }).unwrap();
+        owner.queue_command(QueuedCommand {
+            command: OwnerCommand::Disconnect {
+                reason: sme::UserDisconnectReason::Unknown,
+                reply: second_tx,
+            },
+            deadline: deadline.checked_add(std::time::Duration::from_secs(5)).unwrap(),
+        }).unwrap();
+        let drain = deadline.checked_add(REPLY_DRAIN_ALLOWANCE).unwrap().into_nanos();
+        assert_eq!(owner.poll_timeout(drain - 1).unwrap(), 1);
+        let error = owner.poll_timeout(drain).unwrap_err();
+        owner.finish(error);
+        assert!(futures::executor::block_on(first_rx).unwrap().is_err());
+        assert!(futures::executor::block_on(second_rx).unwrap().is_err());
+        assert!(owner.handle_reply(Message::DisconnectReply(Reply {
+            in_reply_to: 2, result: CommandReply::Success,
+        })).is_err());
+    }
+
+    #[test]
     fn prepared_client_leaves_inbound_bytes_queued_until_started() {
         let (client_fd, server_fd) = sockets();
         let prepared =
@@ -694,7 +777,7 @@ mod tests {
             let first = receive(server_fd.as_raw_fd());
             let second = receive(server_fd.as_raw_fd());
             let (connect_id, disconnect_id) = match (&first.message, &second.message) {
-                (Message::Connect(_), Message::Disconnect(_)) => (first.request_id, second.request_id),
+                (Message::Connect { .. }, Message::Disconnect { .. }) => (first.request_id, second.request_id),
                 other => panic!("unexpected requests: {other:?}"),
             };
             let event = sme::ConnectTransactionEvent::OnSignalReport { ind: internal::SignalReportIndication { rssi_dbm: -47, snr_db: 22 } };
@@ -739,7 +822,7 @@ mod tests {
         let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
         let server = thread::spawn(move || {
             let request = receive(server_fd.as_raw_fd());
-            assert!(matches!(request.message, Message::Scan(_)));
+            assert!(matches!(request.message, Message::Scan { .. }));
             send_packet(server_fd.as_raw_fd(), 1, Message::ScanReply(Reply { in_reply_to: request.request_id, result: Err(sme::ScanErrorCode::ShouldWait) }), &[]);
         });
         let request = sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![1, 6, 11] });
@@ -760,8 +843,8 @@ mod tests {
         let server = thread::spawn(move || {
             let connect = receive(server_fd.as_raw_fd());
             let disconnect = receive(server_fd.as_raw_fd());
-            assert!(matches!(connect.message, Message::Connect(_)));
-            assert!(matches!(disconnect.message, Message::Disconnect(_)));
+            assert!(matches!(connect.message, Message::Connect { .. }));
+            assert!(matches!(disconnect.message, Message::Disconnect { .. }));
             let result = sme::ConnectResult { code: ieee::StatusCode::Success, is_credential_rejected: false, is_reconnect: false };
             send_packet(server_fd.as_raw_fd(), 1, Message::ConnectReply(Reply { in_reply_to: connect.request_id, result: ConnectReply::Completed(result) }), &[]);
             send_packet(server_fd.as_raw_fd(), 2, Message::Event(
@@ -769,7 +852,7 @@ mod tests {
             ), &[]);
             send_packet(server_fd.as_raw_fd(), 3, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
             let replacement = receive(server_fd.as_raw_fd());
-            assert!(matches!(replacement.message, Message::Connect(_)));
+            assert!(matches!(replacement.message, Message::Connect { .. }));
             send_packet(server_fd.as_raw_fd(), 4, Message::ConnectReply(Reply {
                 in_reply_to: replacement.request_id, result: ConnectReply::Completed(result),
             }), &[]);
@@ -790,7 +873,7 @@ mod tests {
             let disconnect = receive(server_fd.as_raw_fd());
             send_packet(server_fd.as_raw_fd(), 2, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
             let second = receive(server_fd.as_raw_fd());
-            assert!(matches!(second.message, Message::Connect(_)));
+            assert!(matches!(second.message, Message::Connect { .. }));
             send_packet(server_fd.as_raw_fd(), 3, Message::ConnectReply(Reply { in_reply_to: second.request_id, result: ConnectReply::Completed(success) }), &[]);
         });
         let request = connect_request();
@@ -806,10 +889,10 @@ mod tests {
         let client = HostControlClient::from_inherited_socket(client_fd, GENERATION).unwrap();
         let server = thread::spawn(move || {
             let roam = receive(server_fd.as_raw_fd());
-            assert!(matches!(roam.message, Message::Roam(_)));
+            assert!(matches!(roam.message, Message::Roam { .. }));
             send_packet(server_fd.as_raw_fd(), 1, Message::RoamReply(Reply { in_reply_to: roam.request_id, result: CommandReply::Unsupported }), &[]);
             let disconnect = receive(server_fd.as_raw_fd());
-            assert!(matches!(disconnect.message, Message::Disconnect(_)));
+            assert!(matches!(disconnect.message, Message::Disconnect { .. }));
             send_packet(server_fd.as_raw_fd(), 2, Message::DisconnectReply(Reply { in_reply_to: disconnect.request_id, result: CommandReply::Success }), &[]);
         });
         client.roam(&sme::RoamRequest { bss_description: connect_request().bss_description }).unwrap();

@@ -98,11 +98,17 @@ fn run() -> Result<(), String> {
         Packet {
             generation,
             request_id: 1,
-            message: Message::Scan(fidl_fuchsia_wlan_sme::ScanRequest::Passive(
-                fidl_fuchsia_wlan_sme::PassiveScanRequest {
-                    channels: vec![149],
-                },
-            )),
+            message: Message::Scan {
+                deadline: cleanup_try!(
+                    wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30))
+                        .map_err(|e| format!("create operation deadline: {e}"))
+                ),
+                request: fidl_fuchsia_wlan_sme::ScanRequest::Passive(
+                    fidl_fuchsia_wlan_sme::PassiveScanRequest {
+                        channels: vec![149],
+                    },
+                )
+            },
         },
         deadline,
     ));
@@ -159,18 +165,24 @@ fn run() -> Result<(), String> {
         Packet {
             generation,
             request_id: 2,
-            message: Message::Connect(fidl_fuchsia_wlan_sme::ConnectRequest {
-                ssid: b"ajay".to_vec(),
-                bss_description: bss,
-                multiple_bss_candidates: false,
-                authentication: fidl_fuchsia_wlan_internal::Authentication {
-                    protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa3Personal,
-                    credentials: Some(Box::new(fidl_fuchsia_wlan_internal::Credentials::Wpa(
-                        fidl_fuchsia_wlan_internal::WpaCredentials::Passphrase(passphrase),
-                    ))),
-                },
-                deprecated_scan_type: fidl_fuchsia_wlan_common::ScanType::Passive,
-            }),
+            message: Message::Connect {
+                deadline: cleanup_try!(
+                    wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30))
+                        .map_err(|e| format!("create operation deadline: {e}"))
+                ),
+                request: fidl_fuchsia_wlan_sme::ConnectRequest {
+                    ssid: b"ajay".to_vec(),
+                    bss_description: bss,
+                    multiple_bss_candidates: false,
+                    authentication: fidl_fuchsia_wlan_internal::Authentication {
+                        protocol: fidl_fuchsia_wlan_internal::Protocol::Wpa3Personal,
+                        credentials: Some(Box::new(fidl_fuchsia_wlan_internal::Credentials::Wpa(
+                            fidl_fuchsia_wlan_internal::WpaCredentials::Passphrase(passphrase),
+                        ))),
+                    },
+                    deprecated_scan_type: fidl_fuchsia_wlan_common::ScanType::Passive,
+                }
+            },
         },
         deadline,
     ));

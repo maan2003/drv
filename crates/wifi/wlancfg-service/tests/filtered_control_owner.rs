@@ -62,7 +62,7 @@ fn parked_owner_exchanges_control_under_fatal_filter_and_returns() {
     // seccomp. It must remain unread until the child activates after lockdown.
     send_with_fd(&parent, 1, Message::Ready, marker.as_raw_fd());
     let scan = receive(&parent);
-    assert!(matches!(scan.message, Message::Scan(_)));
+    assert!(matches!(scan.message, Message::Scan { .. }));
     for entry in std::fs::read_dir(format!("/proc/{child_pid}/fd")).unwrap() {
         let target = std::fs::read_link(entry.unwrap().path()).unwrap();
         assert_ne!(target, marker_path, "SCM_RIGHTS descriptor was installed");

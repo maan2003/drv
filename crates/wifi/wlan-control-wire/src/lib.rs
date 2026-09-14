@@ -26,10 +26,78 @@ use fidl_fuchsia_wlan_sme as sme;
 use std::fmt;
 
 pub const MAGIC: [u8; 4] = *b"WLCP";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 36;
 pub const MAX_PACKET: usize = 8192;
 pub const MAX_BSS_IE_LEN: usize = 4096;
+
+/// An absolute Linux CLOCK_MONOTONIC deadline. A valid value does not certify
+/// that time remains: receivers must check expiry before admitting work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MonotonicDeadline(u64);
+
+impl MonotonicDeadline {
+    pub fn from_nanos(nanos: u64) -> Result<Self, Error> {
+        if nanos == 0 || nanos > i64::MAX as u64 {
+            return Err(Error::InvalidValue("monotonic deadline"));
+        }
+        Ok(Self(nanos))
+    }
+
+    pub fn after(duration: std::time::Duration) -> std::io::Result<Self> {
+        Self::from_now(monotonic_time_ns()?, duration)
+    }
+
+    fn from_now(now: u64, duration: std::time::Duration) -> std::io::Result<Self> {
+        let nanos = u64::try_from(duration.as_nanos())
+            .ok()
+            .and_then(|duration| now.checked_add(duration))
+            .and_then(|deadline| Self::from_nanos(deadline).ok());
+        nanos.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "deadline arithmetic overflow",
+            )
+        })
+    }
+
+    pub const fn into_nanos(self) -> u64 {
+        self.0
+    }
+
+    pub fn checked_add(self, allowance: std::time::Duration) -> std::io::Result<Self> {
+        Self::from_now(self.0, allowance)
+    }
+
+    pub fn remaining(self, now: u64) -> Option<std::time::Duration> {
+        self.0
+            .checked_sub(now)
+            .filter(|remaining| *remaining != 0)
+            .map(std::time::Duration::from_nanos)
+    }
+}
+
+/// Shared clock domain for policy and Wi-Fi processes. Their launcher must not
+/// place them in time namespaces with different CLOCK_MONOTONIC offsets.
+pub fn monotonic_time_ns() -> std::io::Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|seconds| seconds.checked_add(time.tv_nsec as u64))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "monotonic clock out of range",
+            )
+        })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectReply {
@@ -66,13 +134,25 @@ pub struct Reply<T> {
 #[derive(Clone, Eq, PartialEq)]
 pub enum Message {
     Ready,
-    Scan(sme::ScanRequest),
+    Scan {
+        deadline: MonotonicDeadline,
+        request: sme::ScanRequest,
+    },
     ScanReply(Reply<Result<Vec<sme::ScanResult>, sme::ScanErrorCode>>),
-    Connect(sme::ConnectRequest),
+    Connect {
+        deadline: MonotonicDeadline,
+        request: sme::ConnectRequest,
+    },
     ConnectReply(Reply<ConnectReply>),
-    Disconnect(sme::UserDisconnectReason),
+    Disconnect {
+        deadline: MonotonicDeadline,
+        reason: sme::UserDisconnectReason,
+    },
     DisconnectReply(Reply<CommandReply>),
-    Roam(sme::RoamRequest),
+    Roam {
+        deadline: MonotonicDeadline,
+        request: sme::RoamRequest,
+    },
     RoamReply(Reply<CommandReply>),
     Event(sme::ConnectTransactionEvent),
     /// Terminal for the entire Wi-Fi service generation. On receipt, a
@@ -80,6 +160,9 @@ pub enum Message {
     /// reject further sends; runtime-terminal failures are never command
     /// replies.
     GenerationEnd(GenerationEndReason),
+    /// This request expired before execution; no hardware work was started.
+    /// Active expiry requires quiescence or a terminal generation failure.
+    DeadlineExceeded(Reply<()>),
 }
 
 // Do not derive Debug: ConnectRequest authentication may contain credentials.
@@ -87,35 +170,59 @@ impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready => f.write_str("Ready"),
-            Self::Scan(request) => f.debug_tuple("Scan").field(request).finish(),
+            Self::Scan { deadline, request } => f
+                .debug_struct("Scan")
+                .field("deadline", deadline)
+                .field("request", request)
+                .finish(),
             Self::ScanReply(reply) => f.debug_tuple("ScanReply").field(reply).finish(),
-            Self::Connect(request) => f
+            Self::Connect { deadline, request } => f
                 .debug_struct("Connect")
+                .field("deadline", deadline)
                 .field("ssid_len", &request.ssid.len())
                 .field("bssid", &request.bss_description.bssid)
                 .field("authentication", &"<redacted>")
                 .finish(),
             Self::ConnectReply(reply) => f.debug_tuple("ConnectReply").field(reply).finish(),
-            Self::Disconnect(reason) => f.debug_tuple("Disconnect").field(reason).finish(),
+            Self::Disconnect { deadline, reason } => f
+                .debug_struct("Disconnect")
+                .field("deadline", deadline)
+                .field("reason", reason)
+                .finish(),
             Self::DisconnectReply(reply) => f.debug_tuple("DisconnectReply").field(reply).finish(),
-            Self::Roam(request) => f
+            Self::Roam { deadline, request } => f
                 .debug_struct("Roam")
+                .field("deadline", deadline)
                 .field("bssid", &request.bss_description.bssid)
                 .finish(),
             Self::RoamReply(reply) => f.debug_tuple("RoamReply").field(reply).finish(),
             Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
+            Self::DeadlineExceeded(reply) => {
+                f.debug_tuple("DeadlineExceeded").field(reply).finish()
+            }
             Self::GenerationEnd(reason) => f.debug_tuple("GenerationEnd").field(reason).finish(),
         }
     }
 }
 
 impl Message {
+    pub const fn deadline(&self) -> Option<MonotonicDeadline> {
+        match self {
+            Self::Scan { deadline, .. }
+            | Self::Connect { deadline, .. }
+            | Self::Disconnect { deadline, .. }
+            | Self::Roam { deadline, .. } => Some(*deadline),
+            _ => None,
+        }
+    }
+
     pub const fn in_reply_to(&self) -> Option<u64> {
         match self {
             Self::ScanReply(reply) => Some(reply.in_reply_to),
             Self::ConnectReply(reply) => Some(reply.in_reply_to),
             Self::DisconnectReply(reply) => Some(reply.in_reply_to),
             Self::RoamReply(reply) => Some(reply.in_reply_to),
+            Self::DeadlineExceeded(reply) => Some(reply.in_reply_to),
             _ => None,
         }
     }
@@ -198,6 +305,7 @@ const EVENT: u16 = 8;
 const GENERATION_END: u16 = 9;
 const SCAN: u16 = 11;
 const SCAN_REPLY: u16 = 12;
+const DEADLINE_EXCEEDED: u16 = 13;
 
 /// Number of file descriptors the policy transport must attach to this message.
 /// Policy transport bindings must use kernel operations without an ancillary
@@ -270,7 +378,11 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
     let mut w = Vec::new();
     let kind = match message {
         Message::Ready => READY,
-        Message::Scan(v) => {
+        Message::Scan {
+            deadline,
+            request: v,
+        } => {
+            put_u64(&mut w, deadline.into_nanos());
             enc_scan(&mut w, v)?;
             SCAN
         }
@@ -278,7 +390,11 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             enc_reply(&mut w, v, enc_scan_reply)?;
             SCAN_REPLY
         }
-        Message::Connect(v) => {
+        Message::Connect {
+            deadline,
+            request: v,
+        } => {
+            put_u64(&mut w, deadline.into_nanos());
             enc_connect(&mut w, v)?;
             CONNECT
         }
@@ -289,7 +405,11 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             })?;
             CONNECT_REPLY
         }
-        Message::Disconnect(v) => {
+        Message::Disconnect {
+            deadline,
+            reason: v,
+        } => {
+            put_u64(&mut w, deadline.into_nanos());
             put_u32(&mut w, *v as u32);
             DISCONNECT
         }
@@ -300,7 +420,11 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             })?;
             DISCONNECT_REPLY
         }
-        Message::Roam(v) => {
+        Message::Roam {
+            deadline,
+            request: v,
+        } => {
+            put_u64(&mut w, deadline.into_nanos());
             enc_bss(&mut w, &v.bss_description)?;
             ROAM
         }
@@ -315,6 +439,10 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             enc_event(&mut w, v)?;
             EVENT
         }
+        Message::DeadlineExceeded(reply) => {
+            enc_reply(&mut w, reply, |_, ()| Ok(()))?;
+            DEADLINE_EXCEEDED
+        }
         Message::GenerationEnd(v) => {
             w.push(generation_end(*v));
             GENERATION_END
@@ -326,18 +454,31 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
 fn decode_message(kind: u16, r: &mut Reader<'_>) -> Result<Message, Error> {
     Ok(match kind {
         READY => Message::Ready,
-        SCAN => Message::Scan(dec_scan(r)?),
+        SCAN => Message::Scan {
+            deadline: MonotonicDeadline::from_nanos(r.u64()?)?,
+            request: dec_scan(r)?,
+        },
         SCAN_REPLY => Message::ScanReply(dec_reply(r, dec_scan_reply)?),
-        CONNECT => Message::Connect(dec_connect(r)?),
+        CONNECT => Message::Connect {
+            deadline: MonotonicDeadline::from_nanos(r.u64()?)?,
+            request: dec_connect(r)?,
+        },
         CONNECT_REPLY => Message::ConnectReply(dec_reply(r, dec_connect_reply)?),
-        DISCONNECT => Message::Disconnect(dec_disconnect_reason(r.u32()?)?),
+        DISCONNECT => Message::Disconnect {
+            deadline: MonotonicDeadline::from_nanos(r.u64()?)?,
+            reason: dec_disconnect_reason(r.u32()?)?,
+        },
         DISCONNECT_REPLY => Message::DisconnectReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?),
-        ROAM => Message::Roam(sme::RoamRequest {
-            bss_description: dec_bss(r)?,
-        }),
+        ROAM => Message::Roam {
+            deadline: MonotonicDeadline::from_nanos(r.u64()?)?,
+            request: sme::RoamRequest {
+                bss_description: dec_bss(r)?,
+            },
+        },
         ROAM_REPLY => Message::RoamReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?),
         EVENT => Message::Event(dec_event(r)?),
         GENERATION_END => Message::GenerationEnd(dec_generation_end(r.u8()?)?),
+        DEADLINE_EXCEEDED => Message::DeadlineExceeded(dec_reply(r, |_| Ok(()))?),
         other => return Err(Error::UnknownKind(other)),
     })
 }
@@ -1027,6 +1168,61 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deadlines_preserve_absolute_time_and_reject_unrepresentable_values() {
+        use std::time::Duration;
+        assert!(MonotonicDeadline::from_nanos(0).is_err());
+        assert!(MonotonicDeadline::from_nanos(u64::MAX).is_err());
+        let deadline = MonotonicDeadline::from_nanos(100).unwrap();
+        assert_eq!(deadline.remaining(99), Some(Duration::from_nanos(1)));
+        assert_eq!(deadline.remaining(100), None);
+        assert_eq!(deadline.remaining(101), None);
+        assert_eq!(
+            deadline
+                .checked_add(Duration::from_nanos(10))
+                .unwrap()
+                .into_nanos(),
+            110
+        );
+        assert!(
+            MonotonicDeadline::from_nanos(i64::MAX as u64)
+                .unwrap()
+                .checked_add(Duration::from_nanos(1))
+                .is_err()
+        );
+        assert!(MonotonicDeadline::from_now(u64::MAX, Duration::from_nanos(1)).is_err());
+        let before = monotonic_time_ns().unwrap();
+        let made = MonotonicDeadline::after(Duration::from_secs(1)).unwrap();
+        let after = monotonic_time_ns().unwrap();
+        assert!(made.into_nanos() >= before + 1_000_000_000);
+        assert!(made.into_nanos() <= after + 1_000_000_000);
+    }
+
+    #[test]
+    fn expired_deadline_is_well_formed_but_zero_wire_deadline_is_not() {
+        let mut bytes = encode(&packet(
+            Message::Connect {
+                deadline: MonotonicDeadline::from_nanos(1).unwrap(),
+                request: connect(),
+            },
+            1,
+        ))
+        .unwrap();
+        assert!(
+            decode(&bytes).is_ok(),
+            "expiry is an admission result, not malformed wire"
+        );
+        bytes[HEADER_LEN..HEADER_LEN + 8].fill(0);
+        assert_eq!(
+            decode(&bytes),
+            Err(Error::InvalidValue("monotonic deadline"))
+        );
+    }
+
+    fn deadline() -> super::MonotonicDeadline {
+        super::MonotonicDeadline::from_nanos(123).unwrap()
+    }
+
     use super::*;
 
     fn channel(number: u8) -> ieee::ChannelNumber {
@@ -1112,26 +1308,40 @@ mod tests {
         };
         let messages = vec![
             Message::Ready,
-            Message::Scan(sme::ScanRequest::Active(sme::ActiveScanRequest {
-                ssids: vec![b"one".to_vec(), b"two".to_vec()],
-                channels: vec![1, 36],
-            })),
-            Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
-                channels: vec![],
-            })),
+            Message::DeadlineExceeded(reply(())),
+            Message::Scan {
+                deadline: deadline(),
+                request: sme::ScanRequest::Active(sme::ActiveScanRequest {
+                    ssids: vec![b"one".to_vec(), b"two".to_vec()],
+                    channels: vec![1, 36],
+                }),
+            },
+            Message::Scan {
+                deadline: deadline(),
+                request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+            },
             Message::ScanReply(reply(Ok(vec![scan_result]))),
             Message::ScanReply(reply(Err(sme::ScanErrorCode::ShouldWait))),
-            Message::Connect(connect()),
+            Message::Connect {
+                deadline: deadline(),
+                request: connect(),
+            },
             Message::ConnectReply(reply(ConnectReply::Completed(sme::ConnectResult {
                 code: ieee::StatusCode::EstablishRsnaFailure,
                 is_credential_rejected: true,
                 is_reconnect: false,
             }))),
-            Message::Disconnect(sme::UserDisconnectReason::ProactiveNetworkSwitch),
+            Message::Disconnect {
+                deadline: deadline(),
+                reason: sme::UserDisconnectReason::ProactiveNetworkSwitch,
+            },
             Message::DisconnectReply(reply(CommandReply::Success)),
-            Message::Roam(sme::RoamRequest {
-                bss_description: bss(vec![]),
-            }),
+            Message::Roam {
+                deadline: deadline(),
+                request: sme::RoamRequest {
+                    bss_description: bss(vec![]),
+                },
+            },
             Message::RoamReply(reply(CommandReply::NotConnected)),
             Message::GenerationEnd(GenerationEndReason::Shutdown),
             Message::GenerationEnd(GenerationEndReason::Timeout),
@@ -1193,7 +1403,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes.len(), 36);
-        assert_eq!(&bytes[4..6], &[1, 0]);
+        assert_eq!(&bytes[4..6], &[2, 0]);
         assert_eq!(&bytes[6..8], &[1, 0]);
         assert_eq!(&bytes[8..12], &[0; 4]);
         assert_eq!(&bytes[12..28], &[0xab; 16]);
@@ -1208,8 +1418,8 @@ mod tests {
         bad[0] = 0;
         assert_eq!(decode(&bad), Err(Error::BadMagic));
         let mut bad = valid.clone();
-        bad[4..6].copy_from_slice(&2u16.to_le_bytes());
-        assert_eq!(decode(&bad), Err(Error::UnsupportedVersion(2)));
+        bad[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(decode(&bad), Err(Error::UnsupportedVersion(1)));
         let mut bad = valid.clone();
         bad[6..8].copy_from_slice(&99u16.to_le_bytes());
         assert_eq!(decode(&bad), Err(Error::UnknownKind(99)));
@@ -1230,35 +1440,51 @@ mod tests {
     #[test]
     fn rejects_unknown_nested_discriminants_and_noncanonical_bool() {
         let mut bytes = encode(&packet(
-            Message::Disconnect(sme::UserDisconnectReason::Startup),
+            Message::Disconnect {
+                deadline: deadline(),
+                reason: sme::UserDisconnectReason::Startup,
+            },
             1,
         ))
         .unwrap();
-        bytes[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&11u32.to_le_bytes());
+        bytes[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&11u32.to_le_bytes());
         assert!(matches!(
             decode(&bytes),
             Err(Error::UnknownDiscriminant("UserDisconnectReason", 11))
         ));
-        let mut bytes = encode(&packet(Message::Connect(connect()), 1)).unwrap();
+        let mut bytes = encode(&packet(
+            Message::Connect {
+                deadline: deadline(),
+                request: connect(),
+            },
+            1,
+        ))
+        .unwrap();
         // SSID length + SSID, BSS through the two signed signal bytes, then boolean.
         let bool_at =
-            HEADER_LEN + 4 + b"secret-network".len() + 6 + 4 + 2 + 2 + 4 + 4 + 2 + 4 + 2 + 2;
+            HEADER_LEN + 8 + 4 + b"secret-network".len() + 6 + 4 + 2 + 2 + 4 + 4 + 2 + 4 + 2 + 2;
         bytes[bool_at] = 2;
         assert_eq!(decode(&bytes), Err(Error::UnknownDiscriminant("bool", 2)));
     }
 
     #[test]
     fn enforces_ie_and_packet_bounds_without_truncation() {
-        let too_many_ies = Message::Roam(sme::RoamRequest {
-            bss_description: bss(vec![0; MAX_BSS_IE_LEN + 1]),
-        });
+        let too_many_ies = Message::Roam {
+            deadline: deadline(),
+            request: sme::RoamRequest {
+                bss_description: bss(vec![0; MAX_BSS_IE_LEN + 1]),
+            },
+        };
         assert_eq!(
             encode(&packet(too_many_ies, 1)),
             Err(Error::BoundExceeded("BSS IEs"))
         );
-        let maximum = Message::Roam(sme::RoamRequest {
-            bss_description: bss(vec![0; MAX_BSS_IE_LEN]),
-        });
+        let maximum = Message::Roam {
+            deadline: deadline(),
+            request: sme::RoamRequest {
+                bss_description: bss(vec![0; MAX_BSS_IE_LEN]),
+            },
+        };
         roundtrip(maximum);
         let many = (0..3)
             .map(|_| sme::ScanResult {
@@ -1341,7 +1567,13 @@ mod tests {
 
     #[test]
     fn debug_redacts_credentials() {
-        let rendered = format!("{:?}", Message::Connect(connect()));
+        let rendered = format!(
+            "{:?}",
+            Message::Connect {
+                deadline: deadline(),
+                request: connect()
+            }
+        );
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("do-not-log-me"));
     }
@@ -1365,7 +1597,10 @@ mod tests {
             sme::UserDisconnectReason::WlanServiceUtilTesting,
             sme::UserDisconnectReason::WlanDevTool,
         ] {
-            roundtrip(Message::Disconnect(reason));
+            roundtrip(Message::Disconnect {
+                deadline: deadline(),
+                reason: reason,
+            });
         }
         for reply in [
             CommandReply::Success,
@@ -1398,12 +1633,18 @@ mod tests {
                 },
             ))),
         };
-        roundtrip(Message::Connect(request));
+        roundtrip(Message::Connect {
+            deadline: deadline(),
+            request: request,
+        });
         let mut request = connect();
         request.authentication.credentials = Some(Box::new(internal::Credentials::Wpa(
             internal::WpaCredentials::Psk([0xa5; 32]),
         )));
-        roundtrip(Message::Connect(request));
+        roundtrip(Message::Connect {
+            deadline: deadline(),
+            request: request,
+        });
         let result = sme::ScanResult {
             compatibility: sme::Compatibility::Incompatible(sme::Incompatible {
                 description: "enterprise role mismatch".into(),

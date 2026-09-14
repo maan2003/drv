@@ -177,7 +177,17 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     drive_until(&mut server, || {
         policy.try_receive_packet().unwrap().is_some()
     });
-    send(&policy, 1, Message::Connect(connect_request()));
+    send(
+        &policy,
+        1,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect_request(),
+        },
+    );
     let mut connected = false;
     let mut ethernet = None;
     for _ in 0..2_000 {
@@ -228,9 +238,15 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     send(
         &policy,
         2,
-        Message::Roam(sme::RoamRequest {
-            bss_description: connect_request().bss_description,
-        }),
+        Message::Roam {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                10,
+            ))
+            .unwrap(),
+            request: sme::RoamRequest {
+                bss_description: connect_request().bss_description,
+            },
+        },
     );
     let mut roam_rejected = false;
     for _ in 0..100 {
@@ -257,7 +273,13 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     send(
         &policy,
         3,
-        Message::Disconnect(sme::UserDisconnectReason::FidlStopClientConnectionsRequest),
+        Message::Disconnect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                10,
+            ))
+            .unwrap(),
+            reason: sme::UserDisconnectReason::FidlStopClientConnectionsRequest,
+        },
     );
     let mut disconnected = false;
     for _ in 0..2_000 {
@@ -278,7 +300,17 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
     );
     assert!(effects.lock().unwrap().links.ends_with(&[false]));
 
-    send(&policy, 4, Message::Connect(connect_request()));
+    send(
+        &policy,
+        4,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect_request(),
+        },
+    );
     let mut reconnected = false;
     let mut replacement = None;
     for _ in 0..2_000 {

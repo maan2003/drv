@@ -204,6 +204,7 @@ pub struct ReceivedPacket {
 }
 
 struct OutboundPacket {
+    drain_deadline: Instant,
     bytes: Vec<u8>,
     fd: Option<OwnedFd>,
 }
@@ -268,6 +269,7 @@ impl UnixSeqpacketEndpoint {
             });
         }
         self.try_send(&OutboundPacket {
+            drain_deadline: Instant::now() + Duration::from_secs(2),
             bytes: encode(packet)?,
             fd: fd.map(OwnedFd::try_clone).transpose()?,
         })
@@ -582,38 +584,62 @@ impl<R: WifiRuntime> ControlServer<R> {
 
     async fn dispatch(&mut self, packet: Packet) -> Result<(), GenerationEndReason> {
         let id = packet.request_id;
+        let admitted_deadline = if let Some(deadline) = packet.message.deadline() {
+            let local_now = Instant::now();
+            let now = wlan_control_wire::monotonic_time_ns()
+                .map_err(|_| GenerationEndReason::DriverFault)?;
+            let Some(remaining) = deadline.remaining(now) else {
+                self.queue(
+                    Message::DeadlineExceeded(Reply {
+                        in_reply_to: id,
+                        result: (),
+                    }),
+                    None,
+                )?;
+                return Ok(());
+            };
+            if remaining > Duration::from_secs(30) {
+                return Err(GenerationEndReason::ProtocolViolation);
+            }
+            Some(local_now + remaining)
+        } else {
+            None
+        };
         match packet.message {
-            Message::Scan(request) => {
+            Message::Scan { request, .. } => {
                 if self.scan_request.is_some() {
                     self.queue_scan_reply(id, Err(sme::ScanErrorCode::ShouldWait))?;
                 } else {
-                    match self
-                        .runtime
-                        .begin_scan(request, Instant::now() + Duration::from_secs(30))
-                    {
+                    match self.runtime.begin_scan(
+                        request,
+                        admitted_deadline.expect("command deadline admitted"),
+                    ) {
                         Ok(()) => self.scan_request = Some(id),
                         Err(error) => return Err(runtime_end(error)),
                     }
                 }
             }
-            Message::Connect(request) => {
+            Message::Connect { request, .. } => {
                 if self.connect_request.is_some() {
                     return Err(GenerationEndReason::ProtocolViolation);
                 } else {
-                    match self
-                        .runtime
-                        .begin_connect(request, Instant::now() + Duration::from_secs(30))
-                    {
+                    match self.runtime.begin_connect(
+                        request,
+                        admitted_deadline.expect("command deadline admitted"),
+                    ) {
                         Ok(()) => self.connect_request = Some(id),
                         Err(error) => return Err(runtime_end(error)),
                     }
                 }
             }
-            Message::Disconnect(reason) => {
+            Message::Disconnect { reason, .. } => {
                 let result = if let Some(connect_id) = self.connect_request.take() {
                     match self
                         .runtime
-                        .cancel_connect(reason, Instant::now() + Duration::from_secs(10))
+                        .cancel_connect(
+                            reason,
+                            admitted_deadline.expect("command deadline admitted"),
+                        )
                         .await
                     {
                         Ok(result) => {
@@ -625,7 +651,10 @@ impl<R: WifiRuntime> ControlServer<R> {
                 } else {
                     match self
                         .runtime
-                        .disconnect(reason, Instant::now() + Duration::from_secs(10))
+                        .disconnect(
+                            reason,
+                            admitted_deadline.expect("command deadline admitted"),
+                        )
                         .await
                     {
                         Ok(()) => CommandReply::Success,
@@ -640,7 +669,7 @@ impl<R: WifiRuntime> ControlServer<R> {
                     None,
                 )?;
             }
-            Message::Roam(request) => {
+            Message::Roam { request, .. } => {
                 let reply = match self.runtime.roam(request) {
                     Ok(()) => CommandReply::Success,
                     Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
@@ -816,7 +845,11 @@ impl<R: WifiRuntime> ControlServer<R> {
             .checked_add(1)
             .ok_or(GenerationEndReason::ProtocolViolation)?;
         self.outbound_bytes += bytes.len();
-        self.outbound.push_back(OutboundPacket { bytes, fd });
+        self.outbound.push_back(OutboundPacket {
+            bytes,
+            fd,
+            drain_deadline: Instant::now() + Duration::from_secs(2),
+        });
         Ok(())
     }
     fn queue_supervisor_install(
@@ -840,6 +873,7 @@ impl<R: WifiRuntime> ControlServer<R> {
         }
         self.supervisor_outbound_bytes += bytes.len();
         self.supervisor_outbound.push_back(OutboundPacket {
+            drain_deadline: Instant::now() + Duration::from_secs(2),
             bytes,
             fd: Some(fd),
         });
@@ -859,7 +893,11 @@ impl<R: WifiRuntime> ControlServer<R> {
             encode(&packet).map_err(|error| ServiceError::Endpoint(EndpointError::Wire(error)))?;
         self.next_request_id += 1;
         self.outbound_bytes += bytes.len();
-        self.outbound.push_back(OutboundPacket { bytes, fd: None });
+        self.outbound.push_back(OutboundPacket {
+            bytes,
+            fd: None,
+            drain_deadline: Instant::now() + Duration::from_secs(2),
+        });
         debug_assert!(self.outbound.len() <= MAX_OUTBOUND_PACKETS);
 
         debug_assert!(self.outbound_bytes <= MAX_OUTBOUND_BYTES);
@@ -868,6 +906,19 @@ impl<R: WifiRuntime> ControlServer<R> {
     }
     fn flush(&mut self) -> Result<bool, ServiceError> {
         let mut progressed = false;
+        // Per-packet absolute bounds also cover terminal messages and retained
+        // Ethernet descriptors. A stalled consumer cannot hold this owner
+        // forever. Returning an error preserves runtime ownership for cleanup.
+        if self
+            .outbound
+            .front()
+            .into_iter()
+            .chain(self.supervisor_outbound.front())
+            .any(|packet| Instant::now() >= packet.drain_deadline)
+        {
+            self.terminal = true;
+            return Err(ServiceError::Runtime(RuntimeError::Timeout));
+        }
         while let Some(packet) = self.outbound.front() {
             if !self.policy_endpoint.try_send(packet)? {
                 break;
@@ -1073,5 +1124,67 @@ impl WifiRuntime for SimulatedWifiRuntime {
         _: Instant,
     ) -> Result<(), RuntimeError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn expired_outbound_returns_owner_for_cleanup_even_after_terminal() {
+        for supervisor_queue in [false, true] {
+            let (policy, _policy_peer) = pair();
+            let (supervisor, _supervisor_peer) = pair();
+            let mut server = PreparedServer::new(
+                policy,
+                supervisor,
+                [1; 16],
+                SimulatedWifiRuntime::new([2; 6]),
+            )
+            .unwrap()
+            .post_lockdown_open_complete()
+            .unwrap();
+            server.flush().unwrap();
+            if supervisor_queue {
+                let (ethernet, _peer) = pair();
+                server
+                    .queue_supervisor_install(1, [2; 6], ethernet)
+                    .unwrap();
+                server
+                    .supervisor_outbound
+                    .front_mut()
+                    .unwrap()
+                    .drain_deadline = Instant::now();
+            } else {
+                server
+                    .end_generation(GenerationEndReason::Shutdown)
+                    .unwrap();
+                server.outbound.front_mut().unwrap().drain_deadline = Instant::now();
+            }
+            assert!(matches!(
+                server.flush(),
+                Err(ServiceError::Runtime(RuntimeError::Timeout))
+            ));
+            let runtime = server.into_runtime();
+            assert_eq!(runtime.public_mac(), [2; 6]);
+        }
     }
 }

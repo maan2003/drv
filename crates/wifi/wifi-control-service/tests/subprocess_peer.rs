@@ -186,11 +186,25 @@ fn real_subprocess_simulated_peer_exercises_control_contract() {
     send(
         &endpoint,
         1,
-        Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
-            channels: vec![],
-        })),
+        Message::Scan {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+        },
     );
-    send(&endpoint, 2, Message::Connect(connect(b"fail")));
+    send(
+        &endpoint,
+        2,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect(b"fail"),
+        },
+    );
     let mut saw_scan = false;
     let mut saw_exact_failure = false;
     for _ in 0..2 {
@@ -214,7 +228,17 @@ fn real_subprocess_simulated_peer_exercises_control_contract() {
 
     // The exact SME failure was retry-safe: the same generation accepts a
     // fresh attempt, emits its event, and transfers Ethernet exactly once.
-    send(&endpoint, 3, Message::Connect(connect(b"retry")));
+    send(
+        &endpoint,
+        3,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect(b"retry"),
+        },
+    );
     assert!(matches!(
         receive(&endpoint).packet.message,
         Message::ConnectReply(ref reply)
@@ -252,21 +276,41 @@ fn real_subprocess_simulated_peer_exercises_control_contract() {
     send(
         &endpoint,
         4,
-        Message::Roam(sme::RoamRequest {
-            bss_description: bss(),
-        }),
+        Message::Roam {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                10,
+            ))
+            .unwrap(),
+            request: sme::RoamRequest {
+                bss_description: bss(),
+            },
+        },
     );
     assert!(
         matches!(receive(&endpoint).packet.message, Message::RoamReply(ref reply) if reply.in_reply_to == 4 && reply.result == CommandReply::Success)
     );
 
-    send(&endpoint, 5, Message::Connect(connect(b"hold")));
+    send(
+        &endpoint,
+        5,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect(b"hold"),
+        },
+    );
     send(
         &endpoint,
         6,
-        Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
-            channels: vec![],
-        })),
+        Message::Scan {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+        },
     );
     assert!(
         matches!(receive(&endpoint).packet.message, Message::ScanReply(ref reply) if reply.in_reply_to == 6 && reply.result == Ok(vec![]))
@@ -274,7 +318,13 @@ fn real_subprocess_simulated_peer_exercises_control_contract() {
     send(
         &endpoint,
         7,
-        Message::Disconnect(sme::UserDisconnectReason::NetworkUnsaved),
+        Message::Disconnect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                10,
+            ))
+            .unwrap(),
+            reason: sme::UserDisconnectReason::NetworkUnsaved,
+        },
     );
     let first = receive(&endpoint).packet.message;
     let second = receive(&endpoint).packet.message;
@@ -307,7 +357,17 @@ fn stale_failed_attempt_event_terminates_without_a_failure_reply() {
     drop(child_supervisor_fd);
     let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(client_fd).unwrap();
     assert!(matches!(receive(&endpoint).packet.message, Message::Ready));
-    send(&endpoint, 1, Message::Connect(connect(b"stale")));
+    send(
+        &endpoint,
+        1,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: connect(b"stale"),
+        },
+    );
     assert!(matches!(
         receive(&endpoint).packet.message,
         Message::GenerationEnd(GenerationEndReason::DriverFault)
@@ -332,9 +392,15 @@ fn rejected_scan_reply_is_flushed_before_policy_eof_stops_the_service() {
     send(
         &endpoint,
         1,
-        Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
-            channels: vec![149],
-        })),
+        Message::Scan {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: sme::ScanRequest::Passive(sme::PassiveScanRequest {
+                channels: vec![149],
+            }),
+        },
     );
     assert!(matches!(
         receive(&endpoint).packet.message,
@@ -367,7 +433,17 @@ fn runtime_faults_are_sole_terminal_generation_messages() {
         drop(child_supervisor_fd);
         let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(client_fd).unwrap();
         assert!(matches!(receive(&endpoint).packet.message, Message::Ready));
-        send(&endpoint, 1, Message::Connect(connect(ssid)));
+        send(
+            &endpoint,
+            1,
+            Message::Connect {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap(),
+                request: connect(ssid),
+            },
+        );
         assert!(
             matches!(receive(&endpoint).packet.message, Message::GenerationEnd(actual) if actual == reason)
         );
@@ -375,4 +451,47 @@ fn runtime_faults_are_sole_terminal_generation_messages() {
         drop(supervisor_fd);
         assert!(child.wait().unwrap().success());
     }
+}
+
+#[test]
+fn expired_command_never_starts_runtime_and_fresh_command_still_runs() {
+    let (policy_fd, child_policy) = pair();
+    let (supervisor_fd, child_supervisor) = pair();
+    let mut child = spawn_peer(&child_policy, &child_supervisor);
+    drop(child_policy);
+    drop(child_supervisor);
+    let endpoint = UnixSeqpacketEndpoint::from_inherited_fd(policy_fd).unwrap();
+    assert!(matches!(receive(&endpoint).packet.message, Message::Ready));
+    send(
+        &endpoint,
+        1,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::from_nanos(1).unwrap(),
+            request: connect(b"hold"),
+        },
+    );
+    assert!(matches!(
+        receive(&endpoint).packet.message,
+        Message::DeadlineExceeded(wlan_control_wire::Reply { in_reply_to: 1, .. })
+    ));
+    send(
+        &endpoint,
+        2,
+        Message::Connect {
+            deadline: wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30)).unwrap(),
+            request: connect(b"fresh"),
+        },
+    );
+    assert!(matches!(
+        receive(&endpoint).packet.message,
+        Message::ConnectReply(wlan_control_wire::Reply { in_reply_to: 2, .. })
+    ));
+    assert!(matches!(
+        receive(&endpoint).packet.message,
+        Message::Event(sme::ConnectTransactionEvent::OnConnectResult { .. })
+    ));
+    let (_, ethernet) = receive_supervisor(&supervisor_fd);
+    assert_eq!(ethernet.len(), 1);
+    drop(endpoint);
+    assert!(child.wait().unwrap().success());
 }

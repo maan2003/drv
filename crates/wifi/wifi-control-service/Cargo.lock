@@ -1009,6 +1009,7 @@ dependencies = [
  "fidl-fuchsia-wlan-ieee80211",
  "fidl-fuchsia-wlan-internal",
  "fidl-fuchsia-wlan-sme",
+ "libc",
 ]
 
 [[package]]

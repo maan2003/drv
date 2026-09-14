@@ -112,6 +112,15 @@ remain distinct. Status/disconnect must not wait behind a blocking connect
 handler. Slow observers may resynchronize from a snapshot; safety-critical
 completion must not silently disappear.
 
+The deadline migration is partial: WLCP v2 carries checked absolute Linux
+CLOCK_MONOTONIC deadlines on commands, rejects expired commands before runtime
+admission, and bounds pending reply drain and outbound delivery. Both peers
+must share the same monotonic time namespace. The current transport still
+creates per-submission budgets; policy selection, persistence and retries
+must be changed to consume one original operation budget before this contract
+is complete. Active runtime timeout remains terminal, not a reusable timeout
+without proved quiescence. No architecture-wide KVM acceptance is claimed yet.
+
 Device, connection and Ethernet attachment lifetimes are distinct. Replace
 the finite boot-time inventory of Ethernet generations with reusable
 epoch-enforced attachments or supervisor-provisioned fresh endpoints.

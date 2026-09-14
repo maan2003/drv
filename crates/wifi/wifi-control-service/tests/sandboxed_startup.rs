@@ -66,9 +66,13 @@ fn prequeued_policy_is_read_only_after_lockdown_and_only_three_capabilities_surv
     let request = Packet {
         generation: GENERATION,
         request_id: 41,
-        message: Message::Scan(sme::ScanRequest::Passive(sme::PassiveScanRequest {
-            channels: vec![],
-        })),
+        message: Message::Scan {
+            deadline: wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(
+                30,
+            ))
+            .unwrap(),
+            request: sme::ScanRequest::Passive(sme::PassiveScanRequest { channels: vec![] }),
+        },
     };
     // Queue input before exec: an EPERM exit can therefore prove setup did not read it.
     send(&policy, &request);
