@@ -7,7 +7,7 @@ use zeroize::Zeroize;
 
 const MIN_CREDENTIAL_BYTES: usize = 8;
 const MAX_CREDENTIAL_BYTES: usize = 63;
-const MAX_REGULATORY_SNAPSHOT_BYTES: usize = 4096;
+const MAX_REGULATORY_DATABASE_BYTES: usize = 1024 * 1024;
 
 /// This identity must come from trusted build metadata or the supervising
 /// process. Accepting an expectation supplied by an untrusted client would
@@ -149,29 +149,56 @@ impl Drop for CredentialBytes {
     }
 }
 
-/// An inherited, supervisor-generated regulatory snapshot descriptor.
-/// Adoption is deliberately inert; raw wireless-regdb parsing stays in the
-/// trusted pre-lockdown generator.
-pub struct RegulatorySnapshotFile(File);
+/// An inherited pinned wireless-regdb descriptor. Adoption is inert;
+/// reading, authentication and parsing occur only after sandbox lockdown.
+pub struct RegulatoryDatabaseFile(File);
 
-impl RegulatorySnapshotFile {
+/// Authenticated immutable bytes; the core parser alone does not verify hashes.
+#[derive(Debug)]
+pub struct VerifiedRegulatoryDatabase {
+    bytes: Vec<u8>,
+    sha256: [u8; 32],
+}
+
+impl RegulatoryDatabaseFile {
     pub fn adopt(file: File) -> Self {
         Self(file)
     }
 
-    /// Consume the descriptor after lockdown, reading the declared snapshot
-    /// length and requiring immediate EOF. The caller subsequently decodes it
-    /// against the trusted regulatory source hash.
-    pub fn read_exact(self, length: usize) -> std::io::Result<Vec<u8>> {
-        if !(1..=MAX_REGULATORY_SNAPSHOT_BYTES).contains(&length) {
+    pub fn verify(
+        self,
+        length: usize,
+        sha256: [u8; 32],
+    ) -> std::io::Result<VerifiedRegulatoryDatabase> {
+        if !(1..=MAX_REGULATORY_DATABASE_BYTES).contains(&length) {
             return Err(invalid_data(
-                "regulatory snapshot length is outside 1..=4096 bytes",
+                "regulatory database length is outside 1..=1048576 bytes",
             ));
         }
-        read_exact_to_eof(
+        let bytes = read_exact_to_eof(
             self.0,
             length,
-            "regulatory snapshot exceeds declared length",
+            "regulatory database exceeds declared length",
+        )?;
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != sha256 {
+            return Err(invalid_data("regulatory database SHA-256 mismatch"));
+        }
+        Ok(VerifiedRegulatoryDatabase { bytes, sha256 })
+    }
+}
+
+impl VerifiedRegulatoryDatabase {
+    pub fn world_snapshot(
+        &self,
+        generation: u64,
+        capability: mt7921_core::NicCapability,
+    ) -> Result<mt7921_core::RegulatoryRatePowerSnapshot, mt7921_core::RateTxPowerError> {
+        mt7921_core::regulatory_rate_power_snapshot_from_regdb_v20(
+            &self.bytes,
+            generation,
+            *b"00",
+            capability,
+            self.sha256,
         )
     }
 }
@@ -322,7 +349,7 @@ mod tests {
             input_file("snapshot", b"snapshot", 2);
 
         let _credential = CredentialFile::adopt(credential);
-        let _snapshot = RegulatorySnapshotFile::adopt(snapshot);
+        let _snapshot = RegulatoryDatabaseFile::adopt(snapshot);
         assert_eq!(credential_observer.stream_position().unwrap(), 3);
         assert_eq!(snapshot_observer.stream_position().unwrap(), 2);
 
@@ -373,42 +400,35 @@ mod tests {
     }
 
     #[test]
-    fn regulatory_snapshot_read_is_exact_bounded_and_eof_terminated() {
-        let (file, path) = fresh_input("snapshot-exact", b"snapshot");
-        assert_eq!(
-            RegulatorySnapshotFile::adopt(file).read_exact(8).unwrap(),
-            b"snapshot"
-        );
+    fn regulatory_database_read_authenticates_exact_bounded_bytes() {
+        let bytes = include_bytes!("../../mt7921-core/tests/fixtures/regulatory.db");
+        let sha = <[u8; 32]>::from(Sha256::digest(bytes));
+        let (file, path) = fresh_input("regdb-exact", bytes);
+        let verified = RegulatoryDatabaseFile::adopt(file)
+            .verify(bytes.len(), sha)
+            .unwrap();
+        assert_eq!(verified.bytes, bytes);
+        assert_eq!(verified.sha256, sha);
         std::fs::remove_file(path).unwrap();
 
-        let (file, path) = fresh_input("snapshot-short", b"short");
-        assert_eq!(
-            RegulatorySnapshotFile::adopt(file)
-                .read_exact(8)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::UnexpectedEof
-        );
-        std::fs::remove_file(path).unwrap();
-
-        let (file, path) = fresh_input("snapshot-extra", b"snapshot-extra");
-        assert_eq!(
-            RegulatorySnapshotFile::adopt(file)
-                .read_exact(8)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        std::fs::remove_file(path).unwrap();
-
-        for length in [0, 4097] {
-            let (file, path) = fresh_input("snapshot-bounds", b"");
+        for (length, hash, expected) in [
+            (bytes.len(), [0; 32], std::io::ErrorKind::InvalidData),
+            (bytes.len() + 1, sha, std::io::ErrorKind::UnexpectedEof),
+            (bytes.len() - 1, sha, std::io::ErrorKind::InvalidData),
+            (0, sha, std::io::ErrorKind::InvalidData),
+            (
+                MAX_REGULATORY_DATABASE_BYTES + 1,
+                sha,
+                std::io::ErrorKind::InvalidData,
+            ),
+        ] {
+            let (file, path) = fresh_input("regdb-invalid", bytes);
             assert_eq!(
-                RegulatorySnapshotFile::adopt(file)
-                    .read_exact(length)
+                RegulatoryDatabaseFile::adopt(file)
+                    .verify(length, hash)
                     .unwrap_err()
                     .kind(),
-                std::io::ErrorKind::InvalidData
+                expected
             );
             std::fs::remove_file(path).unwrap();
         }

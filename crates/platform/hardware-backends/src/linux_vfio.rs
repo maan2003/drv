@@ -347,6 +347,7 @@ impl LinuxVfioPciCapabilities {
         let mut inherited = vec![pci_config_fd, vfio_fd, iommufd, irq_eventfd];
         if let Some(service) = &service {
             inherited.extend([service.control_fd, service.supervisor_fd]);
+            inherited.extend(service.regulatory_fd);
             inherited.extend(&service.ethernet_fds);
             inherited.extend(&service.runtime_fds);
         }

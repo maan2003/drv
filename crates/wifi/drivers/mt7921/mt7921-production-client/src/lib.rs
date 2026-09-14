@@ -20,7 +20,8 @@ mod setup_inputs;
 mod softmac;
 pub use setup_inputs::{
     CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
-    FirmwareVerificationError, RegulatorySnapshotFile, VerifiedFirmware, VerifiedFirmwareImages,
+    FirmwareVerificationError, RegulatoryDatabaseFile, VerifiedFirmware, VerifiedFirmwareImages,
+    VerifiedRegulatoryDatabase,
 };
 
 use activation::activate;
@@ -835,6 +836,11 @@ pub struct Mt7921FirmwareRunReport {
 
 #[derive(Debug)]
 pub enum Mt7921FirmwareRunError {
+    Regulatory {
+        source: mt7921_core::RateTxPowerError,
+        acquisition: AcquisitionLedger,
+        containment: Box<Result<ContainmentLedger, Mt7921ContainmentError>>,
+    },
     Open(Mt7921HardwareSessionError),
     Activation {
         stage: String,
@@ -856,6 +862,9 @@ pub enum Mt7921FirmwareRunError {
 impl fmt::Display for Mt7921FirmwareRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Regulatory { source, .. } => {
+                write!(f, "derive MT7921 regulatory policy: {source:?}")
+            }
             Self::Open(error) => write!(f, "open production MT7921 resources: {error}"),
             Self::Activation { stage, detail, .. } => {
                 write!(f, "activate MT7921 loader at {stage}: {detail}")
@@ -912,6 +921,7 @@ pub fn run_firmware_bootstrap(
 pub struct Mt7921Driver {
     session: Mt7921HardwareSession,
     firmware: FirmwareLoaderReport,
+    regulatory: mt7921_core::RegulatoryRatePowerSnapshot,
     mac_initialization: radio::MacInitialization,
     data_rx: receive::DataRx,
     upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
@@ -921,6 +931,7 @@ impl Mt7921Driver {
     pub fn initialize(
         config: Mt7921HardwareSessionConfig,
         images: VerifiedFirmwareImages,
+        database: VerifiedRegulatoryDatabase,
     ) -> Result<Self, Mt7921FirmwareRunError> {
         let mut session = Mt7921HardwareSession::open_and_activate(config)?;
         let verified = images.open();
@@ -931,10 +942,24 @@ impl Mt7921Driver {
         );
         match firmware {
             Ok(firmware) => {
+                let regulatory = match database.world_snapshot(1, firmware.nic_capability) {
+                    Ok(regulatory) => regulatory,
+                    Err(source) => {
+                        session.lifecycle = SessionLifecycle::Closing;
+                        let acquisition = session.acquisition.clone();
+                        let containment = session.contain();
+                        return Err(Mt7921FirmwareRunError::Regulatory {
+                            source,
+                            acquisition,
+                            containment: Box::new(containment),
+                        });
+                    }
+                };
                 session.lifecycle = SessionLifecycle::FirmwareInitialized;
                 Ok(Self {
                     session,
                     firmware,
+                    regulatory,
                     mac_initialization: radio::MacInitialization::new(),
                     data_rx: receive::DataRx::default(),
                     upcalls: None,

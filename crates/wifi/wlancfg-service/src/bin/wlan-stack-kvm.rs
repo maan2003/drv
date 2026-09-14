@@ -66,16 +66,16 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let regulatory_fd = std::env::var("DRV_REGULATORY_SNAPSHOT_FD")
-        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_FD is required".to_string())?
+    let regulatory_fd = std::env::var("DRV_REGULATORY_DATABASE_FD")
+        .map_err(|_| "DRV_REGULATORY_DATABASE_FD is required".to_string())?
         .parse::<RawFd>()
-        .map_err(|_| "DRV_REGULATORY_SNAPSHOT_FD is invalid".to_string())?;
+        .map_err(|_| "DRV_REGULATORY_DATABASE_FD is invalid".to_string())?;
     if regulatory_fd != REGULATORY_FD {
-        return Err("physical launcher requires regulatory snapshot on FD4".into());
+        return Err("physical launcher requires regulatory database on FD4".into());
     }
     if unsafe { libc::fcntl(regulatory_fd, libc::F_GETFD) } < 0 {
         return Err(format!(
-            "inspect regulatory snapshot: {}",
+            "inspect regulatory database: {}",
             std::io::Error::last_os_error()
         ));
     }

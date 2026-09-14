@@ -61,6 +61,7 @@ pub enum Profile {
 pub struct WifiServiceFds {
     pub control_fd: RawFd,
     pub supervisor_fd: RawFd,
+    pub regulatory_fd: Option<RawFd>,
     pub ethernet_fds: Vec<RawFd>,
     pub runtime_fds: Vec<RawFd>,
 }
@@ -317,6 +318,7 @@ impl Sandbox<SetupComplete> {
             let mut expected = vec![*pci_config_fd, *vfio_fd, *iommufd, *irq_eventfd];
             if let Some(service) = service {
                 expected.extend([service.control_fd, service.supervisor_fd]);
+                expected.extend(service.regulatory_fd);
                 expected.extend(&service.ethernet_fds);
                 expected.extend(&service.runtime_fds);
             }
@@ -814,6 +816,14 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
                         );
                     }
                 }
+                readable.extend(service.regulatory_fd);
+                if let Some(fd) = service.regulatory_fd {
+                    allow(
+                        &mut rules,
+                        libc::SYS_fcntl,
+                        vec![eq(0, fd as u64), eq(1, libc::F_GETFD as u64)],
+                    );
+                }
                 readable.extend(&service.runtime_fds);
                 writable.extend(&service.runtime_fds);
             }
@@ -1022,6 +1032,7 @@ mod filter_tests {
                 iommufd: 5,
                 irq_eventfd: 6,
                 service: Some(WifiServiceFds {
+                    regulatory_fd: None,
                     control_fd: 7,
                     supervisor_fd: 8,
                     ethernet_fds: (9..17).collect(),
@@ -1083,6 +1094,7 @@ mod filter_tests {
                 iommufd: hardware[2],
                 irq_eventfd: hardware[3],
                 service: Some(WifiServiceFds {
+                    regulatory_fd: None,
                     control_fd: policy[0],
                     supervisor_fd: supervisor[0],
                     ethernet_fds: vec![ethernet[0], ethernet[1]],
@@ -1471,6 +1483,7 @@ mod filter_tests {
                 iommufd: device,
                 irq_eventfd: raw,
                 service: Some(WifiServiceFds {
+                    regulatory_fd: None,
                     control_fd: device,
                     supervisor_fd: device,
                     ethernet_fds: Vec::new(),
@@ -1517,6 +1530,65 @@ mod filter_tests {
     }
 
     #[test]
+    fn mt7921_regulatory_database_is_read_only_and_fd_scoped() {
+        const TEST: &str = "filter_tests::mt7921_regulatory_database_is_read_only_and_fd_scoped";
+        if let Ok(mode) = std::env::var("DRV_MT7921_REGDB_PROBE") {
+            let database = unsafe { libc::open(c"/dev/zero".as_ptr(), libc::O_RDWR) };
+            let foreign = unsafe { libc::open(c"/dev/zero".as_ptr(), libc::O_RDWR) };
+            let device = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            assert!(database >= 0 && foreign >= 0 && device >= 0);
+            enable_filter(Profile::Mt7921Vfio {
+                pci_config_fd: device,
+                vfio_fd: device,
+                iommufd: device,
+                irq_eventfd: device,
+                service: Some(WifiServiceFds {
+                    regulatory_fd: Some(database),
+                    control_fd: device,
+                    supervisor_fd: device,
+                    ethernet_fds: Vec::new(),
+                    runtime_fds: Vec::new(),
+                }),
+            });
+            let mut byte = 1u8;
+            match mode.as_str() {
+                "read" => assert_eq!(
+                    unsafe { libc::read(database, (&mut byte as *mut u8).cast(), 1) },
+                    1
+                ),
+                "write" => unsafe {
+                    libc::write(database, (&byte as *const u8).cast(), 1);
+                },
+                "foreign" => unsafe {
+                    libc::read(foreign, (&mut byte as *mut u8).cast(), 1);
+                },
+                "seek" => unsafe {
+                    libc::lseek(database, 0, libc::SEEK_SET);
+                },
+                "duplicate" => unsafe {
+                    libc::fcntl(database, libc::F_DUPFD_CLOEXEC, 0);
+                },
+                _ => unreachable!(),
+            }
+            unsafe { libc::_exit(0) }
+        }
+        for mode in ["read", "write", "foreign", "seek", "duplicate"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .env("DRV_MT7921_REGDB_PROBE", mode)
+                .status()
+                .unwrap();
+            if mode == "read" {
+                assert!(status.success());
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGSYS), "{mode}: {status}");
+            }
+        }
+    }
+
+    #[test]
     fn mt7921_runtime_registration_is_fd_scoped() {
         const TEST: &str = "filter_tests::mt7921_runtime_registration_is_fd_scoped";
         if let Ok(mode) = std::env::var("DRV_MT7921_REACTOR_PROBE") {
@@ -1531,6 +1603,7 @@ mod filter_tests {
                 iommufd: device,
                 irq_eventfd: irq,
                 service: Some(WifiServiceFds {
+                    regulatory_fd: None,
                     control_fd: device,
                     supervisor_fd: device,
                     ethernet_fds: Vec::new(),

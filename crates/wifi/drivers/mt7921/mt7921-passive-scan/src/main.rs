@@ -4,7 +4,8 @@
 //! MLME/SME and that driver run under one ClientRuntime, without radio IPC.
 
 use mt7921_production_client::{
-    FirmwareImageExpectation, Mt7921Driver, Mt7921HardwareSessionConfig, VerifiedFirmwareImages,
+    FirmwareImageExpectation, Mt7921Driver, Mt7921HardwareSessionConfig, RegulatoryDatabaseFile,
+    VerifiedFirmwareImages,
 };
 use std::{
     env,
@@ -113,10 +114,23 @@ fn run() -> Result<(), String> {
     let supervisor_fd = required("DRV_WIFI_SUPERVISOR_FD")?
         .parse::<RawFd>()
         .map_err(|_| "invalid supervisor FD")?;
-    if policy_fd < 3 || supervisor_fd < 3 || policy_fd == supervisor_fd {
-        return Err("control descriptors must be distinct non-stdio capabilities".into());
+    let regulatory_fd = required("DRV_REGULATORY_DATABASE_FD")?
+        .parse::<RawFd>()
+        .map_err(|_| "invalid regulatory FD")?;
+    let regulatory_length = required("DRV_REGULATORY_DATABASE_LEN")?
+        .parse::<usize>()
+        .map_err(|_| "invalid regulatory length")?;
+    let regulatory_sha256 = hex::<32>(&required("DRV_REGULATORY_DATABASE_SHA256")?)?;
+    if [policy_fd, supervisor_fd, regulatory_fd]
+        .iter()
+        .any(|fd| *fd < 3)
+        || policy_fd == supervisor_fd
+        || regulatory_fd == policy_fd
+        || regulatory_fd == supervisor_fd
+    {
+        return Err("inherited descriptors must be distinct non-stdio capabilities".into());
     }
-    for fd in [policy_fd, supervisor_fd] {
+    for fd in [policy_fd, supervisor_fd, regulatory_fd] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
             return Err(format!(
@@ -127,6 +141,7 @@ fn run() -> Result<(), String> {
     }
     // Only the entrypoint adopts inherited process descriptors. The driver
     // never receives policy IPC or creates a second hardware owner.
+    let database = RegulatoryDatabaseFile::adopt(unsafe { File::from_raw_fd(regulatory_fd) });
     let endpoints = wifi_control_service::PreparedServerEndpoints::new(
         unsafe { OwnedFd::from_raw_fd(policy_fd) },
         unsafe { OwnedFd::from_raw_fd(supervisor_fd) },
@@ -164,6 +179,7 @@ fn run() -> Result<(), String> {
     let service = linux_self_sandbox::WifiServiceFds {
         control_fd,
         supervisor_fd,
+        regulatory_fd: Some(regulatory_fd),
         ethernet_fds: resources.fd_identities(),
         runtime_fds,
     };
@@ -181,7 +197,10 @@ fn run() -> Result<(), String> {
         .lock_down_with_service(service)
         .map_err(|error| format!("lock down MT7921 service: {error}"))?;
     local.block_on(&executor, async move {
-        let driver = Mt7921Driver::initialize(config, images)
+        let database = database
+            .verify(regulatory_length, regulatory_sha256)
+            .map_err(|error| format!("verify regulatory database: {error}"))?;
+        let driver = Mt7921Driver::initialize(config, images, database)
             .map_err(|error| format!("initialize MT7921: {error:?}"))?;
         if driver.firmware().nic_capability.mac_address != Some(mac) {
             return Err(
