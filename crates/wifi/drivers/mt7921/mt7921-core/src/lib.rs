@@ -7199,11 +7199,10 @@ fn encode_legacy_wme_wcid_command(
     Ok(expanded)
 }
 
-/// Linux's first `mt7921_mac_sta_add` command for a newly allocated peer.
-///
-/// This publishes only `STA_REC_BASIC` plus an empty reset-and-set WTBL
-/// request.  The later preauthentication station update adds PHY/RA/state and
-/// the nested WTBL TLVs; they are two distinct firmware transitions.
+/// Retired userspace pre-reset fixture, retained for its legacy callers.
+/// This is NOT Linux mt7921_mac_sta_add: the pinned add-station path enables
+/// the peer and includes PHY/RA/state plus generic/RX/header/SMPS WTBL TLVs.
+/// Production must use encode_preauth_peer_wcid_command instead.
 pub fn encode_initial_peer_wcid_command(
     sequence: u8,
     bss_index: u8,
@@ -7238,29 +7237,53 @@ pub fn encode_initial_peer_wcid_command(
     Ok(bytes)
 }
 
+/// Pinned mt7921_mac_sta_add -> mt7921_mcu_sta_update(enable=true,
+/// STATE_NONE), for a legacy station before authentication. The mac80211
+/// band index and rate bitmaps come from the selected BSS/local intersection.
+/// No HT/VHT/HE, QoS, AID, header translation or dynamic SMPS is active yet.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_preauth_peer_wcid_command(
     sequence: u8,
     bss_index: u8,
     wcid: u8,
     peer: [u8; 6],
+    band: u8,
     rcpi: u8,
     basic_rates: u16,
     legacy_rates: u16,
 ) -> Result<Vec<u8>, String> {
-    encode_legacy_wme_wcid_command(
-        sequence,
-        bss_index,
-        wcid,
-        0,
-        peer,
-        rcpi,
-        basic_rates,
-        legacy_rates,
-        None,
-        None,
-        0,
-        false,
-    )
+    if !(1..=15).contains(&sequence)
+        || !(1..19).contains(&wcid)
+        || peer == [0; 6]
+        || peer[0] & 1 != 0
+        || band > 1
+    {
+        return Err("preauth station identity or band is invalid".into());
+    }
+    let mut body = vec![0; 128];
+    body[..8].copy_from_slice(&[bss_index, wcid, 5, 0, 1, 0, 0, 0]);
+    // STA_REC_BASIC: CONNECTION_INFRA_AP, PORT_SECURE firmware connection
+    // state (not the host controlled port), EXTRA_INFO_VER | EXTRA_INFO_NEW.
+    body[8..12].copy_from_slice(&[0, 0, 20, 0]);
+    body[12..16].copy_from_slice(&0x0001_0002u32.to_le_bytes());
+    body[16] = 2;
+    body[20..26].copy_from_slice(&peer);
+    body[26..28].copy_from_slice(&3u16.to_le_bytes());
+    body[28..32].copy_from_slice(&[21, 0, 12, 0]);
+    body[32..34].copy_from_slice(&basic_rates.to_le_bytes());
+    body[34] = if band == 0 { 0x03 } else { 0x08 };
+    body[37] = rcpi;
+    body[40..44].copy_from_slice(&[1, 0, 16, 0]);
+    body[44..46].copy_from_slice(&legacy_rates.to_le_bytes());
+    body[56..60].copy_from_slice(&[7, 0, 12, 0]); // STATE_NONE = 0
+    // STA_REC_WTBL + WTBL_RESET_AND_SET, four nested TLVs.
+    body[68..80].copy_from_slice(&[13, 0, 60, 0, wcid, 1, 4, 0, 0, 0, 0, 0]);
+    body[80..84].copy_from_slice(&[0, 0, 20, 0]);
+    body[84..90].copy_from_slice(&peer);
+    body[100..112].copy_from_slice(&[1, 0, 12, 0, 0, 1, 1, 1, 0, 0, 0, 0]);
+    body[112..120].copy_from_slice(&[6, 0, 8, 0, 1, 0, 1, 0]);
+    body[120..128].copy_from_slice(&[13, 0, 8, 0, 0, 0, 0, 0]);
+    Ok(encode_uni_mcu(3, &body, sequence))
 }
 
 pub fn encode_legacy_wme_add_wcid_command(
@@ -8648,6 +8671,7 @@ impl ClientFirmwareEffectsState {
             peer.bss_index,
             peer.peer_wcid.get(),
             peer.peer,
+            channel.channel.band,
             peer.rcpi,
             peer.basic_rates,
             peer.legacy_rates,
@@ -12239,6 +12263,7 @@ mod tests {
             0,
             7,
             [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            1,
             100,
             basic,
             legacy,
@@ -12252,6 +12277,17 @@ mod tests {
                 0x15, 0, 0x0c, 0, 0x15, 0, 0x08, 0, 0, 100, 0, 0, 0x01, 0, 0x10, 0, 0xc0, 0x3f, 0,
                 0, 0, 0, 0, 0,
             ]
+        );
+        assert_eq!(&encoded[64..68], &[2, 0, 0, 0]);
+        assert_eq!(&encoded[74..76], &[3, 0]);
+        assert_eq!(&encoded[168..176], &[13, 0, 8, 0, 0, 0, 0, 0]);
+        let two_ghz =
+            encode_preauth_peer_wcid_command(1, 0, 1, [2, 0, 0, 0, 0, 1], 0, 120, 0x15f, 0x3fcf)
+                .unwrap();
+        assert_eq!(two_ghz[82], 0x03);
+        assert!(
+            encode_preauth_peer_wcid_command(1, 0, 19, [2, 0, 0, 0, 0, 1], 0, 120, 0x15f, 0x3fcf)
+                .is_err()
         );
         assert_eq!(&encoded[80..82], &[0x15, 0]);
         assert_eq!(encoded[82], 0x08);
