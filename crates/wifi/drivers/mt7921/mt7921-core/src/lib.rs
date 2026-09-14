@@ -3629,7 +3629,7 @@ pub enum PassiveMcuCommand {
     },
     StartScan {
         scan_sequence: u8,
-        channel: CandidateChannel,
+        channels: Vec<CandidateChannel>,
     },
     CancelScan {
         scan_sequence: u8,
@@ -3642,6 +3642,7 @@ pub enum PassiveMcuCommandError {
     UnsupportedChannel,
     InvalidAntennaMask,
     InvalidScanSequence,
+    InvalidScanChannelCount,
     ActiveScanMaterial,
 }
 
@@ -4036,24 +4037,39 @@ pub fn encode_passive_mcu_command(
         }
         PassiveMcuCommand::StartScan {
             scan_sequence,
-            channel,
+            channels,
         } => {
             if *scan_sequence > 0x7f {
                 return Err(PassiveMcuCommandError::InvalidScanSequence);
             }
-            let scan_band = match channel.band {
-                PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 1,
-                PhysicalBand::Ghz5 if PASSIVE_5GHZ.contains(&channel.number) => 2,
-                _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
-            };
+            // Never turn a malformed explicit channel list into Linux's
+            // full-band scan fallback: callers must supply authorized channels.
+            if !(1..=64).contains(&channels.len()) {
+                return Err(PassiveMcuCommandError::InvalidScanChannelCount);
+            }
             let mut payload = vec![0; 1186];
             payload[0] = *scan_sequence;
             payload[3] = 1;
             payload[7] = 1;
             payload[158] = 4;
-            payload[159] = 1;
-            payload[160] = scan_band;
-            payload[161] = channel.number as u8;
+            payload[159] = channels.len().min(32) as u8;
+            payload[826] = channels.len().saturating_sub(32) as u8;
+            for (index, channel) in channels.iter().enumerate() {
+                let scan_band = match channel.band {
+                    PhysicalBand::Ghz2 if (1..=14).contains(&channel.number) => 1,
+                    PhysicalBand::Ghz5 if PASSIVE_5GHZ.contains(&channel.number) => 2,
+                    _ => return Err(PassiveMcuCommandError::UnsupportedChannel),
+                };
+                // Packed mt76_connac_hw_scan_req has 32 primary entries
+                // and 32 extension entries after the 600-byte IE field.
+                let offset = if index < 32 {
+                    160 + index * 2
+                } else {
+                    830 + (index - 32) * 2
+                };
+                payload[offset] = scan_band;
+                payload[offset + 1] = channel.number as u8;
+            }
             payload[6] = 1 << 5;
             // Linux mt76_connac_mcu_hw_scan copies cfg80211's wildcard
             // BSSID, not the zero-initialized address, for an unfiltered scan.
@@ -15180,7 +15196,7 @@ mod tests {
         let scan = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
-                channel,
+                channels: vec![channel],
             },
             3,
         )
@@ -15201,7 +15217,7 @@ mod tests {
         assert!(
             !PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
-                channel
+                channels: vec![channel]
             }
             .expects_response()
         );
@@ -15227,7 +15243,7 @@ mod tests {
         let scan_5ghz = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 2,
-                channel: channel_5ghz,
+                channels: vec![channel_5ghz],
             },
             5,
         )
@@ -15243,12 +15259,73 @@ mod tests {
             encode_passive_mcu_command(
                 &PassiveMcuCommand::StartScan {
                     scan_sequence: 1,
-                    channel: forbidden,
+                    channels: vec![forbidden],
                 },
                 1,
             ),
             Err(PassiveMcuCommandError::UnsupportedChannel)
         );
+    }
+
+    #[test]
+    fn passive_scan_encodes_both_linux_channel_arrays_without_full_scan_fallback() {
+        let channel = CandidateChannel {
+            band: PhysicalBand::Ghz2,
+            number: 1,
+            frequency_mhz: 2412,
+        };
+        for count in [1, 32, 33, 64] {
+            let mut channels = vec![channel; count];
+            channels[count - 1] = CandidateChannel {
+                band: PhysicalBand::Ghz5,
+                number: 36,
+                frequency_mhz: 5180,
+            };
+            let bytes = encode_passive_mcu_command(
+                &PassiveMcuCommand::StartScan {
+                    scan_sequence: 127,
+                    channels: channels.clone(),
+                },
+                15,
+            )
+            .unwrap();
+            let request = &bytes[64..];
+            assert_eq!(request[159], count.min(32) as u8);
+            assert_eq!(request[826], count.saturating_sub(32) as u8);
+            for (index, channel) in channels.iter().enumerate() {
+                let offset = if index < 32 {
+                    160 + 2 * index
+                } else {
+                    830 + 2 * (index - 32)
+                };
+                assert_eq!(
+                    &request[offset..offset + 2],
+                    &[
+                        if channel.band == PhysicalBand::Ghz2 {
+                            1
+                        } else {
+                            2
+                        },
+                        channel.number as u8
+                    ]
+                );
+            }
+            assert_eq!(&request[1110..1116], &[255; 6]);
+            assert_eq!(request[2], 0); // no active probes
+            assert_eq!(&request[154..158], &[0; 4]); // Connac2 firmware dwell/timeout
+        }
+        for count in [0, 65] {
+            assert_eq!(
+                encode_passive_mcu_command(
+                    &PassiveMcuCommand::StartScan {
+                        scan_sequence: 1,
+                        channels: vec![channel; count]
+                    },
+                    1
+                ),
+                Err(PassiveMcuCommandError::InvalidScanChannelCount)
+            );
+        }
     }
 
     #[test]
