@@ -105,6 +105,21 @@ fn parent() -> anyhow::Result<()> {
         "Wi-Fi logs exposed credential"
     );
 
+    // A terminal AP-loss event must cross certified cleanup before the
+    // actual policy/control client may scan and reconnect on this generation.
+    let lost = start_generation(&state, &listener, "terminal-loss")?;
+    wait_status(&socket_path, "association=connected")?;
+    wait_status(&socket_path, "association=disconnected")?;
+    require_success(&cli(&socket_path, &["scan"], None)?, "scan after terminal loss")?;
+    require_success(&cli(
+        &socket_path, &["connect", "selected-network", "wpa3"], Some(PASSWORD),
+    )?, "connect after terminal loss")?;
+    wait_status(&socket_path, "association=connected")?;
+    let lost_wifi = lost.stop()?;
+    assert_eq!(lines(&lost_wifi, "CONNECT ").len(), 2, "{lost_wifi}");
+    assert_eq!(lines(&lost_wifi, "TERMINAL_LOSS").len(), 1, "{lost_wifi}");
+    assert_eq!(lines(&lost_wifi, "TERMINAL_CLEANUP").len(), 1, "{lost_wifi}");
+
     // The same persisted store is loaded by a fresh daemon process, which
     // automatically selects and reconnects through the same policy/control path.
     let restarted = start_generation(&state, &listener, "success")?;
@@ -471,9 +486,14 @@ fn wifi_child() -> anyhow::Result<()> {
     let policy = unsafe { OwnedFd::from_raw_fd(3) };
     let supervisor = unsafe { OwnedFd::from_raw_fd(4) };
     let runtime = FixtureWifi::new(std::env::var("DRV_WLANCFG_E2E_SCENARIO")?);
-    PreparedServer::new(policy, supervisor, GENERATION, runtime)?
-        .post_lockdown_open_complete()?
-        .run()?;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    tokio::task::LocalSet::new().block_on(&executor, async {
+        PreparedServer::new(policy, supervisor, GENERATION, runtime)?
+            .post_lockdown_open_complete()?
+            .run().await
+    })?;
     Ok(())
 }
 fn capability_checkpoint() -> io::Result<()> {
@@ -493,6 +513,7 @@ struct FixtureWifi {
     events: std::collections::VecDeque<sme::ConnectTransactionEvent>,
     started: Instant,
     connected_idle: usize,
+    needs_cleanup: bool,
 }
 
 impl FixtureWifi {
@@ -506,6 +527,7 @@ impl FixtureWifi {
             events: Default::default(),
             started: Instant::now(),
             connected_idle: 0,
+            needs_cleanup: false,
         }
     }
 }
@@ -517,11 +539,12 @@ impl WifiRuntime for FixtureWifi {
     fn take_ethernet_device(&mut self) -> Option<OwnedFd> {
         None
     }
-    fn begin_connect(
+    async fn begin_connect(
         &mut self,
         request: sme::ConnectRequest,
         _: Instant,
     ) -> Result<(), RuntimeError> {
+        assert!(!self.needs_cleanup, "connect before certified cleanup");
         self.pending_connect = Some(request);
         Ok(())
     }
@@ -590,7 +613,8 @@ impl WifiRuntime for FixtureWifi {
     fn roam(&mut self, _: sme::RoamRequest) -> Result<(), RuntimeError> {
         Ok(())
     }
-    fn begin_scan(&mut self, request: sme::ScanRequest, _: Instant) -> Result<(), RuntimeError> {
+    async fn begin_scan(&mut self, request: sme::ScanRequest, _: Instant) -> Result<(), RuntimeError> {
+        assert!(!self.needs_cleanup, "scan before certified cleanup");
         self.pending_scan = Some(request);
         Ok(())
     }
@@ -637,6 +661,23 @@ impl WifiRuntime for FixtureWifi {
         Ok(Some(Ok(results)))
     }
     async fn drive_once(&mut self) -> Result<bool, RuntimeError> {
+        if self.scenario == "terminal-loss" && self.attempts == 1 && self.connected_idle > 0 {
+            self.connected_idle += 1;
+            if self.connected_idle == 100 {
+                self.connected_idle = 0;
+                self.needs_cleanup = true;
+                self.events.push_back(sme::ConnectTransactionEvent::OnDisconnect {
+                    info: sme::DisconnectInfo {
+                        is_sme_reconnecting: false,
+                        disconnect_source: sme::DisconnectSource::User(
+                            sme::UserDisconnectReason::FailedToConnect,
+                        ),
+                    },
+                });
+                println!("TERMINAL_LOSS");
+                return Ok(true);
+            }
+        }
         Ok(false)
     }
     fn next_connection_event(
@@ -649,6 +690,11 @@ impl WifiRuntime for FixtureWifi {
         _: sme::UserDisconnectReason,
         _: Instant,
     ) -> Result<(), RuntimeError> {
+        if self.needs_cleanup {
+            println!("TERMINAL_CLEANUP");
+        }
+        self.needs_cleanup = false;
+        self.events.clear();
         Ok(())
     }
 }

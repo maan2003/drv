@@ -794,6 +794,11 @@ struct ConnectAttempt {
     deadline: std::time::Instant,
 }
 
+enum Connection {
+    Active(wlan_sme::client::ConnectTransactionStream),
+    EndedNeedsCleanup,
+}
+
 struct Cleanup {
     deadline: std::time::Instant,
     terminal: Option<fidl_sme::ConnectTransactionEvent>,
@@ -826,7 +831,8 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     connect_attempt: Option<ConnectAttempt>,
     cleanup: Option<Cleanup>,
     scan_attempt: Option<ScanAttempt>,
-    connection: Option<wlan_sme::client::ConnectTransactionStream>,
+    connection: Option<Connection>,
+    connection_events: VecDeque<fidl_sme::ConnectTransactionEvent>,
     revoked: bool,
 }
 
@@ -1036,6 +1042,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             cleanup: None,
             scan_attempt: None,
             connection: None,
+            connection_events: VecDeque::new(),
             revoked: false,
         };
         // Constructor maintenance timers are not connection authority.
@@ -1295,7 +1302,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         request: fidl_sme::ConnectRequest,
         deadline: std::time::Instant,
     ) -> Result<fidl_sme::ConnectResult, ConnectError> {
-        self.begin_connect(request, deadline)?;
+        self.begin_connect(request, deadline).await?;
         loop {
             if let Some(result) = self.drive_connect_once().await? {
                 return Ok(result);
@@ -1307,13 +1314,21 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     /// Start one policy-selected connect attempt while retaining its SME
     /// transaction in the runtime. This permits a service loop to keep
     /// processing control requests without dropping an in-flight attempt.
-    pub fn begin_connect(
+    pub async fn begin_connect(
         &mut self,
         request: fidl_sme::ConnectRequest,
         deadline: std::time::Instant,
     ) -> Result<(), ConnectError> {
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
+        }
+        self.drain_connection_events()?;
+        if matches!(self.connection, Some(Connection::EndedNeedsCleanup)) {
+            self.disconnect(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)
+                .await?;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ConnectError::Timeout);
         }
         if self.connection.is_some() {
             return Err(ConnectError::Driver(DriverError::AlreadyConnected));
@@ -1373,7 +1388,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
 
     /// Start one SME discovery scan while retaining its response in the
     /// runtime for a nonblocking service loop.
-    pub fn begin_scan(
+    pub async fn begin_scan(
         &mut self,
         request: fidl_sme::ScanRequest,
         deadline: std::time::Instant,
@@ -1384,7 +1399,18 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.scan_attempt.is_some() {
             return Err(ConnectError::Driver(DriverError::ScanInProgress));
         }
-        if self.connect_attempt.is_some() || self.cleanup.is_some() {
+        if self.connect_attempt.is_some() {
+            return Err(ConnectError::Driver(DriverError::ConnectInProgress));
+        }
+        self.drain_connection_events()?;
+        if matches!(self.connection, Some(Connection::EndedNeedsCleanup)) {
+            self.disconnect(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)
+                .await?;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ConnectError::Timeout);
+        }
+        if self.cleanup.is_some() {
             return Err(ConnectError::Driver(DriverError::ConnectInProgress));
         }
         if self.connection.is_none() {
@@ -1487,8 +1513,8 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
     }
 
     /// Request a policy-owned disconnect and drive the pinned SME/MLME until
-    /// it reaches Idle. The retained transaction still carries the resulting
-    /// `OnDisconnect` event for the policy service to consume.
+    /// it reaches Idle and the driver certifies drain. The reply is the
+    /// terminal acknowledgment; no second disconnect event is emitted.
     pub async fn disconnect(
         &mut self,
         reason: fidl_sme::UserDisconnectReason,
@@ -1524,7 +1550,10 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
         };
         match result {
-            Ok(()) if self.finish_failed_attempt_cleanup() => Ok(()),
+            Ok(()) if self.finish_failed_attempt_cleanup() => {
+                self.connection = None;
+                Ok(())
+            }
             Ok(()) => Err(self.contain_error(ConnectError::Driver(DriverError::RetryCleanup))),
             Err(error) if !self.revoked => Err(self.contain_error(error)),
             Err(error) => Err(error),
@@ -1659,7 +1688,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                         .connect_attempt
                         .take()
                         .expect("connect attempt retained");
-                    self.connection = Some(attempt.transaction);
+                    self.connection = Some(Connection::Active(attempt.transaction));
                     return Ok(Some(result));
                 }
                 Ok(_) => {}
@@ -1734,25 +1763,45 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if self.revoked {
             return Err(ConnectError::Driver(DriverError::Stopped));
         }
-        let Some(connection) = self.connection.as_mut() else {
-            return Ok(None);
-        };
-        match connection.try_recv() {
-            Ok(event) => {
-                if matches!(
-                    &event,
-                    wlan_sme::client::ConnectTransactionEvent::OnDisconnect { info }
-                        if !info.is_sme_reconnecting
-                ) {
-                    self.connection = None;
+        self.drain_connection_events()?;
+        Ok(self.connection_events.pop_front())
+    }
+
+    fn drain_connection_events(&mut self) -> Result<(), ConnectError> {
+        loop {
+            if self.connection_events.len() >= 64 {
+                return Err(self.contain_error(ConnectError::Driver(DriverError::UpcallOverflow)));
+            }
+            let Some(Connection::Active(connection)) = self.connection.as_mut() else {
+                return Ok(());
+            };
+            let result = match connection.try_recv() {
+                Ok(event) => {
+                    if matches!(
+                        &event,
+                        wlan_sme::client::ConnectTransactionEvent::OnDisconnect { info }
+                            if !info.is_sme_reconnecting
+                    ) {
+                        self.mlme.epoch.revoke();
+                        self.io.lock().unwrap().ethernet.set_link(false);
+                        let result = self.device.lock().unwrap().device.set_link_up(false);
+                        if let Err(status) = result {
+                            return Err(self.contain_error(ConnectError::Driver(
+                                DriverError::Ethernet(status),
+                            )));
+                        }
+                        self.connection = Some(Connection::EndedNeedsCleanup);
+                    }
+                    self.connection_events.push_back(event.into_fidl());
+                    Ok(())
                 }
-                Ok(Some(event.into_fidl()))
-            }
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Closed) => {
-                self.connection = None;
-                Err(ConnectError::Driver(DriverError::ConnectTransactionClosed))
-            }
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Closed) => {
+                    Err(self
+                        .contain_error(ConnectError::Driver(DriverError::ConnectTransactionClosed)))
+                }
+            };
+            result?;
         }
     }
 }
@@ -1813,6 +1862,7 @@ mod tests {
         scan_offload: bool,
         empty_bands: bool,
         channel_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
+        clear_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
     }
 
     #[derive(Clone)]
@@ -1998,7 +2048,17 @@ mod tests {
             &mut self,
             _: fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-            std::future::ready(record!(self, "clear", ()))
+            let completion = {
+                let mut effects = self.0.lock().unwrap();
+                effects.calls.push("clear");
+                effects.clear_completion.take()
+            };
+            async move {
+                match completion {
+                    Some(completion) => completion.await.unwrap_or(Err(zx::Status::CANCELED)),
+                    None => Ok(()),
+                }
+            }
         }
         fn start_passive_scan(
             &mut self,
@@ -2377,6 +2437,7 @@ mod tests {
                     connect_request(),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(runtime.drive_connect_once().await.unwrap(), None);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2416,6 +2477,7 @@ mod tests {
                         connect_request(),
                         std::time::Instant::now() + std::time::Duration::from_secs(2),
                     )
+                    .await
                     .unwrap();
                 runtime.drive_connect_once().await.unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -2465,6 +2527,7 @@ mod tests {
                             connect_request(),
                             std::time::Instant::now() + std::time::Duration::from_secs(5),
                         )
+                        .await
                         .is_err()
                 );
                 reply.send(Ok(())).unwrap();
@@ -2558,6 +2621,7 @@ mod tests {
                     connect_request(),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(runtime.drive_connect_once().await.unwrap(), None);
             assert!(!runtime.mlme.is_idle());
@@ -2611,6 +2675,7 @@ mod tests {
                     }),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(runtime.drive_scan_once().await.unwrap(), None);
             assert!(!runtime.mlme.is_idle());
@@ -2744,9 +2809,15 @@ mod tests {
                     .unwrap()
                     .recv(vec![0, 0], rx_info());
 
-                let error = (runtime.connect(connect_request(), std::time::Instant::now()))
+                runtime
+                    .begin_connect(
+                        connect_request(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
                     .await
-                    .unwrap_err();
+                    .unwrap();
+                runtime.connect_attempt.as_mut().unwrap().deadline = std::time::Instant::now();
+                let error = runtime.drive_connect_once().await.unwrap_err();
                 assert_eq!(
                     error,
                     if reset_failure {
@@ -2847,12 +2918,142 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_admission_retains_terminal_event_and_original_cleanup_deadline() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            effects.lock().unwrap().retry_cleanup = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            runtime.connect(connect_request(), deadline).await.unwrap();
+            let (reply, completion) = oneshot::channel();
+            effects.lock().unwrap().clear_completion = Some(completion);
+            let (events, stream) = mpsc::unbounded();
+            runtime.connection = Some(Connection::Active(stream));
+            events
+                .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+                    info: fidl_sme::DisconnectInfo {
+                        is_sme_reconnecting: false,
+                        disconnect_source: fidl_sme::DisconnectSource::User(
+                            fidl_sme::UserDisconnectReason::FailedToConnect,
+                        ),
+                    },
+                })
+                .unwrap();
+            drop(events);
+            {
+                let mut admission =
+                    std::pin::pin!(runtime.begin_connect(connect_request(), deadline));
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        assert!(admission.as_mut().now_or_never().is_none());
+                        if effects.lock().unwrap().calls.contains(&"clear") {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(runtime.cleanup.as_ref().unwrap().deadline, deadline);
+            assert_eq!(runtime.connection_events.len(), 1);
+            reply.send(Ok(())).unwrap();
+            runtime
+                .disconnect(
+                    fidl_sme::UserDisconnectReason::FailedToConnect,
+                    deadline + std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
+            ));
+            assert!(runtime.next_connection_event().unwrap().is_none());
+            assert!(runtime.connect_attempt.is_none());
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn terminal_disconnect_requires_certified_cleanup_before_connect_or_scan() {
+        for (certified, scan) in [(false, false), (true, false), (false, true), (true, true)] {
+            run_local_test(async {
+                let (fake, effects) = Fake::new(0);
+                effects.lock().unwrap().retry_cleanup = certified;
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                let (events, stream) = mpsc::unbounded();
+                runtime.connection = Some(Connection::Active(stream));
+                events
+                    .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
+                        info: fidl_sme::DisconnectInfo {
+                            is_sme_reconnecting: false,
+                            disconnect_source: fidl_sme::DisconnectSource::User(
+                                fidl_sme::UserDisconnectReason::FailedToConnect,
+                            ),
+                        },
+                    })
+                    .unwrap();
+                drop(events);
+                // Do not consume the terminal event first: admission must
+                // reconcile the authoritative stream itself.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                let result = if scan {
+                    runtime
+                        .begin_scan(
+                            fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                                channels: vec![],
+                            }),
+                            deadline,
+                        )
+                        .await
+                } else {
+                    runtime.begin_connect(connect_request(), deadline).await
+                };
+                assert_eq!(result.is_ok(), certified);
+                assert!(
+                    effects
+                        .lock()
+                        .unwrap()
+                        .calls
+                        .contains(&"finish_failed_connect_attempt")
+                );
+                if certified {
+                    assert!(matches!(
+                        runtime.next_connection_event().unwrap(),
+                        Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
+                    ));
+                    assert!(runtime.next_connection_event().unwrap().is_none());
+                    assert!(runtime.cleanup.is_none());
+                    if scan {
+                        assert_eq!(runtime.scan_attempt.as_ref().unwrap().deadline, deadline);
+                    } else {
+                        assert_eq!(runtime.connect_attempt.as_ref().unwrap().deadline, deadline);
+                        effects.lock().unwrap().simulate_ap = true;
+                        loop {
+                            if let Some(result) = runtime.drive_connect_once().await.unwrap() {
+                                assert_eq!(result.code, fidl_ieee80211::StatusCode::Success);
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                } else {
+                    assert!(runtime.revoked);
+                }
+                runtime.shutdown().await.unwrap();
+            });
+        }
+    }
+
+    #[test]
     fn reconnecting_disconnect_retains_the_transaction_stream() {
         run_local_test(async {
             let (fake, _) = Fake::new(0);
             let mut runtime = runtime(fake).await;
             let (events, stream) = mpsc::unbounded();
-            runtime.connection = Some(stream);
+            runtime.connection = Some(Connection::Active(stream));
             events
                 .unbounded_send(wlan_sme::client::ConnectTransactionEvent::OnDisconnect {
                     info: fidl_sme::DisconnectInfo {
@@ -2908,12 +3109,15 @@ mod tests {
                     connect_request(),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(
-                runtime.begin_connect(
-                    connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                ),
+                runtime
+                    .begin_connect(
+                        connect_request(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
+                    .await,
                 Err(ConnectError::Driver(DriverError::ConnectInProgress))
             );
 
@@ -2947,6 +3151,7 @@ mod tests {
                     connect_request(),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             let result = loop {
                 if let Some(result) = (runtime.drive_connect_once()).await.unwrap() {
@@ -2973,6 +3178,7 @@ mod tests {
                     connect_request(),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
 
             assert_eq!(
@@ -3048,10 +3254,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(matches!(
-                runtime.next_connection_event().unwrap(),
-                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
-            ));
+            assert!(runtime.next_connection_event().unwrap().is_none());
             assert!(sme_is_retry_quiescent(&runtime.sme().status()));
 
             (runtime.connect(
@@ -3128,14 +3331,17 @@ mod tests {
                     }),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(
-                runtime.begin_scan(
-                    fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
-                        channels: vec![]
-                    }),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                ),
+                runtime
+                    .begin_scan(
+                        fidl_sme::ScanRequest::Passive(fidl_sme::PassiveScanRequest {
+                            channels: vec![]
+                        }),
+                        std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
+                    .await,
                 Err(ConnectError::Driver(DriverError::ScanInProgress))
             );
             assert_eq!((runtime.drive_scan_once()).await.unwrap(), None);
@@ -3176,6 +3382,7 @@ mod tests {
                     }),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(runtime.drive_scan_once().await.unwrap(), None);
             drain_mlme(&mut runtime).await;
@@ -3215,6 +3422,7 @@ mod tests {
                     }),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
+                .await
                 .unwrap();
             assert_eq!(runtime.drive_scan_once().await.unwrap(), None);
             drain_mlme(&mut runtime).await;
