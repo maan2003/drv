@@ -87,6 +87,19 @@ impl Default for ClientTx {
 }
 
 impl ClientTx {
+    pub(super) fn has_published(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Ring reset does not discard CPU-owned queued frames or PID retirement.
+    pub(super) fn rebase_after_wpdma_reset(&mut self) -> Result<(), zx::Status> {
+        if self.pending.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        self.producer = 0;
+        Ok(())
+    }
+
     pub fn idle(&self) -> bool {
         self.queue.is_empty() && self.pending.is_none() && self.roc.is_none()
     }
@@ -1120,5 +1133,38 @@ mod tests {
             tx.enqueue(context, &frame(), 12, channel()),
             Err(zx::Status::NO_RESOURCES)
         );
+    }
+    #[test]
+    fn wpdma_rebase_resets_only_hardware_cursor() {
+        let mut tx = ClientTx::default();
+        tx.producer = 9;
+        tx.retired_pids[4] = true;
+        tx.rebase_after_wpdma_reset().unwrap();
+        assert_eq!(tx.producer, 0);
+        assert!(tx.retired_pids[4]);
+
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            Instant::now() + Duration::from_secs(1),
+        );
+        tx.pending = Some(PublishedFrame {
+            frame: QueuedFrame {
+                context,
+                bytes: zeroize::Zeroizing::new(frame()),
+                control_port: false,
+                data: false,
+                tid: 0,
+                rate: 12,
+                channel: channel(),
+            },
+            slot: 0,
+            next: 1,
+            token: 0,
+            pid: 3,
+            deadline: Instant::now() + Duration::from_secs(1),
+            descriptor_done: false,
+            freed: false,
+            status: None,
+        });
+        assert_eq!(tx.rebase_after_wpdma_reset(), Err(zx::Status::BAD_STATE));
     }
 }

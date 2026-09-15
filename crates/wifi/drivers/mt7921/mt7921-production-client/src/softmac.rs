@@ -26,6 +26,10 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
 
     fn stop(&mut self) -> Result<(), zx::Status> {
         self.upcalls = None;
+        self.hif_epoch = self.hif_epoch.wrapping_add(1);
+        if !matches!(self.hif_state, crate::HifPowerState::DriverOwned) {
+            self.session.attempt_driver_ownership_for_stop();
+        }
         self.session
             .contain()
             .map(|_| ())
@@ -33,10 +37,135 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
     }
 }
 
+fn check_power_transition_authority(
+    change: Option<&crate::peer::PowerSaveChange>,
+    now: std::time::Instant,
+) -> Result<(), zx::Status> {
+    match change {
+        Some(change) => change.context.check(now),
+        None => Ok(()),
+    }
+}
+
+impl crate::HifPowerState {
+    fn retain_irq_wake(&self, pending: &mut bool) {
+        if !matches!(self, Self::DriverOwned) {
+            *pending = true;
+        }
+    }
+
+    /// Completing CLR_OWN consumes the retained reason only when this turn is
+    /// allowed to continue into the operational drain.
+    fn complete_driver_wake(&mut self, pending: &mut bool) -> bool {
+        *self = Self::DriverOwned;
+        *pending = false;
+        true
+    }
+}
+
+impl Mt7921Driver {
+    fn host_work_except_power_change(&self) -> bool {
+        !matches!(
+            self.mac_initialization,
+            crate::radio::MacInitialization::Ready
+        ) || !self.radio_preparation.ready()
+            || self.channel_change.is_some()
+            || self.peer_join.is_some()
+            || self.peer_association.is_some()
+            || self.key_installation.is_some()
+            || self.scan.is_some()
+            || !self.tx.idle()
+            || self.irq_wake_pending
+    }
+
+    fn host_work_pending(&self) -> bool {
+        self.host_work_except_power_change() || self.power_save_change.is_some()
+    }
+
+    fn ownership_authority(&self) -> mt7921_core::DriverOwnershipWakeAuthority {
+        mt7921_core::DriverOwnershipWakeAuthority {
+            epoch: self.hif_epoch,
+            deadline_ms: self.session.now_ms().saturating_add(501),
+        }
+    }
+
+    fn begin_firmware_ownership(&mut self) -> Result<(), zx::Status> {
+        self.session
+            .enable_power_wake_sources()
+            .map_err(|_| zx::Status::IO)?;
+        let now = self.session.now_ms();
+        let sleep = mt7921_core::FirmwareOwnershipSleep::new(self.ownership_authority(), now)
+            .map_err(|_| zx::Status::TIMED_OUT)?;
+        self.hif_state = crate::HifPowerState::Sleeping(sleep);
+        Ok(())
+    }
+
+    /// Return true only when operational MMIO is legal in this turn.
+    fn drive_hif_gate(&mut self) -> Result<bool, zx::Status> {
+        let now = self.session.now_ms();
+        match &mut self.hif_state {
+            crate::HifPowerState::DriverOwned => Ok(true),
+            crate::HifPowerState::FirmwareOwned => {
+                if !self.host_work_pending() {
+                    return Ok(false);
+                }
+                let wake = mt7921_core::DriverOwnershipWake::new(
+                    mt7921_core::DriverOwnershipWakeAuthority {
+                        epoch: self.hif_epoch,
+                        deadline_ms: now.saturating_add(501),
+                    },
+                    now,
+                )
+                .map_err(|_| zx::Status::TIMED_OUT)?;
+                self.hif_state = crate::HifPowerState::Waking(wake);
+                Ok(false)
+            }
+            crate::HifPowerState::Sleeping(sleep) => {
+                match self
+                    .session
+                    .poll_firmware_ownership(sleep, self.hif_epoch)
+                    .map_err(|_| zx::Status::IO)?
+                {
+                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => Ok(false),
+                    mt7921_core::DriverOwnershipWakeProgress::Acquired => {
+                        self.hif_state = crate::HifPowerState::FirmwareOwned;
+                        Ok(false)
+                    }
+                }
+            }
+            crate::HifPowerState::Waking(wake) => {
+                match self
+                    .session
+                    .poll_driver_ownership(wake, self.hif_epoch)
+                    .map_err(|_| zx::Status::IO)?
+                {
+                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => Ok(false),
+                    mt7921_core::DriverOwnershipWakeProgress::Acquired => {
+                        if self
+                            .session
+                            .wpdma_needs_reinit()
+                            .map_err(|_| zx::Status::IO)?
+                        {
+                            self.session
+                                .runtime_reinitialize(&mut self.data_rx, &mut self.tx)
+                                .map_err(|_| zx::Status::IO)?;
+                        }
+                        Ok(self
+                            .hif_state
+                            .complete_driver_wake(&mut self.irq_wake_pending))
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl ClientRuntimeDriver for Mt7921Driver {
     fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
         use std::future::Future as _;
-        if self.drive()? {
+        let idle_firmware_owned = matches!(self.hif_state, crate::HifPowerState::FirmwareOwned)
+            && !self.host_work_pending();
+        if !idle_firmware_owned && self.drive()? {
             return Ok(true);
         }
         let resources = self
@@ -53,10 +182,17 @@ impl ClientRuntimeDriver for Mt7921Driver {
             std::task::Poll::Pending => Ok(false),
             // Reading eventfd consumes the notification, not the descriptors:
             // force another bounded hardware observation before sleeping.
-            std::task::Poll::Ready(Ok(_)) => Ok(true),
+            std::task::Poll::Ready(Ok(_)) => {
+                self.hif_state.retain_irq_wake(&mut self.irq_wake_pending);
+                Ok(true)
+            }
             std::task::Poll::Ready(Err(_)) => {
                 self.session.lifecycle = SessionLifecycle::Closing;
                 self.upcalls = None;
+                if !matches!(self.hif_state, crate::HifPowerState::DriverOwned) {
+                    self.session.attempt_driver_ownership_for_stop();
+                }
+                let _ = self.session.contain();
                 Err(zx::Status::IO)
             }
         }
@@ -77,19 +213,49 @@ impl ClientRuntimeDriver for Mt7921Driver {
             || self.power_save_change.is_some()
             || self.scan.is_some()
             || !self.tx.idle();
-        pending.then(|| std::time::Instant::now() + std::time::Duration::from_millis(1))
+        (pending
+            || matches!(
+                self.hif_state,
+                crate::HifPowerState::Sleeping(_) | crate::HifPowerState::Waking(_)
+            ))
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1))
     }
 
     fn drive(&mut self) -> Result<bool, zx::Status> {
         if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
             return Err(zx::Status::BAD_STATE);
         }
-        let resources = self
-            .session
-            .resources
-            .as_mut()
-            .ok_or(zx::Status::BAD_STATE)?;
         let result = (|| {
+            // SET_OWN/CLR_OWN polling never renews the caller's lease. Check
+            // every transition turn, including after hardware handoff and
+            // immediately before acknowledging state 2.
+            check_power_transition_authority(
+                self.power_save_change.as_ref(),
+                std::time::Instant::now(),
+            )?;
+            // A completed state-2 command is acknowledged only after SET_OWN
+            // itself has been observed. This bookkeeping performs no MMIO.
+            if matches!(self.hif_state, crate::HifPowerState::FirmwareOwned)
+                && self
+                    .power_save_change
+                    .as_ref()
+                    .is_some_and(|change| change.enabled && change.complete())
+            {
+                let mut change = self.power_save_change.take().expect("checked above");
+                self.power_save_enabled = true;
+                if let Some(reply) = change.reply.take() {
+                    let _ = reply.send(Ok(()));
+                }
+                return Ok(true);
+            }
+            if !self.drive_hif_gate()? {
+                return Ok(false);
+            }
+            let resources = self
+                .session
+                .resources
+                .as_mut()
+                .ok_or(zx::Status::BAD_STATE)?;
             let mut progressed = self.mac_initialization.drive(
                 resources,
                 &mut self.session.mcu.0,
@@ -244,17 +410,49 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     self.peer_association = None;
                 }
             }
-            if let Some(change) = self.power_save_change.as_mut() {
-                progressed |= change.drive(
-                    resources,
-                    &mut self.session.mcu.0,
-                    &mut self.session.receive,
-                    self.session.start,
-                    std::time::Instant::now(),
-                )?;
-                if change.complete() {
+            let defer_unstarted_balanced = self
+                .power_save_change
+                .as_ref()
+                .is_some_and(|change| change.enabled && !change.complete())
+                && self.session.mcu.0.active_command_slot().is_none()
+                && (self.channel_change.is_some()
+                    || self.peer_join.is_some()
+                    || self.peer_association.is_some()
+                    || self.key_installation.is_some()
+                    || self.scan.is_some()
+                    || !self.tx.idle()
+                    || self.irq_wake_pending);
+            if !defer_unstarted_balanced {
+                if let Some(change) = self.power_save_change.as_mut() {
+                    progressed |= change.drive(
+                        resources,
+                        &mut self.session.mcu.0,
+                        &mut self.session.receive,
+                        self.session.start,
+                        std::time::Instant::now(),
+                    )?;
+                    if !change.complete() {
+                        // Serialize the state transition's MCU ownership.
+                        return Ok(progressed);
+                    }
                     change.context.check(std::time::Instant::now())?;
-                    self.power_save_enabled = change.enabled;
+                    if change.enabled {
+                        if self.channel_change.is_some()
+                            || self.peer_join.is_some()
+                            || self.peer_association.is_some()
+                            || self.key_installation.is_some()
+                            || self.scan.is_some()
+                            || !self.tx.idle()
+                            || self.irq_wake_pending
+                        {
+                            return Ok(progressed);
+                        }
+                        // Firmware has acknowledged state 2 while the host
+                        // still owns HIF; enable wake sources, then SET_OWN.
+                        self.begin_firmware_ownership()?;
+                        return Ok(true);
+                    }
+                    self.power_save_enabled = false;
                     if let Some(reply) = change.reply.take() {
                         let _ = reply.send(Ok(()));
                     }
@@ -290,6 +488,13 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     self.key_installation = None;
                 }
             }
+            if self.power_save_enabled
+                && !self.host_work_pending()
+                && matches!(self.hif_state, crate::HifPowerState::DriverOwned)
+            {
+                self.begin_firmware_ownership()?;
+                progressed = true;
+            }
             Ok(progressed)
         })();
         if let Err(status) = result {
@@ -321,6 +526,13 @@ impl ClientRuntimeDriver for Mt7921Driver {
             self.current_channel = None;
             self.session.lifecycle = SessionLifecycle::Closing;
             self.upcalls = None;
+            // Operational MMIO/DMA failures are ambiguous. Retain ownership
+            // until the existing reset/BME containment transaction proves it
+            // safe rather than waiting for another protocol call.
+            if !matches!(self.hif_state, crate::HifPowerState::DriverOwned) {
+                self.session.attempt_driver_ownership_for_stop();
+            }
+            let _ = self.session.contain();
         }
         result
     }
@@ -342,6 +554,10 @@ impl ClientRuntimeDriver for Mt7921Driver {
 
     fn reset(&mut self) -> Result<(), zx::Status> {
         self.upcalls = None;
+        self.hif_epoch = self.hif_epoch.wrapping_add(1);
+        if !matches!(self.hif_state, crate::HifPowerState::DriverOwned) {
+            self.session.attempt_driver_ownership_for_stop();
+        }
         self.session
             .contain()
             .map(|_| ())
@@ -1024,5 +1240,69 @@ mod tests {
             false,
         );
         assert_eq!(upcalls.0.len(), 1);
+    }
+    #[test]
+    fn irq_wake_is_retained_through_every_non_driver_owned_state() {
+        let authority = mt7921_core::DriverOwnershipWakeAuthority {
+            epoch: 1,
+            deadline_ms: 10,
+        };
+        let sleep = mt7921_core::FirmwareOwnershipSleep::new(authority, 0).unwrap();
+        let wake = mt7921_core::DriverOwnershipWake::new(authority, 0).unwrap();
+
+        for state in [
+            crate::HifPowerState::Sleeping(sleep),
+            crate::HifPowerState::FirmwareOwned,
+            crate::HifPowerState::Waking(wake),
+        ] {
+            let mut pending = false;
+            state.retain_irq_wake(&mut pending);
+            assert!(pending);
+        }
+
+        let mut pending = false;
+        crate::HifPowerState::DriverOwned.retain_irq_wake(&mut pending);
+        assert!(!pending);
+    }
+
+    #[test]
+    fn acquired_wake_clears_intent_only_as_operational_drain_resumes() {
+        let authority = mt7921_core::DriverOwnershipWakeAuthority {
+            epoch: 1,
+            deadline_ms: 10,
+        };
+        let mut state = crate::HifPowerState::Waking(
+            mt7921_core::DriverOwnershipWake::new(authority, 0).unwrap(),
+        );
+        let mut pending = true;
+        assert!(state.complete_driver_wake(&mut pending));
+        assert!(matches!(state, crate::HifPowerState::DriverOwned));
+        assert!(!pending);
+    }
+    #[test]
+    fn power_transition_handoff_does_not_renew_expired_or_revoked_authority() {
+        let now = std::time::Instant::now();
+        let expired = wlan_softmac_class_support::conformance::operation_context(
+            now - std::time::Duration::from_millis(1),
+        )
+        .0;
+        let (reply, _) = futures_channel::oneshot::channel();
+        let expired = crate::peer::PowerSaveChange::new(expired, true, reply).unwrap();
+        assert_eq!(
+            check_power_transition_authority(Some(&expired), now),
+            Err(zx::Status::TIMED_OUT)
+        );
+
+        let (revoked, revocation) = wlan_softmac_class_support::conformance::operation_context(
+            now + std::time::Duration::from_secs(1),
+        );
+        let (reply, _) = futures_channel::oneshot::channel();
+        let revoked = crate::peer::PowerSaveChange::new(revoked, true, reply).unwrap();
+        revocation();
+        assert_eq!(
+            check_power_transition_authority(Some(&revoked), now),
+            Err(zx::Status::CANCELED)
+        );
+        assert_eq!(check_power_transition_authority(None, now), Ok(()));
     }
 }

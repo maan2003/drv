@@ -792,6 +792,259 @@ pub(super) fn activate<B: Backend>(
     })
 }
 
+/// Rebuild the live WPDMA transport after firmware reports lost ring state.
+///
+/// The caller has already acquired the HIF. No PCI, MSI, or allocation
+/// ownership changes here; any error is ambiguous and requires containment.
+pub(super) fn runtime_reinitialize<B: Backend>(
+    resources: &mut OwnedHardwareResources<B>,
+    mechanics: &mut mt7921_core::LoaderMechanics,
+    receive: &mut crate::receive::RxRouting,
+    data_rx: &mut crate::receive::DataRx,
+    tx: &mut crate::transmit::ClientTx,
+) -> Result<(), String> {
+    if mechanics.active_command_slot().is_some() || mechanics.has_pending_scatter() {
+        return Err("MCU DMA publication is still owned".into());
+    }
+    if tx.has_published() {
+        return Err("client TX DMA publication is still owned".into());
+    }
+
+    let wfdma = resources
+        .bar0
+        .slice(0xd4000, PAGE)
+        .map_err(|e| format!("slice WFDMA: {e:?}"))?;
+    let mac = resources
+        .bar0
+        .slice(0x10000, PAGE)
+        .map_err(|e| format!("slice PCIe MAC: {e:?}"))?;
+    wfdma
+        .write_u32(HOST_INT_ENABLE, 0)
+        .map_err(|e| format!("mask host IRQ: {e:?}"))?;
+    readback(&wfdma, HOST_INT_ENABLE, 0, "masked host interrupt enable")?;
+    mac.write_u32(PCIE_MAC_INT_ENABLE, 0)
+        .map_err(|e| format!("mask MAC IRQ: {e:?}"))?;
+    readback(&mac, PCIE_MAC_INT_ENABLE, 0, "masked MAC interrupt enable")?;
+
+    let initial = wfdma
+        .read_u32(WFDMA_GLO_CFG)
+        .map_err(|e| format!("read WFDMA global: {e:?}"))?;
+    if initial == u32::MAX {
+        return Err("WFDMA global returned all ones".into());
+    }
+    let disabled = initial & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+    wfdma
+        .write_u32(WFDMA_GLO_CFG, disabled)
+        .map_err(|e| format!("disable WFDMA: {e:?}"))?;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        let value = wfdma
+            .read_u32(WFDMA_GLO_CFG)
+            .map_err(|e| format!("read WFDMA idle: {e:?}"))?;
+        if value == u32::MAX {
+            return Err("WFDMA idle read returned all ones".into());
+        }
+        if value & WFDMA_GLO_CFG_BUSY == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("WFDMA did not quiesce: {value:#010x}"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    initialize_descriptors(&mut resources.dma)
+        .map_err(|e| format!("initialize runtime descriptors: {e:?}"))?;
+
+    let tx_guard = resources
+        .dma
+        .tx_guard
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let fwdl = resources
+        .dma
+        .fwdl_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let mcu_tx = resources
+        .dma
+        .mcu_tx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let band0 = resources
+        .dma
+        .management_tx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    prepare_global_tx_rings(
+        &mut TxIo(
+            resources
+                .bar0
+                .slice(0xd4000, PAGE)
+                .map_err(|e| format!("slice TX WFDMA: {e:?}"))?,
+        ),
+        tx_guard,
+        fwdl,
+        mcu_tx,
+        band0,
+        |_| {},
+    )
+    .map_err(|e| format!("route runtime TX rings: {e:?}"))?;
+
+    let rx_guard = resources
+        .dma
+        .rx_guard
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let wm = resources
+        .dma
+        .mcu_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    prepare_global_rx_rings(
+        &mut RxIo(
+            resources
+                .bar0
+                .slice(0xd4000, PAGE)
+                .map_err(|e| format!("slice RX WFDMA: {e:?}"))?,
+        ),
+        rx_guard,
+        wm,
+        |_| {},
+    )
+    .map_err(|e| format!("route runtime RX rings: {e:?}"))?;
+    let data = resources
+        .dma
+        .data_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits() as u32;
+    let wm2 = resources
+        .dma
+        .wa_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits() as u32;
+    let mut rx = RxIo(
+        resources
+            .bar0
+            .slice(0xd4000, PAGE)
+            .map_err(|e| format!("slice routed WFDMA: {e:?}"))?,
+    );
+    for (index, base, count) in [
+        (2, data, MT7921_DATA_RX_RING_COUNT as u32),
+        (4, wm2, MT7921_MCU_RX_RING_COUNT as u32),
+    ] {
+        rx.write_ring_initial(index, base, count)
+            .map_err(|e| format!("route runtime RX ring {index}: {e:?}"))?;
+        rx.release_fence();
+        rx.publish_ring_cpu_index(index, count - 1)
+            .map_err(|e| format!("publish runtime RX ring {index}: {e:?}"))?;
+    }
+
+    for (offset, value) in [
+        (0x2f0, 0),
+        (0x680, 4),
+        (0x688, 0x0040_0004),
+        (0x68c, 0x0080_0004),
+        (0x690, 0x00c0_0004),
+        (0x694, 0x0100_0004),
+        (0x600, 0x0140_0004),
+        (0x604, 0x0180_0004),
+        (0x608, 0x01c0_0004),
+        (0x60c, 0x0200_0004),
+        (0x610, 0x0240_0004),
+        (0x614, 0x0280_0004),
+        (0x618, 0x02c0_0004),
+        (0x640, 0x0340_0004),
+        (0x644, 0x0380_0004),
+    ] {
+        wfdma
+            .write_u32(offset, value)
+            .map_err(|e| format!("configure runtime prefetch: {e:?}"))?;
+    }
+
+    mechanics
+        .rebase_after_wpdma_reset()
+        .map_err(|e| format!("rebase MCU: {e:?}"))?;
+    receive.rebase_after_wpdma_reset();
+    data_rx.rebase_after_wpdma_reset();
+    tx.rebase_after_wpdma_reset()
+        .map_err(|e| format!("rebase client TX: {e:?}"))?;
+
+    let global = disabled
+        | (1 << 0)
+        | (1 << 2)
+        | (3 << 4)
+        | (1 << 6)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 15)
+        | (1 << 21)
+        | (1 << 28)
+        | (1 << 30);
+    wfdma
+        .write_u32(WFDMA_GLO_CFG, global)
+        .map_err(|e| format!("enable WFDMA: {e:?}"))?;
+    let actual = wfdma
+        .read_u32(WFDMA_GLO_CFG)
+        .map_err(|e| format!("verify WFDMA: {e:?}"))?;
+    verify_wfdma_global_readback(actual, global, "runtime WFDMA global")?;
+
+    // Mark the rebuilt engine healthy before allowing firmware to own it again.
+    let dummy = resources
+        .bar0
+        .read_u32(0x2120)
+        .map_err(|e| format!("read dummy: {e:?}"))?;
+    if dummy == u32::MAX {
+        return Err("WFDMA dummy returned all ones".into());
+    }
+    resources
+        .bar0
+        .write_u32(0x2120, dummy | (1 << 1))
+        .map_err(|e| format!("mark WFDMA healthy: {e:?}"))?;
+    readback(&resources.bar0, 0x2120, dummy | (1 << 1), "WFDMA healthy")?;
+
+    let wake = resources
+        .bar0
+        .read_u32(0xd41f4)
+        .map_err(|e| format!("read wake IRQ: {e:?}"))?;
+    if wake == u32::MAX {
+        return Err("MCU wake IRQ enable returned all ones".into());
+    }
+    resources
+        .bar0
+        .write_u32(0xd41f4, wake | 1)
+        .map_err(|e| format!("enable wake IRQ: {e:?}"))?;
+    readback(&resources.bar0, 0xd41f4, wake | 1, "MCU wake IRQ enable")?;
+    let host_mask =
+        McuRxIrqTopology::firmware().mask() | mt7921_core::MT7921_DATA_RX_IRQ_BIT | (1 << 29);
+    wfdma
+        .write_u32(HOST_INT_ENABLE, host_mask)
+        .map_err(|e| format!("restore host IRQ: {e:?}"))?;
+    readback(
+        &wfdma,
+        HOST_INT_ENABLE,
+        host_mask,
+        "runtime host interrupt enable",
+    )?;
+    mac.write_u32(PCIE_MAC_INT_ENABLE, 0xff)
+        .map_err(|e| format!("restore MAC IRQ: {e:?}"))?;
+    readback(
+        &mac,
+        PCIE_MAC_INT_ENABLE,
+        0xff,
+        "runtime MAC interrupt enable",
+    )
+}
+
 pub(super) fn quiesce<B: Backend>(
     resources: &mut OwnedHardwareResources<B>,
     pci: &mut impl ActivationPci,
@@ -866,6 +1119,41 @@ mod tests {
             post_reset_registers: None,
             post_reset_pci: None,
         }
+    }
+
+    #[test]
+    fn runtime_reinit_rebuilds_rings_and_restores_exact_wake_masks() {
+        let (device, _, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        let mut mechanics = mt7921_core::LoaderMechanics::new(73);
+        let mut receive = crate::receive::RxRouting::default();
+        let mut data = crate::receive::DataRx::default();
+        let mut tx = crate::transmit::ClientTx::default();
+
+        runtime_reinitialize(
+            &mut resources,
+            &mut mechanics,
+            &mut receive,
+            &mut data,
+            &mut tx,
+        )
+        .unwrap();
+
+        assert_eq!(mechanics.sequence(), 73);
+        assert_eq!(mechanics.command_producer(), 0);
+        assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & (1 << 1), 1 << 1);
+        assert_eq!(resources.bar0.read_u32(0xd41f4).unwrap() & 1, 1);
+        assert_eq!(
+            resources.bar0.read_u32(0xd4204).unwrap(),
+            McuRxIrqTopology::firmware().mask() | mt7921_core::MT7921_DATA_RX_IRQ_BIT | (1 << 29)
+        );
+        assert_eq!(resources.bar0.read_u32(0x10188).unwrap(), 0xff);
+        assert_eq!(resources.bar0.read_u32(0xd4508).unwrap(), 7);
+        assert_eq!(
+            resources.bar0.read_u32(0xd4528).unwrap(),
+            (MT7921_DATA_RX_RING_COUNT - 1) as u32
+        );
     }
 
     #[test]
