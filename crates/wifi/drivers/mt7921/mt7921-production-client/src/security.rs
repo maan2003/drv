@@ -97,7 +97,11 @@ pub(super) fn accept_rx(
     if cipher == 0 {
         return fc & 0x4000 == 0 && (eapol || (robust && !pmf));
     }
-    if cipher != 4 || rxd1 & ((1 << 23) | (1 << 24)) != 0 || rxd1 & 0x3ff != 1 {
+    // Firmware may report the interface's GTK slot for group traffic.
+    // Like Linux's peer-to-VIF receive mapping, either reported slot still
+    // selects the GTK below; the interface slot never authorizes unicast.
+    let wcid = rxd1 & 0x3ff;
+    if cipher != 4 || rxd1 & ((1 << 23) | (1 << 24)) != 0 || !(wcid == 1 || (group && wcid == 19)) {
         return false;
     }
     let key = if group { gtk.as_mut() } else { ptk.as_mut() };
@@ -158,6 +162,80 @@ pub(super) fn association_pmf(frame: &[u8]) -> Result<bool, zx::Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn group_wcid_uses_gtk_without_accepting_foreign_or_unicast_slots() {
+        let gtk_descriptor = 19u32 | (4 << 16) | (2 << 21);
+        for (group, descriptor, accepted) in [
+            (true, gtk_descriptor, true),
+            (true, (gtk_descriptor & !0x3ff) | 1, true),
+            (true, (gtk_descriptor & !0x3ff) | 2, false),
+            (false, 19 | (4 << 16), false),
+            (false, 1 | (4 << 16), true),
+            (true, gtk_descriptor | (1 << 23), false),
+            (true, gtk_descriptor | (1 << 24), false),
+            (true, gtk_descriptor & !(3 << 21), false),
+            (true, gtk_descriptor & !(31 << 16), false),
+        ] {
+            let mut envelope = [0; 24];
+            envelope[4..8].copy_from_slice(&descriptor.to_le_bytes());
+            let mut bytes = vec![0; 32];
+            bytes[..2].copy_from_slice(&[0x08, 0x42]);
+            bytes[4..10].copy_from_slice(&if group { [0x33; 6] } else { [2; 6] });
+            bytes[10..16].copy_from_slice(&[4; 6]);
+            bytes[24..].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x86, 0xdd]);
+            let mut frame = mt7921_core::Connac2RxFrame {
+                bytes,
+                band: mt7921_core::PhysicalBand::Ghz5,
+                channel: 149,
+                rssi_dbm: -60,
+                pn: Some([0, 0, 0, 0, 0, 1]),
+            };
+            let key = |index| {
+                Some(crate::peer::ClientKey {
+                    index,
+                    bytes: zeroize::Zeroizing::new(vec![0x5a; 16]),
+                    rx_pn: [0; 16],
+                    management_rx_pn: 0,
+                })
+            };
+            let (mut ptk, mut gtk) = (key(0), key(2));
+            assert_eq!(
+                accept_rx(
+                    &envelope,
+                    &mut frame,
+                    [2; 6],
+                    Some([4; 6]),
+                    &mut ptk,
+                    &mut gtk,
+                    &mut None,
+                    true
+                ),
+                accepted,
+                "group={group}, descriptor={descriptor:x}"
+            );
+            assert_eq!(gtk.as_ref().unwrap().rx_pn[0], u64::from(accepted && group));
+            assert_eq!(
+                ptk.as_ref().unwrap().rx_pn[0],
+                u64::from(accepted && !group)
+            );
+            if accepted {
+                assert!(
+                    !accept_rx(
+                        &envelope,
+                        &mut frame,
+                        [2; 6],
+                        Some([4; 6]),
+                        &mut ptk,
+                        &mut gtk,
+                        &mut None,
+                        true
+                    ),
+                    "replay accepted"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bip_authentication_rejects_tampering_and_replay() {
         let mut key = crate::peer::ClientKey {
