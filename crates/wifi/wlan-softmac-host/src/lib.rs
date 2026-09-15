@@ -6,7 +6,10 @@
 
 mod driver;
 pub mod ethernet;
+mod mlme;
 pub mod runtime;
+mod serve;
+mod sme;
 
 #[cfg(any(test, feature = "conformance"))]
 pub use wlan_softmac_class_support::conformance;

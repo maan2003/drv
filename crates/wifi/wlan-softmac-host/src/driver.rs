@@ -151,6 +151,7 @@ struct Message {
 struct Mailbox {
     queue: VecDeque<Message>,
     closed: bool,
+    waker: Option<std::task::Waker>,
 }
 
 pub(crate) struct DriverHandle(Rc<RefCell<Mailbox>>);
@@ -180,11 +181,23 @@ impl DriverHandle {
             return Err(zx::Status::NO_RESOURCES);
         }
         mailbox.queue.push_back(Message { epoch, command });
+        if let Some(waker) = mailbox.waker.take() {
+            waker.wake();
+        }
         Ok(())
     }
 }
 
-pub(crate) struct DriverActor<D> {
+/// Native lifecycle operations are distinct from protocol requests. A stop or
+/// reset can revoke a suspended request without dropping its DMA ownership.
+pub(crate) enum OwnerCommand {
+    Link(bool, oneshot::Sender<Result<(), zx::Status>>),
+    FinishAttempt(oneshot::Sender<Result<(), zx::Status>>),
+    Stop,
+    Reset,
+}
+
+pub(crate) struct DriverActor<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> {
     device: D,
     mailbox: Rc<RefCell<Mailbox>>,
     pending: Option<Pin<Box<dyn Future<Output = ()>>>>,
@@ -196,6 +209,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
         let mailbox = Rc::new(RefCell::new(Mailbox {
             queue: VecDeque::new(),
             closed: false,
+            waker: None,
         }));
         let handle = DriverHandle(mailbox.clone());
         (
@@ -207,6 +221,58 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             },
             handle,
         )
+    }
+
+    /// Independently progress hardware while MLME awaits DeviceOps. The device
+    /// never leaves this owner until the loop returns it for final containment.
+    pub(crate) async fn serve(
+        mut self,
+        mut control: futures::channel::mpsc::Receiver<OwnerCommand>,
+    ) -> (Self, Result<(), zx::Status>) {
+        use futures::{FutureExt, StreamExt};
+        loop {
+            let turn = {
+                let command = control.next().fuse();
+                // The existing native service uses this bounded polling cadence;
+                // a mailbox enqueue wakes the owner immediately. Hardware-specific
+                // IRQ/deadline readiness can replace the fallback tick separately.
+                let tick = tokio::time::sleep(std::time::Duration::from_millis(1)).fuse();
+                let work = std::future::poll_fn(|cx| match self.poll(cx) {
+                    Ok(true) => Poll::Ready(Ok(())),
+                    Ok(false) => Poll::Pending,
+                    Err(error) => Poll::Ready(Err(error)),
+                })
+                .fuse();
+                futures::pin_mut!(command, tick, work);
+                futures::select_biased! {
+                    command = command => Ok(Some(command)),
+                    result = work => result.map(|()| None),
+                    _ = tick => Ok(None),
+                }
+            };
+            match turn {
+                Err(error) => {
+                    self.close();
+                    return (self, Err(error));
+                }
+                Ok(Some(Some(OwnerCommand::Link(up, reply)))) => {
+                    let _ = reply.send(self.set_link_up(up));
+                }
+                Ok(Some(Some(OwnerCommand::FinishAttempt(reply)))) => {
+                    let _ = reply.send(self.finish_failed_connect_attempt());
+                }
+                Ok(Some(Some(OwnerCommand::Reset))) => {
+                    let result = self.reset();
+                    return (self, result);
+                }
+                Ok(Some(Some(OwnerCommand::Stop))) | Ok(Some(None)) => {
+                    let result = self.stop();
+                    return (self, result);
+                }
+                Ok(None) => {}
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     pub(crate) fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status> {
@@ -299,6 +365,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
         }
         let message = self.mailbox.borrow_mut().queue.pop_front();
         let Some(message) = message else {
+            self.mailbox.borrow_mut().waker = Some(cx.waker().clone());
             return Ok(progressed);
         };
         if !message.epoch.is_live() {
@@ -395,5 +462,105 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             self.pending = None;
         }
         Ok(true)
+    }
+}
+
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> Drop for DriverActor<D> {
+    fn drop(&mut self) {
+        // Task cancellation and discarded task output must not bypass the
+        // owner's final stop attempt. Device resource RAII remains the backstop;
+        // Drop is not a cleanup certificate.
+        let _ = self.stop();
+    }
+}
+
+/// Ownership survives canceled shutdown waiters and failed containment attempts.
+/// The protocol side receives only command capabilities, never shared mutable D.
+pub(crate) enum HardwareOwner<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> {
+    Running {
+        task: tokio::task::JoinHandle<(DriverActor<D>, Result<(), zx::Status>)>,
+        control: futures::channel::mpsc::Sender<OwnerCommand>,
+    },
+    Returned {
+        actor: DriverActor<D>,
+        result: Result<(), zx::Status>,
+    },
+    Lost,
+}
+
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> HardwareOwner<D> {
+    pub(crate) fn observe(&mut self) -> Option<Result<(), zx::Status>> {
+        use futures::FutureExt;
+        if let Self::Running { task, .. } = self {
+            match task.now_or_never()? {
+                Ok((actor, result)) => *self = Self::Returned { actor, result },
+                Err(_) => *self = Self::Lost,
+            }
+        }
+        Some(match self {
+            Self::Returned { result, .. } => *result,
+            Self::Lost => Err(zx::Status::IO),
+            Self::Running { .. } => unreachable!(),
+        })
+    }
+
+    pub(crate) fn send(&mut self, command: OwnerCommand) -> Result<(), zx::Status> {
+        match self {
+            Self::Running { control, .. } => control.try_send(command).map_err(|error| {
+                if error.is_full() {
+                    zx::Status::NO_RESOURCES
+                } else {
+                    zx::Status::BAD_STATE
+                }
+            }),
+            _ => Err(zx::Status::BAD_STATE),
+        }
+    }
+
+    /// Admission only. The caller retains reset escalation even if closing the
+    /// full control channel can initially request only a stop.
+    pub(crate) fn request_stop(&mut self, reset: bool) {
+        if let Self::Running { control, .. } = self {
+            let command = if reset {
+                OwnerCommand::Reset
+            } else {
+                OwnerCommand::Stop
+            };
+            if control.try_send(command).is_err() {
+                control.close_channel();
+            }
+        }
+    }
+
+    pub(crate) async fn join(&mut self) {
+        if let Self::Running { task, .. } = self {
+            // Borrow, do not take: dropping this waiter cannot detach the task
+            // or discard the actor it will return.
+            let result = task.await;
+            *self = match result {
+                Ok((actor, result)) => Self::Returned { actor, result },
+                Err(_) => Self::Lost,
+            };
+        }
+    }
+
+    pub(crate) fn certify(&mut self, reset: bool) -> Result<(), zx::Status> {
+        match self {
+            Self::Returned { actor, result } => {
+                *result = if reset { actor.reset() } else { actor.stop() };
+                *result
+            }
+            Self::Running { .. } => Err(zx::Status::SHOULD_WAIT),
+            Self::Lost => Err(zx::Status::IO),
+        }
+    }
+}
+
+impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> Drop for HardwareOwner<D> {
+    fn drop(&mut self) {
+        if let Self::Running { task, control } = self {
+            control.close_channel();
+            task.abort();
+        }
     }
 }

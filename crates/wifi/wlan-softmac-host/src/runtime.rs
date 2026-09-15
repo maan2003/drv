@@ -35,17 +35,17 @@ const ETHERNET_QUEUE_CAPACITY: usize = 256;
 /// terminates the runtime cleanly rather than creating a descriptor post-lock.
 pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
 
-struct ScanOperation {
-    transaction_id: u64,
-    device_scan_id: Option<u64>,
-    context: OperationContext,
+pub(super) struct ScanOperation {
+    pub(super) transaction_id: u64,
+    pub(super) device_scan_id: Option<u64>,
+    pub(super) context: OperationContext,
 }
 
-struct MlmeExecution {
-    operation: RefCell<OperationContext>,
-    scan: RefCell<Option<ScanOperation>>,
-    epoch: RefCell<OperationEpoch>,
-    rejected: Cell<bool>,
+pub(super) struct MlmeExecution {
+    pub(super) operation: Arc<Mutex<OperationContext>>,
+    pub(super) scan: RefCell<Option<ScanOperation>>,
+    pub(super) epoch: RefCell<OperationEpoch>,
+    pub(super) rejected: Cell<bool>,
 }
 
 impl MlmeExecution {
@@ -58,16 +58,16 @@ impl MlmeExecution {
     }
 }
 
-struct HostIo {
-    ethernet: DriverEthernetPort,
-    replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
-    unpublished_ethernet_device: Option<HostEthernetDevice>,
-    pending_ethernet_devices: VecDeque<HostEthernetDevice>,
-    ethernet_mac_address: [u8; 6],
-    minstrel: Option<wlan_mlme::MinstrelWrapper>,
+pub(super) struct HostIo {
+    pub(super) ethernet: DriverEthernetPort,
+    pub(super) replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    pub(super) unpublished_ethernet_device: Option<HostEthernetDevice>,
+    pub(super) pending_ethernet_devices: VecDeque<HostEthernetDevice>,
+    pub(super) ethernet_mac_address: [u8; 6],
+    pub(super) minstrel: Option<wlan_mlme::MinstrelWrapper>,
 }
 
-enum Upcall {
+pub(super) enum Upcall {
     Recv {
         bytes: Vec<u8>,
         info: fidl_softmac::WlanRxInfo,
@@ -79,12 +79,13 @@ enum Upcall {
     },
 }
 
-struct UpcallQueue {
-    epoch: OperationEpoch,
-    live: bool,
-    overflowed: bool,
-    raw_queued: usize,
-    queue: VecDeque<Upcall>,
+pub(super) struct UpcallQueue {
+    pub(super) epoch: OperationEpoch,
+    pub(super) live: bool,
+    pub(super) overflowed: bool,
+    pub(super) raw_queued: usize,
+    pub(super) queue: VecDeque<Upcall>,
+    pub(super) notify: Arc<tokio::sync::Notify>,
 }
 
 /// All callbacks share one bounded ordered queue. Raw RX drops at capacity;
@@ -109,12 +110,14 @@ impl UpcallSender {
             } else {
                 state.live = false;
                 state.overflowed = true;
+                state.notify.notify_one();
                 state.queue.clear();
                 state.raw_queued = 0;
                 return;
             }
         }
         state.queue.push_back(upcall);
+        state.notify.notify_one();
     }
 }
 
@@ -124,6 +127,7 @@ impl WlanSoftmacUpcalls for UpcallSender {
         if state.live && state.queue.len() < UPCALL_QUEUE_CAPACITY {
             state.raw_queued += 1;
             state.queue.push_back(Upcall::Recv { bytes, info });
+            state.notify.notify_one();
         }
     }
 
@@ -178,7 +182,7 @@ impl HostMlmeDevice {
             OperationContext::new(std::time::Instant::now() + std::time::Duration::from_secs(3));
         Self {
             execution: Rc::new(MlmeExecution {
-                operation: RefCell::new(operation.clone()),
+                operation: Arc::new(Mutex::new(operation.clone())),
                 scan: RefCell::new(None),
                 epoch: RefCell::new(operation.epoch().clone()),
                 rejected: Cell::new(false),
@@ -250,7 +254,7 @@ impl DeviceOps for HostMlmeDevice {
         self.driver.send(
             self.execution.epoch.borrow().clone(),
             Command::Transmit(
-                self.execution.operation.borrow().clone(),
+                self.execution.operation.lock().unwrap().clone(),
                 buffer.to_vec(),
                 flags,
             ),
@@ -313,7 +317,7 @@ impl DeviceOps for HostMlmeDevice {
             .borrow()
             .as_ref()
             .map(|scan| scan.context.clone())
-            .unwrap_or_else(|| self.execution.operation.borrow().clone());
+            .unwrap_or_else(|| self.execution.operation.lock().unwrap().clone());
         let result = self
             .request(|reply| {
                 Command::Channel(
@@ -412,7 +416,7 @@ impl DeviceOps for HostMlmeDevice {
     }
     async fn join_bss(&mut self, request: &fidl_driver::JoinBssRequest) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        let context = self.execution.operation.borrow().clone();
+        let context = self.execution.operation.lock().unwrap().clone();
         self.request(|reply| Command::Join(context, request.clone(), reply))
             .await
     }
@@ -430,7 +434,7 @@ impl DeviceOps for HostMlmeDevice {
         key: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        let context = self.execution.operation.borrow().clone();
+        let context = self.execution.operation.lock().unwrap().clone();
         self.request(|reply| Command::Key(context, key.clone(), reply))
             .await
     }
@@ -439,7 +443,7 @@ impl DeviceOps for HostMlmeDevice {
         config: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        let context = self.execution.operation.borrow().clone();
+        let context = self.execution.operation.lock().unwrap().clone();
         eprintln!("client_association stage=configure_enter config={config:?}");
         let result = self
             .request(|reply| Command::Association(context, config, reply))
@@ -452,7 +456,7 @@ impl DeviceOps for HostMlmeDevice {
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        let context = self.execution.operation.borrow().clone();
+        let context = self.execution.operation.lock().unwrap().clone();
         self.request(|reply| Command::ClearAssociation(context, request.clone(), reply))
             .await
     }
@@ -586,7 +590,7 @@ impl MlmeTask {
         let future = async move {
             while let Some((context, input)) = receiver.next().await {
                 let epoch = context.epoch().clone();
-                execution.operation.replace(context);
+                *execution.operation.lock().unwrap() = context;
                 execution.epoch.replace(epoch.clone());
                 execution.rejected.set(false);
                 // Completion still retires scanner bookkeeping after revocation,
@@ -1004,6 +1008,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             live: true,
             overflowed: false,
             raw_queued: 0,
+            notify: Arc::new(tokio::sync::Notify::new()),
             queue: VecDeque::new(),
         }));
         let (mut device, driver) = DriverActor::new(device);
@@ -1961,6 +1966,7 @@ mod tests {
         extra_band: Option<fidl_softmac::WlanSoftmacBandCapability>,
         empty_bands: bool,
         channel_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
+        complete_channel_on_drive: Option<oneshot::Sender<Result<(), zx::Status>>>,
         clear_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
     }
 
@@ -2001,6 +2007,13 @@ mod tests {
     impl ClientRuntimeDriver for Fake {
         fn drive(&mut self) -> Result<bool, zx::Status> {
             let mut effects = self.0.lock().unwrap();
+            if effects.calls.contains(&"channel")
+                && let Some(reply) = effects.complete_channel_on_drive.take()
+            {
+                let _ = reply.send(Ok(()));
+                return Ok(true);
+            }
+
             let Some(bytes) = effects.pending_rx.pop_front() else {
                 return Ok(false);
             };
@@ -2489,7 +2502,7 @@ mod tests {
             let epoch = bridge.execution.epoch.borrow().clone();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             let context = OperationContext::child(epoch.clone(), deadline);
-            bridge.execution.operation.replace(context.clone());
+            *bridge.execution.operation.lock().unwrap() = context.clone();
             bridge
                 .send_wlan_frame(
                     vec![1, 0x40, 3].into(),
@@ -2513,10 +2526,8 @@ mod tests {
                 effects.lock().unwrap().tx_contexts[0].check(std::time::Instant::now()),
                 Err(zx::Status::CANCELED)
             );
-            bridge
-                .execution
-                .operation
-                .replace(OperationContext::child(epoch, std::time::Instant::now()));
+            *bridge.execution.operation.lock().unwrap() =
+                OperationContext::child(epoch, std::time::Instant::now());
             assert_eq!(
                 bridge.send_wlan_frame(
                     vec![1, 0x40, 3].into(),
@@ -2610,7 +2621,7 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             let context =
                 OperationContext::child(bridge.execution.epoch.borrow().clone(), deadline);
-            bridge.execution.operation.replace(context.clone());
+            *bridge.execution.operation.lock().unwrap() = context.clone();
             actor
                 .run_until(async {
                     bridge.install_key(&Default::default()).await?;
@@ -2642,7 +2653,7 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             let context =
                 OperationContext::child(bridge.execution.epoch.borrow().clone(), deadline);
-            bridge.execution.operation.replace(context.clone());
+            *bridge.execution.operation.lock().unwrap() = context.clone();
             actor
                 .run_until(bridge.set_channel(
                     wlan_channel(),
@@ -2683,6 +2694,145 @@ mod tests {
                 actor.run_until(operation).await.unwrap(),
                 Err(zx::Status::IO)
             );
+        });
+    }
+
+    #[test]
+    fn independent_hardware_owner_completes_awaited_device_operation() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (completion, receiver) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(receiver);
+            effects.lock().unwrap().complete_channel_on_drive = Some(completion);
+            let (mut bridge, mut actor, _) = parts(fake);
+            actor
+                .start(Box::new(UpcallSender(Arc::new(Mutex::new(UpcallQueue {
+                    epoch: OperationEpoch::new(),
+                    live: true,
+                    overflowed: false,
+                    raw_queued: 0,
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                    queue: VecDeque::new(),
+                })))))
+                .unwrap();
+            let (mut control, commands) = mpsc::channel(4);
+            let task = tokio::task::spawn_local(actor.serve(commands));
+            // No runtime pump or actor.drive_once here: the awaited operation
+            // only completes if the independently owned hardware keeps moving.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                bridge.set_channel(
+                    wlan_channel(),
+                    fidl_ieee80211::ChannelBandwidth::Cbw20,
+                    wlan_channel(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            control.try_send(crate::driver::OwnerCommand::Stop).unwrap();
+            let (_owner, result) = task.await.unwrap();
+            result.unwrap();
+            assert_eq!(effects.lock().unwrap().calls, ["start", "channel", "stop"]);
+        });
+    }
+
+    fn independent_owner(fake: Fake) -> (HostMlmeDevice, crate::driver::HardwareOwner<Fake>) {
+        let (bridge, mut actor, _) = parts(fake);
+        actor
+            .start(Box::new(UpcallSender(Arc::new(Mutex::new(UpcallQueue {
+                epoch: OperationEpoch::new(),
+                live: true,
+                overflowed: false,
+                raw_queued: 0,
+                notify: Arc::new(tokio::sync::Notify::new()),
+                queue: VecDeque::new(),
+            })))))
+            .unwrap();
+        let (control, commands) = mpsc::channel(1);
+        let task = tokio::task::spawn_local(actor.serve(commands));
+        (
+            bridge,
+            crate::driver::HardwareOwner::Running { task, control },
+        )
+    }
+
+    #[test]
+    fn canceling_hardware_join_retains_owner_for_stop_retry() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(1);
+            let (_bridge, mut owner) = independent_owner(fake);
+            {
+                let mut join = std::pin::pin!(owner.join());
+                assert!(join.as_mut().now_or_never().is_none());
+            }
+            assert!(matches!(
+                &owner,
+                crate::driver::HardwareOwner::Running { .. }
+            ));
+            owner.request_stop(false);
+            owner.join().await;
+            assert!(owner.observe().unwrap().is_err());
+            owner.certify(false).unwrap();
+            assert_eq!(
+                effects
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "stop")
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn full_owner_queue_cannot_lose_reset_escalation() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (_bridge, mut owner) = independent_owner(fake);
+            loop {
+                let (reply, _) = oneshot::channel();
+                if owner
+                    .send(crate::driver::OwnerCommand::Link(false, reply))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            owner.request_stop(true);
+            owner.join().await;
+            // Closing a full queue requests stop; the retained terminal intent
+            // still requires reset on the returned owner before certification.
+            owner.certify(true).unwrap();
+            assert!(effects.lock().unwrap().calls.contains(&"reset"));
+        });
+    }
+
+    #[test]
+    fn dropping_hardware_owner_stops_a_suspended_device_operation() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (_completion, receiver) = oneshot::channel();
+            effects.lock().unwrap().channel_completion = Some(receiver);
+            let (mut bridge, owner) = independent_owner(fake);
+            let mut operation = std::pin::pin!(bridge.set_channel(
+                wlan_channel(),
+                fidl_ieee80211::ChannelBandwidth::Cbw20,
+                wlan_channel(),
+            ));
+            assert!(operation.as_mut().now_or_never().is_none());
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !effects.lock().unwrap().calls.contains(&"channel") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(owner);
+            assert_eq!(operation.await, Err(zx::Status::CANCELED));
+            assert!(effects.lock().unwrap().calls.contains(&"stop"));
         });
     }
 
@@ -3170,6 +3320,7 @@ mod tests {
                 live: true,
                 overflowed: false,
                 raw_queued: 0,
+                notify: Arc::new(tokio::sync::Notify::new()),
                 queue: VecDeque::new(),
             }));
             let mut sender = UpcallSender(state.clone());

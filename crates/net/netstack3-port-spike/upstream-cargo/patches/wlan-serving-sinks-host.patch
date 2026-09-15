@@ -1,0 +1,118 @@
+--- a/src/connectivity/wlan/lib/common/rust/src/sink.rs
++++ b/src/connectivity/wlan/lib/common/rust/src/sink.rs
+@@ -7 +7,6 @@
+-#[derive(Debug)]
++enum Destination<T> {
++    Channel(mpsc::UnboundedSender<T>),
++    #[cfg(not(target_os = "fuchsia"))]
++    Native(std::sync::Arc<dyn Fn(T) + Send + Sync>),
++}
++
+@@ -9 +14,7 @@
+-    sink: mpsc::UnboundedSender<T>,
++    sink: Destination<T>,
++}
++
++impl<T> std::fmt::Debug for UnboundedSink<T> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("UnboundedSink").finish_non_exhaustive()
++    }
+@@ -16 +27,7 @@
+-        Self { sink: self.sink.clone() }
++        Self {
++            sink: match &self.sink {
++                Destination::Channel(sink) => Destination::Channel(sink.clone()),
++                #[cfg(not(target_os = "fuchsia"))]
++                Destination::Native(sink) => Destination::Native(sink.clone()),
++            },
++        }
+@@ -22 +39,9 @@
+-        UnboundedSink { sink }
++        UnboundedSink { sink: Destination::Channel(sink) }
++    }
++
++    /// Supply the native transport at the emission boundary. This lets the
++    /// owner capture operation authority and enforce bounded admission before
++    /// the message enters a queue, including while a protocol handler awaits.
++    #[cfg(not(target_os = "fuchsia"))]
++    pub fn native(send: impl Fn(T) + Send + Sync + 'static) -> Self {
++        Self { sink: Destination::Native(std::sync::Arc::new(send)) }
+@@ -26 +51,9 @@
+-        match self.sink.unbounded_send(msg) {
++        let sink = match &self.sink {
++            Destination::Channel(sink) => sink,
++            #[cfg(not(target_os = "fuchsia"))]
++            Destination::Native(send) => {
++                send(msg);
++                return;
++            }
++        };
++        match sink.unbounded_send(msg) {
+--- a/src/connectivity/wlan/lib/sme/src/client/mod.rs
++++ b/src/connectivity/wlan/lib/sme/src/client/mod.rs
+@@ -802,0 +803,23 @@
++        let (mlme_sender, mlme_stream) = mpsc::unbounded();
++        let mlme_sink = MlmeSink::new(mlme_sender);
++        let (timer, time_stream) = timer::create_timer();
++        let sme = Self::new_with_sinks(
++            cfg, info, inspector, inspect_node, security_support, spectrum_management_support, mlme_sink.clone(), timer,
++        );
++        (sme, mlme_sink, mlme_stream, time_stream)
++    }
++
++    /// Construct the same station with owner-provided message and timer sinks.
++    /// Native serving binds authority and queue admission at emission, rather
++    /// than forwarding untagged messages after a handler has suspended.
++    #[allow(clippy::too_many_arguments)]
++    pub fn new_with_sinks(
++        cfg: ClientConfig,
++        info: fidl_mlme::DeviceInfo,
++        inspector: fuchsia_inspect::Inspector,
++        inspect_node: fuchsia_inspect::Node,
++        security_support: fidl_common::SecuritySupport,
++        spectrum_management_support: fidl_common::SpectrumManagementSupport,
++        mlme_sink: MlmeSink,
++        mut timer: timer::Timer<Event>,
++    ) -> Self {
+@@ -804,2 +826,0 @@
+-        let (mlme_sink, mlme_stream) = mpsc::unbounded();
+-        let (mut timer, time_stream) = timer::create_timer();
+@@ -814,2 +835 @@
+-        (
+-            ClientSme {
++        ClientSme {
+@@ -825 +845 @@
+-                    mlme_sink: MlmeSink::new(mlme_sink.clone()),
++                    mlme_sink,
+@@ -832,5 +852 @@
+-            },
+-            MlmeSink::new(mlme_sink),
+-            mlme_stream,
+-            time_stream,
+-        )
++        }
+--- a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs
++++ b/src/connectivity/wlan/lib/mlme/rust/src/lib.rs
+@@ -192,0 +193,13 @@
++/// Bind the pinned rate selector to the serving loop's timer transport.
++pub fn new_minstrel(
++    timer: common::timer::Timer<()>,
++    update_interval: Duration,
++) -> MinstrelWrapper {
++    Arc::new(Mutex::new(minstrel::MinstrelRateSelector::new(
++        MinstrelTimer { timer, current_timer: None },
++        update_interval,
++        probe_sequence::ProbeSequence::random_new(),
++    )))
++}
++
++
+@@ -360,2 +373,2 @@
+-            let minstrel = Arc::new(Mutex::new(minstrel::MinstrelRateSelector::new(
+-                MinstrelTimer { timer: minstrel_timer, current_timer: None },
++            let minstrel = new_minstrel(
++                minstrel_timer,
+@@ -371,2 +384 @@
+-                probe_sequence::ProbeSequence::random_new(),
+-            )));
++            );

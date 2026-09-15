@@ -24,6 +24,7 @@ fidl-fuchsia-wlan-softmac = { path = "../../../reference/fuchsia-1e1219e3fac944c
 fuchsia-inspect = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }
 fuchsia-trace = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/trace/rust" }
 futures = "=0.3.32"
+log = "=0.4.29"
 netstack3-port-spike = { path = "../../net/netstack3-port-spike" }
 tokio = { version = "=1.52.3", features = ["rt", "time", "sync"] }
 wlan-mlme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/mlme/rust" }
