@@ -46,6 +46,9 @@ pub fn run_provider(
         1500,
     )
     .map_err(|e| format!("{e:?}"))?;
+    if ethernet_mac.is_some() {
+        runtime.enable_dynamic_ipv6();
+    }
     runtime.enable_loopback();
     let mut network = netstack3_port_integration::service::DhcpService::new(
         runtime,
@@ -132,7 +135,7 @@ pub fn run_provider(
     }
     let mut pending_frame = None;
     let mut ethernet_active = ethernet.is_some();
-    let mut last_network_status = None;
+    let mut last_network_snapshot = None;
     let mut bootstrap_pending = bootstrap;
     let mut workers: HashMap<u64, SocketWorker> = HashMap::new();
     let start = Instant::now();
@@ -253,13 +256,21 @@ pub fn run_provider(
                 frame_events = wanted;
             }
             let status = network.status();
-            if last_network_status != Some(status) {
+            let snapshot = {
+                let runtime = network.runtime();
+                (
+                    status,
+                    runtime.ipv4_address(),
+                    runtime.ipv6_address(),
+                    runtime.dns_servers(),
+                )
+            };
+            if last_network_snapshot != Some(snapshot) {
                 eprintln!(
-                    "provider_network_status={status:?} ipv4={:?} dns={:?}",
-                    network.runtime().ipv4_address(),
-                    network.runtime().dns_servers()
+                    "provider_network_status={status:?} ipv4={:?} ipv6={:?} dns={:?}",
+                    snapshot.1, snapshot.2, snapshot.3,
                 );
-                last_network_status = Some(status);
+                last_network_snapshot = Some(snapshot);
             }
             if bootstrap_pending && status == netstack3_port_integration::service::DhcpStatus::Bound
             {
