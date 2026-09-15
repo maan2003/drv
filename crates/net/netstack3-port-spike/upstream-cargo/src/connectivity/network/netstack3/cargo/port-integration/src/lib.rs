@@ -11,7 +11,6 @@ pub mod service;
 pub mod socket_provider;
 pub mod sockets;
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
@@ -37,17 +36,20 @@ use netstack3_base::{
 };
 use netstack3_core::PendingDatagramSocketError;
 use netstack3_core::device::{
-    BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceId, EthernetLinkDevice,
-    EthernetWeakDeviceId, LoopbackDeviceId, LoopbackDevice, LoopbackCreationProperties, MaxEthernetFrameSize, PureIpDeviceId,
+    BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceEvent as CoreEthernetDeviceEvent,
+    EthernetDeviceId, EthernetLinkDevice, EthernetWeakDeviceId, LoopbackDeviceId, LoopbackDevice,
+    LoopbackCreationProperties, MaxEthernetFrameSize, PureIpDeviceId,
     RecvEthernetFrameMeta, TransmitQueueConfiguration, WeakDeviceId,
 };
 use netstack3_core::device_socket::{
     DeviceSocketMetadata, EthernetHeaderParams, Protocol, TargetDevice,
 };
 use netstack3_core::ip::{
-    IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate, Ipv6DeviceConfiguration,
-    Ipv6DeviceConfigurationUpdate, RouteDiscoveryConfigurationUpdate, SlaacConfigurationUpdate,
+    IpDeviceConfigurationUpdate, IpDeviceEvent, Ipv4DeviceConfigurationUpdate,
+    Ipv6DeviceConfiguration, Ipv6DeviceConfigurationUpdate, RouteDiscoveryConfigurationUpdate,
+    RouterAdvertisementEvent, SlaacConfigurationUpdate,
 };
+use netstack3_core::neighbor;
 use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
 use netstack3_core::udp::UdpRemotePort;
 use netstack3_core::{CoreTxMetadata, IpExt, StackState, StackStateBuilder, TimerId};
@@ -313,7 +315,9 @@ fn udp_socket_info<A: net_types::ip::IpAddress, D>(
 struct Queues {
     tx: VecDeque<TxFrame>,
     events: VecDeque<String>,
-    ipv6_route_events: VecDeque<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>>,
+    // Adapted from Fuchsia bindings.rs: device IDs are downgraded before
+    // route work crosses the synchronous core/bindings boundary.
+    ipv6_route_events: VecDeque<IpLayerEvent<WeakDeviceId<NativeBindingsCtx>, Ipv6>>,
     readiness: VecDeque<ReadinessEvent>,
 }
 
@@ -1027,16 +1031,79 @@ impl SocketOpsFilterBindingContext<DeviceId<Self>> for NativeBindingsCtx {
     }
 }
 
-impl<T: Debug + 'static> EventContext<T> for NativeBindingsCtx {
-    fn on_event(&mut self, event: T) {
-        let rendered = format!("{event:?}");
-        let event: Box<dyn Any> = Box::new(event);
-        if let Ok(event) =
-            event.downcast::<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>>()
-        {
-            self.queues.ipv6_route_events.push_back(*event);
+impl NativeBindingsCtx {
+    fn record_core_event(&mut self, event: &impl Debug) {
+        let _ = Self::push_bounded(
+            self.queue_capacity,
+            &mut self.queues.events,
+            format!("{event:?}"),
+        );
+    }
+}
+
+// Adapted from Fuchsia 1e1219e3fac944c9a906aea9646939746b6062b3,
+// src/connectivity/network/netstack3/src/bindings.rs EventContext implementations.
+// Unlike Fuchsia's asynchronous route worker, this synchronous embedding drains
+// the typed queue from Runtime. Downgrade immediately so queued NDP work cannot
+// keep an otherwise-removed core device alive.
+impl EventContext<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>) {
+        self.record_core_event(&event);
+        let event = event.map_device(|device| device.downgrade());
+        match event {
+            IpLayerEvent::AddRoute(_) | IpLayerEvent::RemoveRoutes { .. } => {
+                self.queues.ipv6_route_events.push_back(event)
+            }
+            // Multicast forwarding has no host API in this deliberately small
+            // embedding. It remains a typed diagnostic event, not route work.
+            IpLayerEvent::MulticastForwarding(_) => {}
         }
-        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, rendered);
+    }
+}
+
+impl EventContext<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv4>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv4>) {
+        // This embedding has no IPv4 route-discovery producer. Keep the typed
+        // dispatch (including multicast-forwarding diagnostics) without
+        // inventing a second dynamic IPv4 routing state machine.
+        self.record_core_event(&event);
+    }
+}
+
+impl<I: Ip> EventContext<IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeInstant>>
+    for NativeBindingsCtx
+{
+    fn on_event(&mut self, event: IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeInstant>) {
+        self.record_core_event(&event);
+    }
+}
+
+impl<I: Ip>
+    EventContext<neighbor::Event<Mac, EthernetDeviceId<NativeBindingsCtx>, I, NativeInstant>>
+    for NativeBindingsCtx
+{
+    fn on_event(
+        &mut self,
+        event: neighbor::Event<Mac, EthernetDeviceId<NativeBindingsCtx>, I, NativeInstant>,
+    ) {
+        self.record_core_event(&event);
+    }
+}
+
+impl EventContext<RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>) {
+        self.record_core_event(&event);
+    }
+}
+
+impl EventContext<CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>>
+    for NativeBindingsCtx
+{
+    fn on_event(
+        &mut self,
+        event: CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>,
+    ) {
+        self.record_core_event(&event);
     }
 }
 
@@ -1353,7 +1420,7 @@ pub struct Runtime {
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
     dynamic_ipv6: bool,
-    ipv6_discovered_routes: Vec<AddableEntry<Ipv6Addr, DeviceId<NativeBindingsCtx>>>,
+    ipv6_discovered_routes: Vec<AddableEntry<Ipv6Addr, WeakDeviceId<NativeBindingsCtx>>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
     storage_budget: Arc<StorageBudget>,
@@ -1529,6 +1596,12 @@ impl Runtime {
             return;
         }
         while let Some(event) = self.bindings.queues.ipv6_route_events.pop_front() {
+            // CoreNdp membership is owned by dynamic IPv6. Once administrative
+            // revocation has disabled it, stale or newly queued NDP changes
+            // must not enter the explicit route set.
+            if !self.dynamic_ipv6 {
+                continue;
+            }
             match event {
                 IpLayerEvent::AddRoute(entry) => {
                     if !self.ipv6_discovered_routes.contains(&entry) {
@@ -1546,11 +1619,19 @@ impl Runtime {
             }
         }
         if !self.dynamic_ipv6 { return; }
+        // A queued CoreNdp route whose device has since been removed is stale.
+        // Purge it instead of allowing notification work to extend device life.
+        self.ipv6_discovered_routes
+            .retain(|entry| entry.device.upgrade().is_some());
         let mut generation = Generation::initial();
-        let routes = self.ipv6_discovered_routes.iter().cloned().map(|entry| {
+        let routes = self.ipv6_discovered_routes.iter().filter_map(|entry| {
+            let entry = entry
+                .clone()
+                .try_map_device_id(|device| device.upgrade().ok_or(()))
+                .ok()?;
             let route = entry.resolve_metric(RawMetric(0)).with_generation(generation);
             generation = generation.next();
-            route
+            Some(route)
         }).collect();
         let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
         let table = api.main_table_id();
@@ -3246,6 +3327,127 @@ mod tests {
             .unwrap_b()
             .into_inner();
         EthernetFrame::try_from(bytes).unwrap()
+    }
+
+    fn default_v6_route(
+        device: DeviceId<NativeBindingsCtx>,
+    ) -> AddableEntry<Ipv6Addr, DeviceId<NativeBindingsCtx>> {
+        AddableEntry::without_gateway(
+            Subnet::new(Ipv6Addr::from_bytes([0; 16]), 0).unwrap(),
+            device,
+            AddableMetric::MetricTracksInterface,
+        )
+    }
+
+    #[test]
+    fn typed_core_ndp_add_and_remove_use_discovered_membership() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_dynamic_ipv6();
+        let device: DeviceId<_> = runtime.device.clone().into();
+        let entry = default_v6_route(device.clone());
+
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(entry.clone()),
+        );
+        runtime.process_ipv6_route_events();
+        assert!(runtime.has_ipv6_default_route());
+        assert_eq!(runtime.ipv6_discovered_routes.len(), 1);
+
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::RemoveRoutes {
+                subnet: entry.subnet,
+                device,
+                gateway: entry.gateway,
+            },
+        );
+        runtime.process_ipv6_route_events();
+        assert!(!runtime.has_ipv6_default_route());
+        assert!(runtime.ipv6_discovered_routes.is_empty());
+    }
+
+    #[test]
+    fn core_ndp_events_cannot_replace_explicit_or_revoked_routes() {
+        let mut runtime = runtime_ipv6(
+            1,
+            [2, 0, 0, 0, 0, 1],
+            CLIENT_V6,
+            64,
+            Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfe]),
+        );
+        let device: DeviceId<_> = runtime.device.clone().into();
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device.clone())),
+        );
+        runtime.process_ipv6_route_events();
+
+        assert!(runtime.has_ipv6_default_route(), "explicit default route survives");
+        assert!(
+            runtime.ipv6_discovered_routes.is_empty(),
+            "CoreNdp membership stays disabled for explicit configuration",
+        );
+
+        runtime.revoke_ipv6();
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device)),
+        );
+        assert_eq!(runtime.dispatch_due(0), 0, "no core turn was dispatched");
+        assert!(!runtime.has_ipv6_default_route());
+        assert!(runtime.ipv6_discovered_routes.is_empty());
+    }
+
+    #[test]
+    fn queued_core_event_does_not_retain_removed_device() {
+        let mut bindings = NativeBindingsCtx::new(
+            8,
+            (0u8..=255).cycle().take(8192),
+        );
+        let stack = bindings.build_stack();
+        let device = stack
+            .api(&mut bindings)
+            .device::<EthernetLinkDevice>()
+            .add_device(
+                NativeDeviceIdentifier(NonZeroU64::new(7).unwrap()),
+                EthernetCreationProperties {
+                    mac: UnicastAddr::new(Mac::new([2, 0, 0, 0, 0, 7])).unwrap(),
+                    max_frame_size: MaxEthernetFrameSize::from_mtu(Mtu::new(1500)).unwrap(),
+                    tx_offload_spec: netstack3_base::ChecksumOffloadSpec::none(),
+                },
+                RawMetric(0),
+                NativeDeviceState,
+                netstack3_device::queue::BufVecU8Allocator::default(),
+            );
+        let weak = device.downgrade();
+        EventContext::on_event(
+            &mut bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device.clone().into())),
+        );
+
+        drop(
+            stack
+                .api(&mut bindings)
+                .device::<EthernetLinkDevice>()
+                .remove_device(device),
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "queued notification work must not keep the device alive",
+        );
+        let queued = bindings.queues.ipv6_route_events.pop_front().unwrap();
+        match queued {
+            IpLayerEvent::AddRoute(entry) => assert!(entry.device.upgrade().is_none()),
+            event => panic!("unexpected queued event: {event:?}"),
+        }
     }
 
     #[test]
