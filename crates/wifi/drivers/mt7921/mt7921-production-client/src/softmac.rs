@@ -5,6 +5,7 @@
 //! retired lab owner fail explicitly; no compatibility transport is retained.
 
 use crate::{Mt7921Driver, SessionLifecycle, radio::ControlOperation};
+use std::ops::ControlFlow;
 use wlan_softmac_class_support::*;
 
 impl WlanSoftmacLifecycle for Mt7921Driver {
@@ -46,10 +47,10 @@ impl crate::HifPowerState {
 
     /// Completing CLR_OWN consumes the retained reason only when this turn is
     /// allowed to continue into the operational drain.
-    fn complete_driver_wake(&mut self, pending: &mut bool) -> bool {
+    fn complete_driver_wake(&mut self, pending: &mut bool) -> ControlFlow<bool> {
         *self = Self::DriverOwned;
         *pending = false;
-        true
+        ControlFlow::Continue(())
     }
 }
 
@@ -82,36 +83,41 @@ impl Mt7921Driver {
         Ok(())
     }
 
-    /// Return true only when operational MMIO is legal in this turn.
-    fn drive_hif_gate(&mut self) -> Result<bool, zx::Status> {
+    /// Continue only when operational MMIO is legal. A transition that must
+    /// stop this turn still reports progress so the owner rearms its timer.
+    fn drive_hif_gate(&mut self) -> Result<ControlFlow<bool>, zx::Status> {
         let now = self.session.now_ms();
         match &mut self.hif_state {
-            crate::HifPowerState::DriverOwned => Ok(true),
+            crate::HifPowerState::DriverOwned => Ok(ControlFlow::Continue(())),
             crate::HifPowerState::FirmwareOwned => {
                 if !self.host_work_pending() {
-                    return Ok(false);
+                    return Ok(ControlFlow::Break(false));
                 }
                 let wake = mt7921_core::DriverOwnershipWake::new(
                     mt7921_core::DriverOwnershipWakeAuthority {
                         epoch: self.hif_epoch,
-                        deadline_ms: now.saturating_add(501),
+                        deadline_ms: now
+                            .saturating_add(mt7921_core::DRIVER_OWN_ASPM_HARD_DEADLINE_MS + 1),
                     },
                     now,
                 )
                 .map_err(|_| zx::Status::TIMED_OUT)?;
                 self.hif_state = crate::HifPowerState::Waking(wake);
-                Ok(false)
+                Ok(ControlFlow::Break(true))
             }
             crate::HifPowerState::Sleeping(sleep) => {
                 match self
                     .session
                     .poll_firmware_ownership(sleep, self.hif_epoch)
+                    .inspect_err(|error| eprintln!("mt7921_hif_fault phase=sleep detail={error}"))
                     .map_err(|_| zx::Status::IO)?
                 {
-                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => Ok(false),
+                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => {
+                        Ok(ControlFlow::Break(false))
+                    }
                     mt7921_core::DriverOwnershipWakeProgress::Acquired => {
                         self.hif_state = crate::HifPowerState::FirmwareOwned;
-                        Ok(false)
+                        Ok(ControlFlow::Break(true))
                     }
                 }
             }
@@ -119,17 +125,26 @@ impl Mt7921Driver {
                 match self
                     .session
                     .poll_driver_ownership(wake, self.hif_epoch)
+                    .inspect_err(|error| eprintln!("mt7921_hif_fault phase=wake detail={error}"))
                     .map_err(|_| zx::Status::IO)?
                 {
-                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => Ok(false),
+                    mt7921_core::DriverOwnershipWakeProgress::Pending { .. } => {
+                        Ok(ControlFlow::Break(false))
+                    }
                     mt7921_core::DriverOwnershipWakeProgress::Acquired => {
                         if self
                             .session
                             .wpdma_needs_reinit()
+                            .inspect_err(|error| {
+                                eprintln!("mt7921_hif_fault phase=reinit_check detail={error}")
+                            })
                             .map_err(|_| zx::Status::IO)?
                         {
                             self.session
                                 .runtime_reinitialize(&mut self.data_rx, &mut self.tx)
+                                .inspect_err(|error| {
+                                    eprintln!("mt7921_hif_fault phase=reinit detail={error}")
+                                })
                                 .map_err(|_| zx::Status::IO)?;
                         }
                         Ok(self
@@ -143,6 +158,13 @@ impl Mt7921Driver {
 }
 
 impl ClientRuntimeDriver for Mt7921Driver {
+    fn station_offload_support(&self) -> wlan_softmac_class_support::StationOffloadSupport {
+        wlan_softmac_class_support::StationOffloadSupport {
+            connection_monitor: true,
+            power_save: true,
+        }
+    }
+
     fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
         use std::future::Future as _;
         let idle_firmware_owned = matches!(self.hif_state, crate::HifPowerState::FirmwareOwned)
@@ -168,7 +190,8 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 self.hif_state.retain_irq_wake(&mut self.irq_wake_pending);
                 Ok(true)
             }
-            std::task::Poll::Ready(Err(_)) => {
+            std::task::Poll::Ready(Err(error)) => {
+                eprintln!("mt7921_irq_fault error={error:?}");
                 self.session.lifecycle = SessionLifecycle::Closing;
                 self.upcalls = None;
                 if !matches!(self.hif_state, crate::HifPowerState::DriverOwned) {
@@ -223,8 +246,8 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 self.control_scheduler.complete()?;
                 return Ok(true);
             }
-            if !self.drive_hif_gate()? {
-                return Ok(false);
+            if let ControlFlow::Break(progressed) = self.drive_hif_gate()? {
+                return Ok(progressed);
             }
             let resources = self
                 .session
@@ -339,6 +362,15 @@ impl ClientRuntimeDriver for Mt7921Driver {
                         }
                     }
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
+                        if self.associated_qos.is_some()
+                            && let Ok(loss) = mt7921_core::parse_client_beacon_loss(&bytes.bytes)
+                            && loss.bss_index == 0
+                        {
+                            if let Some(bss) = &self.joined {
+                                eprintln!("mt7921_connection_loss source=firmware bss_index=0 reason={}", loss.reason);
+                                upcalls.notify_connection_loss(bss.bssid);
+                            }
+                        }
                         if let Ok(grant) = mt7921_core::parse_client_join_roc_grant(&bytes.bytes) {
                             self.tx.roc_grant(grant, std::time::Instant::now())?;
                         }
@@ -464,6 +496,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
             Ok(progressed)
         })();
         if let Err(status) = result {
+            eprintln!("mt7921_runtime_fault status={status:?}");
             self.control_scheduler.fail_all(status);
             self.current_channel = None;
             self.session.lifecycle = SessionLifecycle::Closing;
@@ -568,7 +601,12 @@ impl WlanSoftmac for Mt7921Driver {
         })
     }
     fn query_mac_sublayer_support(&mut self) -> Result<MacSublayerSupport, zx::Status> {
-        Ok(Default::default())
+        Ok(MacSublayerSupport {
+            rate_selection_offload: Some(fidl_fuchsia_wlan_common::RateSelectionOffloadExtension {
+                supported: Some(true),
+            }),
+            ..Default::default()
+        })
     }
     fn query_security_support(&mut self) -> Result<SecuritySupport, zx::Status> {
         Ok(SecuritySupport {
@@ -1029,6 +1067,11 @@ impl WlanSoftmac for Mt7921Driver {
             || bytes.get(10..16) != Some(local.as_slice())
             || (!data && bytes.get(16..22) != Some(peer.bssid.as_slice()))
         {
+            eprintln!(
+                "mt7921_tx_reject stage=identity bytes={} frame_control={:02x?}",
+                bytes.len(),
+                bytes.get(..2).unwrap_or(bytes)
+            );
             return Err(zx::Status::INVALID_ARGS);
         }
         if protected && (self.ptk.is_none() || (data && !self.controlled_port_open)) {
@@ -1069,7 +1112,36 @@ pub(super) fn drive_radio_io<B: drv_hardware::Backend>(
     start: std::time::Instant,
     now: std::time::Instant,
 ) -> Result<(bool, bool, Vec<mt7921_core::McuRxRoute>), zx::Status> {
-    let mut progressed = management_tx.drive(resources, mechanics, receive, start, now)?;
+    // MCU wake is a separate interrupt source from descriptor completion.
+    // Consume both latches while driver-owned, as mt792x_irq_tasklet does;
+    // leaving the software cause asserted can prevent the next wake edge.
+    let status = resources
+        .bar0
+        .read_u32(0xd4200)
+        .map_err(|_| zx::Status::IO)?;
+    if status == u32::MAX {
+        return Err(zx::Status::IO);
+    }
+    let wake = status & (1 << 29) != 0;
+    if wake {
+        resources
+            .bar0
+            .write_u32(0xd4200, 1 << 29)
+            .map_err(|_| zx::Status::IO)?;
+        let cause = resources
+            .bar0
+            .read_u32(0xd41f0)
+            .map_err(|_| zx::Status::IO)?;
+        if cause == u32::MAX {
+            return Err(zx::Status::IO);
+        }
+        resources
+            .bar0
+            .write_u32(0xd41f0, cause)
+            .map_err(|_| zx::Status::IO)?;
+    }
+    let mut progressed = wake;
+    progressed |= management_tx.drive(resources, mechanics, receive, start, now)?;
     if mechanics.active_command_slot().is_none() {
         let mut views = resources
             .active_mcu_views(receive, start)
@@ -1155,6 +1227,64 @@ fn deliver_raw_rx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operational_io_acknowledges_host_and_software_wake_before_ring_polling() {
+        use drv_hardware_backends::{DeterministicBackend, DeviceResponseInput, Operation};
+        let (device, log, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(DeviceResponseInput {
+                register_reads: vec![1 << 29, 1],
+                ..Default::default()
+            });
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+        let now = std::time::Instant::now();
+        let (progress, _, _) = drive_radio_io(
+            &mut resources,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            now,
+            now,
+        )
+        .unwrap();
+        assert!(progress);
+        let log = log.borrow();
+        let host = log
+            .iter()
+            .position(|op| {
+                matches!(op,
+            Operation::WriteU32 { offset: 0xd4200, value, .. } if *value == 1 << 29)
+            })
+            .unwrap();
+        let software = log
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    Operation::WriteU32 {
+                        offset: 0xd41f0,
+                        value: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let ring = log
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    Operation::WriteU32 {
+                        offset: 0xd4204,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(host < software && software < ring);
+    }
+
     #[derive(Default)]
     struct Upcalls(Vec<(Vec<u8>, WlanRxInfo)>);
     impl WlanSoftmacUpcalls for Upcalls {
@@ -1162,6 +1292,7 @@ mod tests {
             self.0.push((bytes, info));
         }
         fn report_tx_result(&mut self, _: WlanTxResult) {}
+        fn notify_connection_loss(&mut self, _: [u8; 6]) {}
         fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
     }
 
@@ -1263,7 +1394,10 @@ mod tests {
             mt7921_core::DriverOwnershipWake::new(authority, 0).unwrap(),
         );
         let mut pending = true;
-        assert!(state.complete_driver_wake(&mut pending));
+        assert_eq!(
+            state.complete_driver_wake(&mut pending),
+            ControlFlow::Continue(())
+        );
         assert!(matches!(state, crate::HifPowerState::DriverOwned));
         assert!(!pending);
     }

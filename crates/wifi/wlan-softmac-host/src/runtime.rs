@@ -8,7 +8,7 @@ use crate::ethernet::{
 };
 use crate::sme::client::{ConnectTransaction, Request as SmeRequest, ScanReceiver};
 use crate::{
-    ClientRuntimeDriver, OperationContext, OperationEpoch, WlanSoftmac, WlanSoftmacLifecycle,
+    ClientRuntimeDriver, OperationContext, OperationEpoch, StationOffloadSupport, WlanSoftmac, WlanSoftmacLifecycle,
     WlanSoftmacUpcalls,
 };
 use fdf::ArenaStaticBox;
@@ -67,6 +67,7 @@ pub(super) struct HostIo {
 }
 
 pub(super) enum Upcall {
+    ConnectionLoss([u8; 6]),
     Recv {
         bytes: Vec<u8>,
         info: fidl_softmac::WlanRxInfo,
@@ -121,6 +122,10 @@ impl UpcallSender {
 }
 
 impl WlanSoftmacUpcalls for UpcallSender {
+    fn notify_connection_loss(&mut self, peer: [u8; 6]) {
+        self.push_control(Upcall::ConnectionLoss(peer));
+    }
+
     fn recv(&mut self, bytes: Vec<u8>, info: fidl_softmac::WlanRxInfo) {
         let mut state = self.0.lock().unwrap();
         if state.live && state.queue.len() < UPCALL_QUEUE_CAPACITY {
@@ -167,6 +172,7 @@ fn ethernet_status(error: EthernetIngressError) -> zx::Status {
 }
 
 struct HostMlmeDevice {
+    station_offload: StationOffloadSupport,
     execution: Rc<MlmeExecution>,
     driver: DriverHandle,
     io: Arc<Mutex<HostIo>>,
@@ -176,11 +182,12 @@ struct HostMlmeDevice {
 }
 
 impl HostMlmeDevice {
-    fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>) -> Self {
+    fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>, station_offload: StationOffloadSupport) -> Self {
         let (event_sink, event_stream) = mpsc::channel(UPCALL_QUEUE_CAPACITY);
         let operation =
             OperationContext::new(std::time::Instant::now() + std::time::Duration::from_secs(3));
         Self {
+            station_offload,
             execution: Rc::new(MlmeExecution {
                 operation: Arc::new(Mutex::new(operation.clone())),
                 scan: RefCell::new(None),
@@ -212,6 +219,14 @@ impl HostMlmeDevice {
 }
 
 impl DeviceOps for HostMlmeDevice {
+    fn power_save_offload(&self) -> bool {
+        self.station_offload.power_save
+    }
+
+    fn connection_monitor_offload(&self) -> bool {
+        self.station_offload.connection_monitor
+    }
+
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
@@ -761,8 +776,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             ethernet_mac_address: mac_address,
             minstrel: None,
         }));
+        let station_offload = device.station_offload_support();
         let (mut actor, driver) = DriverActor::new(device);
-        let mut mlme_device = HostMlmeDevice::new(driver, io.clone());
+        let mut mlme_device = HostMlmeDevice::new(driver, io.clone(), station_offload);
         let mlme_events = mlme_device
             .event_stream
             .take()
@@ -1592,6 +1608,7 @@ mod tests {
         association_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
+        ps_polls: usize,
         suppress_auth_response: bool,
         reject_next_auth: bool,
         pending_rx: VecDeque<Vec<u8>>,
@@ -1600,6 +1617,7 @@ mod tests {
         link_failure: bool,
         scan_id: u64,
         scan_offload: bool,
+        station_offload: StationOffloadSupport,
         scan_contexts: Vec<OperationContext>,
         extra_band: Option<fidl_softmac::WlanSoftmacBandCapability>,
         empty_bands: bool,
@@ -1647,6 +1665,9 @@ mod tests {
     }
 
     impl ClientRuntimeDriver for Fake {
+        fn station_offload_support(&self) -> StationOffloadSupport {
+            self.0.lock().unwrap().station_offload
+        }
         fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
             self.0.lock().unwrap().wake = Some(cx.waker().clone());
             self.drive()
@@ -1918,6 +1939,7 @@ mod tests {
                     }
                     Some(0x00) => effects.pending_rx.push_back(association_response()),
                     Some(0xc0) => {}
+                    Some(0xa4) => effects.ps_polls += 1,
                     _ => return Err(zx::Status::NOT_SUPPORTED),
                 }
             } else {
@@ -1942,7 +1964,7 @@ mod tests {
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
             minstrel: None,
         }));
-        (HostMlmeDevice::new(driver, io), actor, effects)
+        (HostMlmeDevice::new(driver, io, StationOffloadSupport::default()), actor, effects)
     }
 
     fn wlan_channel() -> fidl_ieee80211::ChannelNumber {
@@ -3875,6 +3897,76 @@ mod tests {
     }
 
     #[test]
+    fn firmware_power_save_owns_more_data_and_tim_delivery() {
+        run_local_test(async {
+            for offload in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                {
+                    let mut effects = effects.lock().unwrap();
+                    effects.simulate_ap = true;
+                    effects.retry_cleanup = true;
+                    effects.station_offload.power_save = offload;
+                }
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                runtime.connect(
+                    connect_request(), Instant::now() + Duration::from_secs(1),
+                ).await.unwrap();
+                let mut data = stale_data_frame();
+                data[1] |= 0x20; // More Data from our associated AP.
+                effects.lock().unwrap().upcalls.as_mut().unwrap().recv(data, rx_info());
+                drain_mlme(&mut runtime).await;
+                let ps_polls = effects.lock().unwrap().ps_polls;
+                assert_eq!(ps_polls, usize::from(!offload));
+
+                let peer = connect_request().bss_description.bssid;
+                let mut beacon = vec![0x80, 0, 0, 0];
+                beacon.extend_from_slice(&[0xff; 6]);
+                beacon.extend_from_slice(&peer);
+                beacon.extend_from_slice(&peer);
+                beacon.extend_from_slice(&[0; 10]); // sequence + TSF
+                beacon.extend_from_slice(&[100, 0, 1, 0]);
+                // TIM advertises buffered traffic for the fixture's AID 42.
+                beacon.extend_from_slice(&[5, 9, 0, 1, 0, 0, 0, 0, 0, 0, 4]);
+                effects.lock().unwrap().upcalls.as_mut().unwrap().recv(beacon, rx_info());
+                drain_mlme(&mut runtime).await;
+                let ps_polls = effects.lock().unwrap().ps_polls;
+                assert_eq!(ps_polls, 2 * usize::from(!offload));
+                runtime.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn firmware_connection_loss_is_capability_and_peer_scoped() {
+        run_local_test(async {
+            for offload in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                {
+                    let mut effects = effects.lock().unwrap();
+                    effects.simulate_ap = true;
+                    effects.retry_cleanup = true;
+                    effects.station_offload.connection_monitor = offload;
+                }
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                let peer = connect_request().bss_description.bssid;
+                runtime.connect(
+                    connect_request(), Instant::now() + Duration::from_secs(1),
+                ).await.unwrap();
+                effects.lock().unwrap().calls.clear();
+                effects.lock().unwrap().upcalls.as_mut().unwrap()
+                    .notify_connection_loss([9; 6]);
+                drain_mlme(&mut runtime).await;
+                assert!(!effects.lock().unwrap().calls.contains(&"clear"));
+                effects.lock().unwrap().upcalls.as_mut().unwrap()
+                    .notify_connection_loss(peer);
+                drain_mlme(&mut runtime).await;
+                assert_eq!(effects.lock().unwrap().calls.contains(&"clear"), offload);
+                runtime.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn successful_connection_retains_events_and_disconnects_before_reuse() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);
@@ -4261,7 +4353,7 @@ mod tests {
                 ethernet_mac_address: mac,
                 minstrel: None,
             }));
-            let mut host_device = HostMlmeDevice::new(driver, io.clone());
+            let mut host_device = HostMlmeDevice::new(driver, io.clone(), StationOffloadSupport::default());
 
             actor
                 .run_until(host_device.set_ethernet_status(LinkStatus::UP))
@@ -4339,7 +4431,7 @@ mod tests {
                     ethernet_mac_address: mac,
                     minstrel: None,
                 }));
-                (HostMlmeDevice::new(driver, io.clone()), actor, io)
+                (HostMlmeDevice::new(driver, io.clone(), StationOffloadSupport::default()), actor, io)
             };
 
             let (mut before_up, mut before_actor, before_up_io) = make_host();

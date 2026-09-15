@@ -58,6 +58,7 @@ let
     "wlan-mlme-connection-monitor-offload-host.patch"
     "wlan-mlme-async-cancel-host.patch"
     "wlan-serving-sinks-host.patch"
+    "wlan-mlme-connection-loss-host.patch"
   ];
   patchRows = map (file: {
     name = builtins.baseNameOf file;

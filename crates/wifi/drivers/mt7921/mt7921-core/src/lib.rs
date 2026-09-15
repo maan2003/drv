@@ -1725,8 +1725,8 @@ pub enum DriverOwnershipWakeError<E> {
 /// Nonblocking PCIe driver-ownership acquisition for an actor-owned TX queue.
 ///
 /// Each call performs at most one CLR_OWN write and one status read. This
-/// preserves Linux's ten 50 ms attempts and 1 ms poll interval without sleeping
-/// the exclusive hardware owner. `epoch` must be the currently live authority
+/// preserves Linux's ten 50 ms attempts, conservative ASPM settling, and 1 ms
+/// poll interval without sleeping the exclusive hardware owner. `epoch` must be the currently live authority
 /// generation on every call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DriverOwnershipWake {
@@ -1773,10 +1773,16 @@ impl DriverOwnershipWake {
                 .write_clear_own()
                 .map_err(DriverOwnershipWakeError::Transport)?;
             self.attempts += 1;
-            self.attempt_deadline_ms = now
+            // A userspace/VFIO caller cannot infer the physical upstream
+            // link's ASPM state from a virtual PCI topology. Honor Linux's
+            // maximum ASPM settling interval without blocking the owner.
+            self.next_poll_ms = now
+                .saturating_add(DRIVER_OWN_ASPM_DELAY_MAX_US.div_ceil(1_000))
+                .min(self.authority.deadline_ms);
+            self.attempt_deadline_ms = self
+                .next_poll_ms
                 .saturating_add(DRIVER_OWN_ATTEMPT_MS)
                 .min(self.authority.deadline_ms);
-            self.next_poll_ms = now;
         }
 
         if now < self.next_poll_ms {
@@ -4604,6 +4610,24 @@ pub fn validate_passive_mac_bar_read(
 /// an immediate hardware readback to match it.
 pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
     mt76_mmio_rmw_value(initial, mask, value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientBeaconLoss {
+    pub bss_index: u8,
+    pub reason: u8,
+}
+
+/// Decode the legacy unsolicited beacon-loss event.
+/// Linux's mt76_connac_beacon_loss_event has a four-byte body; its reason is
+/// informational, and every reason reports loss of the associated connection.
+pub fn parse_client_beacon_loss(bytes: &[u8]) -> Result<ClientBeaconLoss, PassiveRxError> {
+    let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
+    if response.event_id != 0x13 || response.sequence != 0 {
+        return Err(PassiveRxError::WrongEvent);
+    }
+    let body = bytes.get(36..40).ok_or(PassiveRxError::Truncated)?;
+    Ok(ClientBeaconLoss { bss_index: body[0], reason: body[1] })
 }
 
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
@@ -8459,6 +8483,9 @@ pub struct ClientRxCandidate {
     pub pn: [u8; 6],
 }
 
+/// Linux's reserved PID for a frame without host TX-status correlation.
+pub const MT7921_PACKET_ID_NO_SKB: u8 = 1;
+
 pub fn encode_client_data_txwi(
     payload_len: usize,
     payload_iova: u64,
@@ -8477,7 +8504,7 @@ pub fn encode_client_data_txwi(
             .checked_add(payload_len as u64 - 1)
             .is_none_or(|end| end > u64::from(u32::MAX))
         || token >= 8192
-        || !(3..127).contains(&pid)
+        || (!(3..127).contains(&pid) && (eapol || pid != MT7921_PACKET_ID_NO_SKB))
         || tid > 7
         || wcid >= 20
     {
@@ -8521,7 +8548,7 @@ pub fn encode_client_data_txwi(
             0x0000_0028,
             0x0000_7802,
             0,
-            0x400 | u32::from(pid),
+            u32::from(pid) | if pid >= 3 { 0x400 } else { 0 },
             0,
             0x0028_0000,
         ]
@@ -13282,21 +13309,26 @@ mod tests {
         };
         assert_eq!(
             wake.poll(&mut transport, 7),
-            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 1 })
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
         );
         assert_eq!(transport.writes, 1);
 
         transport.now = 1;
         assert_eq!(
             wake.poll(&mut transport, 7),
-            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 2 })
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
         );
         assert_eq!(
             transport.writes, 1,
             "a pending poll must not reissue CLR_OWN"
         );
 
-        transport.now = 2;
+        transport.now = 3;
+        assert_eq!(
+            wake.poll(&mut transport, 7),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 4 })
+        );
+        transport.now = 4;
         transport.status = 0;
         assert_eq!(
             wake.poll(&mut transport, 7),
@@ -13409,6 +13441,11 @@ mod tests {
             raw: Ok(u32::MAX),
             writes: 0,
         };
+        assert_eq!(
+            wake.poll(&mut transport, 1),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
+        );
+        transport.now = 3;
         assert_eq!(
             wake.poll(&mut transport, 1),
             Err(DriverOwnershipWakeError::UnexpectedState(u32::MAX))
@@ -15236,6 +15273,42 @@ mod tests {
             &[0, 0, 0, 0, 1, 0, 12, 0, 0, 9, 0xff, 0, 0, 0, 0, 0]
         );
         assert!(encode_client_join_roc_abort(8, 0, 0).is_err());
+    }
+
+    #[test]
+    fn data_without_host_status_uses_the_reserved_linux_pid() {
+        let encode = |pid, eapol| encode_client_data_txwi(
+            64, 0x1000, 0, pid, eapol, !eapol, false, 0, 1, 12,
+        );
+        let bytes = encode(MT7921_PACKET_ID_NO_SKB, false).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 1);
+        let bytes = encode(3, false).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x403);
+        assert!(encode(MT7921_PACKET_ID_NO_SKB, true).is_err());
+        for pid in [0, 2, 127, 255] {
+            assert!(encode(pid, false).is_err());
+        }
+    }
+
+    #[test]
+    fn beacon_loss_requires_a_complete_unsolicited_event_and_preserves_bss() {
+        let mut bytes = [0u8; 40];
+        bytes[24..26].copy_from_slice(&16u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        bytes[28] = 0x13;
+        for bss in [0, 1, 255] {
+            bytes[36] = bss;
+            bytes[37] = 7; // Linux treats every reason as connection loss.
+            assert_eq!(parse_client_beacon_loss(&bytes), Ok(ClientBeaconLoss { bss_index: bss, reason: 7 }));
+        }
+        for length in 0..40 {
+            assert!(parse_client_beacon_loss(&bytes[..length]).is_err());
+        }
+        bytes[29] = 1;
+        assert!(parse_client_beacon_loss(&bytes).is_err());
+        bytes[29] = 0;
+        bytes[28] = 0x0d;
+        assert_eq!(parse_client_beacon_loss(&bytes), Err(PassiveRxError::WrongEvent));
     }
 
     #[test]

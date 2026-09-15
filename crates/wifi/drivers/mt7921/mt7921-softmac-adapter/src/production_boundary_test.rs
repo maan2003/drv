@@ -36,6 +36,7 @@ struct ScanCompleteUpcalls(Arc<Mutex<Vec<(zx::Status, u64)>>>);
 impl wlan_softmac_class_support::WlanSoftmacUpcalls for ScanCompleteUpcalls {
     fn recv(&mut self, _: Vec<u8>, _: fidl_softmac::WlanRxInfo) {}
     fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+    fn notify_connection_loss(&mut self, _: [u8; 6]) {}
     fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
         self.0.lock().unwrap().push((status, scan_id));
     }

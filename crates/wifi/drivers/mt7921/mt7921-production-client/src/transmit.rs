@@ -196,6 +196,7 @@ impl ClientTx {
 
     pub fn tx_status(&mut self, status: Mt7921TxStatus) -> Result<(), zx::Status> {
         if let Some(pending) = self.pending.as_mut()
+            && pending.pid != mt7921_core::MT7921_PACKET_ID_NO_SKB
             && status.pid == pending.pid
             && status.wcid == 1
         {
@@ -365,7 +366,10 @@ impl ClientTx {
             progressed |= self.drive_dma(resources, now, grant_until)?;
             Ok(progressed)
         })();
-        if result.is_err() {
+        if let Err(status) = result {
+            eprintln!("mt7921_tx_fault status={status:?} queued={} front_data={:?} pending={} roc={}",
+                self.queue.len(), self.queue.front().map(|frame| frame.data),
+                self.pending.is_some(), self.roc.is_some());
             self.failed = true;
         }
         result
@@ -430,7 +434,9 @@ impl ClientTx {
                 }
                 return Ok(changed);
             }
-            if pending.status.is_none() {
+            // Ordinary data asks for no host TXS. DMA+TXFREE is its complete
+            // reclamation proof, independent of optional acknowledgment telemetry.
+            if pending.pid != mt7921_core::MT7921_PACKET_ID_NO_SKB && pending.status.is_none() {
                 if now < pending.deadline {
                     return Ok(changed);
                 }
@@ -488,20 +494,21 @@ impl ClientTx {
             .device_address(0)
             .map_err(|_| zx::Status::IO)?
             .bits();
-        let Some(pid) = (0..124u16)
-            .map(|offset| (((u16::from(self.next_pid) - 3 + offset) % 124) + 3) as u8)
-            .find(|pid| !self.retired_pids[usize::from(*pid)])
-        else {
-            return Err(zx::Status::NO_RESOURCES);
+        let pid = if frame.data && !frame.control_port {
+            mt7921_core::MT7921_PACKET_ID_NO_SKB
+        } else {
+            (0..124u16)
+                .map(|offset| (((u16::from(self.next_pid) - 3 + offset) % 124) + 3) as u8)
+                .find(|pid| !self.retired_pids[usize::from(*pid)])
+                .ok_or(zx::Status::NO_RESOURCES)?
         };
-        self.next_pid = pid;
         let mut encoded = if frame.data {
             let qos = frame.control_port && frame.bytes[0] == 0x88;
             let txwi = mt7921_core::encode_client_data_txwi(
                 frame.bytes.len(),
                 frame_iova,
                 self.next_token,
-                self.next_pid,
+                pid,
                 frame.control_port,
                 !frame.control_port,
                 qos,
@@ -523,7 +530,7 @@ impl ClientTx {
                 txwi,
                 descriptor,
                 token: self.next_token,
-                pid: self.next_pid,
+                pid,
             }
         } else {
             mt7921_core::encode_client_management_tx(
@@ -531,7 +538,7 @@ impl ClientTx {
                 txwi_iova,
                 frame_iova,
                 self.next_token,
-                self.next_pid,
+                pid,
                 1,
                 frame.rate,
             )
@@ -559,7 +566,7 @@ impl ClientTx {
             slot: self.producer,
             next: ((u32::from(self.producer) + 1) % MT7921_BAND0_TX_RING_COUNT) as u16,
             token: self.next_token,
-            pid: self.next_pid,
+            pid,
             deadline: now + Duration::from_secs(1),
             descriptor_done: false,
             freed: false,
@@ -567,11 +574,9 @@ impl ClientTx {
         };
         self.producer = pending.next;
         self.next_token = (self.next_token + 1) % 8192;
-        self.next_pid = if self.next_pid == 126 {
-            3
-        } else {
-            self.next_pid + 1
-        };
+        if pid != mt7921_core::MT7921_PACKET_ID_NO_SKB {
+            self.next_pid = if pid == 126 { 3 } else { pid + 1 };
+        }
         self.pending = Some(pending);
         let pending = self.pending.as_ref().unwrap();
         resources
@@ -1006,6 +1011,39 @@ mod tests {
             .unwrap();
             assert_eq!(tx.pending.as_ref().unwrap().status, None);
         }
+    }
+
+    #[test]
+    fn data_reclaims_on_dma_and_token_without_requesting_or_waiting_for_txs() {
+        let (device, _, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
+        let mut data = vec![0; 40];
+        data[0..2].copy_from_slice(&[0x08, 0x41]);
+        data[4..10].copy_from_slice(&[2; 6]);
+        data[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        let mut tx = ClientTx::default();
+        tx.enqueue(context, &data, 12, channel()).unwrap();
+        assert!(tx.drive_dma(&mut resources, now, None).unwrap());
+        assert_eq!(tx.pending.as_ref().unwrap().pid, mt7921_core::MT7921_PACKET_ID_NO_SKB);
+        tx.tx_status(Mt7921TxStatus { wcid: 1, pid: 1, acked: true }).unwrap();
+        assert!(tx.pending.as_ref().unwrap().status.is_none());
+        tx.tx_free(Mt7921TxFree {
+            wcid: Some(1), token: 0, dropped: false, attempts: 1,
+            status: 0, pair_word: None, info_word: 0,
+        }).unwrap();
+        assert!(!tx.drive_dma(&mut resources, now, None).unwrap());
+        assert!(tx.pending.is_some()); // TXFREE alone never releases DMA.
+        mark_done(&mut resources.dma.management_tx_ring, &model, 0);
+        resources.bar0.write_u32(0xd430c, 1).unwrap();
+        assert!(tx.drive_dma(&mut resources, now, None).unwrap());
+        assert!(tx.idle());
+        assert_eq!(tx.next_pid, 3);
+        assert!(!tx.retired_pids.iter().any(|retired| *retired));
     }
 
     #[test]

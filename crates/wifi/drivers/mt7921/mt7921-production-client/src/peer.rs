@@ -377,8 +377,14 @@ impl PeerAssociation {
                 ))?,
                 RadioResponse::Unified(3),
             ),
-            // Keep BCNFT disabled: host MLME monitors received beacons and
-            // firmware beacon-loss event 0x13 is not routed to that monitor.
+            // Firmware owns connection monitoring and needs the AP's
+            // beacon/DTIM schedule for dynamic power saving.
+            (
+                encode(encode_client_post_assoc_beacon_timing_command(
+                    1, 0, bss.beacon_period, dtim,
+                ))?,
+                RadioResponse::Unified(2),
+            ),
             (
                 encode(encode_client_post_assoc_rx_filter_command(1))?,
                 RadioResponse::None,
@@ -766,18 +772,15 @@ mod tests {
             let power = association.commands.queued_command(power_index).unwrap();
             assert_eq!(&power[52..54], &[21, 0]);
             assert_eq!(power[56], 0);
-            // Host MLME is the connection monitor. BCNFT would suppress the
-            // beacons it needs; firmware beacon-loss events are not routed.
-            let beacon_filter = mt7921_core::encode_client_post_assoc_beacon_timing_command(
-                1,
-                0,
-                bss.beacon_period,
-                bss.dtim_period.unwrap(),
-            )
-            .unwrap();
-            for command in (0..).map_while(|index| association.commands.queued_command(index)) {
-                assert_ne!(command, beacon_filter.as_slice());
-            }
+            // The advertised firmware monitor must be configured before
+            // the association completion permits MLME to omit its host timer.
+            let beacon_timing = mt7921_core::encode_client_post_assoc_beacon_timing_command(
+                1, 0, bss.beacon_period, bss.dtim_period.unwrap(),
+            ).unwrap();
+            assert_eq!(
+                association.commands.queued_command(power_index + 2).unwrap(),
+                beacon_timing.as_slice(),
+            );
             let mut mechanics = LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
             let mut busy = crate::transmit::ClientTx::default();
@@ -806,9 +809,9 @@ mod tests {
             )));
             let idle = crate::transmit::ClientTx::default();
             let expected: &[Option<u8>] = if qos {
-                &[Some(2), Some(2), Some(3), None, Some(2), Some(3), None]
+                &[Some(2), Some(2), Some(3), None, Some(2), Some(3), Some(2), None]
             } else {
-                &[Some(2), Some(2), Some(3), Some(2), Some(3), None]
+                &[Some(2), Some(2), Some(3), Some(2), Some(3), Some(2), None]
             };
             let mut published = 0;
             let mut rx_slot = 0usize;

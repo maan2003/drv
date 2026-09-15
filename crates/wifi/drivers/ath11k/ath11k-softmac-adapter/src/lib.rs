@@ -1572,6 +1572,7 @@ mod tests {
     impl WlanSoftmacUpcalls for NoopUpcalls {
         fn recv(&mut self, _: Vec<u8>, _: WlanRxInfo) {}
         fn report_tx_result(&mut self, _: WlanTxResult) {}
+        fn notify_connection_loss(&mut self, _: [u8; 6]) {}
         fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
     }
 
@@ -1597,6 +1598,7 @@ mod tests {
                 .tx
                 .push((result.peer_addr, result.result_code));
         }
+        fn notify_connection_loss(&mut self, _: [u8; 6]) {}
         fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
             self.0.lock().unwrap().scans.push((status, scan_id));
         }

@@ -117,6 +117,8 @@ pub trait WlanSoftmacUpcalls: Send {
     fn recv(&mut self, bytes: Vec<u8>, info: WlanRxInfo);
     fn report_tx_result(&mut self, result: WlanTxResult);
     fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64);
+    /// Loss of the firmware-monitored associated BSS, never a synthetic frame.
+    fn notify_connection_loss(&mut self, peer: [u8; 6]);
 }
 
 /// Run-scoped ownership paired with the SoftMAC operation contract.
@@ -125,9 +127,23 @@ pub trait WlanSoftmacLifecycle {
     fn stop(&mut self) -> Result<(), zx::Status>;
 }
 
+/// Station responsibilities retained by firmware rather than host MLME.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StationOffloadSupport {
+    /// Association configures monitoring and every loss indication is routed
+    /// through `notify_connection_loss` before this may be advertised.
+    pub connection_monitor: bool,
+    /// Firmware retrieves TIM/More-Data buffered units without host PS-Poll.
+    pub power_save: bool,
+}
+
 /// Synchronous, policy-free hardware work driven at the host runtime's
 /// deterministic device slot.
 pub trait ClientRuntimeDriver {
+    /// Immutable firmware station responsibilities supplied by this driver.
+    fn station_offload_support(&self) -> StationOffloadSupport {
+        StationOffloadSupport::default()
+    }
     fn drive(&mut self) -> Result<bool, zx::Status>;
     /// Perform one bounded turn and register the driver's external wake source.
     /// `false` means no immediate progress, not completion of pending operations.

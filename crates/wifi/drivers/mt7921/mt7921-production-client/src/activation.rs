@@ -681,8 +681,9 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
         let value = wfdma
             .read_u32(WFDMA_GLO_CFG)
             .map_err(|error| format!("read WFDMA global: {error:?}"))?;
-        verify_wfdma_global_readback(value, global, "WFDMA global")
-            .inspect(|()| self.enabled_wfdma = Some(global))
+        verify_wfdma_global_readback(value, global, "WFDMA global")?;
+        self.enabled_wfdma = Some(global);
+        mark_wfdma_initialized(&self.resources.bar0)
     }
     fn enable_host_interrupt(&mut self) -> Result<(), Self::Error> {
         let wfdma = self.region(0xd4000)?;
@@ -798,6 +799,20 @@ pub(super) fn activate<B: Backend>(
         enabled_wfdma: None,
         interrupt_install_attempted: false,
     })
+}
+
+// Linux mt792x_dma_enable marks every initialized engine, including cold
+// startup. Otherwise the first ownership wake needlessly rebuilds live rings.
+fn mark_wfdma_initialized<B: Backend>(bar: &MmioRegion<B>) -> Result<(), String> {
+    let dummy = bar
+        .read_u32(0x2120)
+        .map_err(|e| format!("read dummy: {e:?}"))?;
+    if dummy == u32::MAX {
+        return Err("WFDMA dummy returned all ones".into());
+    }
+    bar.write_u32(0x2120, dummy | (1 << 1))
+        .map_err(|e| format!("mark WFDMA healthy: {e:?}"))?;
+    readback(bar, 0x2120, dummy | (1 << 1), "WFDMA healthy")
 }
 
 /// Rebuild the live WPDMA transport after firmware reports lost ring state.
@@ -1059,19 +1074,7 @@ pub(super) fn runtime_reinitialize<B: Backend>(
         .map_err(|e| format!("verify WFDMA: {e:?}"))?;
     verify_wfdma_global_readback(actual, global, "runtime WFDMA global")?;
 
-    // Mark the rebuilt engine healthy before allowing firmware to own it again.
-    let dummy = resources
-        .bar0
-        .read_u32(0x2120)
-        .map_err(|e| format!("read dummy: {e:?}"))?;
-    if dummy == u32::MAX {
-        return Err("WFDMA dummy returned all ones".into());
-    }
-    resources
-        .bar0
-        .write_u32(0x2120, dummy | (1 << 1))
-        .map_err(|e| format!("mark WFDMA healthy: {e:?}"))?;
-    readback(&resources.bar0, 0x2120, dummy | (1 << 1), "WFDMA healthy")?;
+    mark_wfdma_initialized(&resources.bar0)?;
 
     let wake = resources
         .bar0
@@ -1279,6 +1282,7 @@ mod tests {
         let mut containment = containment();
         let mut state =
             activate(&mut resources, &mut pci, &mut acquisition, &mut containment).unwrap();
+        assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & 2, 2);
         assert_eq!(
             state.interrupt,
             mt7921_core::InterruptInstallState::InstalledAndQuiet
