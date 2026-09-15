@@ -1649,9 +1649,11 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn queue_tx(
         &mut self,
+        context: wlan_softmac_host::OperationContext,
         bytes: &[u8],
         flags: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
+        context.check(std::time::Instant::now())?;
         self.queue_tx_inner(bytes, flags)
     }
 }

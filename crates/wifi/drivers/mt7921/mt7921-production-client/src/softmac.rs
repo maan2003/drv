@@ -478,7 +478,13 @@ impl WlanSoftmac for Mt7921Driver {
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn queue_tx(&mut self, _: &[u8], _: WlanTxInfoFlags) -> Result<(), zx::Status> {
+    fn queue_tx(
+        &mut self,
+        context: wlan_softmac_host::OperationContext,
+        _: &[u8],
+        _: WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        context.check(std::time::Instant::now())?;
         Err(zx::Status::NOT_SUPPORTED)
     }
 }

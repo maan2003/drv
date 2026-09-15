@@ -249,7 +249,11 @@ impl DeviceOps for HostMlmeDevice {
         }
         self.driver.send(
             self.execution.epoch.borrow().clone(),
-            Command::Transmit(buffer.to_vec(), flags),
+            Command::Transmit(
+                self.execution.operation.borrow().clone(),
+                buffer.to_vec(),
+                flags,
+            ),
         )
     }
     async fn set_ethernet_status(&mut self, status: LinkStatus) -> Result<(), zx::Status> {
@@ -1942,6 +1946,7 @@ mod tests {
         reset_failure: bool,
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
+        tx_contexts: Vec<OperationContext>,
         channel_contexts: Vec<OperationContext>,
         join_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
@@ -2211,9 +2216,11 @@ mod tests {
         }
         fn queue_tx(
             &mut self,
+            context: crate::OperationContext,
             bytes: &[u8],
             flags: fidl_softmac::WlanTxInfoFlags,
         ) -> Result<(), zx::Status> {
+            context.check(std::time::Instant::now())?;
             let mut effects = self.0.lock().unwrap();
             if effects.simulate_ap {
                 match bytes.first().copied() {
@@ -2235,6 +2242,7 @@ mod tests {
             } else {
                 assert_eq!(bytes, [1, 0x40, 3]);
             }
+            effects.tx_contexts.push(context);
             effects.tx_flags.push(flags);
             effects.calls.push("tx");
             Ok(())
@@ -2453,6 +2461,54 @@ mod tests {
             let io = io.lock().unwrap();
             assert!(!io.ethernet.is_link_up());
             assert!(io.pending_ethernet_devices.is_empty());
+        });
+    }
+
+    #[test]
+    fn transmit_preserves_authority_and_rejects_revoked_or_expired_work() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut bridge, mut actor, _) = parts(fake);
+            let epoch = bridge.execution.epoch.borrow().clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let context = OperationContext::child(epoch.clone(), deadline);
+            bridge.execution.operation.replace(context.clone());
+            bridge
+                .send_wlan_frame(
+                    vec![1, 0x40, 3].into(),
+                    fidl_softmac::WlanTxInfoFlags::empty(),
+                    None,
+                )
+                .unwrap();
+            actor.drive_once().await.unwrap();
+            assert_eq!(effects.lock().unwrap().tx_contexts[0].deadline(), deadline);
+            bridge
+                .send_wlan_frame(
+                    vec![1, 0x40, 3].into(),
+                    fidl_softmac::WlanTxInfoFlags::empty(),
+                    None,
+                )
+                .unwrap();
+            context.revoke();
+            actor.drive_once().await.unwrap();
+            assert_eq!(effects.lock().unwrap().tx_flags.len(), 1);
+            assert_eq!(
+                effects.lock().unwrap().tx_contexts[0].check(std::time::Instant::now()),
+                Err(zx::Status::CANCELED)
+            );
+            bridge
+                .execution
+                .operation
+                .replace(OperationContext::child(epoch, std::time::Instant::now()));
+            assert_eq!(
+                bridge.send_wlan_frame(
+                    vec![1, 0x40, 3].into(),
+                    fidl_softmac::WlanTxInfoFlags::empty(),
+                    None
+                ),
+                Err(zx::Status::TIMED_OUT)
+            );
+            assert_eq!(effects.lock().unwrap().tx_flags.len(), 1);
         });
     }
 

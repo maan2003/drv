@@ -206,7 +206,14 @@ pub trait WlanSoftmac {
         &mut self,
         request: WlanSoftmacBaseUpdateWmmParametersRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
-    fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status>;
+    /// Admission is not hardware completion. Retain context with queued frames
+    /// and recheck it immediately before deferred hardware publication.
+    fn queue_tx(
+        &mut self,
+        context: crate::OperationContext,
+        bytes: &[u8],
+        flags: WlanTxInfoFlags,
+    ) -> Result<(), zx::Status>;
 }
 
 #[cfg(test)]
@@ -380,7 +387,13 @@ mod tests {
                 Ok(())
             })
         }
-        fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status> {
+        fn queue_tx(
+            &mut self,
+            context: crate::OperationContext,
+            bytes: &[u8],
+            flags: WlanTxInfoFlags,
+        ) -> Result<(), zx::Status> {
+            context.check(std::time::Instant::now())?;
             self.calls.push("queue_tx");
             self.tx = Some((bytes.to_vec(), flags));
             Ok(())
@@ -408,11 +421,11 @@ mod tests {
             .start_passive_scan(context.clone(), Default::default())
             .await?;
         device
-            .start_active_scan(context, Default::default())
+            .start_active_scan(context.clone(), Default::default())
             .await?;
         device.cancel_scan(Default::default()).await?;
         device.update_wmm_parameters(Default::default()).await?;
-        device.queue_tx(&[1, 2, 3], WlanTxInfoFlags::PROTECTED)
+        device.queue_tx(context, &[1, 2, 3], WlanTxInfoFlags::PROTECTED)
     }
 
     #[test]

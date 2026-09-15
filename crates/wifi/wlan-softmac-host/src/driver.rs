@@ -70,7 +70,7 @@ pub(crate) enum Command {
         oneshot::Sender<Result<(), zx::Status>>,
     ),
     Link(bool, oneshot::Sender<Result<(), zx::Status>>),
-    Transmit(Vec<u8>, WlanTxInfoFlags),
+    Transmit(OperationContext, Vec<u8>, WlanTxInfoFlags),
 }
 
 impl Command {
@@ -78,6 +78,7 @@ impl Command {
         match self {
             Self::Channel(context, ..)
             | Self::Join(context, ..)
+            | Self::Transmit(context, ..)
             | Self::PassiveScan(context, ..)
             | Self::ActiveScan(context, ..) => Some(context),
             _ => None,
@@ -378,7 +379,9 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
             Command::Link(request, reply) => {
                 let _ = reply.send(self.device.set_link_up(request));
             }
-            Command::Transmit(bytes, flags) => self.device.queue_tx(&bytes, flags)?,
+            Command::Transmit(context, bytes, flags) => {
+                self.device.queue_tx(context, &bytes, flags)?
+            }
         }
         if let Some(pending) = self.pending.as_mut()
             && pending.as_mut().poll(cx).is_ready()

@@ -305,7 +305,13 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))
         }
-        fn queue_tx(&mut self, _: &[u8], _: WlanTxInfoFlags) -> Result<(), zx::Status> {
+        fn queue_tx(
+            &mut self,
+            context: crate::OperationContext,
+            _: &[u8],
+            _: WlanTxInfoFlags,
+        ) -> Result<(), zx::Status> {
+            context.check(std::time::Instant::now())?;
             Ok(())
         }
     }

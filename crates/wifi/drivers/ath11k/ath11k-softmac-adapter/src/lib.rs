@@ -1409,7 +1409,13 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
-    fn queue_tx(&mut self, bytes: &[u8], flags: WlanTxInfoFlags) -> Result<(), zx::Status> {
+    fn queue_tx(
+        &mut self,
+        context: wlan_softmac_host::OperationContext,
+        bytes: &[u8],
+        flags: WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        context.check(std::time::Instant::now())?;
         if bytes.len() < 24 {
             return Err(zx::Status::INVALID_ARGS);
         }
@@ -2318,7 +2324,7 @@ mod tests {
             0, 0, // no PMF
         ]);
         adapter
-            .queue_tx(&request, WlanTxInfoFlags::empty())
+            .queue_tx(operation_context(), &request, WlanTxInfoFlags::empty())
             .unwrap();
 
         let mut association = open_association();
@@ -2352,12 +2358,16 @@ mod tests {
         data[16..22].copy_from_slice(&PEER);
         data.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
         assert_eq!(
-            adapter.queue_tx(&data, WlanTxInfoFlags::empty()),
+            adapter.queue_tx(operation_context(), &data, WlanTxInfoFlags::empty()),
             Err(zx::Status::BAD_STATE)
         );
         data[30..32].copy_from_slice(&[0x88, 0x8e]);
         adapter
-            .queue_tx(&data, WlanTxInfoFlags::FAVOR_RELIABILITY)
+            .queue_tx(
+                operation_context(),
+                &data,
+                WlanTxInfoFlags::FAVOR_RELIABILITY,
+            )
             .unwrap();
         assert!(matches!(adapter.device.backend().operations().last(),
             Some(Operation::DpTransmitData { flags, .. }) if flags.favor_reliability));
@@ -2373,10 +2383,12 @@ mod tests {
             })
         ));
         data[30..32].copy_from_slice(&[8, 0]);
-        adapter.queue_tx(&data, WlanTxInfoFlags::empty()).unwrap();
+        adapter
+            .queue_tx(operation_context(), &data, WlanTxInfoFlags::empty())
+            .unwrap();
         data[4] ^= 2;
         assert_eq!(
-            adapter.queue_tx(&data, WlanTxInfoFlags::empty()),
+            adapter.queue_tx(operation_context(), &data, WlanTxInfoFlags::empty()),
             Err(zx::Status::BAD_STATE)
         );
     }
@@ -2421,7 +2433,9 @@ mod tests {
         let mut frame = vec![0; 24];
         frame[0] = 0xb0;
         frame[4..10].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
-        adapter.queue_tx(&frame, WlanTxInfoFlags::empty()).unwrap();
+        adapter
+            .queue_tx(operation_context(), &frame, WlanTxInfoFlags::empty())
+            .unwrap();
         let vdev = adapter.vdev.unwrap();
         assert!(
             adapter
@@ -2457,7 +2471,9 @@ mod tests {
         assert!(adapter.drive().unwrap());
         let mut group = frame.clone();
         group[4..10].copy_from_slice(&[0xff; 6]);
-        adapter.queue_tx(&group, WlanTxInfoFlags::empty()).unwrap();
+        adapter
+            .queue_tx(operation_context(), &group, WlanTxInfoFlags::empty())
+            .unwrap();
         adapter
             .device
             .backend_mut()
@@ -2546,18 +2562,18 @@ mod tests {
         frame[0] = 0xb0;
 
         assert_eq!(
-            adapter.queue_tx(&frame, WlanTxInfoFlags::PROTECTED),
+            adapter.queue_tx(operation_context(), &frame, WlanTxInfoFlags::PROTECTED),
             Err(zx::Status::NOT_SUPPORTED)
         );
         frame[1] |= 0x40;
         assert_eq!(
-            adapter.queue_tx(&frame, WlanTxInfoFlags::empty()),
+            adapter.queue_tx(operation_context(), &frame, WlanTxInfoFlags::empty()),
             Err(zx::Status::NOT_SUPPORTED)
         );
         frame[1] &= !0x40;
         frame[0] |= 1;
         assert_eq!(
-            adapter.queue_tx(&frame, WlanTxInfoFlags::empty()),
+            adapter.queue_tx(operation_context(), &frame, WlanTxInfoFlags::empty()),
             Err(zx::Status::INVALID_ARGS)
         );
     }

@@ -163,7 +163,13 @@ impl WlanSoftmac for FakeSoftmac {
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))
     }
-    fn queue_tx(&mut self, bytes: &[u8], _: softmac::WlanTxInfoFlags) -> Result<(), zx::Status> {
+    fn queue_tx(
+        &mut self,
+        context: wlan_softmac_host::OperationContext,
+        bytes: &[u8],
+        _: softmac::WlanTxInfoFlags,
+    ) -> Result<(), zx::Status> {
+        context.check(std::time::Instant::now())?;
         let response = match bytes.first().copied() {
             Some(0xb0) => authentication_response(),
             Some(0x00) => association_response(),
