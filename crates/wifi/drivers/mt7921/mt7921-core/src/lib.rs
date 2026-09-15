@@ -6789,6 +6789,19 @@ pub fn encode_mt7921_5ghz_auth_tx(
     if frame_control != 0x00b0 {
         return Err(Mt7921MgmtTxError::InvalidFrame);
     }
+    encode_management_tx(frame, txwi_iova, frame_iova, token, pid, wcid)
+}
+
+/// Common raw-management envelope; callers validate their frame contract.
+fn encode_management_tx(
+    frame: &[u8],
+    txwi_iova: u64,
+    frame_iova: u64,
+    token: u16,
+    pid: u8,
+    wcid: u16,
+) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
+    let subtype = u32::from((frame[0] >> 4) & 0xf);
     let fits_low32 = |iova: u64, len: usize| {
         len != 0
             && iova
@@ -6816,15 +6829,15 @@ pub fn encode_mt7921_5ghz_auth_tx(
     word(0, (0x10 << 25) | ((frame.len() as u32 + 32) & 0xffff));
     // Long format, 802.11 header, 24-byte management header / 2.
     word(1, (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid));
-    // Authentication subtype, fixed legacy rate, and HTC-valid as in Linux.
-    word(2, (1 << 31) | (1 << 13) | 0x0b);
+    // Management subtype, fixed legacy rate, and HTC-valid as in Linux.
+    word(2, (1 << 31) | (1 << 13) | subtype);
     // 15 remaining attempts and BA disabled for fixed-rate management TX.
     word(3, (1 << 28) | (15 << 11));
     word(4, 0);
     word(5, (1 << 10) | u32::from(pid));
     // 5-GHz lowest basic rate: OFDM 6 Mbps (mode 1, hardware index 11).
     word(6, ((0x40u32 | 11) << 16) | (1 << 2));
-    word(7, 0x0b << 16);
+    word(7, subtype << 16);
     drop(word);
 
     txwi[32..34].copy_from_slice(&(token | 0x8000).to_le_bytes());
@@ -8407,30 +8420,8 @@ pub fn encode_client_management_tx(
     if control & 0x000c != 0 || !(24..=0x0fff).contains(&frame.len()) {
         return Err("client management TX requires one complete management MPDU".into());
     }
-    // The existing golden encoder owns the complete Linux TXWI/TXP envelope.
-    // Pad short valid management subtypes (for example a 26-byte deauth) only
-    // while obtaining that envelope; the published DMA length remains exact.
-    let mut auth_shape = frame.to_vec();
-    auth_shape.resize(30, 0);
-    auth_shape[0..2].copy_from_slice(&0x00b0u16.to_le_bytes());
-    let mut encoded =
-        encode_mt7921_5ghz_auth_tx(&auth_shape, txwi_iova, frame_iova, token, pid, 19)
-            .map_err(|error| format!("encode client management MPDU: {error:?}"))?;
-    let mut txd0 = u32::from_le_bytes(encoded.txwi[0..4].try_into().unwrap());
-    txd0 = (txd0 & !0xffff) | ((frame.len() as u32 + 32) & 0xffff);
-    encoded.txwi[0..4].copy_from_slice(&txd0.to_le_bytes());
-    let mut txd2 = u32::from_le_bytes(encoded.txwi[8..12].try_into().unwrap());
-    let subtype = u32::from((control >> 4) & 0xf);
-    txd2 = (txd2 & !0xf) | subtype;
-    encoded.txwi[8..12].copy_from_slice(&txd2.to_le_bytes());
-    let mut txd7 = u32::from_le_bytes(encoded.txwi[28..32].try_into().unwrap());
-    txd7 = (txd7 & !(0xf << 16)) | (subtype << 16);
-    encoded.txwi[28..32].copy_from_slice(&txd7.to_le_bytes());
-    // The auth-shaped padding is never published; TXP length is the original
-    // MPDU length and the DMA payload arena contains only `frame`.
-    encoded.txwi[40..44].copy_from_slice(&(frame_iova as u32).to_le_bytes());
-    encoded.txwi[44..46].copy_from_slice(&((frame.len() as u16) | 0x8000).to_le_bytes());
-    Ok(encoded)
+    encode_management_tx(frame, txwi_iova, frame_iova, token, pid, 19)
+        .map_err(|error| format!("encode client management MPDU: {error:?}"))
 }
 
 #[derive(Default)]
@@ -12688,6 +12679,31 @@ mod tests {
             encode_mt7921_5ghz_auth_tx(&txp_oversized, 0x1000, 0x2000, 0, 3, 19),
             Err(Mt7921MgmtTxError::InvalidFrame)
         );
+    }
+
+    #[test]
+    fn management_tx_validates_original_payload_extent_without_auth_padding() {
+        let mut frame = vec![0; 512];
+        frame[0] = 0;
+        assert!(
+            encode_client_management_tx(&frame, 0x1000, u64::from(u32::MAX) - 30, 7, 11).is_err()
+        );
+        let last_base = u64::from(u32::MAX) - frame.len() as u64 + 1;
+        let tx = encode_client_management_tx(&frame, 0x1000, last_base, 7, 11).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(tx.txwi[44..46].try_into().unwrap()),
+            0x8200
+        );
+        frame.truncate(26);
+        frame[0] = 0xc0;
+        let tx =
+            encode_client_management_tx(&frame, 0x1000, u64::from(u32::MAX) - 25, 7, 11).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(tx.txwi[44..46].try_into().unwrap()),
+            0x801a
+        );
+        assert_eq!(tx.txwi[8] & 0xf, 12);
+        assert_eq!(tx.txwi[30] & 0xf, 12);
     }
 
     #[test]
