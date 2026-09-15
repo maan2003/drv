@@ -278,7 +278,9 @@ impl LoaderMechanics {
         self.pending_scatter.is_some()
     }
 
-    fn active_command_slot(&self) -> Option<u16> {
+    /// The command pump owns MCU response correlation until both command
+    /// completion and DMA reclaim have retired this slot.
+    pub fn active_command_slot(&self) -> Option<u16> {
         self.pending_command
             .or_else(|| self.deferred_command.as_ref().map(|command| command.slot))
     }

@@ -10,9 +10,11 @@ been exercised with the assigned MT7921 inside KVM through the production CLI.
 Regulatory input is a hash-verified inherited database; the chip owner retains
 its immutable world-domain policy. Passive scan does not grant transmit
 authority. Bounded 20 MHz channel tuning and preauthentication peer setup are
-implemented and model-tested; neither has physical acceptance yet. Active scan,
-scan cancellation, peer removal, key configuration, association, TX and MAC
-override remain unavailable. Earlier Internet
+implemented and model-tested; neither has physical acceptance yet. Bounded
+unprotected management TX now waits for a matching firmware JOIN-ROC grant and
+retains DMA through descriptor, token and status completion; it has model coverage
+only. Active scan, scan cancellation, peer removal, key configuration,
+association completion, protected/data TX and MAC override remain unavailable. Earlier Internet
 demonstrations used the retired implementation and are not acceptance of this
 replacement.
 

@@ -86,6 +86,15 @@ impl ObservedBss {
         })
     }
 
+    pub fn management_rate(&self) -> u8 {
+        let ofdm = if self.channel.band == PhysicalBand::Ghz2 {
+            self.basic_rates >> 4
+        } else {
+            self.basic_rates
+        };
+        OFDM_RATES[ofdm.trailing_zeros() as usize]
+    }
+
     pub fn fresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.observed_at) < Duration::from_secs(30)
     }

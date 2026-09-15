@@ -19,6 +19,7 @@ mod peer;
 mod radio;
 mod setup_inputs;
 mod softmac;
+mod transmit;
 pub use setup_inputs::{
     CredentialBytes, CredentialFile, FirmwareImageExpectation, FirmwareImageKind,
     FirmwareVerificationError, RegulatoryDatabaseFile, VerifiedFirmware, VerifiedFirmwareImages,
@@ -965,6 +966,7 @@ pub struct Mt7921Driver {
     observations: std::collections::VecDeque<peer::ObservedBss>,
     peer_join: Option<peer::PeerJoin>,
     joined: Option<peer::ObservedBss>,
+    management_tx: transmit::ManagementTx,
     next_scan_id: u64,
     upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
 }
@@ -1025,6 +1027,7 @@ impl Mt7921Driver {
                     observations: std::collections::VecDeque::new(),
                     peer_join: None,
                     joined: None,
+                    management_tx: transmit::ManagementTx::default(),
                     next_scan_id: 1,
                     upcalls: None,
                 })

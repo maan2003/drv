@@ -108,35 +108,31 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     return Ok(progressed);
                 }
             }
-            let mut views = resources
-                .active_mcu_views(&mut self.session.receive, self.session.start)
-                .map_err(|_| zx::Status::IO)?;
-            progressed |= self
-                .session
-                .mcu
-                .0
-                .poll_events(&mut views, &mut ())
-                .map_err(|_| zx::Status::IO)?;
-            let (data_progress, routes) =
-                self.data_rx.poll(resources).map_err(|_| zx::Status::IO)?;
-            progressed |= data_progress;
+            let (io_progress, receive_idle, routes) = drive_radio_io(
+                resources,
+                &mut self.session.mcu.0,
+                &mut self.session.receive,
+                &mut self.data_rx,
+                &mut self.management_tx,
+                self.session.start,
+                std::time::Instant::now(),
+            )?;
+            progressed |= io_progress;
             let upcalls = self.upcalls.as_mut().ok_or(zx::Status::BAD_STATE)?;
             for route in routes {
-                if let mt7921_core::McuRxRoute::Normal(bytes) = route {
-                    deliver_raw_rx(upcalls.as_mut(), &mut self.observations, &bytes);
-                }
-            }
-            let mut event_count = 0;
-            for _ in 0..64 {
-                let Some(event) = self.session.receive.take_event() else {
-                    break;
-                };
-                event_count += 1;
-                match event.into_route().map_err(|_| zx::Status::IO)? {
+                match route {
                     mt7921_core::McuRxRoute::Normal(bytes) => {
                         deliver_raw_rx(upcalls.as_mut(), &mut self.observations, &bytes)
                     }
+                    mt7921_core::McuRxRoute::TxFree(free) => self.management_tx.tx_free(free)?,
+                    mt7921_core::McuRxRoute::TxStatus(status) => {
+                        self.management_tx.tx_status(status)?
+                    }
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
+                        if let Ok(grant) = mt7921_core::parse_client_join_roc_grant(&bytes.bytes) {
+                            self.management_tx
+                                .roc_grant(grant, std::time::Instant::now())?;
+                        }
                         if let Ok(done) = mt7921_core::parse_passive_scan_done(&bytes.bytes) {
                             if let Some(scan) = self.scan.as_mut() {
                                 if done.scan_sequence == scan.sequence {
@@ -145,10 +141,9 @@ impl ClientRuntimeDriver for Mt7921Driver {
                             }
                         }
                     }
-                    _ => {}
                 }
             }
-            if !data_progress && event_count == 0 {
+            if receive_idle {
                 if let Some(scan) = self.scan.as_mut() {
                     if scan.reclaimed && scan.done.is_some() {
                         scan.context.check(std::time::Instant::now())?;
@@ -406,6 +401,9 @@ impl WlanSoftmac for Mt7921Driver {
             if self.scan.is_some() || self.channel_change.is_some() || self.peer_join.is_some() {
                 return Err(zx::Status::SHOULD_WAIT);
             }
+            if self.joined.is_some() || !self.management_tx.idle() {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
             let requested = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
             if !(1..=64).contains(&requested.len()) {
                 return Err(zx::Status::INVALID_ARGS);
@@ -481,12 +479,73 @@ impl WlanSoftmac for Mt7921Driver {
     fn queue_tx(
         &mut self,
         context: wlan_softmac_host::OperationContext,
-        _: &[u8],
-        _: WlanTxInfoFlags,
+        bytes: &[u8],
+        flags: WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
         context.check(std::time::Instant::now())?;
-        Err(zx::Status::NOT_SUPPORTED)
+        if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
+            return Err(zx::Status::BAD_STATE);
+        }
+        if self.scan.is_some() || self.channel_change.is_some() || self.peer_join.is_some() {
+            return Err(zx::Status::SHOULD_WAIT);
+        }
+        let peer = self.joined.as_ref().ok_or(zx::Status::BAD_STATE)?;
+        let local = self
+            .firmware
+            .nic_capability
+            .mac_address
+            .ok_or(zx::Status::BAD_STATE)?;
+        if self.current_channel != Some(peer.channel)
+            || bytes.get(4..10) != Some(peer.bssid.as_slice())
+            || bytes.get(10..16) != Some(local.as_slice())
+            || bytes.get(16..22) != Some(peer.bssid.as_slice())
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        if flags.contains(WlanTxInfoFlags::PROTECTED) {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        self.management_tx
+            .enqueue(context, bytes, peer.management_rate(), peer.channel)
     }
+}
+
+/// One operational radio I/O turn shared by the physical driver and model.
+/// The command pump owns correlated MCU RX while busy; already collected
+/// events and the independent data RX ring are still serviced every turn.
+pub(super) fn drive_radio_io<B: drv_hardware::Backend>(
+    resources: &mut crate::OwnedHardwareResources<B>,
+    mechanics: &mut mt7921_core::LoaderMechanics,
+    receive: &mut crate::receive::RxRouting,
+    data_rx: &mut crate::receive::DataRx,
+    management_tx: &mut crate::transmit::ManagementTx,
+    start: std::time::Instant,
+    now: std::time::Instant,
+) -> Result<(bool, bool, Vec<mt7921_core::McuRxRoute>), zx::Status> {
+    let mut progressed = management_tx.drive(resources, mechanics, receive, start, now)?;
+    if mechanics.active_command_slot().is_none() {
+        let mut views = resources
+            .active_mcu_views(receive, start)
+            .map_err(|_| zx::Status::IO)?;
+        progressed |= mechanics
+            .poll_events(&mut views, &mut ())
+            .map_err(|_| zx::Status::IO)?;
+    }
+    let (data_progress, mut routes) = data_rx.poll(resources).map_err(|_| zx::Status::IO)?;
+    progressed |= data_progress;
+    let mut event_count = 0;
+    for _ in 0..64 {
+        let Some(event) = receive.take_event() else {
+            break;
+        };
+        event_count += 1;
+        routes.push(event.into_route().map_err(|_| zx::Status::IO)?);
+    }
+    Ok((
+        progressed || event_count != 0,
+        !data_progress && event_count == 0,
+        routes,
+    ))
 }
 
 fn deliver_raw_rx(

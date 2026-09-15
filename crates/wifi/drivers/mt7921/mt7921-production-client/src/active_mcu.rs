@@ -355,7 +355,7 @@ impl<B: Backend> LoaderMechanicsTransport for ActiveMcuViews<'_, B> {
     }
 }
 
-fn descriptor_from_bytes(bytes: [u8; DMA_DESCRIPTOR_LEN]) -> DmaDescriptor {
+pub(super) fn descriptor_from_bytes(bytes: [u8; DMA_DESCRIPTOR_LEN]) -> DmaDescriptor {
     DmaDescriptor {
         buf0: u32::from_le_bytes(bytes[0..4].try_into().expect("descriptor word")),
         ctrl: u32::from_le_bytes(bytes[4..8].try_into().expect("descriptor word")),
