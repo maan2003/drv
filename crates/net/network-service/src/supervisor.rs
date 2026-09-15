@@ -147,6 +147,7 @@ enum NetworkFrontend {
     },
     Kernel {
         registration_path: PathBuf,
+        resolver_listener: Option<std::os::unix::net::UnixListener>,
     },
 }
 
@@ -213,11 +214,13 @@ impl NetworkServiceSupervisor {
 
     /// Construct the production kernel-socket provider supervisor. A fresh
     /// registration session is opened for each independently replaceable
-    /// provider generation after its predecessor has been reaped.
+    /// provider generation after its predecessor has been reaped. The optional
+    /// resolver listener survives those generations; its caller owns pathname locking.
     pub fn new_kernel(
         binary: impl AsRef<Path>,
         registration_path: impl AsRef<Path>,
         mac_address: [u8; 6],
+        resolver_listener: Option<std::os::unix::net::UnixListener>,
     ) -> Result<Self, String> {
         if mac_address == [0; 6] || mac_address[0] & 1 != 0 {
             return Err("network-service MAC must be nonzero unicast".into());
@@ -226,6 +229,7 @@ impl NetworkServiceSupervisor {
             binary: binary.as_ref().to_owned(),
             frontend: NetworkFrontend::Kernel {
                 registration_path: registration_path.as_ref().to_owned(),
+                resolver_listener,
             },
             mac_address,
             next_generation: 1,
@@ -371,7 +375,7 @@ impl NetworkServiceSupervisor {
                         .env(
                             "DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_REGISTRATION",
                             match &self.frontend {
-                                NetworkFrontend::Kernel { registration_path } => registration_path,
+                                NetworkFrontend::Kernel { registration_path, .. } => registration_path,
                                 NetworkFrontend::Socks { .. } => unreachable!(),
                             },
                         );
@@ -423,7 +427,7 @@ impl NetworkServiceSupervisor {
 
     /// Starts a fresh production provider generation while offline.
     pub fn start_provider(&mut self) -> Result<u64, String> {
-        let NetworkFrontend::Kernel { registration_path } = &self.frontend else {
+        let NetworkFrontend::Kernel { registration_path, resolver_listener } = &self.frontend else {
             return Err("SOCKS frontend starts with an Ethernet generation".into());
         };
         if self.kernel_process.is_some() {
@@ -449,13 +453,18 @@ impl NetworkServiceSupervisor {
         let generation = self.next_provider_generation;
         let next = generation.checked_add(1).ok_or("provider generation exhausted")?;
         let mac = self.mac_address.map(|octet| format!("{octet:02x}")).join(":");
-        let inherited = [
+        let resolver_pass = resolver_listener.as_ref()
+            .map(|listener| duplicate_capability(listener.as_raw_fd())).transpose()?;
+        let mut inherited = vec![
             (registration.as_raw_fd(), FRAME_FD),
             (placeholder.as_raw_fd(), LISTENER_FD),
             (bootstrap_pass.as_raw_fd(), BOOTSTRAP_FD),
             (control_pass.as_raw_fd(), LINK_CONTROL_FD),
             (placeholder.as_raw_fd(), crate::link_control::FRAME_RESERVATION_FD),
         ];
+        if let Some(listener) = &resolver_pass {
+            inherited.push((listener.as_raw_fd(), 7));
+        }
         let mut command = Command::new(&self.binary);
         command
             .env_clear()
@@ -485,9 +494,21 @@ impl NetworkServiceSupervisor {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO", "1");
             }
         }
+        if resolver_pass.is_some() {
+            #[cfg(not(test))]
+            command.arg("--resolver-fd");
+            #[cfg(test)]
+            if self.fixture {
+                let address = resolver_listener.as_ref().unwrap().local_addr().unwrap();
+                command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_RESOLVER",
+                    address.as_pathname().unwrap());
+            } else {
+                command.arg("--resolver-fd");
+            }
+        }
         unsafe {
             command.pre_exec(move || {
-                for (source, target) in inherited {
+                for &(source, target) in &inherited {
                     if dup2(source, target) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -917,6 +938,14 @@ mod tests {
             let flags = unsafe { fcntl(fd, F_GETFD) };
             assert!(flags >= 0, "missing inherited fd {fd}");
             assert_eq!(flags & FD_CLOEXEC, 0, "inherited fd {fd} is CLOEXEC");
+        }
+        if let Some(path) = std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_RESOLVER") {
+            let resolver = unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) };
+            assert_eq!(resolver.local_addr().unwrap().as_pathname(), Some(Path::new(&path)));
+            assert_eq!(unsafe { fcntl(7, F_GETFD) } & FD_CLOEXEC, 0);
+            // This fixture checks inheritance; the supervisor retains its
+            // own listener for the replacement process.
+            drop(resolver);
         }
         let mut bootstrap = unsafe { UnixStream::from_raw_fd(BOOTSTRAP_FD) };
         bootstrap.write_all(b"READY").unwrap();
@@ -1641,6 +1670,7 @@ mod tests {
             std::env::current_exe().unwrap(),
             &path,
             [2, 0, 0, 0, 0, 1],
+            None,
         )
         .unwrap();
         supervisor.arguments = [
@@ -1672,6 +1702,7 @@ mod tests {
             std::env::current_exe().unwrap(),
             "/dev/netstack3",
             [2, 0, 0, 0, 0, 1],
+            None,
         )
         .unwrap();
         supervisor.arguments = [
@@ -1743,10 +1774,13 @@ mod tests {
             std::process::id()
         ));
         let registration = File::create(&path).unwrap();
+        let resolver_path = path.with_extension("resolver.sock");
+        let resolver = std::os::unix::net::UnixListener::bind(&resolver_path).unwrap();
         let mut supervisor = NetworkServiceSupervisor::new_kernel(
             std::env::current_exe().unwrap(),
             &path,
             [2, 0, 0, 0, 0, 1],
+            Some(resolver),
         )
         .unwrap();
         supervisor.arguments = [
@@ -1816,6 +1850,8 @@ mod tests {
         wait_for_driver_closed(&mut second_driver);
         drop(registration);
         std::fs::remove_file(path).unwrap();
+        drop(supervisor);
+        std::fs::remove_file(resolver_path).unwrap();
     }
 
     #[test]

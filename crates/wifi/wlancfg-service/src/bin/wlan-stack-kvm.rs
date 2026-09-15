@@ -140,7 +140,11 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all("/run/drv").map_err(|error| format!("create /run/drv: {error}"))?;
     std::fs::create_dir_all(&state_directory)
         .map_err(|error| format!("create saved-network directory: {error}"))?;
-    let (_application_lock, application) = bind_application(Path::new("/run/drv/wlancfg.sock"))?;
+    let (_application_lock, application) =
+        bind_listener(Path::new("/run/drv/wlancfg.sock"), ListenerKind::Policy)?;
+    let (_resolver_lock, resolver) =
+        bind_listener(Path::new(drv_dns_wire::PATH), ListenerKind::Resolver)?;
+    let resolver = std::os::unix::net::UnixListener::from(resolver);
     let state = File::open(&state_directory)
         .map_err(|error| format!("open saved-network directory: {error}"))?;
     if unsafe { libc::fchown(state.as_raw_fd(), 65534, 65534) } != 0 {
@@ -190,7 +194,9 @@ fn run() -> Result<(), String> {
         }
     };
     let mut network =
-        match NetworkServiceSupervisor::new_kernel(network_binary, "/dev/netstack3", mac) {
+        match NetworkServiceSupervisor::new_kernel(
+            network_binary, "/dev/netstack3", mac, Some(resolver),
+        ) {
             Ok(network) => network,
             Err(error) => {
                 let _ = policy_child.kill();
@@ -208,7 +214,7 @@ fn run() -> Result<(), String> {
     // Diagnostic output must not unwind past live hardware-owning children.
     let _ = writeln!(
         std::io::stdout(),
-        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider resolver=false"
+        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider resolver=true"
     );
 
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
@@ -462,7 +468,17 @@ fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
+#[derive(Clone, Copy)]
+enum ListenerKind {
+    Policy,
+    Resolver,
+}
+
+fn bind_listener(path: &Path, kind: ListenerKind) -> Result<(File, OwnedFd), String> {
+    let (socket_type, permissions) = match kind {
+        ListenerKind::Policy => (libc::SOCK_SEQPACKET, 0o600),
+        ListenerKind::Resolver => (libc::SOCK_STREAM, 0o666),
+    };
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let lock = OpenOptions::new()
         .read(true)
@@ -471,31 +487,31 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
         .truncate(false)
         .mode(0o600)
         .open(path.with_extension("lock"))
-        .map_err(|error| format!("open application ownership lock: {error}"))?;
+        .map_err(|error| format!("open local ownership lock: {error}"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(format!(
-            "application listener already owned: {}",
+            "local listener already owned: {}",
             std::io::Error::last_os_error()
         ));
     }
     let encoded_path = CString::new(
         path.to_str()
-            .ok_or("application socket path is not UTF-8")?,
+            .ok_or("local socket path is not UTF-8")?,
     )
-    .map_err(|_| "application socket path contains NUL")?;
+    .map_err(|_| "local socket path contains NUL")?;
     if encoded_path.as_bytes_with_nul().len() > 108 {
-        return Err("application socket path is too long".into());
+        return Err("local socket path is too long".into());
     }
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            socket_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             0,
         )
     };
     if fd < 0 {
         return Err(format!(
-            "create application listener: {}",
+            "create local listener: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -525,18 +541,18 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
                 )
             };
             if connected == 0 {
-                return Err("application listener is still live".into());
+                return Err("local listener is still live".into());
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ECONNREFUSED) {
-                return Err(format!("probe existing application listener: {error}"));
+                return Err(format!("probe existing local listener: {error}"));
             }
             std::fs::remove_file(path)
-                .map_err(|error| format!("remove stale application socket: {error}"))?;
+                .map_err(|error| format!("remove stale local socket: {error}"))?;
         }
-        Ok(_) => return Err("application socket path is not a socket".into()),
+        Ok(_) => return Err("local socket path is not a socket".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("inspect application socket: {error}")),
+        Err(error) => return Err(format!("inspect local socket: {error}")),
     }
     if unsafe {
         libc::bind(
@@ -547,16 +563,16 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
     } != 0
     {
         return Err(format!(
-            "bind application listener: {}",
+            "bind local listener: {}",
             std::io::Error::last_os_error()
         ));
     }
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("protect application listener: {error}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(permissions))
+        .map_err(|error| format!("protect local listener: {error}"))?;
     if unsafe { libc::listen(fd.as_raw_fd(), 16) } != 0 {
         return Err(format!(
-            "listen on application socket: {}",
+            "listen on local socket: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -661,32 +677,34 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn application_listener_reclaims_stale_socket_without_replacing_live_owner() {
-        let directory = std::env::temp_dir().join(format!(
-            "wlan-{}-{:x}",
-            std::process::id(),
-            u64::from_le_bytes(generation().unwrap()[..8].try_into().unwrap()),
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("application.sock");
-        let first = bind_application(&path).unwrap();
-        assert!(bind_application(&path).is_err());
-        assert!(path.exists());
-        // Simulate a listener retained by a child after parent-lock release.
-        assert_eq!(
-            unsafe { libc::flock(first.0.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
-        assert!(bind_application(&path).is_err());
-        assert!(path.exists());
-        drop(first);
-        let second = bind_application(&path).unwrap();
-        drop(second);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"not a socket").unwrap();
-        assert!(bind_application(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
-        std::fs::remove_dir_all(directory).unwrap();
+    fn local_listeners_reclaim_stale_socket_without_replacing_live_owner() {
+        for kind in [ListenerKind::Policy, ListenerKind::Resolver] {
+            let directory = std::env::temp_dir().join(format!(
+                "wlan-{}-{:x}",
+                std::process::id(),
+                u64::from_le_bytes(generation().unwrap()[..8].try_into().unwrap()),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("application.sock");
+            let first = bind_listener(&path, kind).unwrap();
+            assert!(bind_listener(&path, kind).is_err());
+            assert!(path.exists());
+            // Simulate a listener retained by a child after parent-lock release.
+            assert_eq!(
+                unsafe { libc::flock(first.0.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+            assert!(bind_listener(&path, kind).is_err());
+            assert!(path.exists());
+            drop(first);
+            let second = bind_listener(&path, kind).unwrap();
+            drop(second);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"not a socket").unwrap();
+            assert!(bind_listener(&path, kind).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

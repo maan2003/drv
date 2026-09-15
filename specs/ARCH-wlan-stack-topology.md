@@ -19,9 +19,12 @@ acknowledged firmware commands, enforces receive integrity/replay checks and
 gates protected data on the controlled port. Physical validation has exercised
 WPA3 SAE, DHCP, encrypted DNS and HTTPS through separately sandboxed Netstack3
 with kernel Internet disabled, followed by safe hardware shutdown and native
-restoration. Active scan, scan cancellation, peer removal and MAC override
-remain unavailable; sustained operation, reconnect and power-management
-acceptance remain separate from this bounded Internet proof.
+restoration. Acknowledged peer teardown now permits disconnect/reconnect
+without resetting the device, and firmware owns station power saving and
+connection monitoring. Bounded physical tests exercise power-mode changes,
+idle wake, reconnect and saved-state restart; they do not establish sustained
+production acceptance. Active scan, scan cancellation and MAC override remain
+unavailable.
 
 The policy daemon owns persistence and network intent, and drives the pinned
 Fuchsia selector/state machine over bounded, fd-free control IPC. Application
@@ -51,9 +54,11 @@ does not wait on it. Explicit
 SoftMAC roam is reported unsupported without disturbing the current link;
 the pinned SoftMAC MLME does not implement the fullmac roam request.
 
-MT7921 radio recovery, firmware beacon-loss delivery, connection-monitor
-offload, and retry-safe per-attempt cleanup remain future work; the replacement
-does not admit those operations.
+Firmware beacon-loss reports enter the peer-scoped Fuchsia lifecycle. Terminal
+events follow asynchronous device cleanup so SME cannot revoke its authority
+prematurely. Completed peer removal drains firmware, DMA and receive work before
+certifying retry safety; uncertain partial operations still require containment.
+Automatic recovery from arbitrary radio faults remains unqualified.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
@@ -72,7 +77,7 @@ connection authentication material and session keys; it is not secret-free.
 | Process | Owns | fs | secrets | hardware | Internet parser | lifecycle |
 |---|---|---|---|---|---|---|
 | driver + MLME + SME + RSN | VFIO/DMA, 802.11 control, SAE, 4-way handshake, keys | no | active connection only | yes | no | ephemeral |
-| netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | ephemeral |
+| netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | provider generation; survives link replacement |
 | dns (later separate process) | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
 | policy (wlancfg) | saved networks, config, credentials, connection policy | yes | yes | no | no | stateful |
 

@@ -2929,6 +2929,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "drv-dns-wire",
  "drv-network-service",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",

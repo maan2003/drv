@@ -18,6 +18,7 @@ futures = "=0.3.32"
 libc = "=0.2.189"
 linux-self-sandbox = { path = "../../platform/linux-self-sandbox" }
 drv-network-service = { path = "../../net/network-service" }
+drv-dns-wire = { path = "../../net/dns-wire" }
 tokio = { version = "=1.52.3", features = ["rt", "time"] }
 fidl-fuchsia-wlan-sme = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.sme" }
 fuchsia-inspect = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/diagnostics/inspect/rust" }

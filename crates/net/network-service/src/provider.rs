@@ -24,10 +24,16 @@ pub(crate) fn read_control(fd: &OwnedFd, bytes: &mut [u8; 128]) -> rustix::io::R
     else { Ok(result as usize) }
 }
 
+/// Resolver endpoint provenance at the privileged process-entry boundary.
+pub enum ResolverEndpoint {
+    BindDefault,
+    Inherited,
+}
+
 pub fn run_provider(
     ethernet_mac: Option<[u8; 6]>,
     bootstrap: bool,
-    resolver: bool,
+    resolver: Option<ResolverEndpoint>,
     link_control: bool,
 ) -> Result<(), String> {
     if bootstrap && ethernet_mac.is_none() {
@@ -85,27 +91,54 @@ pub fn run_provider(
     };
     // Bind before empty-root/no-open sandboxing, never from the DNS engine or NSS.
     // Do not unlink an existing path: another provider may own it.
-    let resolver_listener = if resolver {
-        use std::os::unix::fs::PermissionsExt;
-        let listener = std::os::unix::net::UnixListener::bind(drv_dns_wire::PATH)
-            .map_err(|e| format!("resolver listener: {e}"))?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))
-            .map_err(|e| e.to_string())?;
-        if listener.as_raw_fd() != 7 {
-            // SAFETY: before sandbox setup, reserve the documented listener capability
-            // slot. The listener owns its original FD; the duplicate gets one owner below.
-            if unsafe { libc::dup3(listener.as_raw_fd(), 7, libc::O_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error().to_string());
+    let resolver_listener = match resolver {
+        Some(ResolverEndpoint::Inherited) => {
+            // Validate the transferred endpoint before assuming FD ownership.
+            for (option, expected) in [
+                (libc::SO_TYPE, libc::SOCK_STREAM),
+                (libc::SO_DOMAIN, libc::AF_UNIX),
+                (libc::SO_ACCEPTCONN, 1),
+            ] {
+                let mut value = 0i32;
+                let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        7, libc::SOL_SOCKET, option,
+                        (&mut value as *mut i32).cast(), &mut length,
+                    )
+                } != 0 || value != expected
+                {
+                    return Err("FD7 must be a listening Unix resolver stream".into());
+                }
             }
-            Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) })
-        } else {
+            // FD7 is transferred exclusively by the supervisor before exec.
+            let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) };
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
             Some(listener)
         }
-    } else {
-        None
+        Some(ResolverEndpoint::BindDefault) => {
+            use std::os::unix::fs::PermissionsExt;
+            let listener = std::os::unix::net::UnixListener::bind(drv_dns_wire::PATH)
+                .map_err(|e| format!("resolver listener: {e}"))?;
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))
+                .map_err(|e| e.to_string())?;
+            if listener.as_raw_fd() != 7 {
+                // SAFETY: before sandbox setup, reserve the documented listener capability
+                // slot. The listener owns its original FD; the duplicate gets one owner below.
+                if unsafe { libc::dup3(listener.as_raw_fd(), 7, libc::O_CLOEXEC) } < 0 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) })
+            } else {
+                Some(listener)
+            }
+        }
+        None => None,
     };
-    crate::child::provider_setup(ethernet.is_some(), bootstrap, resolver, link_control)?;
+    crate::child::provider_setup(
+        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control,
+    )?;
     // SAFETY: setup retains this inherited descriptor exclusively for this
     // provider. Keep its ownership explicit for every ancillary operation.
     let link_control = link_control.then(|| unsafe {

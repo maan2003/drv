@@ -33,7 +33,9 @@ supervisor starts one offline provider generation and uses a private,
 generation-tagged descriptor channel to detach and replace Ethernet links
 without replacing the provider process or socket namespace. Provider crash
 and restart remain a distinct, terminal generation boundary for old sockets.
-Continuous physical validation of link replacement remains pending.
+Bounded physical validation now exercises disconnect/reconnect with the same
+provider and listener processes, including renewed IPv4/IPv6 traffic and SSH.
+This does not establish continuous deployment acceptance.
 
 ## Owner-selected goal and rationale
 
@@ -71,8 +73,11 @@ remote address, connection, or application frontend. SOCKS and the Linux
 socket frontend are bindings to this service, not separate network stacks.
 Wi-Fi selection and credentials belong to wlancfg. DNS currently shares
 the network process and uses Hickory 0.26.3 with native Netstack3 transport;
-the optional NSS endpoint carries lookup requests, not DNS parsing or a second
-network stack. Its C ABI pointer adapter is isolated from safe Rust lookup,
+the NSS endpoint carries lookup requests, not DNS parsing or a second
+network stack. The kernel-provider launcher owns and locks its Unix listener,
+passing only the listener capability into the sandbox. The endpoint survives
+link and provider replacement; a new launcher may reclaim a stale endpoint
+only after excluding a live owner. Its C ABI pointer adapter is isolated from safe Rust lookup,
 layout and I/O code; the separate DNS service described in
 [ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) remains a later boundary.
 

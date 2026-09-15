@@ -25,7 +25,7 @@ mod child;
 mod provider;
 mod socket_worker;
 mod resolver;
-pub use provider::run_provider;
+pub use provider::{run_provider, ResolverEndpoint};
 mod ethernet_device;
 mod lifecycle;
 mod link_control;
