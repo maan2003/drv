@@ -199,8 +199,6 @@ pub(crate) async fn serve_wlan_softmac_ifc_bridge(
     let notify = upcalls.lock().unwrap().notify.clone();
     let mut stop = stop.fuse();
     let mut hardware_exit = hardware_exit.fuse();
-    let mut ethernet_ticks = tokio::time::interval(Duration::from_millis(1));
-    ethernet_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if overflow.load(Ordering::Acquire) {
             anyhow::bail!("Native serving queue overflow");
@@ -223,10 +221,31 @@ pub(crate) async fn serve_wlan_softmac_ifc_bridge(
             }
         }
         .fuse();
-        // The current Ethernet seam is nonblocking and has no async readiness
-        // API. Preserve the existing service cadence without a protocol pump.
-        let ethernet = ethernet_ticks.tick().fuse();
+        let ethernet =
+            std::future::poll_fn(|cx| io.lock().unwrap().ethernet.poll_transmit(cx)).fuse();
         futures::pin_mut!(callback, ethernet);
+        // Fair RX/TX selection now that both sources may stay ready. Terminal
+        // control remains outside this selection and has strict priority.
+        let ingress = async {
+            futures::select! {
+                frame = ethernet => {
+                    let frame = frame
+                        .map_err(|error| anyhow::anyhow!("Ethernet ingress: {error:?}"))?;
+                    let epoch = upcalls.lock().unwrap().epoch.clone();
+                    Ok::<_, Error>((epoch, DriverEvent::EthernetTxEvent(frame.as_bytes().to_vec())))
+                },
+                callback = callback => {
+                    let (epoch, upcall) = callback?;
+                    let event = match upcall {
+                        Upcall::Recv { bytes, info } => DriverEvent::WlanRxEvent { bytes, rx_info: info },
+                        Upcall::TxResult(tx_result) => DriverEvent::TxResultReport { tx_result },
+                        Upcall::ScanComplete { status, scan_id } => DriverEvent::ScanComplete { status, scan_id },
+                    };
+                    Ok((epoch, event))
+                },
+            }
+        }.fuse();
+        futures::pin_mut!(ingress);
         let (epoch, event) = futures::select_biased! {
             requested = stop => {
                 requested.map_err(|_| anyhow::anyhow!("Callback control closed without stop"))?;
@@ -246,26 +265,7 @@ pub(crate) async fn serve_wlan_softmac_ifc_bridge(
             result = hardware_exit => {
                 anyhow::bail!("Hardware owner exited before protocol stop: {result:?}");
             },
-            _ = ethernet => {
-                let frame = {
-                    let mut io = io.lock().unwrap();
-                    if !io.ethernet.is_link_up() { continue; }
-                    io.ethernet.take_transmit()
-                        .map_err(|error| anyhow::anyhow!("Ethernet ingress: {error:?}"))?
-                };
-                let Some(frame) = frame else { continue; };
-                let epoch = upcalls.lock().unwrap().epoch.clone();
-                (epoch, DriverEvent::EthernetTxEvent(frame.as_bytes().to_vec()))
-            },
-            callback = callback => {
-                let (epoch, upcall) = callback?;
-                let event = match upcall {
-                    Upcall::Recv { bytes, info } => DriverEvent::WlanRxEvent { bytes, rx_info: info },
-                    Upcall::TxResult(tx_result) => DriverEvent::TxResultReport { tx_result },
-                    Upcall::ScanComplete { status, scan_id } => DriverEvent::ScanComplete { status, scan_id },
-                };
-                (epoch, event)
-            },
+            event = ingress => event?,
         };
         let end = deadline
             .lock()

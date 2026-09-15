@@ -62,12 +62,8 @@ fn raw_vfio_authority_stays_in_the_current_owner_crates() {
         "userspace-vfio".to_owned(),
         // Seccomp owner imports the backend's exact request inventory and never issues ioctls.
         "linux-self-sandbox".to_owned(),
-        // Cut-2 migration source; eng-0lja will replace its direct UAPI use.
-        "mt7921-port-spike".to_owned(),
         // Preflight cdev/sysfs consumer; eng-xvq1 will review routing it through the backend.
         "ath11k-bringup".to_owned(),
-        // Apparently unused manifest dependency; eng-0lja will remove it in MT7921 cut 2.
-        "mt7921-passive-scan".to_owned(),
         // Direct ioctl definitions in an unowned spike; manager: eng-k6ud.
         "amd-hda-spike".to_owned(),
     ]);

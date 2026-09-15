@@ -142,7 +142,6 @@ dependencies = [
  "linux-self-sandbox",
  "qrtr-socket",
  "tokio",
- "userspace-vfio",
  "wifi-control-service",
  "wifi-supervisor-wire",
  "wlan-control-wire",

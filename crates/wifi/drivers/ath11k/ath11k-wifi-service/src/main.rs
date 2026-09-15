@@ -99,8 +99,11 @@ fn start() -> Result<(), String> {
         .difference(&before)
         .copied()
         .collect::<Vec<_>>();
-    let runtime_resources = PreparedRuntimeResources::new(config.mac)
-        .map_err(|error| format!("prepare host runtime: {error}"))?;
+    let runtime_resources = {
+        let _entered = executor.enter();
+        PreparedRuntimeResources::new(config.mac)
+    }
+    .map_err(|error| format!("prepare host runtime: {error}"))?;
     eprintln!("ath11k_wifi_startup=RUNTIME_RESOURCES_READY");
     let ethernet_fds = runtime_resources.fd_identities();
     let mut remoteproc_state = OpenOptions::new()
@@ -513,7 +516,7 @@ fn stop_and_verify_remoteproc(state: &mut File) -> Result<(), String> {
 }
 
 fn monotonic_now() -> u64 {
-    userspace_vfio::monotonic_time_ns().unwrap_or(0)
+    drv_hardware_backends::monotonic_time_ns().unwrap_or(0)
 }
 fn control_deadline() -> u64 {
     monotonic_now().saturating_add(CONTROL_TIMEOUT_NS)

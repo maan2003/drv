@@ -232,13 +232,30 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
         mut control: futures::channel::mpsc::Receiver<OwnerCommand>,
     ) -> (Self, Result<(), zx::Status>) {
         use futures::{FutureExt, StreamExt};
+        let mut timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
+            // Recompute after every admitted command. Preserve an earlier armed
+            // observation so unrelated wakes cannot slide the fallback timer.
+            match self.device.next_deadline() {
+                None => timer = None,
+                Some(deadline) => {
+                    let deadline = tokio::time::Instant::from_std(deadline);
+                    if timer
+                        .as_ref()
+                        .is_none_or(|timer| deadline < timer.deadline())
+                    {
+                        timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                    }
+                }
+            }
+            let mut timer_fired = false;
             let turn = {
                 let command = control.next().fuse();
-                // The existing native service uses this bounded polling cadence;
-                // a mailbox enqueue wakes the owner immediately. Hardware-specific
-                // IRQ/deadline readiness can replace the fallback tick separately.
-                let tick = tokio::time::sleep(std::time::Duration::from_millis(1)).fuse();
+                let tick = std::future::poll_fn(|cx| match timer.as_mut() {
+                    Some(timer) => timer.as_mut().poll(cx),
+                    None => Poll::Pending,
+                })
+                .fuse();
                 let work = std::future::poll_fn(|cx| match self.poll(cx) {
                     Ok(true) => Poll::Ready(Ok(())),
                     Ok(false) => Poll::Pending,
@@ -249,9 +266,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                 futures::select_biased! {
                     command = command => Ok(Some(command)),
                     result = work => result.map(|()| None),
-                    _ = tick => Ok(None),
+                    _ = tick => { timer_fired = true; Ok(None) },
                 }
             };
+            if timer_fired {
+                timer = None;
+            }
             match turn {
                 Err(error) => {
                     self.close();
@@ -360,7 +380,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Result<bool, zx::Status> {
         let mut progressed = if self.stop_pending {
-            self.device.drive()?
+            self.device.poll_drive(cx)?
         } else {
             false
         };

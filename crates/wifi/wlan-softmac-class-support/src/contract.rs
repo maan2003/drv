@@ -129,6 +129,18 @@ pub trait WlanSoftmacLifecycle {
 /// deterministic device slot.
 pub trait ClientRuntimeDriver {
     fn drive(&mut self) -> Result<bool, zx::Status>;
+    /// Perform one bounded turn and register the driver's external wake source.
+    /// `false` means no immediate progress, not completion of pending operations.
+    /// A consumed wake must cause another observation before returning idle.
+    fn poll_drive(&mut self, _cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
+        self.drive()
+    }
+    /// Absolute next required observation, including waits without an IRQ.
+    /// `None` permits IRQ/mailbox-only sleep. Legacy drivers retain polling;
+    /// operation deadlines remain owned by the driver and are never renewed here.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(1))
+    }
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status>;
     /// Make a completed, unsuccessful connection attempt safe to retry.
     ///

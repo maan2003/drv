@@ -177,8 +177,11 @@ fn run() -> Result<(), String> {
         .difference(&before)
         .copied()
         .collect();
-    let resources = PreparedRuntimeResources::new(mac)
-        .map_err(|error| format!("prepare protocol runtime: {error}"))?;
+    let resources = {
+        let _entered = executor.enter();
+        PreparedRuntimeResources::new(mac)
+    }
+    .map_err(|error| format!("prepare protocol runtime: {error}"))?;
     let [control_fd, supervisor_fd] = endpoints.fd_identities();
     let service = linux_self_sandbox::WifiServiceFds {
         control_fd,

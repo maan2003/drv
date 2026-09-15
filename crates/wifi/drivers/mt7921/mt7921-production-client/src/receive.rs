@@ -280,7 +280,49 @@ pub(super) struct DataRx {
 }
 
 impl DataRx {
+    /// Data ring 2 is independent of the firmware response IRQ mask. Enable
+    /// it only after firmware initialization, when the protocol owner starts.
+    pub fn enable<B: drv_hardware::Backend>(
+        resources: &mut crate::OwnedHardwareResources<B>,
+    ) -> Result<()> {
+        let enabled = resources.bar0.read_u32(0xd4204)?;
+        if enabled == u32::MAX {
+            return Err(Error::DeviceFault);
+        }
+        resources
+            .bar0
+            .write_u32(0xd4204, enabled | mt7921_core::MT7921_DATA_RX_IRQ_BIT)
+    }
+
     pub fn poll<B: drv_hardware::Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+    ) -> Result<(bool, Vec<McuRxRoute>)> {
+        let enabled = resources.bar0.read_u32(0xd4204)?;
+        if enabled == u32::MAX {
+            return Err(Error::DeviceFault);
+        }
+        resources
+            .bar0
+            .write_u32(0xd4204, enabled & !mt7921_core::MT7921_DATA_RX_IRQ_BIT)?;
+        // ACK before draining: an arrival after the drain must remain pending
+        // when the source is re-enabled. Budget exhaustion requests another turn.
+        let result = (|| {
+            let status = resources.bar0.read_u32(0xd4200)?;
+            if status == u32::MAX {
+                return Err(Error::DeviceFault);
+            }
+            resources
+                .bar0
+                .write_u32(0xd4200, status & mt7921_core::MT7921_DATA_RX_IRQ_BIT)?;
+            self.drain(resources)
+        })();
+        // Failure to restore the mask is terminal even if draining succeeded.
+        resources.bar0.write_u32(0xd4204, enabled)?;
+        result
+    }
+
+    fn drain<B: drv_hardware::Backend>(
         &mut self,
         resources: &mut crate::OwnedHardwareResources<B>,
     ) -> Result<(bool, Vec<McuRxRoute>)> {
@@ -351,14 +393,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn data_irq_enable_and_mask_ack_restore_preserve_firmware_sources() {
+        use drv_hardware_backends::{DeterministicBackend, Operation};
+        let (device, log, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        let firmware = mt7921_core::McuRxIrqTopology::firmware().mask();
+        let data = mt7921_core::MT7921_DATA_RX_IRQ_BIT;
+        resources.bar0.write_u32(0xd4204, firmware).unwrap();
+        DataRx::enable(&mut resources).unwrap();
+        assert_eq!(resources.bar0.read_u32(0xd4204).unwrap(), firmware | data);
+        let mut rx = DataRx::default();
+        // Even repeated notifications with an empty ring must rearm without
+        // delivering a frame or swallowing another source's interrupt mask.
+        for _ in 0..3 {
+            log.borrow_mut().clear();
+            assert_eq!(rx.poll(&mut resources).unwrap(), (false, vec![]));
+            let writes: Vec<_> = log
+                .borrow()
+                .iter()
+                .filter_map(|op| match op {
+                    Operation::WriteU32 { offset, value, .. } => Some((*offset, *value)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                writes,
+                [
+                    (0xd4204, firmware),
+                    (0xd4200, 0),
+                    (0xd4204, firmware | data),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn data_irq_restore_failure_is_an_error_not_successful_receive() {
+        use drv_hardware_backends::DeterministicBackend;
+        let (device, _, failures) =
+            DeterministicBackend::recording_mt7921_activation_device_with_failures();
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        DataRx::enable(&mut resources).unwrap();
+        let enabled = resources.bar0.read_u32(0xd4204).unwrap();
+        failures.fail_next_matching_mmio_write(0xd4204, enabled);
+        assert!(matches!(
+            DataRx::default().poll(&mut resources),
+            Err(Error::DeviceFault)
+        ));
+        assert_eq!(
+            resources.bar0.read_u32(0xd4204).unwrap(),
+            enabled & !mt7921_core::MT7921_DATA_RX_IRQ_BIT
+        );
+        // This failure does not release the owner's descriptor storage.
+        let mut descriptor = [0; mt7921_core::DMA_DESCRIPTOR_LEN];
+        resources.dma.data_rx_ring.read(0, &mut descriptor).unwrap();
+    }
+
+    #[test]
     fn data_rx_reposts_before_returning_and_wraps_without_duplicate_routes() {
         use drv_hardware_backends::{DeterministicBackend, Operation};
         use mt7921_core::{
             DMA_DESCRIPTOR_LEN, DmaDescriptor, MT7921_DATA_RX_RING_COUNT,
             MT7921_MCU_RX_BUFFER_BYTES,
         };
-        let (device, log, model) =
-            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (device, log, model) = DeterministicBackend::recording_mt7921_device_with_model(
+            drv_hardware_backends::DeviceResponseInput {
+                register_reads: (0..2 * (MT7921_DATA_RX_RING_COUNT + 3))
+                    .flat_map(|_| {
+                        [
+                            mt7921_core::McuRxIrqTopology::firmware().mask()
+                                | mt7921_core::MT7921_DATA_RX_IRQ_BIT,
+                            mt7921_core::MT7921_WM_RX_IRQ_BIT | mt7921_core::MT7921_DATA_RX_IRQ_BIT,
+                        ]
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
         let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
         let mut rx = DataRx::default();
         for ordinal in 0..MT7921_DATA_RX_RING_COUNT + 3 {
@@ -393,9 +505,43 @@ mod tests {
             let (progress, routes) = rx.poll(&mut resources).unwrap();
             assert!(progress);
             assert_eq!(routes, vec![McuRxRoute::Normal(bytes)]);
-            assert!(
-                matches!(log.borrow().last(), Some(Operation::WriteU32 { offset: 0xd4528, value, .. }) if *value == slot as u32)
-            );
+            assert!(matches!(log.borrow().iter().rev().find(|op| matches!(op,
+                    Operation::WriteU32 { offset: 0xd4528, .. })),
+                    Some(Operation::WriteU32 { value, .. }) if *value == slot as u32));
+            {
+                let operations = log.borrow();
+                let ack = operations
+                    .iter()
+                    .rposition(|op| {
+                        matches!(op,
+                            Operation::WriteU32 { offset: 0xd4200, value, .. }
+                            if *value == mt7921_core::MT7921_DATA_RX_IRQ_BIT,
+                        )
+                    })
+                    .unwrap();
+                let publish = operations
+                    .iter()
+                    .rposition(|op| {
+                        matches!(
+                            op,
+                            Operation::WriteU32 {
+                                offset: 0xd4528,
+                                ..
+                            },
+                        )
+                    })
+                    .unwrap();
+                let rearm = operations
+                    .iter()
+                    .rposition(|op| {
+                        matches!(op,
+                            Operation::WriteU32 { offset: 0xd4204, value, .. }
+                            if value & mt7921_core::MT7921_DATA_RX_IRQ_BIT != 0,
+                        )
+                    })
+                    .unwrap();
+                assert!(ack < publish && publish < rearm);
+            }
             let posted = (slot + MT7921_DATA_RX_RING_COUNT - 1) % MT7921_DATA_RX_RING_COUNT;
             let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
             resources

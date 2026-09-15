@@ -625,6 +625,8 @@ pub struct PreparedRuntimeResources {
 }
 
 impl PreparedRuntimeResources {
+    /// Prepare all descriptors and reactor registrations before sandbox lockdown.
+    /// Requires an entered Tokio runtime with I/O enabled.
     pub fn new(mac_address: [u8; 6]) -> Result<Self, anyhow::Error> {
         Self::with_ethernet_capacity(mac_address, ETHERNET_QUEUE_CAPACITY)
     }
@@ -637,6 +639,9 @@ impl PreparedRuntimeResources {
             .map(|_| ethernet_port(mac_address, ethernet_queue_capacity))
             .collect::<Result<VecDeque<_>, _>>()
             .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
+        for (_, driver) in &mut generations {
+            driver.register_readiness()?;
+        }
         let (ethernet_device, ethernet) = generations.pop_front().unwrap();
         Ok(Self {
             ethernet_device,
@@ -1511,6 +1516,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> Drop for Clien
 mod tests {
     fn run_local_test(future: impl std::future::Future<Output = ()>) {
         let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
             .enable_time()
             .build()
             .unwrap();
@@ -1548,6 +1554,10 @@ mod tests {
         channel_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
         complete_channel_on_drive: Option<oneshot::Sender<Result<(), zx::Status>>>,
         clear_completion: Option<oneshot::Receiver<Result<(), zx::Status>>>,
+        event_driven: bool,
+        drive_count: usize,
+        wake: Option<std::task::Waker>,
+        observation_deadline: Option<Instant>,
     }
 
     #[derive(Clone)]
@@ -1585,8 +1595,27 @@ mod tests {
     }
 
     impl ClientRuntimeDriver for Fake {
+        fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
+            self.0.lock().unwrap().wake = Some(cx.waker().clone());
+            self.drive()
+        }
+        fn next_deadline(&self) -> Option<Instant> {
+            let effects = self.0.lock().unwrap();
+            if effects.event_driven {
+                effects.observation_deadline
+            } else {
+                Some(Instant::now() + Duration::from_millis(1))
+            }
+        }
         fn drive(&mut self) -> Result<bool, zx::Status> {
             let mut effects = self.0.lock().unwrap();
+            effects.drive_count += 1;
+            if effects
+                .observation_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                effects.observation_deadline = None;
+            }
             if effects.calls.contains(&"channel")
                 && let Some(reply) = effects.complete_channel_on_drive.take()
             {
@@ -2336,6 +2365,68 @@ mod tests {
             bridge,
             crate::driver::HardwareOwner::Running { task, control },
         )
+    }
+
+    #[test]
+    fn event_driven_owner_sleeps_until_device_or_mailbox_wakes_it() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().event_driven = true;
+            let (mut bridge, mut owner) = independent_owner(fake);
+            tokio::task::yield_now().await;
+            let idle_count = effects.lock().unwrap().drive_count;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(effects.lock().unwrap().drive_count, idle_count);
+
+            let wake = effects.lock().unwrap().wake.clone().unwrap();
+            wake.wake();
+            tokio::task::yield_now().await;
+            assert!(effects.lock().unwrap().drive_count > idle_count);
+            let after_irq = effects.lock().unwrap().drive_count;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(effects.lock().unwrap().drive_count, after_irq);
+
+            bridge.wlan_softmac_query_response().await.unwrap();
+            assert!(effects.lock().unwrap().calls.contains(&"query"));
+            // Releasing the completed request may wake its owner once to
+            // discard cancellation bookkeeping; that is not periodic polling.
+            tokio::task::yield_now().await;
+            let after_mailbox = effects.lock().unwrap().drive_count;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(effects.lock().unwrap().drive_count, after_mailbox);
+            owner.request_stop(false);
+            owner.join().await;
+            owner.certify(false).unwrap();
+        });
+    }
+
+    #[test]
+    fn owner_deadline_survives_unrelated_wakes_and_returns_to_idle() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().event_driven = true;
+            let original = Instant::now() + Duration::from_millis(30);
+            effects.lock().unwrap().observation_deadline = Some(original);
+            let (mut bridge, mut owner) = independent_owner(fake);
+            for _ in 0..3 {
+                bridge.wlan_softmac_query_response().await.unwrap();
+                assert_eq!(effects.lock().unwrap().observation_deadline, Some(original));
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while effects.lock().unwrap().observation_deadline.is_some() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let count = effects.lock().unwrap().drive_count;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(effects.lock().unwrap().drive_count, count);
+            owner.request_stop(false);
+            owner.join().await;
+            owner.certify(false).unwrap();
+        });
     }
 
     #[test]

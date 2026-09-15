@@ -13,6 +13,8 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use tokio::io::unix::AsyncFd;
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;
 
@@ -66,6 +68,20 @@ enum SeqpacketFrameError {
     InvalidFrame(usize),
 }
 
+impl From<SeqpacketFrameError> for EthernetIngressError {
+    fn from(error: SeqpacketFrameError) -> Self {
+        match error {
+            SeqpacketFrameError::Closed => Self::Closed,
+            SeqpacketFrameError::Backpressure => Self::Backpressure,
+            SeqpacketFrameError::InvalidFrame(len) => Self::InvalidFrame(if len < 14 {
+                FrameSizeError::TooShort { len }
+            } else {
+                FrameSizeError::TooLong { len }
+            }),
+        }
+    }
+}
+
 struct PortLifecycleState {
     properties: Option<EthernetPortProperties>,
     link_up: bool,
@@ -73,12 +89,71 @@ struct PortLifecycleState {
 }
 
 struct SeqpacketFrameEndpoint {
+    // This registration borrows the numeric fd, never duplicates authority.
+    // Drop it before closing or transferring the owned descriptor.
+    readiness: Option<AsyncFd<RawFd>>,
     fd: Option<OwnedFd>,
     receive_notified: bool,
     transmit_blocked: bool,
 }
 
 impl SeqpacketFrameEndpoint {
+    fn read_frame(fd: RawFd) -> Result<Option<EthernetFrame>, SeqpacketFrameError> {
+        let mut bytes = [0u8; 1514];
+        let received = unsafe {
+            recv(
+                fd,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                MSG_DONTWAIT | MSG_TRUNC,
+            )
+        };
+        if received == 0 {
+            return Err(SeqpacketFrameError::Closed);
+        }
+        if received < 0 {
+            return match std::io::Error::last_os_error().kind() {
+                ErrorKind::WouldBlock => Ok(None),
+                _ => Err(SeqpacketFrameError::Closed),
+            };
+        }
+        let received = received as usize;
+        if received > 1514 {
+            return Err(SeqpacketFrameError::InvalidFrame(received));
+        }
+        EthernetFrame::copy_from_slice(&bytes[..received])
+            .map(Some)
+            .map_err(|_| SeqpacketFrameError::InvalidFrame(received))
+    }
+
+    fn poll_receive_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<EthernetFrame, SeqpacketFrameError>> {
+        let readiness = self
+            .readiness
+            .as_ref()
+            .expect("runtime frame endpoint was prepared");
+        loop {
+            let mut guard = match readiness.poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(SeqpacketFrameError::Closed)),
+                Poll::Ready(Ok(guard)) => guard,
+            };
+            match Self::read_frame(self.raw_fd()) {
+                Ok(None) => {
+                    self.receive_notified = false;
+                    // Only recv(EAGAIN), not a frame budget, clears readiness.
+                    guard.clear_ready();
+                    // Cached readiness need not have installed this task's
+                    // waker. Poll again until the reactor registers it.
+                }
+                Ok(Some(frame)) => return Poll::Ready(Ok(frame)),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
     fn discard_frames(&mut self) {
         // Repeated link-down notifications may arrive after the endpoint was
         // closed. Do not issue recv(-1), including under an fd-bound sandbox.
@@ -102,6 +177,7 @@ impl SeqpacketFrameEndpoint {
     }
 
     fn close(&mut self) {
+        self.readiness.take();
         self.fd.take();
     }
 
@@ -134,6 +210,7 @@ impl SeqpacketFrameEndpoint {
     }
 
     fn take_fd(&mut self) -> OwnedFd {
+        self.readiness.take();
         self.fd.take().expect("frame endpoint is open")
     }
 }
@@ -171,34 +248,11 @@ impl EthernetFrameSeam for SeqpacketFrameEndpoint {
     }
 
     fn try_receive_frame(&mut self) -> Result<Option<EthernetFrame>, Self::Error> {
-        let mut bytes = [0u8; 1514];
-        let received = unsafe {
-            recv(
-                self.raw_fd(),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                MSG_DONTWAIT | MSG_TRUNC,
-            )
-        };
-        if received == 0 {
-            return Err(SeqpacketFrameError::Closed);
+        let result = Self::read_frame(self.raw_fd());
+        if matches!(result, Ok(None)) {
+            self.receive_notified = false;
         }
-        if received < 0 {
-            return match std::io::Error::last_os_error().kind() {
-                ErrorKind::WouldBlock => {
-                    self.receive_notified = false;
-                    Ok(None)
-                }
-                _ => Err(SeqpacketFrameError::Closed),
-            };
-        }
-        let received = received as usize;
-        if received > 1514 {
-            return Err(SeqpacketFrameError::InvalidFrame(received));
-        }
-        EthernetFrame::copy_from_slice(&bytes[..received])
-            .map(Some)
-            .map_err(|_| SeqpacketFrameError::InvalidFrame(received))
+        result
     }
 }
 
@@ -245,6 +299,7 @@ pub struct HostEthernetDevice {
 /// Driver-side endpoint retained by the host device. The controlled-port
 /// gate is deliberately outside [`EthernetFrameSeam`].
 pub struct DriverEthernetPort {
+    receive_waker: Option<Waker>,
     seam: SeqpacketFrameEndpoint,
     lifecycle: Arc<Mutex<PortLifecycleState>>,
 }
@@ -307,6 +362,7 @@ pub fn ethernet_port(
     Ok((
         HostEthernetDevice {
             seam: SeqpacketFrameEndpoint {
+                readiness: None,
                 fd: Some(netstack_fd),
                 receive_notified: false,
                 transmit_blocked: false,
@@ -314,7 +370,9 @@ pub fn ethernet_port(
             lifecycle: lifecycle.clone(),
         },
         DriverEthernetPort {
+            receive_waker: None,
             seam: SeqpacketFrameEndpoint {
+                readiness: None,
                 fd: Some(driver_fd),
                 receive_notified: false,
                 transmit_blocked: false,
@@ -379,6 +437,27 @@ impl<D: wlan_mlme::device::DeviceOps> AssociatedSoftmacTx for wlan_mlme::client:
 }
 
 impl DriverEthernetPort {
+    pub(crate) fn register_readiness(&mut self) -> std::io::Result<()> {
+        self.seam.readiness = Some(AsyncFd::with_interest(
+            self.seam.raw_fd(),
+            tokio::io::Interest::READABLE,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn poll_transmit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<EthernetFrame, EthernetIngressError>> {
+        self.receive_waker = Some(cx.waker().clone());
+        if !self.is_link_up() {
+            return Poll::Pending;
+        }
+        self.seam
+            .poll_receive_frame(cx)
+            .map(|result| result.map_err(Into::into))
+    }
+
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.seam.raw_fd()
     }
@@ -458,6 +537,10 @@ impl DriverEthernetPort {
         if changed {
             push_event(&mut state.events, EthernetDeviceEvent::LinkStateChanged(up));
         }
+        drop(state);
+        if let Some(waker) = self.receive_waker.take() {
+            waker.wake();
+        }
     }
 
     pub fn teardown(&mut self) {
@@ -475,6 +558,10 @@ impl DriverEthernetPort {
         state.link_up = false;
         state.properties = None;
         self.seam.close();
+        drop(state);
+        if let Some(waker) = self.receive_waker.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -522,6 +609,155 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn async_ingress_sleeps_then_drains_frames_without_timer_ticks() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (mut host, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 8).unwrap();
+            driver.register_readiness().unwrap();
+            driver.set_link(true);
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            let task = tokio::spawn(async move {
+                let frame = std::future::poll_fn(|cx| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    driver.poll_transmit(cx)
+                })
+                .await;
+                (driver, frame)
+            });
+            tokio::task::yield_now().await;
+            let before = polls.load(Ordering::SeqCst);
+            assert!(before > 0);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(polls.load(Ordering::SeqCst), before);
+            for tag in 0..3 {
+                let mut bytes = [0u8; 60];
+                bytes[0] = tag;
+                host.transmit(EthernetFrame::copy_from_slice(&bytes).unwrap())
+                    .unwrap();
+            }
+            let (mut driver, frame) = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.unwrap().as_bytes()[0], 0);
+            for tag in 1..3 {
+                let frame = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    std::future::poll_fn(|cx| driver.poll_transmit(cx)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(frame.as_bytes()[0], tag);
+            }
+            // A different task sees cached readable state followed by EAGAIN.
+            // It must register its own waker, not leave the completed task's.
+            let next_task = tokio::spawn(async move {
+                let frame = std::future::poll_fn(|cx| driver.poll_transmit(cx)).await;
+                (driver, frame)
+            });
+            tokio::task::yield_now().await;
+            assert!(!next_task.is_finished());
+            let mut bytes = [0; 60];
+            bytes[0] = 3;
+            host.transmit(EthernetFrame::copy_from_slice(&bytes).unwrap())
+                .unwrap();
+            let (mut driver, frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), next_task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(frame.unwrap().as_bytes()[0], 3);
+
+            // A dropped waiter must leave readiness installed for its successor.
+            {
+                use futures::FutureExt;
+                let mut wait = std::pin::pin!(std::future::poll_fn(|cx| driver.poll_transmit(cx)));
+                assert!(wait.as_mut().now_or_never().is_none());
+            }
+            drop(host);
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    std::future::poll_fn(|cx| driver.poll_transmit(cx)),
+                )
+                .await
+                .unwrap(),
+                Err(EthernetIngressError::Closed)
+            );
+        });
+    }
+
+    #[test]
+    fn suspended_frame_waiter_follows_a_new_link_generation() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let (mut old_host, mut old_port) = ethernet_port([2, 0, 0, 0, 0, 1], 8).unwrap();
+            let (mut new_host, mut new_port) = ethernet_port([2, 0, 0, 0, 0, 1], 8).unwrap();
+            old_port.register_readiness().unwrap();
+            new_port.register_readiness().unwrap();
+            old_port.set_link(true);
+            let current = Arc::new(Mutex::new(old_port));
+            let waiting = current.clone();
+            let task = tokio::spawn(async move {
+                std::future::poll_fn(|cx| waiting.lock().unwrap().poll_transmit(cx)).await
+            });
+            tokio::task::yield_now().await;
+            old_host
+                .transmit(EthernetFrame::copy_from_slice(&[0x11; 60]).unwrap())
+                .unwrap();
+            current.lock().unwrap().set_link(false); // discard old queued frame
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            *current.lock().unwrap() = new_port;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            current.lock().unwrap().set_link(true);
+            new_host
+                .transmit(EthernetFrame::copy_from_slice(&[0x42; 60]).unwrap())
+                .unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.as_bytes(), &[0x42; 60]);
+        });
+    }
+
+    #[test]
+    fn link_transition_wakes_a_frame_waiter_without_polling_closed_fd() {
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (_, mut driver) = ethernet_port([2, 0, 0, 0, 0, 1], 8).unwrap();
+        assert!(driver.poll_transmit(&mut cx).is_pending());
+        driver.set_link(true);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        driver.teardown();
+        assert!(driver.poll_transmit(&mut cx).is_pending());
     }
 
     #[test]

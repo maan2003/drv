@@ -26,7 +26,6 @@ futures = "=0.3.32"
 libc = "=0.2.189"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }
 qrtr-socket = { path = "../../../../qualcomm/qrtr-socket" }
-userspace-vfio = { path = "../../../../platform/userspace-vfio" }
 wifi-control-service = { path = "../../../wifi-control-service" }
 wifi-supervisor-wire = { path = "../../../wifi-supervisor-wire" }
 wlan-control-wire = { path = "../../../wlan-control-wire" }

@@ -12,6 +12,13 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
         if self.session.lifecycle != SessionLifecycle::FirmwareInitialized {
             return Err(zx::Status::BAD_STATE);
         }
+        crate::receive::DataRx::enable(
+            self.session
+                .resources
+                .as_mut()
+                .ok_or(zx::Status::BAD_STATE)?,
+        )
+        .map_err(|_| zx::Status::IO)?;
         self.upcalls = Some(upcalls);
         self.session.lifecycle = SessionLifecycle::ProtocolStarted;
         Ok(())
@@ -27,6 +34,51 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
 }
 
 impl ClientRuntimeDriver for Mt7921Driver {
+    fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
+        use std::future::Future as _;
+        if self.drive()? {
+            return Ok(true);
+        }
+        let resources = self
+            .session
+            .resources
+            .as_ref()
+            .ok_or(zx::Status::BAD_STATE)?;
+        let interrupt = resources.interrupt.as_ref().ok_or(zx::Status::BAD_STATE)?;
+        let result = {
+            let mut next = std::pin::pin!(interrupt.next());
+            next.as_mut().poll(cx)
+        };
+        match result {
+            std::task::Poll::Pending => Ok(false),
+            // Reading eventfd consumes the notification, not the descriptors:
+            // force another bounded hardware observation before sleeping.
+            std::task::Poll::Ready(Ok(_)) => Ok(true),
+            std::task::Poll::Ready(Err(_)) => {
+                self.session.lifecycle = SessionLifecycle::Closing;
+                self.upcalls = None;
+                Err(zx::Status::IO)
+            }
+        }
+    }
+
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        // Register polls and descriptor reclaim do not all have a guaranteed
+        // IRQ. Retain bounded fallback only while an owned operation exists;
+        // each operation still checks its original deadline before publication.
+        let pending = !matches!(
+            self.mac_initialization,
+            crate::radio::MacInitialization::Ready
+        ) || !self.radio_preparation.ready()
+            || self.channel_change.is_some()
+            || self.peer_join.is_some()
+            || self.peer_association.is_some()
+            || self.key_installation.is_some()
+            || self.scan.is_some()
+            || !self.tx.idle();
+        pending.then(|| std::time::Instant::now() + std::time::Duration::from_millis(1))
+    }
+
     fn drive(&mut self) -> Result<bool, zx::Status> {
         if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
             return Err(zx::Status::BAD_STATE);

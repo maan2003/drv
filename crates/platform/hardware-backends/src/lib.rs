@@ -227,6 +227,7 @@ impl DeterministicResourceProbe {
 
 #[derive(Default)]
 struct FailureState {
+    mmio_write: Option<(usize, u32)>,
     sync_for_device: bool,
     interrupt_open: bool,
     interrupt_disable: usize,
@@ -234,6 +235,10 @@ struct FailureState {
 #[derive(Clone, Default)]
 pub struct FailureInjection(Rc<RefCell<FailureState>>);
 impl FailureInjection {
+    /// Fail the next write matching this register and value, without applying it.
+    pub fn fail_next_matching_mmio_write(&self, offset: usize, value: u32) {
+        self.0.borrow_mut().mmio_write = Some((offset, value));
+    }
     pub fn fail_next_sync_for_device(&self) {
         self.0.borrow_mut().sync_for_device = true;
     }
@@ -515,6 +520,13 @@ impl Backend for DeterministicBackend {
         Ok(value)
     }
     fn write_u32(&mut self, region: &u8, offset: usize, value: u32) -> Result<()> {
+        if let Some(failures) = &self.failures {
+            let mut failure = failures.0.borrow_mut();
+            if failure.mmio_write == Some((offset, value)) {
+                failure.mmio_write = None;
+                return Err(Error::DeviceFault);
+            }
+        }
         if let Some(ordering) = &self.ordering
             && ordering
                 .0

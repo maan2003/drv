@@ -567,6 +567,7 @@ fn poll_hup(fd: i32) -> bool {
 
 fn run_local_test(future: impl std::future::Future<Output = ()>) {
     let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .unwrap();

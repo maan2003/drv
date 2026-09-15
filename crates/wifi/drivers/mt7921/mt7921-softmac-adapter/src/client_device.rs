@@ -3215,8 +3215,9 @@ mod tests {
     }
 
     #[test]
-    fn pinned_runtime_reports_live_shape_connect_driver_stage_without_credentials() {
+    fn pinned_runtime_contains_uncertified_connect_failure_without_credentials() {
         let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
             .enable_time()
             .build()
             .unwrap();
@@ -3282,13 +3283,15 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            let PinnedConnectError::Driver(PinnedDriverError::MlmeRequest { name, detail }) = error
-            else {
-                panic!("expected stage-specific MLME request failure: {error:?}")
-            };
-            assert_eq!(name, "Connect");
-            assert!(detail.contains("IO_REFUSED"), "{detail}");
-            assert!(!detail.contains("synthetic-password"));
+            // Native Fuchsia serving logs rejected MLME requests and lets SME
+            // report its terminal result. This legacy backend cannot certify
+            // retry cleanup, so the owning runtime must contain it instead.
+            assert!(matches!(
+                error,
+                PinnedConnectError::Driver(PinnedDriverError::RetryCleanup),
+            ));
+            assert!(!format!("{error:?}").contains("synthetic-password"));
+            runtime.shutdown().await.unwrap();
             assert!(!backend.lock().unwrap().authorization.is_live());
         });
     }
