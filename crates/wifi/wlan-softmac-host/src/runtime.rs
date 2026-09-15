@@ -1586,6 +1586,7 @@ mod tests {
         query_failure: bool,
         tx_flags: Vec<fidl_softmac::WlanTxInfoFlags>,
         tx_contexts: Vec<OperationContext>,
+        tx_admission_error: Option<zx::Status>,
         channel_contexts: Vec<OperationContext>,
         join_contexts: Vec<OperationContext>,
         association_contexts: Vec<OperationContext>,
@@ -1899,6 +1900,9 @@ mod tests {
         ) -> Result<(), zx::Status> {
             context.check(std::time::Instant::now())?;
             let mut effects = self.0.lock().unwrap();
+            if let Some(error) = effects.tx_admission_error {
+                return Err(error);
+            }
             if effects.simulate_ap {
                 match bytes.first().copied() {
                     Some(0xb0) => {
@@ -2151,6 +2155,58 @@ mod tests {
             let io = io.lock().unwrap();
             assert!(!io.ethernet.is_link_up());
             assert!(io.pending_ethernet_devices.is_empty());
+        });
+    }
+
+    #[test]
+    fn transmit_backpressure_retains_work_without_reviving_revoked_authority() {
+        run_local_test(async {
+            for revoked in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                let (mut actor, handle) = DriverActor::new(fake);
+                let epoch = OperationEpoch::new();
+                let context =
+                    OperationContext::child(epoch.clone(), Instant::now() + Duration::from_secs(1));
+                effects.lock().unwrap().tx_admission_error = Some(zx::Status::NO_RESOURCES);
+                handle
+                    .send(
+                        epoch.clone(),
+                        Command::Transmit(
+                            context.clone(),
+                            vec![1, 0x40, 3],
+                            fidl_softmac::WlanTxInfoFlags::empty(),
+                        ),
+                    )
+                    .unwrap();
+                assert!(!actor.drive_once().await.unwrap());
+                assert!(!actor.drive_once().await.unwrap());
+                assert!(effects.lock().unwrap().tx_contexts.is_empty());
+                if revoked {
+                    context.revoke();
+                }
+                effects.lock().unwrap().tx_admission_error = None;
+                assert!(actor.drive_once().await.unwrap());
+                assert_eq!(
+                    effects.lock().unwrap().tx_contexts.len(),
+                    usize::from(!revoked)
+                );
+                assert!(!actor.drive_once().await.unwrap());
+
+                // Only admission exhaustion is retryable; hardware faults
+                // must still reach the owner's containment path.
+                effects.lock().unwrap().tx_admission_error = Some(zx::Status::IO);
+                handle
+                    .send(
+                        epoch.clone(),
+                        Command::Transmit(
+                            epoch.context(Instant::now() + Duration::from_secs(1)),
+                            vec![1, 0x40, 3],
+                            fidl_softmac::WlanTxInfoFlags::empty(),
+                        ),
+                    )
+                    .unwrap();
+                assert_eq!(actor.drive_once().await, Err(zx::Status::IO));
+            }
         });
     }
 

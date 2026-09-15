@@ -498,7 +498,19 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                 let _ = reply.send(self.device.set_link_up(request));
             }
             Command::Transmit(context, bytes, flags) => {
-                self.device.queue_tx(context, &bytes, flags)?
+                match self.device.queue_tx(context.clone(), &bytes, flags) {
+                    Err(zx::Status::NO_RESOURCES) => {
+                        // Admission did not publish the frame. Retain it within
+                        // the existing mailbox bound while hardware drains;
+                        // retry with the same authority and original deadline.
+                        self.mailbox.borrow_mut().queue.push_front(Message {
+                            epoch: message.epoch,
+                            command: Command::Transmit(context, bytes, flags),
+                        });
+                        return Ok(progressed);
+                    }
+                    result => result?,
+                }
             }
         }
         if let Some(pending) = self.pending.as_mut()
