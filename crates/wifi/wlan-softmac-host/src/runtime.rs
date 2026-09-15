@@ -180,7 +180,7 @@ impl HostMlmeDevice {
             execution: Rc::new(MlmeExecution {
                 operation: RefCell::new(operation.clone()),
                 scan: RefCell::new(None),
-                epoch: RefCell::new(operation.epoch.clone()),
+                epoch: RefCell::new(operation.epoch().clone()),
                 rejected: Cell::new(false),
             }),
             driver,
@@ -581,7 +581,7 @@ impl MlmeTask {
         let progress = changed.clone();
         let future = async move {
             while let Some((context, input)) = receiver.next().await {
-                let epoch = context.epoch.clone();
+                let epoch = context.epoch().clone();
                 execution.operation.replace(context);
                 execution.epoch.replace(epoch.clone());
                 execution.rejected.set(false);
@@ -775,14 +775,7 @@ impl MlmeTask {
             return Err(ConnectError::Driver(DriverError::ControlBudgetExhausted));
         }
         self.sender
-            .try_send((
-                OperationContext {
-                    epoch,
-                    parent: None,
-                    deadline,
-                },
-                input,
-            ))
+            .try_send((epoch.context(deadline), input))
             .map_err(|_| ConnectError::Driver(DriverError::RequestStreamClosed))?;
         self.pending.set(self.pending.get() + 1);
         Ok(())

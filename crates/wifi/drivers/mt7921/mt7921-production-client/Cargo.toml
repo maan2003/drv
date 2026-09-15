@@ -13,7 +13,7 @@ fidl-fuchsia-wlan-common = { path = "../../../../../reference/fuchsia-1e1219e3fa
 futures-channel = "=0.3.34"
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-softmac = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
-wlan-softmac-host = { path = "../../../wlan-softmac-host" }
+wlan-softmac-class-support = { path = "../../../wlan-softmac-class-support" }
 zx = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 drv-hardware = { path = "../../../../platform/hardware-api" }
 drv-hardware-backends = { path = "../../../../platform/hardware-backends" }
@@ -23,8 +23,5 @@ zeroize = "=1.8.2"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }
 
 [dev-dependencies]
-wlan-softmac-host = { path = "../../../wlan-softmac-host", features = ["conformance"] }
+wlan-softmac-class-support = { path = "../../../wlan-softmac-class-support", features = ["conformance"] }
 drv-hardware-backends = { path = "../../../../platform/hardware-backends" }
-[patch.crates-io]
-trust-dns-proto = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }
-trust-dns-resolver = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }

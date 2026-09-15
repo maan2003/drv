@@ -418,7 +418,7 @@ impl FirmwareCommands {
         receive: &mut crate::receive::RxRouting,
         start: Instant,
         now: Instant,
-        context: Option<&wlan_softmac_host::OperationContext>,
+        context: Option<&wlan_softmac_class_support::OperationContext>,
     ) -> Result<bool, zx::Status> {
         let result = (|| {
             if let Some(context) = context {
@@ -439,7 +439,7 @@ impl FirmwareCommands {
         receive: &mut crate::receive::RxRouting,
         start: Instant,
         now: Instant,
-        context: Option<&wlan_softmac_host::OperationContext>,
+        context: Option<&wlan_softmac_class_support::OperationContext>,
     ) -> Result<bool, zx::Status> {
         use mt7921_core::{LoaderCommandCompletion, LoaderCommandProgress, LoaderCompletion};
         if self.failed {
@@ -516,7 +516,7 @@ impl FirmwareCommands {
 /// One admitted channel effect. The reply and plan survive waiter loss.
 /// Channel state is committed only after MCU response + TX reclaim + timing.
 pub(super) struct ChannelChange {
-    pub context: wlan_softmac_host::OperationContext,
+    pub context: wlan_softmac_class_support::OperationContext,
     pub channel: mt7921_core::CandidateChannel,
     commands: FirmwareCommands,
     operations: VecDeque<mt7921_core::ChannelMacOperation>,
@@ -526,7 +526,7 @@ pub(super) struct ChannelChange {
 
 impl ChannelChange {
     pub fn new(
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         channel: mt7921_core::CandidateChannel,
         reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
     ) -> Result<Self, zx::Status> {
@@ -630,13 +630,13 @@ impl ChannelChange {
 }
 
 pub(super) struct PassiveScan {
-    pub context: wlan_softmac_host::OperationContext,
+    pub context: wlan_softmac_class_support::OperationContext,
     pub id: u64,
     pub sequence: u8,
     pub channels: Vec<mt7921_core::CandidateChannel>,
     pub reply: Option<
         futures_channel::oneshot::Sender<
-            Result<wlan_softmac_host::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
+            Result<wlan_softmac_class_support::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
         >,
     >,
     pub published: bool,
@@ -700,7 +700,7 @@ impl PassiveScan {
                     self.reclaimed = true;
                     if let Some(reply) = self.reply.take() {
                         let _ = reply.send(Ok(
-                            wlan_softmac_host::WlanSoftmacBaseStartPassiveScanResponse {
+                            wlan_softmac_class_support::WlanSoftmacBaseStartPassiveScanResponse {
                                 scan_id: Some(self.id),
                                 ..Default::default()
                             },
@@ -732,8 +732,9 @@ mod tests {
             let mut mechanics = LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
             let now = Instant::now();
-            let (context, revoke) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(1));
+            let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(1),
+            );
             let (reply, mut receiver) = futures_channel::oneshot::channel();
             let mut scan = PassiveScan {
                 context,
@@ -864,8 +865,9 @@ mod tests {
             let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
             resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
             let now = Instant::now();
-            let (context, revoke) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(1));
+            let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(1),
+            );
             let (reply, _receiver) = futures_channel::oneshot::channel();
             let channel = CandidateChannel {
                 band: PhysicalBand::Ghz5,
@@ -964,7 +966,7 @@ mod tests {
         let (device, log) = DeterministicBackend::recording_mt7921_activation_device();
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
         let now = Instant::now();
-        let (context, _) = wlan_softmac_host::conformance::operation_context(now);
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(now);
         let (reply, _) = futures_channel::oneshot::channel();
         let mut change = ChannelChange::new(
             context,
@@ -996,7 +998,7 @@ mod tests {
         let (device, log) = DeterministicBackend::recording_mt7921_activation_device();
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
         let now = Instant::now();
-        let (context, _) = wlan_softmac_host::conformance::operation_context(now);
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(now);
         let (reply, mut receiver) = futures_channel::oneshot::channel();
         let mut scan = PassiveScan {
             context,

@@ -611,7 +611,7 @@ dependencies = [
  "linux-self-sandbox",
  "mt7921-core",
  "sha2",
- "wlan-softmac-host",
+ "wlan-softmac-class-support",
  "zeroize",
  "zx",
 ]
@@ -1291,6 +1291,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlan-softmac-class-support"
+version = "0.1.0"
+dependencies = [
+ "fidl-fuchsia-wlan-common",
+ "fidl-fuchsia-wlan-driver",
+ "fidl-fuchsia-wlan-ieee80211",
+ "fidl-fuchsia-wlan-softmac",
+ "zx",
+]
+
+[[package]]
 name = "wlan-softmac-host"
 version = "0.1.0"
 dependencies = [
@@ -1310,6 +1321,7 @@ dependencies = [
  "wlan-common",
  "wlan-mlme",
  "wlan-sme",
+ "wlan-softmac-class-support",
  "zx",
 ]
 

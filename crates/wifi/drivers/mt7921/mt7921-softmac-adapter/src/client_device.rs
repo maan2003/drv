@@ -1130,7 +1130,7 @@ struct ComposedBackend<E, S> {
     rx_integrity_drops: u64,
     #[cfg(test)]
     ethernet: Option<DriverEthernetPort>,
-    upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
+    upcalls: Option<Box<dyn wlan_softmac_class_support::WlanSoftmacUpcalls>>,
 }
 
 impl<E, S> Mt7921ClientDevice<E, S> {
@@ -1291,10 +1291,10 @@ impl<E: Mt7921ClientEffects, T: crate::Mt7921PassiveTransport>
     /// contract without exposing the host crate to binary-only consumers.
     pub fn set_runtime_channel(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        wlan_softmac_host::WlanSoftmac::set_channel(self, context, request)
+        wlan_softmac_class_support::WlanSoftmac::set_channel(self, context, request)
     }
 }
 
@@ -1344,12 +1344,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientIo> Mt7921ClientDevice<E, S> {
     }
 }
 
-impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmacLifecycle
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::WlanSoftmacLifecycle
     for Mt7921ClientDevice<E, S>
 {
     fn start(
         &mut self,
-        upcalls: Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>,
+        upcalls: Box<dyn wlan_softmac_class_support::WlanSoftmacUpcalls>,
     ) -> Result<(), zx::Status> {
         let mut backend = self.backend.lock().unwrap();
         if backend.upcalls.is_some() || !backend.authorization.is_live() {
@@ -1374,7 +1374,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
 }
 
-impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::ClientRuntimeDriver
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::ClientRuntimeDriver
     for Mt7921ClientDevice<E, S>
 {
     fn drive(&mut self) -> Result<bool, zx::Status> {
@@ -1467,7 +1467,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::ClientRunti
     }
 }
 
-impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
+impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::WlanSoftmac
     for Mt7921ClientDevice<E, S>
 {
     fn query(&mut self) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
@@ -1491,7 +1491,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn set_channel(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
@@ -1517,7 +1517,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn join_bss(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_driver::JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         if let Err(status) = context.check(std::time::Instant::now()) {
@@ -1575,7 +1575,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn start_passive_scan(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<fidl_softmac::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -1611,7 +1611,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn start_active_scan(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_softmac::WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<fidl_softmac::WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
@@ -1649,7 +1649,7 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_host::WlanSoftmac
     }
     fn queue_tx(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         bytes: &[u8],
         flags: fidl_softmac::WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
@@ -1925,7 +1925,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use wlan_mlme::MlmeImpl;
-    use wlan_softmac_host::WlanSoftmacLifecycle as _;
+    use wlan_softmac_class_support::WlanSoftmacLifecycle as _;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum PassiveCall {
@@ -2530,10 +2530,10 @@ mod tests {
 
     #[test]
     fn softmac_lifecycle_routes_validated_rx_and_synchronously_revokes_callbacks() {
-        use wlan_softmac_host::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
+        use wlan_softmac_class_support::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
 
         struct Upcalls(Arc<Mutex<Vec<Vec<u8>>>>);
-        impl wlan_softmac_host::WlanSoftmacUpcalls for Upcalls {
+        impl wlan_softmac_class_support::WlanSoftmacUpcalls for Upcalls {
             fn recv(&mut self, bytes: Vec<u8>, _: fidl_softmac::WlanRxInfo) {
                 self.0.lock().unwrap().push(bytes);
             }
@@ -2565,10 +2565,10 @@ mod tests {
 
     #[test]
     fn failed_attempt_cleanup_preserves_retry_authority_and_discards_old_rx() {
-        use wlan_softmac_host::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
+        use wlan_softmac_class_support::{ClientRuntimeDriver as _, WlanSoftmacLifecycle as _};
 
         struct Upcalls(Arc<Mutex<Vec<Vec<u8>>>>);
-        impl wlan_softmac_host::WlanSoftmacUpcalls for Upcalls {
+        impl wlan_softmac_class_support::WlanSoftmacUpcalls for Upcalls {
             fn recv(&mut self, bytes: Vec<u8>, _: fidl_softmac::WlanRxInfo) {
                 self.0.lock().unwrap().push(bytes);
             }
@@ -3383,7 +3383,7 @@ mod tests {
     fn composed_cancel_completes_before_revocation_and_next_scan_remains_usable() {
         futures::executor::block_on(async {
             struct Upcalls(Arc<Mutex<Vec<(zx::Status, u64)>>>);
-            impl wlan_softmac_host::WlanSoftmacUpcalls for Upcalls {
+            impl wlan_softmac_class_support::WlanSoftmacUpcalls for Upcalls {
                 fn recv(&mut self, _: Vec<u8>, _: fidl_softmac::WlanRxInfo) {}
                 fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
                 fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {

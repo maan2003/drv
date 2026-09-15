@@ -43,3 +43,41 @@ fn compatibility_crates_depend_on_the_host_owner() {
         manifest.display()
     );
 }
+
+#[test]
+fn device_contract_and_production_drivers_do_not_depend_on_protocol_execution() {
+    let wifi = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let contract = fs::read_to_string(wifi.join("wlan-softmac-class-support/Cargo.toml")).unwrap();
+    let dependencies = contract.split("[dev-dependencies]").next().unwrap();
+    for forbidden in [
+        "wlan-softmac-host",
+        "wlan-mlme =",
+        "wlan-sme =",
+        "netstack3",
+        "tokio",
+    ] {
+        assert!(
+            !dependencies.contains(forbidden),
+            "contract depends on {forbidden}"
+        );
+    }
+    for driver in [
+        "drivers/mt7921/mt7921-production-client",
+        "drivers/ath11k/ath11k-softmac-adapter",
+    ] {
+        let manifest = fs::read_to_string(wifi.join(driver).join("Cargo.toml")).unwrap();
+        let dependencies = manifest.split("[dev-dependencies]").next().unwrap();
+        assert!(dependencies.contains("wlan-softmac-class-support"));
+        for forbidden in [
+            "wlan-softmac-host",
+            "wlan-mlme =",
+            "wlan-sme =",
+            "netstack3",
+        ] {
+            assert!(
+                !dependencies.contains(forbidden),
+                "{driver} depends on {forbidden}"
+            );
+        }
+    }
+}

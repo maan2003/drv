@@ -33,7 +33,7 @@ const PASSPHRASE: &[u8] = b"password";
 
 struct ScanCompleteUpcalls(Arc<Mutex<Vec<(zx::Status, u64)>>>);
 
-impl wlan_softmac_host::WlanSoftmacUpcalls for ScanCompleteUpcalls {
+impl wlan_softmac_class_support::WlanSoftmacUpcalls for ScanCompleteUpcalls {
     fn recv(&mut self, _: Vec<u8>, _: fidl_softmac::WlanRxInfo) {}
     fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
     fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
@@ -509,7 +509,7 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
         let (mut device, runner) =
             Mt7921ClientDevice::new(backend, physical_adapter(), client_support());
         let scan_completions = Arc::new(Mutex::new(Vec::new()));
-        wlan_softmac_host::WlanSoftmacLifecycle::start(
+        wlan_softmac_class_support::WlanSoftmacLifecycle::start(
             &mut device,
             Box::new(ScanCompleteUpcalls(scan_completions.clone())),
         )
@@ -606,7 +606,12 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
             TelemetrySender::new(telemetry),
         );
         let selected = selector
-            .find_and_select_connection_candidate(wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30)).unwrap(), Some(network), ConnectReason::FidlConnectRequest)
+            .find_and_select_connection_candidate(
+                wlan_control_wire::MonotonicDeadline::after(std::time::Duration::from_secs(30))
+                    .unwrap(),
+                Some(network),
+                ConnectReason::FidlConnectRequest,
+            )
             .await
             .expect("pinned selector must select the physical WPA3 BSS");
 
@@ -669,7 +674,9 @@ fn passive_physical_selection_reaches_one_authorized_production_sae_tx() {
 
 #[test]
 fn real_mt7921_device_passes_the_generic_client_contract() {
-    use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
+    use wlan_softmac_class_support::conformance::{
+        expected_client_conformance, run_client_conformance,
+    };
 
     let state = Arc::new(Mutex::new(BackendState::default()));
     let backend = ProductionBackend(state);

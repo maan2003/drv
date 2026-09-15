@@ -104,7 +104,7 @@ impl ObservedBss {
 /// STATE_NONE station record. No legacy empty-WTBL pre-reset, preauth BSS/RLM
 /// update or extra peer allocation is inserted into the pinned sequence.
 pub(super) struct PeerJoin {
-    pub context: wlan_softmac_host::OperationContext,
+    pub context: wlan_softmac_class_support::OperationContext,
     pub bss: ObservedBss,
     clear: MacPreparation,
     commands: FirmwareCommands,
@@ -113,7 +113,7 @@ pub(super) struct PeerJoin {
 
 impl PeerJoin {
     pub fn new(
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         bss: ObservedBss,
         reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
     ) -> Result<Self, zx::Status> {
@@ -228,8 +228,9 @@ mod tests {
             let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
             resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
             let now = Instant::now();
-            let (context, _) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(1));
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(1),
+            );
             let (reply, _receiver) = futures_channel::oneshot::channel();
             let mut join = PeerJoin::new(
                 context,
@@ -324,8 +325,9 @@ mod tests {
         let (device, log) = DeterministicBackend::recording_mt7921_activation_device();
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
         let now = Instant::now();
-        let (context, revoke) =
-            wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(1));
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(1),
+        );
         let (reply, _) = futures_channel::oneshot::channel();
         let mut join = PeerJoin::new(
             context,

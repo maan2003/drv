@@ -36,6 +36,7 @@ wlan-softmac-host = { path = "../../../wlan-softmac-host" }
 zx = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
 
 [dev-dependencies]
+wlan-softmac-host = { path = "../../../wlan-softmac-host", features = ["conformance"] }
 wlan-control-wire = { path = "../../../wlan-control-wire" }
 async-trait = "=0.1.89"
 dhcp-protocol = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/dhcpv4/protocol" }
@@ -47,7 +48,7 @@ trust-dns-proto = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a90
 trust-dns-resolver = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0", default-features = false, features = ["testing"] }
 wlan-common = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/lib/common/rust" }
 wlancfg-selection = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/wlan/wlancfg" }
-wlan-softmac-host = { path = "../../../wlan-softmac-host", features = ["conformance"] }
+wlan-softmac-class-support = { path = "../../../wlan-softmac-class-support", features = ["conformance"] }
 
 [patch.crates-io]
 trust-dns-proto = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-proto-0.22.0" }

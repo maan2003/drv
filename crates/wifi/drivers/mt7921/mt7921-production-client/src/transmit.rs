@@ -11,7 +11,7 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
-use wlan_softmac_host::OperationContext;
+use wlan_softmac_class_support::OperationContext;
 
 const CAPACITY: usize = 16;
 
@@ -525,8 +525,9 @@ mod tests {
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
         resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
         let now = Instant::now();
-        let (context, _) =
-            wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(10));
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
         let mut tx = ManagementTx::default();
         let mut mechanics = mt7921_core::LoaderMechanics::default();
         let mut receive = crate::receive::RxRouting::default();
@@ -735,8 +736,9 @@ mod tests {
             let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
             resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
             let now = Instant::now();
-            let (context, _) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(10));
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
             let mut tx = ManagementTx::default();
             let mut mechanics = mt7921_core::LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
@@ -793,8 +795,9 @@ mod tests {
                 DeterministicBackend::recording_mt7921_device_with_model(Default::default());
             let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
             let now = Instant::now();
-            let (context, _) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(10));
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
             let mut tx = ManagementTx::default();
             tx.enqueue(context.clone(), &frame(), 12, channel())
                 .unwrap();
@@ -875,8 +878,9 @@ mod tests {
                 DeterministicBackend::recording_mt7921_device_with_model(Default::default());
             let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
             let now = Instant::now();
-            let (context, revocation) =
-                wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(10));
+            let (context, revocation) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
             let mut tx = ManagementTx::default();
             tx.enqueue(context, &frame(), 12, channel()).unwrap();
             assert!(!tx.drive_dma(&mut resources, now, None).unwrap());
@@ -917,8 +921,9 @@ mod tests {
     #[test]
     fn admission_is_bounded_and_unsupported_shapes_do_not_consume_slots() {
         let now = Instant::now();
-        let (context, _) =
-            wlan_softmac_host::conformance::operation_context(now + Duration::from_secs(10));
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
         let mut tx = ManagementTx::default();
         for (offset, bit) in [(1, 0x40), (1, 0x80), (1, 4), (4, 1), (22, 1)] {
             let mut invalid = frame();

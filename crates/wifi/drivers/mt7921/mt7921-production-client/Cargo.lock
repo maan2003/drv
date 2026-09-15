@@ -3,47 +3,6 @@
 version = 4
 
 [[package]]
-name = "anyhow"
-version = "1.0.102"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
-
-[[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
-name = "bitfield"
-version = "0.19.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ba6517c6b0f2bf08be60e187ab64b038438f22dd755614d8fe4d4098c46419"
-dependencies = [
- "bitfield-macros",
-]
-
-[[package]]
-name = "bitfield-macros"
-version = "0.19.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0cb6f3d4773a2107b94cbeccaa5b5f0b35a88389b5d522d13d659f64317b22d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,54 +18,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bssl-macros"
-version = "0.1.0"
-
-[[package]]
-name = "bssl-sys"
-version = "0.1.0"
-dependencies = [
- "bssl-macros",
- "cc",
- "cmake",
-]
-
-[[package]]
-name = "bytes"
-version = "1.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
-
-[[package]]
-name = "cc"
-version = "1.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
-dependencies = [
- "find-msvc-tools",
- "shlex",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "cmov"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "const-oid"
@@ -133,37 +48,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctutils"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
-dependencies = [
- "cmov",
-]
-
-[[package]]
-name = "derivative"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcc3dd5e9e9c0b295d6e1e4d811fb6f157d5ffd784b8d202fc62eac8035a770b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,7 +56,6 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
- "ctutils",
 ]
 
 [[package]]
@@ -197,24 +80,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eapol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "log",
- "thiserror",
- "wlan-bitfield",
- "wlan-common",
- "zerocopy",
-]
-
-[[package]]
-name = "either"
-version = "1.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -223,14 +88,6 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
-
-[[package]]
-name = "fdf"
-version = "0.1.0"
-
-[[package]]
-name = "fidl"
-version = "0.1.0"
 
 [[package]]
 name = "fidl-fuchsia-wlan-common"
@@ -251,41 +108,6 @@ name = "fidl-fuchsia-wlan-ieee80211"
 version = "0.1.0"
 
 [[package]]
-name = "fidl-fuchsia-wlan-internal"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-ieee80211",
-]
-
-[[package]]
-name = "fidl-fuchsia-wlan-minstrel"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-ieee80211",
-]
-
-[[package]]
-name = "fidl-fuchsia-wlan-mlme"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-minstrel",
- "fidl-fuchsia-wlan-stats",
-]
-
-[[package]]
-name = "fidl-fuchsia-wlan-sme"
-version = "0.1.0"
-dependencies = [
- "fidl",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
-]
-
-[[package]]
 name = "fidl-fuchsia-wlan-softmac"
 version = "0.1.0"
 dependencies = [
@@ -294,72 +116,6 @@ dependencies = [
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
 ]
-
-[[package]]
-name = "fidl-fuchsia-wlan-stats"
-version = "0.1.0"
-dependencies = [
- "fidl-fuchsia-wlan-ieee80211",
-]
-
-[[package]]
-name = "find-msvc-tools"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
-
-[[package]]
-name = "fuchsia-async"
-version = "0.1.0"
-dependencies = [
- "futures",
- "tokio",
- "zx",
-]
-
-[[package]]
-name = "fuchsia-inspect"
-version = "0.1.0"
-dependencies = [
- "fidl",
-]
-
-[[package]]
-name = "fuchsia-inspect-contrib"
-version = "0.1.0"
-dependencies = [
- "fuchsia-inspect",
- "zx",
-]
-
-[[package]]
-name = "fuchsia-softmac-port"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eapol",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-softmac",
- "ieee80211",
- "wlan-common",
- "wlan-frame-writer",
- "wlan-rsn",
-]
-
-[[package]]
-name = "fuchsia-sync"
-version = "0.1.0"
-dependencies = [
- "lock_api",
- "parking_lot",
- "parking_lot_core",
-]
-
-[[package]]
-name = "fuchsia-trace"
-version = "0.1.0"
 
 [[package]]
 name = "futures"
@@ -450,60 +206,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "getrandom"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi",
- "wasip2",
-]
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
-name = "hmac"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
-dependencies = [
- "digest",
-]
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
-]
-
-[[package]]
-name = "ieee80211"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arbitrary",
- "fidl-fuchsia-wlan-ieee80211",
- "hex",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
 ]
 
 [[package]]
@@ -525,32 +233,6 @@ dependencies = [
  "libc",
  "seccompiler",
  "userspace-vfio",
-]
-
-[[package]]
-name = "lock_api"
-version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
-dependencies = [
- "scopeguard",
- "serde",
-]
-
-[[package]]
-name = "log"
-version = "0.4.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "md-5"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
-dependencies = [
- "cfg-if",
- "digest",
 ]
 
 [[package]]
@@ -595,159 +277,16 @@ dependencies = [
  "linux-self-sandbox",
  "mt7921-core",
  "sha2",
- "wlan-softmac-host",
+ "wlan-softmac-class-support",
  "zeroize",
  "zx",
 ]
-
-[[package]]
-name = "mundane"
-version = "0.1.0"
-dependencies = [
- "bssl-sys",
-]
-
-[[package]]
-name = "netstack3-port-spike"
-version = "0.1.0"
-
-[[package]]
-name = "nom"
-version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "num"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
-dependencies = [
- "num-bigint",
- "num-complex",
- "num-integer",
- "num-iter",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
-name = "num-bigint"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
-dependencies = [
- "num-integer",
- "num-traits",
- "rand 0.8.8",
-]
-
-[[package]]
-name = "num-complex"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
-dependencies = [
- "num-traits",
- "rand 0.8.8",
-]
-
-[[package]]
-name = "num-derive"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-iter"
-version = "0.1.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-rational"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.9.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
-dependencies = [
- "cfg-if",
- "libc",
- "redox_syscall",
- "smallvec",
- "windows-link",
-]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
 
 [[package]]
 name = "proc-macro2"
@@ -768,65 +307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "r-efi"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "rand"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
-version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
-dependencies = [
- "rand_chacha",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom",
-]
-
-[[package]]
-name = "redox_syscall"
-version = "0.5.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
-dependencies = [
- "bitflags",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,58 +320,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "scopeguard"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
 name = "seccompiler"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "serde"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "serde_core"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
-dependencies = [
- "serde_derive",
-]
-
-[[package]]
-name = "serde_derive"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
-]
-
-[[package]]
-name = "sha1"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest",
 ]
 
 [[package]]
@@ -906,22 +340,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "shlex"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
-
-[[package]]
-name = "smallvec"
-version = "1.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "socket2"
@@ -931,23 +353,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
-]
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
 ]
 
 [[package]]
@@ -970,37 +375,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "synstructure"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1042,15 +416,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-name = "wasip2"
-version = "1.0.4+wasi-0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1066,228 +431,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "wit-bindgen"
-version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "wlan-bitfield"
+name = "wlan-softmac-class-support"
 version = "0.1.0"
 dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "synstructure",
-]
-
-[[package]]
-name = "wlan-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "derivative",
- "fidl",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
- "futures",
- "hex",
- "ieee80211",
- "nom",
- "num",
- "paste",
- "static_assertions",
- "thiserror",
- "tokio",
- "wlan-bitfield",
- "zerocopy",
- "zx",
-]
-
-[[package]]
-name = "wlan-fcg-crypto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bssl-sys",
- "fidl-fuchsia-wlan-ieee80211",
- "ieee80211",
- "log",
- "mundane",
- "num",
- "num-derive",
- "num-traits",
- "wlan-common",
- "wlan-statemachine",
-]
-
-[[package]]
-name = "wlan-fidl-ext"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fidl",
- "itertools",
- "paste",
-]
-
-[[package]]
-name = "wlan-frame-writer"
-version = "0.1.0"
-dependencies = [
- "wlan-common",
- "wlan-frame-writer-macro",
- "zerocopy",
-]
-
-[[package]]
-name = "wlan-frame-writer-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "wlan-mlme"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fdf",
- "fidl",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-minstrel",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",
- "fidl-fuchsia-wlan-stats",
- "fuchsia-async",
- "fuchsia-softmac-port",
- "fuchsia-sync",
- "fuchsia-trace",
  "futures",
- "ieee80211",
- "log",
- "paste",
- "rand 0.9.4",
- "thiserror",
- "wlan-common",
- "wlan-fidl-ext",
- "wlan-frame-writer",
- "wlan-sme",
- "wlan-statemachine",
- "wlan-trace",
- "zerocopy",
  "zx",
-]
-
-[[package]]
-name = "wlan-rsn"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitfield",
- "bssl-sys",
- "bytes",
- "eapol",
- "fidl-fuchsia-wlan-mlme",
- "fuchsia-sync",
- "hmac",
- "ieee80211",
- "log",
- "md-5",
- "mundane",
- "nom",
- "num",
- "rand 0.9.4",
- "sha1",
- "sha2",
- "thiserror",
- "wlan-common",
- "wlan-fcg-crypto",
- "wlan-statemachine",
- "zerocopy",
-]
-
-[[package]]
-name = "wlan-sme"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eapol",
- "fidl",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-internal",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-stats",
- "fuchsia-inspect",
- "fuchsia-inspect-contrib",
- "fuchsia-sync",
- "futures",
- "ieee80211",
- "log",
- "thiserror",
- "wlan-common",
- "wlan-rsn",
- "wlan-statemachine",
- "zx",
-]
-
-[[package]]
-name = "wlan-softmac-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fdf",
- "fidl-fuchsia-wlan-common",
- "fidl-fuchsia-wlan-driver",
- "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
- "fidl-fuchsia-wlan-softmac",
- "fuchsia-inspect",
- "fuchsia-trace",
- "futures",
- "netstack3-port-spike",
- "tokio",
- "wlan-common",
- "wlan-mlme",
- "wlan-sme",
- "zx",
-]
-
-[[package]]
-name = "wlan-statemachine"
-version = "0.1.0"
-dependencies = [
- "wlan-statemachine-macro",
-]
-
-[[package]]
-name = "wlan-statemachine-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "wlan-trace"
-version = "0.1.0"
-dependencies = [
- "fuchsia-trace",
 ]
 
 [[package]]
@@ -1337,11 +489,3 @@ version = "0.1.0"
 dependencies = [
  "zerocopy",
 ]
-
-[[patch.unused]]
-name = "trust-dns-proto"
-version = "0.22.0"
-
-[[patch.unused]]
-name = "trust-dns-resolver"
-version = "0.22.0"

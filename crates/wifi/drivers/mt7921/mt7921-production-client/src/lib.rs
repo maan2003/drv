@@ -968,7 +968,7 @@ pub struct Mt7921Driver {
     joined: Option<peer::ObservedBss>,
     management_tx: transmit::ManagementTx,
     next_scan_id: u64,
-    upcalls: Option<Box<dyn wlan_softmac_host::WlanSoftmacUpcalls>>,
+    upcalls: Option<Box<dyn wlan_softmac_class_support::WlanSoftmacUpcalls>>,
 }
 
 impl Mt7921Driver {

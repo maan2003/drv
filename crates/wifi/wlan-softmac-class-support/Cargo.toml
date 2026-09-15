@@ -8,6 +8,16 @@ version = "0.1.0"
 [workspace]
 resolver = "3"
 
+[features]
+conformance = ["dep:futures"]
+
 [dependencies]
 fidl-fuchsia-wlan-ieee80211 = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.ieee80211" }
 fidl-fuchsia-wlan-softmac = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.softmac" }
+fidl-fuchsia-wlan-common = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
+fidl-fuchsia-wlan-driver = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.driver" }
+zx = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/rust/zx" }
+futures = { version = "=0.3.32", optional = true }
+
+[dev-dependencies]
+futures = "=0.3.32"

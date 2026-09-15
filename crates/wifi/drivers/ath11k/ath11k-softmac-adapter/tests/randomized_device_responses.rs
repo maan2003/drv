@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
-use wlan_softmac_host::{
+use wlan_softmac_class_support::{
     ClientRuntimeDriver, WlanRxInfo, WlanSoftmac, WlanSoftmacBaseStartPassiveScanRequest,
     WlanSoftmacLifecycle, WlanSoftmacUpcalls, WlanTxResult,
 };
@@ -292,7 +292,7 @@ fn exercise(input: DeviceResponseInput) {
 
     let scan = futures::executor::block_on(
         adapter.start_passive_scan(
-            wlan_softmac_host::conformance::operation_context(
+            wlan_softmac_class_support::conformance::operation_context(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             )
             .0,

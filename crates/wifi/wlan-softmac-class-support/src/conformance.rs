@@ -11,8 +11,7 @@ use fidl_fuchsia_wlan_softmac::{
 use futures::FutureExt;
 use std::sync::{Arc, Mutex};
 
-/// Fresh test-only authority. Production drivers can inspect a context but
-/// cannot mint it or upgrade a revoked epoch.
+/// Fresh authority for a conformance test, paired with its revocation action.
 pub fn operation_context(deadline: std::time::Instant) -> (crate::OperationContext, impl FnOnce()) {
     let context = crate::OperationContext::new(deadline);
     let revocation = context.clone();

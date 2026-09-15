@@ -5,7 +5,7 @@
 //! retired lab owner fail explicitly; no compatibility transport is retained.
 
 use crate::{Mt7921Driver, SessionLifecycle};
-use wlan_softmac_host::*;
+use wlan_softmac_class_support::*;
 
 impl WlanSoftmacLifecycle for Mt7921Driver {
     fn start(&mut self, upcalls: Box<dyn WlanSoftmacUpcalls>) -> Result<(), zx::Status> {
@@ -267,7 +267,7 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn set_channel(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         let result = (|| {
@@ -321,7 +321,7 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn join_bss(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         let result = (|| {
@@ -448,7 +448,7 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn start_active_scan(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         _: WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
@@ -478,7 +478,7 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn queue_tx(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         bytes: &[u8],
         flags: WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {

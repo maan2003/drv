@@ -84,7 +84,7 @@ dependencies = [
  "futures",
  "proptest",
  "wlan-mlme",
- "wlan-softmac-host",
+ "wlan-softmac-class-support",
  "zx",
 ]
 
@@ -695,10 +695,6 @@ version = "0.1.0"
 dependencies = [
  "bssl-sys",
 ]
-
-[[package]]
-name = "netstack3-port-spike"
-version = "0.1.0"
 
 [[package]]
 name = "nom"
@@ -1426,25 +1422,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "wlan-softmac-host"
+name = "wlan-softmac-class-support"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "fdf",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-driver",
  "fidl-fuchsia-wlan-ieee80211",
- "fidl-fuchsia-wlan-mlme",
- "fidl-fuchsia-wlan-sme",
  "fidl-fuchsia-wlan-softmac",
- "fuchsia-inspect",
- "fuchsia-trace",
  "futures",
- "netstack3-port-spike",
- "tokio",
- "wlan-common",
- "wlan-mlme",
- "wlan-sme",
  "zx",
 ]
 

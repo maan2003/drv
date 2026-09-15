@@ -13,7 +13,7 @@ use fidl_fuchsia_wlan_ieee80211::{
     BssType, ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType,
 };
 use fidl_fuchsia_wlan_softmac::WlanSoftmacBandCapability;
-use wlan_softmac_host::{
+use wlan_softmac_class_support::{
     ClientRuntimeDriver, DiscoverySupport, JoinBssRequest, MacSublayerSupport, SecuritySupport,
     SpectrumManagementSupport, WlanAssociationConfig, WlanKeyConfiguration, WlanRxInfo,
     WlanSoftmac, WlanSoftmacBaseCancelScanRequest, WlanSoftmacBaseClearAssociationRequest,
@@ -867,7 +867,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn set_channel(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: WlanSoftmacBaseSetChannelRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
@@ -894,7 +894,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn join_bss(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: JoinBssRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready((|| {
@@ -1262,7 +1262,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
     fn start_passive_scan(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: WlanSoftmacBaseStartPassiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -1315,7 +1315,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn start_active_scan(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         request: WlanSoftmacStartActiveScanRequest,
     ) -> impl std::future::Future<
         Output = Result<WlanSoftmacBaseStartActiveScanResponse, zx::Status>,
@@ -1411,7 +1411,7 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn queue_tx(
         &mut self,
-        context: wlan_softmac_host::OperationContext,
+        context: wlan_softmac_class_support::OperationContext,
         bytes: &[u8],
         flags: WlanTxInfoFlags,
     ) -> Result<(), zx::Status> {
@@ -1521,8 +1521,8 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
 
 #[cfg(test)]
 mod tests {
-    fn operation_context() -> wlan_softmac_host::OperationContext {
-        wlan_softmac_host::conformance::operation_context(
+    fn operation_context() -> wlan_softmac_class_support::OperationContext {
+        wlan_softmac_class_support::conformance::operation_context(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .0
@@ -1531,10 +1531,12 @@ mod tests {
     use super::*;
     use ath11k_core::Operation;
     use std::sync::{Arc, Mutex};
-    use wlan_softmac_host::conformance::{expected_client_conformance, run_client_conformance};
+    use wlan_softmac_class_support::conformance::{
+        expected_client_conformance, run_client_conformance,
+    };
 
-    fn scan_context() -> wlan_softmac_host::OperationContext {
-        wlan_softmac_host::conformance::operation_context(
+    fn scan_context() -> wlan_softmac_class_support::OperationContext {
+        wlan_softmac_class_support::conformance::operation_context(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .0
@@ -1802,7 +1804,7 @@ mod tests {
         adapter.start(Box::new(NoopUpcalls)).unwrap();
         futures::executor::block_on(
             adapter.set_channel(
-                wlan_softmac_host::conformance::operation_context(
+                wlan_softmac_class_support::conformance::operation_context(
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
                 .0,
@@ -2412,7 +2414,7 @@ mod tests {
         adapter.start(Box::new(Recorder(records.clone()))).unwrap();
         futures::executor::block_on(
             adapter.set_channel(
-                wlan_softmac_host::conformance::operation_context(
+                wlan_softmac_class_support::conformance::operation_context(
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
                 .0,

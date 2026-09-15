@@ -218,7 +218,10 @@ crate.
 Crates enforce dependency boundaries; they do not themselves provide process
 isolation. `mt76-core` / `mt7921-core`, the chip SoftMAC adapters, and
 `wlan-softmac-host` retain hardware protocol, chip effects, and shared WLAN
-runtime responsibilities respectively. `userspace-vfio` and the typed hardware
+runtime responsibilities respectively. `wlan-softmac-class-support` owns their
+runtime-independent downcalls, callbacks and operation-authority contract.
+Production chip drivers depend on that contract, not the MLME/SME host runtime.
+`userspace-vfio` and the typed hardware
 API/backends retain generic resource mechanics without device protocol policy.
 
 The MT7921 service directly instantiates `mt7921-production-client`'s typed

@@ -5,7 +5,10 @@
 //! descriptors, and device policy remain with their existing owners.
 
 use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber};
-use fidl_fuchsia_wlan_softmac::{WlanRxInfo, WlanSoftmacBaseSetChannelRequest, WlanTxInfoFlags};
+mod contract;
+pub use contract::*;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelDefinition {

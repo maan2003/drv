@@ -6,12 +6,13 @@ license = "GPL-2.0-only"
 version = "0.1.0"
 
 [features]
-conformance = []
+conformance = ["wlan-softmac-class-support/conformance"]
 
 [workspace]
 resolver = "3"
 
 [dependencies]
+wlan-softmac-class-support = { path = "../wlan-softmac-class-support" }
 anyhow = "=1.0.102"
 fidl-fuchsia-wlan-common = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.common" }
 fdf = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/lib/driver-runtime-host" }
@@ -35,5 +36,6 @@ trust-dns-proto = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea96
 trust-dns-resolver = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/rust_crates/forks/trust-dns-resolver-0.22.0" }
 
 [dev-dependencies]
+wlan-softmac-class-support = { path = "../wlan-softmac-class-support", features = ["conformance"] }
 async-trait = "=0.1.89"
 fidl-fuchsia-wlan-internal = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.internal" }
