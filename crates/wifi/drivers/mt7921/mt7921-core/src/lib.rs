@@ -7117,8 +7117,13 @@ fn encode_legacy_wme_wcid_command(
     ht_cap: Option<[u8; 26]>,
     vht_cap: Option<[u8; 12]>,
     bandwidth: u8,
+    band: u8,
+    qos: bool,
     associated: bool,
 ) -> Result<Vec<u8>, String> {
+    if band > 1 || (vht_cap.is_some() && (band == 0 || ht_cap.is_none())) {
+        return Err("associated peer PHY capability or band is invalid".into());
+    }
     if !(1..=15).contains(&sequence) {
         return Err("WCID add omitted valid sequence".into());
     }
@@ -7136,13 +7141,14 @@ fn encode_legacy_wme_wcid_command(
     // mt7921_mac_sta_add publishes STATE_NONE with EXTRA_INFO_NEW before
     // authentication. mt7921_mac_sta_event updates that same WCID to
     // STATE_ASSOC after the association response.
-    bytes[65] = u8::from(associated);
+    bytes[65] = u8::from(associated && qos);
     bytes[74..76].copy_from_slice(&(if associated { 1u16 } else { 3u16 }).to_le_bytes());
     bytes[80..82].copy_from_slice(&basic_rates.to_le_bytes());
+    bytes[82] = if band == 0 { 0x06 } else { 0x08 };
     bytes[92..94].copy_from_slice(&legacy_rates.to_le_bytes());
     bytes[112] = if associated { 2 } else { 0 };
     bytes[132..138].copy_from_slice(&peer);
-    bytes[141] = u8::from(associated);
+    bytes[141] = u8::from(associated && qos);
     bytes[144..146].copy_from_slice(&aid.to_le_bytes());
     if !associated || ht_cap.is_none() {
         return Ok(bytes);
@@ -7164,7 +7170,7 @@ fn encode_legacy_wme_wcid_command(
 
     let phy_start = expanded.len();
     expanded.extend_from_slice(&bytes[76..88]);
-    expanded[phy_start + 6] = 0x08 | 0x10 | if vht_cap.is_some() { 0x20 } else { 0 };
+    expanded[phy_start + 6] = bytes[82] | 0x10 | if vht_cap.is_some() { 0x20 } else { 0 };
     expanded[phy_start + 7] = ht[2] & 0x1f;
     let ra_start = expanded.len();
     expanded.extend_from_slice(&bytes[88..104]);
@@ -7337,6 +7343,8 @@ pub fn encode_legacy_wme_add_wcid_command(
     ht_cap: Option<[u8; 26]>,
     vht_cap: Option<[u8; 12]>,
     bandwidth: u8,
+    band: u8,
+    qos: bool,
 ) -> Result<Vec<u8>, String> {
     if !(1..=2007).contains(&aid) {
         return Err("associated WCID AID escaped infrastructure range".into());
@@ -7356,6 +7364,8 @@ pub fn encode_legacy_wme_add_wcid_command(
         ht_cap,
         vht_cap,
         bandwidth,
+        band,
+        qos,
         true,
     )
 }
@@ -7484,7 +7494,7 @@ pub fn encode_client_post_assoc_rlm_command(
     body[12] = 2; // hweight8(local antenna mask 0x3)
     body[13] = 3; // local RX chain mask
     body[14] = 1; // short slot time
-    body[15] = 4; // HT 40 MHz allowed
+    body[15] = if channel.bandwidth == 0 { 0 } else { 4 }; // Linux clears HT operation for 20 MHz
     body[16] = match channel.primary.cmp(&channel.center) {
         core::cmp::Ordering::Less => 1,
         core::cmp::Ordering::Greater => 3,
@@ -8878,6 +8888,8 @@ impl ClientFirmwareEffectsState {
             association.ht_cap,
             association.vht_cap,
             association.bandwidth,
+            channel.channel.band,
+            association.negotiated_qos,
         )?;
         if let Err(error) = submit(3, &command) {
             self.controlled_port_open = false;
@@ -10616,6 +10628,17 @@ mod tests {
         let rx_filter = encode_client_post_assoc_rx_filter_command(7).unwrap();
         let rx_filter_clear = encode_client_post_assoc_rx_filter_clear_command(9).unwrap();
         let rlm = encode_client_post_assoc_rlm_command(8, 0, channel).unwrap();
+        let twenty = encode_client_post_assoc_rlm_command(
+            8,
+            0,
+            ClientPhysicalChannel {
+                center: 36,
+                bandwidth: 0,
+                ..channel
+            },
+        )
+        .unwrap();
+        assert_eq!(twenty[63], 0); // HT operation: no 40 MHz on a 20 MHz context
 
         assert_eq!(beacon.len(), 60);
         assert_eq!(&beacon[34..36], &[2, 0]);
@@ -10750,9 +10773,44 @@ mod tests {
                 None,
                 None,
                 0,
+                1,
+                true,
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn associated_legacy_peer_uses_negotiated_qos_and_linux_band_phy_mode() {
+        for (band, phy) in [(0, 0x06), (1, 0x08)] {
+            for qos in [false, true] {
+                let command = encode_legacy_wme_add_wcid_command(
+                    1,
+                    0,
+                    1,
+                    42,
+                    [2, 3, 4, 5, 6, 7],
+                    220,
+                    0x15,
+                    0x3fc0,
+                    None,
+                    None,
+                    0,
+                    band,
+                    qos,
+                )
+                .unwrap();
+                // STA_REC_BASIC and WTBL_GENERIC both use sta->wme, not
+                // whether the station is associated. PHY uses the selected band.
+                assert_eq!(command[65], u8::from(qos));
+                assert_eq!(command[141], u8::from(qos));
+                assert_eq!(command[82], phy);
+                assert_eq!(&command[66..68], &42u16.to_le_bytes());
+                assert_eq!(&command[144..146], &42u16.to_le_bytes());
+                assert_eq!(&command[74..76], &1u16.to_le_bytes()); // not newly
+                assert_eq!(command[112], 2); // STATE_ASSOC, regardless of QoS
+            }
+        }
     }
 
     #[test]
@@ -11189,7 +11247,7 @@ mod tests {
         assert_eq!(
             &preauth_rlm[48..],
             &[
-                0, 0, 0, 0, 2, 0, 16, 0, 36, 36, 0, 0, 2, 3, 1, 4, 0, 1, 0, 0
+                0, 0, 0, 0, 2, 0, 16, 0, 36, 36, 0, 0, 2, 3, 1, 0, 0, 1, 0, 0
             ]
         );
         let preauth_add = &transcript[3];
@@ -12344,6 +12402,8 @@ mod tests {
             Some(ht),
             Some(vht),
             2,
+            1,
+            true,
         )
         .unwrap();
         assert_eq!(encoded.len(), 232);
