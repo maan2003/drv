@@ -23,6 +23,11 @@
           ./crates/net/netstack3-port-spike/kernel-provider/check.nix
           { };
 
+      checks.x86_64-linux.openssh-listener-revocation =
+        nixpkgs.legacyPackages.x86_64-linux.callPackage
+          ./crates/net/netstack3-port-spike/kernel-provider/production/applications/openssh-revocation-test.nix
+          { };
+
       checks.x86_64-linux.audio-pipewire-daemon =
         nixpkgs.legacyPackages.x86_64-linux.callPackage ./lab/audio/audio-pipewire-spike/package.nix
           { };
@@ -335,6 +340,9 @@
           ath11k-reference-source = ath11kReferenceSource;
           mt76-reference-source = mt76ReferenceSource;
           mt7921-fuchsia-source = mt7921FuchsiaSource;
+          openssh-revocation = pkgs.callPackage
+            ./crates/net/netstack3-port-spike/kernel-provider/production/applications/openssh-revocation.nix
+            { };
           mt7921-fuchsia-source-negative-tests = pkgs.runCommand
             "mt7921-fuchsia-source-negative-tests"
             { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.findutils pkgs.gnutar pkgs.gnugrep pkgs.patch ]; }
