@@ -198,6 +198,13 @@ fn run() -> Result<(), String> {
                 return wait_driver_after_policy_close(driver_child, error);
             }
         };
+    // The socket namespace exists before Wi-Fi produces an Ethernet link and
+    // remains the same provider generation through ordinary link replacement.
+    if let Err(error) = network.start_provider() {
+        let _ = policy_child.kill();
+        let _ = policy_child.wait();
+        return wait_driver_after_policy_close(driver_child, error);
+    }
     // Diagnostic output must not unwind past live hardware-owning children.
     let _ = writeln!(
         std::io::stdout(),
@@ -296,7 +303,7 @@ fn run() -> Result<(), String> {
             Ok(Some(exit)) if shutdown_cause.is_none() => {
                 break Err(format!(
                     "network-service generation {} exited success={}",
-                    exit.generation, exit.success
+                    exit.provider_generation, exit.success
                 ));
             }
             Ok(_) => {}

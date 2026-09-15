@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,6 +14,7 @@ use std::time::Duration;
 const FRAME_FD: RawFd = 3;
 const LISTENER_FD: RawFd = 4;
 const BOOTSTRAP_FD: RawFd = 5;
+const LINK_CONTROL_FD: RawFd = crate::link_control::CONTROL_FD;
 const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
@@ -105,10 +106,11 @@ fn bootstrap(
     Ok(())
 }
 
-/// An observed service-process exit, tagged with the revoked Ethernet generation.
+/// An observed process exit, with independent provider and link generations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkServiceProcessExit {
-    pub generation: u64,
+    pub provider_generation: u64,
+    pub ethernet_generation: Option<u64>,
     pub success: bool,
 }
 
@@ -122,11 +124,22 @@ struct InstalledGeneration {
     running: Option<RunningProcess>,
 }
 
-/// Trusted launcher for independently replaceable network-service generations.
+struct KernelProcess {
+    generation: u64,
+    child: Child,
+    control: OwnedFd,
+}
+
+enum KernelLink {
+    Offline,
+    Attached { generation: u64, frame: OwnedFd },
+}
+
+/// Trusted launcher for sandboxed network-service generations.
 ///
-/// Each installed frame capability starts a fresh sandboxed process. Replacing
-/// it terminates the preceding process before transferring the new generation;
-/// no Ethernet status or control messages cross the frame-only seam.
+/// Legacy SOCKS starts a process per Ethernet generation. The production
+/// kernel frontend starts offline and changes only its narrowly controlled
+/// Ethernet capability until the provider itself exits or is terminated.
 enum NetworkFrontend {
     Socks {
         listener: TcpListener,
@@ -143,6 +156,9 @@ pub struct NetworkServiceSupervisor {
     mac_address: [u8; 6],
     next_generation: u64,
     installed: Option<InstalledGeneration>,
+    next_provider_generation: u64,
+    kernel_process: Option<KernelProcess>,
+    kernel_link: KernelLink,
     #[cfg(test)]
     arguments: Vec<OsString>,
     #[cfg(test)]
@@ -181,6 +197,9 @@ impl NetworkServiceSupervisor {
             mac_address,
             next_generation: 1,
             installed: None,
+            next_provider_generation: 1,
+            kernel_process: None,
+            kernel_link: KernelLink::Offline,
             #[cfg(test)]
             arguments: Vec::new(),
             #[cfg(test)]
@@ -211,6 +230,9 @@ impl NetworkServiceSupervisor {
             mac_address,
             next_generation: 1,
             installed: None,
+            next_provider_generation: 1,
+            kernel_process: None,
+            kernel_link: KernelLink::Offline,
             #[cfg(test)]
             arguments: Vec::new(),
             #[cfg(test)]
@@ -223,6 +245,13 @@ impl NetworkServiceSupervisor {
     }
 
     pub fn install_generation(&mut self, frame: OwnedFd) -> Result<u64, String> {
+        if matches!(self.frontend, NetworkFrontend::Kernel { .. }) {
+            let generation = self.next_generation;
+            self.next_generation = generation
+                .checked_add(1)
+                .ok_or("Ethernet generation exhausted")?;
+            return self.attach_generation(generation, frame);
+        }
         let generation = self.next_generation;
         let next_generation = generation
             .checked_add(1)
@@ -246,9 +275,26 @@ impl NetworkServiceSupervisor {
     /// Restarts the process for the currently installed Ethernet generation.
     ///
     /// The caller must first observe the preceding process exit with
-    /// [`Self::poll_exit`]. A restart retains the generation number because no
-    /// new Ethernet capability has crossed the Wi-Fi service boundary.
+    /// [`Self::poll_exit`]. The Ethernet generation remains unchanged, but a
+    /// production restart creates a fresh provider namespace; old sockets stay
+    /// revoked. Legacy SOCKS retains its process-generation convention.
     pub fn restart_generation(&mut self) -> Result<u64, String> {
+        if matches!(self.frontend, NetworkFrontend::Kernel { .. }) {
+            if self.kernel_process.is_some() {
+                return Err("network provider generation is still running".into());
+            }
+            let retained = match &self.kernel_link {
+                KernelLink::Offline => None,
+                KernelLink::Attached { generation, frame } => {
+                    Some((*generation, duplicate_capability(frame.as_raw_fd())?))
+                }
+            };
+            self.start_provider()?;
+            if let Some((generation, frame)) = retained {
+                self.attach_generation(generation, frame)?;
+            }
+            return Ok(self.kernel_process.as_ref().unwrap().generation);
+        }
         let generation = self
             .installed
             .as_ref()
@@ -278,15 +324,8 @@ impl NetworkServiceSupervisor {
             NetworkFrontend::Socks { listener, .. } => {
                 (duplicate_capability(listener.as_raw_fd())?, false)
             }
-            NetworkFrontend::Kernel { registration_path } => {
-                let registration = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(registration_path)
-                    .map_err(|error| format!("open fresh kernel registration: {error}"))?;
-                let registration_pass = duplicate_capability(registration.as_raw_fd())?;
-                drop(registration);
-                (registration_pass, true)
+            NetworkFrontend::Kernel { .. } => {
+                return Err("kernel provider uses persistent process startup".into());
             }
         };
         let frame = duplicate_capability(installed.frame.as_raw_fd())?;
@@ -382,7 +421,257 @@ impl NetworkServiceSupervisor {
         Ok(())
     }
 
+    /// Starts a fresh production provider generation while offline.
+    pub fn start_provider(&mut self) -> Result<u64, String> {
+        let NetworkFrontend::Kernel { registration_path } = &self.frontend else {
+            return Err("SOCKS frontend starts with an Ethernet generation".into());
+        };
+        if self.kernel_process.is_some() {
+            return Err("network provider generation is already running".into());
+        }
+        let registration = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(registration_path)
+            .map_err(|error| format!("open fresh kernel registration: {error}"))?;
+        let registration = duplicate_capability(registration.as_raw_fd())?;
+        let placeholder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(|error| format!("reserve provider frame slot: {error}"))?;
+        let placeholder = duplicate_capability(placeholder.as_raw_fd())?;
+        let (control_parent, control_child) = seqpacket_pair()?;
+        let control_pass = duplicate_capability(control_child.as_raw_fd())?;
+        let (mut bootstrap_parent, bootstrap_child) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| format!("create network-provider bootstrap: {error}"))?;
+        let bootstrap_pass = duplicate_capability(bootstrap_child.as_raw_fd())?;
+        let generation = self.next_provider_generation;
+        let next = generation.checked_add(1).ok_or("provider generation exhausted")?;
+        let mac = self.mac_address.map(|octet| format!("{octet:02x}")).join(":");
+        let inherited = [
+            (registration.as_raw_fd(), FRAME_FD),
+            (placeholder.as_raw_fd(), LISTENER_FD),
+            (bootstrap_pass.as_raw_fd(), BOOTSTRAP_FD),
+            (control_pass.as_raw_fd(), LINK_CONTROL_FD),
+            (placeholder.as_raw_fd(), crate::link_control::FRAME_RESERVATION_FD),
+        ];
+        let mut command = Command::new(&self.binary);
+        command
+            .env_clear()
+            .env("DRV_SAE_CLIENT_MAC", &mac)
+            .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        #[cfg(not(test))]
+        command.args(["--ethernet-mac", &mac, "--bootstrap", "--link-control"]);
+        #[cfg(test)]
+        {
+            command.args(&self.arguments);
+            if self.fixture {
+                command
+                    .env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE", "1")
+                    .env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_KERNEL", "1")
+                    .env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_LINK_CONTROL", "1")
+                    .env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_REGISTRATION", registration_path);
+            } else {
+                command.args(["--ethernet-mac", &mac, "--bootstrap", "--link-control"]);
+            }
+            if self.fixture_exit_after_start {
+                command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT", "1");
+            }
+            if self.fixture_echo_frames {
+                command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO", "1");
+            }
+        }
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in inherited {
+                    if dup2(source, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()
+            .map_err(|error| format!("spawn network provider: {error}"))?;
+        drop((registration, placeholder, bootstrap_pass, bootstrap_child, control_child, control_pass));
+        self.kernel_process = Some(KernelProcess {
+            generation,
+            child,
+            control: control_parent,
+        });
+        self.next_provider_generation = next;
+        if let Err(error) = bootstrap(&mut bootstrap_parent, true) {
+            let cleanup = self.terminate_kernel_process();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+            });
+        }
+        Ok(generation)
+    }
+
+    pub fn attach_generation(&mut self, generation: u64, frame: OwnedFd) -> Result<u64, String> {
+        if generation == 0 {
+            return Err("Ethernet generation must be nonzero".into());
+        }
+        if !matches!(self.frontend, NetworkFrontend::Kernel { .. }) {
+            return self.install_generation(frame);
+        }
+        crate::lifecycle::validate_seqpacket(frame.as_raw_fd())?;
+        if self.kernel_process.is_none() {
+            self.start_provider()?;
+        }
+        crate::link_control::send_attach(
+            self.kernel_process.as_ref().unwrap().control.as_fd(),
+            generation,
+            frame.as_fd(),
+        )?;
+        let status = self.wait_link_ack(generation);
+        match status {
+            Ok(crate::link_control::AckStatus::Applied) => {
+                self.kernel_link = KernelLink::Attached { generation, frame };
+                Ok(self.kernel_process.as_ref().unwrap().generation)
+            }
+            Ok(crate::link_control::AckStatus::Rejected) => {
+                Err("network provider rejected Ethernet generation".into())
+            }
+            Err(error) => {
+                // The request was admitted by sendmsg. Without its matching
+                // completion the parent cannot know which capability is live.
+                let cleanup = self.terminate_kernel_process();
+                self.kernel_link = KernelLink::Offline;
+                Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => format!("{error}; fail-closed cleanup failed: {cleanup}"),
+                })
+            }
+        }
+    }
+
+    pub fn revoke_generation(&mut self, generation: u64) -> Result<(), String> {
+        if !matches!(self.frontend, NetworkFrontend::Kernel { .. }) {
+            let active = self.installed.as_ref()
+                .ok_or("network service has no active Ethernet generation")?
+                .generation;
+            if active != generation {
+                return Err("Ethernet revocation does not match active generation".into());
+            }
+            return self.terminate();
+        }
+        let KernelLink::Attached { generation: active, .. } = &self.kernel_link else {
+            return Err("network provider has no active Ethernet generation".into());
+        };
+        if *active != generation {
+            return Err("Ethernet revocation does not match active generation".into());
+        }
+        let process = self.kernel_process.as_ref()
+            .ok_or("network provider is not running")?;
+        crate::link_control::send_detach(
+            process.control.as_fd(),
+            generation,
+        )?;
+        match self.wait_link_ack(generation) {
+            Ok(crate::link_control::AckStatus::Applied) => {
+                self.kernel_link = KernelLink::Offline;
+                Ok(())
+            }
+            Ok(crate::link_control::AckStatus::Rejected) => {
+                Err("network provider rejected Ethernet revocation".into())
+            }
+            Err(error) => {
+                let cleanup = self.terminate_kernel_process();
+                self.kernel_link = KernelLink::Offline;
+                Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => format!("{error}; fail-closed cleanup failed: {cleanup}"),
+                })
+            }
+        }
+    }
+
+    fn wait_link_ack(&mut self, generation: u64) -> Result<crate::link_control::AckStatus, String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let process = self.kernel_process.as_mut()
+                .ok_or("network provider is not running")?;
+            if let Some(status) = process.child.try_wait()
+                .map_err(|error| format!("poll provider during link transfer: {error}"))?
+            {
+                return Err(format!("network provider exited during link transfer: {status}"));
+            }
+            let mut descriptor = libc::pollfd {
+                fd: process.control.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("network provider link-control completion timed out".into());
+            }
+            let timeout = remaining.as_millis().min(100) as i32;
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout.max(1)) };
+            if ready < 0 {
+                return Err(format!("poll network provider link control: {}", std::io::Error::last_os_error()));
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err("network provider link-control channel closed".into());
+            }
+            if descriptor.revents & libc::POLLIN != 0 {
+                return crate::link_control::receive_ack(
+                    process.control.as_fd(),
+                    generation,
+                );
+            }
+        }
+    }
+
+    fn terminate_kernel_process(&mut self) -> Result<(), String> {
+        let Some(mut process) = self.kernel_process.take() else {
+            return Ok(());
+        };
+        match process.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                self.kernel_process = Some(process);
+                return Err(format!("poll network provider before termination: {error}"));
+            }
+        }
+        if let Err(error) = process.child.kill() {
+            self.kernel_process = Some(process);
+            return Err(format!("terminate network provider: {error}"));
+        }
+        match process.child.wait() {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.kernel_process = Some(process);
+                Err(format!("reap network provider: {error}"))
+            }
+        }
+    }
+
     pub fn poll_exit(&mut self) -> Result<Option<NetworkServiceProcessExit>, String> {
+        if let Some(process) = self.kernel_process.as_mut() {
+            let Some(status) = process.child.try_wait()
+                .map_err(|error| format!("poll network provider: {error}"))?
+            else {
+                return Ok(None);
+            };
+            let generation = process.generation;
+            self.kernel_process = None;
+            return Ok(Some(NetworkServiceProcessExit {
+                provider_generation: generation,
+                ethernet_generation: match &self.kernel_link {
+                    KernelLink::Offline => None,
+                    KernelLink::Attached { generation, .. } => Some(*generation),
+                },
+                success: status.success(),
+            }));
+        }
         let Some(installed) = self.installed.as_mut() else {
             return Ok(None);
         };
@@ -397,7 +686,8 @@ impl NetworkServiceSupervisor {
             return Ok(None);
         };
         let exit = NetworkServiceProcessExit {
-            generation: installed.generation,
+            provider_generation: installed.generation,
+            ethernet_generation: Some(installed.generation),
             success: status.success(),
         };
         installed.running = None;
@@ -406,7 +696,9 @@ impl NetworkServiceSupervisor {
 
     pub fn terminate(&mut self) -> Result<(), String> {
         self.terminate_process()?;
+        self.terminate_kernel_process()?;
         self.installed = None;
+        self.kernel_link = KernelLink::Offline;
         Ok(())
     }
 
@@ -437,6 +729,31 @@ impl NetworkServiceSupervisor {
             }
         }
     }
+}
+
+
+fn seqpacket_pair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut descriptors = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+            descriptors.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "create provider link-control capability: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    })
 }
 
 impl Drop for NetworkServiceSupervisor {
@@ -625,6 +942,74 @@ mod tests {
         if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_EXIT").is_some() {
             return;
         }
+        if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_LINK_CONTROL").is_some() {
+            for fd in [4, crate::link_control::FRAME_RESERVATION_FD] {
+                assert_eq!(
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap(),
+                    PathBuf::from("/dev/null")
+                );
+            }
+            crate::lifecycle::validate_seqpacket(LINK_CONTROL_FD).unwrap();
+            let control = unsafe { std::os::fd::BorrowedFd::borrow_raw(LINK_CONTROL_FD) };
+            let mut active: Option<(u64, OwnedFd)> = None;
+            let mut last = 0;
+            loop {
+                let frame_fd = active.as_ref().map_or(-1, |(_, frame)| frame.as_raw_fd());
+                let mut poll = [
+                    libc::pollfd { fd: LINK_CONTROL_FD, events: libc::POLLIN, revents: 0 },
+                    libc::pollfd { fd: frame_fd, events: libc::POLLIN, revents: 0 },
+                ];
+                assert!(unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, -1) } >= 0);
+                if poll[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return;
+                }
+                if poll[0].revents & libc::POLLIN != 0 {
+                    let Some(request) = crate::link_control::receive_request(control).unwrap() else {
+                        continue;
+                    };
+                    let (generation, accepted) = match request {
+                        crate::link_control::Request::Attach { generation, frame }
+                            if generation > last =>
+                        {
+                            active = Some((generation, frame));
+                            last = generation;
+                            (generation, true)
+                        }
+                        crate::link_control::Request::Detach { generation }
+                            if active.as_ref().is_some_and(|(active, _)| *active == generation) =>
+                        {
+                            active = None;
+                            (generation, true)
+                        }
+                        crate::link_control::Request::Attach { generation, .. }
+                        | crate::link_control::Request::Detach { generation } => {
+                            (generation, false)
+                        }
+                    };
+                    crate::link_control::send_ack(
+                        control,
+                        generation,
+                        if accepted {
+                            crate::link_control::AckStatus::Applied
+                        } else {
+                            crate::link_control::AckStatus::Rejected
+                        },
+                    ).unwrap();
+                }
+                if poll[1].revents & libc::POLLIN != 0 {
+                    let (_, frame) = active.as_ref().unwrap();
+                    let mut bytes = [0; 1514];
+                    let read = unsafe {
+                        libc::recv(frame.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT)
+                    };
+                    if read > 0 && std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO").is_some() {
+                        assert_eq!(unsafe {
+                            libc::send(frame.as_raw_fd(), bytes.as_ptr().cast(), read as _, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+                        }, read);
+                    }
+                }
+            }
+        }
         if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_KERNEL").is_some() {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -778,7 +1163,7 @@ mod tests {
         wait_for_driver_closed(&mut first_driver);
 
         drop(second_driver);
-        assert_eq!(wait_for_exit(&mut supervisor).generation, 2);
+        assert_eq!(wait_for_exit(&mut supervisor).provider_generation, 2);
         supervisor.terminate().unwrap();
         assert_eq!(supervisor.poll_exit(), Ok(None));
     }
@@ -808,13 +1193,13 @@ mod tests {
             Ok(1)
         );
         let first_exit = wait_for_exit(&mut supervisor);
-        assert_eq!(first_exit.generation, 1);
+        assert_eq!(first_exit.provider_generation, 1);
 
         supervisor.fixture_exit_after_start = false;
         assert_eq!(supervisor.restart_generation(), Ok(1));
         drop(driver);
         let restarted_exit = wait_for_exit(&mut supervisor);
-        assert_eq!(restarted_exit.generation, 1);
+        assert_eq!(restarted_exit.provider_generation, 1);
         assert!(restarted_exit.success);
         supervisor.terminate().unwrap();
     }
@@ -850,7 +1235,7 @@ mod tests {
         // retained-but-revoked endpoint.
         first_driver.set_link(false);
         drop(first_driver);
-        assert_eq!(wait_for_exit(&mut supervisor).generation, 1);
+        assert_eq!(wait_for_exit(&mut supervisor).provider_generation, 1);
         assert_eq!(
             supervisor.restart_generation(),
             Err("network-service Ethernet generation is revoked".into())
@@ -903,7 +1288,7 @@ mod tests {
             receiver.receive(&mut supervisor).unwrap(),
             Some(WifiLifecycleUpdate::Installed {
                 ethernet_generation: 1,
-                network_generation: 1,
+                provider_generation: 1,
                 ..
             })
         ));
@@ -952,7 +1337,7 @@ mod tests {
             receiver.receive(&mut supervisor).unwrap(),
             Some(WifiLifecycleUpdate::Installed {
                 ethernet_generation: 2,
-                network_generation: 2,
+                provider_generation: 2,
                 ..
             })
         ));
@@ -1148,7 +1533,7 @@ mod tests {
             receiver.receive(&mut supervisor).unwrap(),
             Some(WifiLifecycleUpdate::Installed {
                 ethernet_generation: 2,
-                network_generation: 2,
+                provider_generation: 2,
                 ..
             })
         ));
@@ -1279,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_replacement_revokes_unclaimed_socket_without_resurrection() {
+    fn kernel_replacement_preserves_provider_namespace_and_unclaimed_socket() {
         if std::env::var_os("DRV_KERNEL_PROVIDER_ETHERNET_GUEST").is_none() {
             return;
         }
@@ -1312,21 +1697,13 @@ mod tests {
             "first provider session did not own application socket"
         );
 
-        let first_pid = supervisor
-            .installed
-            .as_ref()
-            .unwrap()
-            .running
-            .as_ref()
-            .unwrap()
-            .child
-            .id() as i32;
+        let first_pid = supervisor.kernel_process.as_ref().unwrap().child.id();
         let (second, _second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
         assert_eq!(supervisor.install_generation(second.into_frame_fd()), Ok(2));
         assert_eq!(
-            unsafe { libc::waitpid(first_pid, std::ptr::null_mut(), libc::WNOHANG) },
-            -1,
-            "kernel registration reopened before the preceding child was reaped"
+            supervisor.kernel_process.as_ref().unwrap().child.id(),
+            first_pid,
+            "Ethernet replacement changed the provider namespace generation"
         );
 
         let fresh = unsafe {
@@ -1342,27 +1719,103 @@ mod tests {
         );
         let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         address.sin_family = libc::AF_INET as _;
-        for _ in 0..2 {
-            assert_eq!(
-                unsafe {
-                    libc::bind(
-                        stale,
-                        (&address as *const libc::sockaddr_in).cast(),
-                        size_of::<libc::sockaddr_in>() as _,
-                    )
-                },
-                -1
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENETDOWN),
-                "replacement resurrected an unclaimed old-session socket"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    stale,
+                    (&address as *const libc::sockaddr_in).cast(),
+                    size_of::<libc::sockaddr_in>() as _,
+                )
+            },
+            0,
+            "replacement destroyed the existing provider socket namespace"
+        );
         assert_eq!(unsafe { libc::close(stale) }, 0);
         assert_eq!(unsafe { libc::close(fresh) }, 0);
         supervisor.terminate().unwrap();
+    }
+
+
+    #[test]
+    fn kernel_provider_stays_online_as_a_namespace_while_links_change() {
+        let path = std::env::temp_dir().join(format!(
+            "persistent-network-provider-registration-{}",
+            std::process::id()
+        ));
+        let registration = File::create(&path).unwrap();
+        let mut supervisor = NetworkServiceSupervisor::new_kernel(
+            std::env::current_exe().unwrap(),
+            &path,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap();
+        supervisor.arguments = [
+            "--exact",
+            "supervisor::tests::supervisor_fixture_child",
+            "--nocapture",
+        ]
+        .map(OsString::from)
+        .into();
+        supervisor.fixture = true;
+        supervisor.fixture_echo_frames = true;
+
+        assert_eq!(supervisor.start_provider(), Ok(1));
+        let provider_pid = supervisor.kernel_process.as_ref().unwrap().child.id();
+        let (invalid, _peer) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        assert_eq!(
+            supervisor.attach_generation(0, invalid.into_frame_fd()),
+            Err("Ethernet generation must be nonzero".into())
+        );
+        assert_eq!(supervisor.kernel_process.as_ref().unwrap().child.id(), provider_pid);
+
+        let (first, mut first_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        first_driver.set_link(true);
+        assert_eq!(supervisor.attach_generation(1, first.into_frame_fd()), Ok(1));
+        first_driver.deliver(&[0x31; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut first_driver).as_bytes(), [0x31; 14]);
+
+        supervisor.revoke_generation(1).unwrap();
+        assert_eq!(
+            supervisor.kernel_process.as_ref().unwrap().child.id(),
+            provider_pid
+        );
+        wait_for_driver_closed(&mut first_driver);
+
+        let (second, mut second_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
+        second_driver.set_link(true);
+        assert_eq!(supervisor.attach_generation(2, second.into_frame_fd()), Ok(1));
+        assert_eq!(
+            supervisor.kernel_process.as_ref().unwrap().child.id(),
+            provider_pid
+        );
+
+        let (stale, mut stale_driver) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
+        stale_driver.set_link(true);
+        assert_eq!(
+            supervisor.attach_generation(2, stale.into_frame_fd()),
+            Err("network provider rejected Ethernet generation".into())
+        );
+        wait_for_driver_closed(&mut stale_driver);
+        second_driver.deliver(&[0x42; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut second_driver).as_bytes(), [0x42; 14]);
+
+        supervisor.kernel_process.as_mut().unwrap().child.kill().unwrap();
+        let exit = wait_for_exit(&mut supervisor);
+        assert_eq!(exit.provider_generation, 1);
+        assert_eq!(exit.ethernet_generation, Some(2));
+        assert!(!exit.success);
+        assert_eq!(supervisor.restart_generation(), Ok(2));
+        assert_ne!(
+            supervisor.kernel_process.as_ref().unwrap().child.id(),
+            provider_pid
+        );
+        second_driver.deliver(&[0x53; 14]).unwrap();
+        assert_eq!(wait_for_transmit(&mut second_driver).as_bytes(), [0x53; 14]);
+
+        supervisor.terminate().unwrap();
+        wait_for_driver_closed(&mut second_driver);
+        drop(registration);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

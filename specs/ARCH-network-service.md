@@ -28,10 +28,12 @@ These tests do not establish broad socket
 compatibility, hostile-provider robustness, or dependable physical throughput. Optimized localhost tests exceed
 100 MB/s; this is not evidence of Wi-Fi deployment throughput.
 
-The service implementation lives in `drv-network-service`. Its standalone
-supervisor starts offline and replaces children across tested Ethernet
-capability generations. Continuous physical service integration and the
-restart semantics below remain destination behavior.
+The service implementation lives in `drv-network-service`. Its production
+supervisor starts one offline provider generation and uses a private,
+generation-tagged descriptor channel to detach and replace Ethernet links
+without replacing the provider process or socket namespace. Provider crash
+and restart remain a distinct, terminal generation boundary for old sockets.
+Continuous physical validation of link replacement remains pending.
 
 ## Owner-selected goal and rationale
 
