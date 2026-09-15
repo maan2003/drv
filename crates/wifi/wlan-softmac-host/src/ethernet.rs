@@ -80,11 +80,16 @@ struct SeqpacketFrameEndpoint {
 
 impl SeqpacketFrameEndpoint {
     fn discard_frames(&mut self) {
+        // Repeated link-down notifications may arrive after the endpoint was
+        // closed. Do not issue recv(-1), including under an fd-bound sandbox.
+        let Some(fd) = self.fd.as_ref() else {
+            return;
+        };
         let mut bytes = [0u8; 1515];
         // Use the same fd-bound receive contract as normal frame delivery.
         while unsafe {
             recv(
-                self.raw_fd(),
+                fd.as_raw_fd(),
                 bytes.as_mut_ptr(),
                 bytes.len(),
                 MSG_DONTWAIT | MSG_TRUNC,
@@ -595,6 +600,8 @@ mod tests {
     fn link_down_revokes_an_already_down_generation() {
         let (_, mut sink) = ethernet_port([2, 0, 0, 0, 0, 1], 1).unwrap();
         assert!(!sink.is_closed());
+        sink.set_link(false);
+        assert!(sink.is_closed());
         sink.set_link(false);
         assert!(sink.is_closed());
     }
