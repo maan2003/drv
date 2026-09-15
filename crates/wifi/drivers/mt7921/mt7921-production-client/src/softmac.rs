@@ -37,6 +37,22 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
     }
 }
 
+impl crate::HifPowerState {
+    fn retain_irq_wake(&self, pending: &mut bool) {
+        if !matches!(self, Self::DriverOwned) {
+            *pending = true;
+        }
+    }
+
+    /// Completing CLR_OWN consumes the retained reason only when this turn is
+    /// allowed to continue into the operational drain.
+    fn complete_driver_wake(&mut self, pending: &mut bool) -> bool {
+        *self = Self::DriverOwned;
+        *pending = false;
+        true
+    }
+}
+
 impl Mt7921Driver {
     fn host_work_except_power_change(&self) -> bool {
         !matches!(
@@ -124,9 +140,9 @@ impl Mt7921Driver {
                                 .runtime_reinitialize(&mut self.data_rx, &mut self.tx)
                                 .map_err(|_| zx::Status::IO)?;
                         }
-                        self.hif_state = crate::HifPowerState::DriverOwned;
-                        self.irq_wake_pending = false;
-                        Ok(true)
+                        Ok(self
+                            .hif_state
+                            .complete_driver_wake(&mut self.irq_wake_pending))
                     }
                 }
             }
@@ -157,9 +173,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
             // Reading eventfd consumes the notification, not the descriptors:
             // force another bounded hardware observation before sleeping.
             std::task::Poll::Ready(Ok(_)) => {
-                if matches!(self.hif_state, crate::HifPowerState::FirmwareOwned) {
-                    self.irq_wake_pending = true;
-                }
+                self.hif_state.retain_irq_wake(&mut self.irq_wake_pending);
                 Ok(true)
             }
             std::task::Poll::Ready(Err(_)) => {
@@ -1181,5 +1195,43 @@ mod tests {
             false,
         );
         assert_eq!(upcalls.0.len(), 1);
+    }
+    #[test]
+    fn irq_wake_is_retained_through_every_non_driver_owned_state() {
+        let authority = mt7921_core::DriverOwnershipWakeAuthority {
+            epoch: 1,
+            deadline_ms: 10,
+        };
+        let sleep = mt7921_core::FirmwareOwnershipSleep::new(authority, 0).unwrap();
+        let wake = mt7921_core::DriverOwnershipWake::new(authority, 0).unwrap();
+
+        for state in [
+            crate::HifPowerState::Sleeping(sleep),
+            crate::HifPowerState::FirmwareOwned,
+            crate::HifPowerState::Waking(wake),
+        ] {
+            let mut pending = false;
+            state.retain_irq_wake(&mut pending);
+            assert!(pending);
+        }
+
+        let mut pending = false;
+        crate::HifPowerState::DriverOwned.retain_irq_wake(&mut pending);
+        assert!(!pending);
+    }
+
+    #[test]
+    fn acquired_wake_clears_intent_only_as_operational_drain_resumes() {
+        let authority = mt7921_core::DriverOwnershipWakeAuthority {
+            epoch: 1,
+            deadline_ms: 10,
+        };
+        let mut state = crate::HifPowerState::Waking(
+            mt7921_core::DriverOwnershipWake::new(authority, 0).unwrap(),
+        );
+        let mut pending = true;
+        assert!(state.complete_driver_wake(&mut pending));
+        assert!(matches!(state, crate::HifPowerState::DriverOwned));
+        assert!(!pending);
     }
 }
