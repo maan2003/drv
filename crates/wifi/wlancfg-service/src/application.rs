@@ -355,6 +355,12 @@ pub enum Security {
     Wpa3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerSaveMode {
+    Performance,
+    Balanced,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum Request {
     Scan,
@@ -365,6 +371,7 @@ pub enum Request {
     },
     Status,
     Disconnect,
+    PowerSave(PowerSaveMode),
     Saved,
     Forget {
         ssid: Vec<u8>,
@@ -390,6 +397,7 @@ impl fmt::Debug for Request {
                 Self::Scan => "Scan",
                 Self::Status => "Status",
                 Self::Disconnect => "Disconnect",
+                Self::PowerSave(_) => "PowerSave",
                 Self::Saved => "Saved",
                 _ => unreachable!(),
             }),
@@ -469,6 +477,13 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, Error> {
         }
         Request::Status => out.push(3),
         Request::Disconnect => out.push(4),
+        Request::PowerSave(mode) => {
+            out.push(7);
+            out.push(match mode {
+                PowerSaveMode::Performance => 0,
+                PowerSaveMode::Balanced => 1,
+            });
+        }
         Request::Saved => out.push(5),
         Request::Forget { ssid, security } => {
             validate_ssid(ssid)?;
@@ -513,6 +528,11 @@ pub fn decode_request(packet: &[u8]) -> Result<Request, Error> {
                 security: decode_security(r.u8()?)?,
             }
         }
+        7 => Request::PowerSave(match r.u8()? {
+            0 => PowerSaveMode::Performance,
+            1 => PowerSaveMode::Balanced,
+            _ => return Err(Error::Invalid),
+        }),
         _ => return Err(Error::Invalid),
     };
     if !r.done() {
@@ -820,6 +840,20 @@ mod tests {
         );
         assert!(!format!("{request:?}").contains("topsecret"));
     }
+    #[test]
+    fn power_save_modes_round_trip_without_unsupported_values() {
+        for mode in [PowerSaveMode::Performance, PowerSaveMode::Balanced] {
+            let request = Request::PowerSave(mode);
+            assert_eq!(
+                decode_request(&encode_request(&request).unwrap()),
+                Ok(request)
+            );
+        }
+        let mut invalid = MAGIC.to_vec();
+        invalid.extend([7, 2]);
+        assert_eq!(decode_request(&invalid), Err(Error::Invalid));
+    }
+
     #[test]
     fn rejects_unbounded_and_malformed_values() {
         assert!(

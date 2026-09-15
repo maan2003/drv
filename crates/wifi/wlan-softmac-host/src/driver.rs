@@ -193,6 +193,11 @@ impl DriverHandle {
 pub(crate) enum OwnerCommand {
     Link(bool, oneshot::Sender<Result<(), zx::Status>>),
     FinishAttempt(oneshot::Sender<Result<(), zx::Status>>),
+    PowerSave(
+        OperationContext,
+        bool,
+        oneshot::Sender<Result<(), zx::Status>>,
+    ),
     Stop,
     Reset,
 }
@@ -282,6 +287,18 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                 }
                 Ok(Some(Some(OwnerCommand::FinishAttempt(reply)))) => {
                     let _ = reply.send(self.finish_failed_connect_attempt());
+                }
+                Ok(Some(Some(OwnerCommand::PowerSave(context, enabled, reply)))) => {
+                    if self.pending.is_some() {
+                        let _ = reply.send(Err(zx::Status::SHOULD_WAIT));
+                    } else if let Err(status) = context.check(std::time::Instant::now()) {
+                        let _ = reply.send(Err(status));
+                    } else {
+                        let completion = self.device.set_power_save_mode(context, enabled);
+                        self.pending = Some(Box::pin(async move {
+                            let _ = reply.send(completion.await);
+                        }));
+                    }
                 }
                 Ok(Some(Some(OwnerCommand::Reset))) => {
                     let result = self.reset();

@@ -610,6 +610,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     overflow: Arc<AtomicBool>,
     connect_attempt: Option<ConnectAttempt>,
     scan_attempt: Option<ScanAttempt>,
+    power_save: Option<oneshot::Receiver<Result<(), zx::Status>>>,
     cleanup: Option<Cleanup>,
     connection: Option<Connection>,
     connection_events: VecDeque<fidl_sme::ConnectTransactionEvent>,
@@ -855,6 +856,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             overflow,
             connect_attempt: None,
             scan_attempt: None,
+            power_save: None,
             cleanup: None,
             connection: None,
             connection_events: VecDeque::new(),
@@ -1435,6 +1437,47 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
                 return Ok(result);
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    pub fn begin_power_save(&mut self, enabled: bool, deadline: Instant) -> Result<(), zx::Status> {
+        self.check_tasks().map_err(|_| zx::Status::IO)?;
+        if Instant::now() >= deadline {
+            return Err(zx::Status::TIMED_OUT);
+        }
+        if self.power_save.is_some() {
+            return Err(zx::Status::SHOULD_WAIT);
+        }
+        if !matches!(self.connection, Some(Connection::Active(_))) || self.cleanup.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        let context = OperationContext::child(self.service_epoch.clone(), deadline);
+        let (reply, receiver) = oneshot::channel();
+        self.hardware
+            .send(OwnerCommand::PowerSave(context, enabled, reply))?;
+        self.power_save = Some(receiver);
+        Ok(())
+    }
+
+    pub async fn drive_power_save_once(&mut self) -> Result<Option<()>, zx::Status> {
+        self.check_tasks().map_err(|_| zx::Status::IO)?;
+        let Some(receiver) = self.power_save.as_mut() else {
+            return Ok(None);
+        };
+        match receiver.try_recv() {
+            Ok(Some(Ok(()))) => {
+                self.power_save = None;
+                Ok(Some(()))
+            }
+            Ok(Some(Err(status))) => {
+                self.power_save = None;
+                Err(status)
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                self.power_save = None;
+                Err(zx::Status::IO)
+            }
         }
     }
 

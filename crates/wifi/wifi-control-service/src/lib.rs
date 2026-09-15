@@ -34,6 +34,8 @@ pub enum RuntimeError {
     Failed(sme::ConnectResult),
     Timeout,
     Unsupported,
+    Busy,
+    NotConnected,
     DriverFault,
     ContainmentFault,
 }
@@ -72,6 +74,16 @@ pub trait WifiRuntime {
         deadline: Instant,
     ) -> Result<(), RuntimeError>;
     async fn drive_disconnect_once(&mut self) -> Result<Option<DisconnectOutcome>, RuntimeError>;
+    fn begin_power_save(
+        &mut self,
+        _mode: wlan_control_wire::PowerSaveMode,
+        _deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+    async fn drive_power_save_once(&mut self) -> Result<Option<()>, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
 }
 
 fn host_runtime_error(error: wlan_softmac_host::runtime::ConnectError) -> RuntimeError {
@@ -157,6 +169,34 @@ where
         self.drive_disconnect_once()
             .await
             .map_err(host_runtime_error)
+    }
+
+    fn begin_power_save(
+        &mut self,
+        mode: wlan_control_wire::PowerSaveMode,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.begin_power_save(
+            matches!(mode, wlan_control_wire::PowerSaveMode::Balanced),
+            deadline,
+        )
+        .map_err(power_runtime_error)
+    }
+
+    async fn drive_power_save_once(&mut self) -> Result<Option<()>, RuntimeError> {
+        self.drive_power_save_once()
+            .await
+            .map_err(power_runtime_error)
+    }
+}
+
+fn power_runtime_error(status: zx::Status) -> RuntimeError {
+    match status {
+        zx::Status::SHOULD_WAIT => RuntimeError::Busy,
+        zx::Status::BAD_STATE => RuntimeError::NotConnected,
+        zx::Status::NOT_SUPPORTED => RuntimeError::Unsupported,
+        zx::Status::TIMED_OUT => RuntimeError::Timeout,
+        _ => RuntimeError::DriverFault,
     }
 }
 
@@ -495,6 +535,7 @@ impl<R: WifiRuntime> PreparedServer<R> {
             connect_request: None,
             scan_request: None,
             disconnect_request: None,
+            power_save_request: None,
             ethernet_generation: 0,
             terminal: false,
         };
@@ -524,6 +565,7 @@ pub struct ControlServer<R> {
     connect_request: Option<u64>,
     scan_request: Option<u64>,
     disconnect_request: Option<PendingDisconnect>,
+    power_save_request: Option<(u64, Instant)>,
     ethernet_generation: u64,
     terminal: bool,
 }
@@ -609,7 +651,10 @@ impl<R: WifiRuntime> ControlServer<R> {
         };
         match packet.message {
             Message::Scan { request, .. } => {
-                if self.scan_request.is_some() || self.disconnect_request.is_some() {
+                if self.scan_request.is_some()
+                    || self.disconnect_request.is_some()
+                    || self.power_save_request.is_some()
+                {
                     self.queue_scan_reply(id, Err(sme::ScanErrorCode::ShouldWait))?;
                 } else {
                     match self
@@ -626,7 +671,10 @@ impl<R: WifiRuntime> ControlServer<R> {
                 }
             }
             Message::Connect { request, .. } => {
-                if self.connect_request.is_some() || self.disconnect_request.is_some() {
+                if self.connect_request.is_some()
+                    || self.disconnect_request.is_some()
+                    || self.power_save_request.is_some()
+                {
                     return Err(GenerationEndReason::ProtocolViolation);
                 } else {
                     match self
@@ -644,6 +692,9 @@ impl<R: WifiRuntime> ControlServer<R> {
             }
             Message::Disconnect { reason, .. } => {
                 let deadline = admitted_deadline.expect("command deadline admitted");
+                if self.power_save_request.is_some() {
+                    return Err(GenerationEndReason::ProtocolViolation);
+                }
                 if let Some(pending) = &mut self.disconnect_request {
                     if pending.requests.len() == NORMAL_PACKET_LIMIT {
                         return Err(GenerationEndReason::Backpressure);
@@ -662,17 +713,46 @@ impl<R: WifiRuntime> ControlServer<R> {
                 }
             }
             Message::Roam { request, .. } => {
-                let reply = if self.disconnect_request.is_some() {
+                let reply =
+                    if self.disconnect_request.is_some() || self.power_save_request.is_some() {
+                        CommandReply::Busy
+                    } else {
+                        match self.runtime.roam(request) {
+                            Ok(()) => CommandReply::Success,
+                            Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
+                            Err(error) => return Err(runtime_end(error)),
+                        }
+                    };
+                self.queue(
+                    Message::RoamReply(Reply {
+                        in_reply_to: id,
+                        result: reply,
+                    }),
+                    None,
+                )?;
+            }
+            Message::SetPowerSave { mode, .. } => {
+                let deadline = admitted_deadline.expect("command deadline admitted");
+                let reply = if self.power_save_request.is_some()
+                    || self.disconnect_request.is_some()
+                    || self.connect_request.is_some()
+                    || self.scan_request.is_some()
+                {
                     CommandReply::Busy
                 } else {
-                    match self.runtime.roam(request) {
-                        Ok(()) => CommandReply::Success,
+                    match self.runtime.begin_power_save(mode, deadline) {
+                        Ok(()) => {
+                            self.power_save_request = Some((id, deadline));
+                            return Ok(());
+                        }
+                        Err(RuntimeError::Busy) => CommandReply::Busy,
+                        Err(RuntimeError::NotConnected) => CommandReply::NotConnected,
                         Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
                         Err(error) => return Err(runtime_end(error)),
                     }
                 };
                 self.queue(
-                    Message::RoamReply(Reply {
+                    Message::SetPowerSaveReply(Reply {
                         in_reply_to: id,
                         result: reply,
                     }),
@@ -700,6 +780,31 @@ impl<R: WifiRuntime> ControlServer<R> {
             Err(reason) => {
                 self.end_generation(reason)?;
                 return Ok(true);
+            }
+        }
+        if let Some((id, deadline)) = self.power_save_request {
+            if Instant::now() >= deadline {
+                self.end_generation(GenerationEndReason::Timeout)?;
+                return Ok(true);
+            }
+            match self.runtime.drive_power_save_once().await {
+                Ok(Some(())) => {
+                    self.power_save_request = None;
+                    self.queue(
+                        Message::SetPowerSaveReply(Reply {
+                            in_reply_to: id,
+                            result: CommandReply::Success,
+                        }),
+                        None,
+                    )
+                    .map_err(terminal_service)?;
+                    return Ok(true);
+                }
+                Ok(None) => return Ok(progressed),
+                Err(error) => {
+                    self.end_generation(runtime_end(error))?;
+                    return Ok(true);
+                }
             }
         }
         if let Some(pending) = &self.disconnect_request {
@@ -983,7 +1088,9 @@ fn runtime_end(error: RuntimeError) -> GenerationEndReason {
     match error {
         RuntimeError::Failed(_) | RuntimeError::DriverFault => GenerationEndReason::DriverFault,
         RuntimeError::Timeout => GenerationEndReason::Timeout,
-        RuntimeError::Unsupported => GenerationEndReason::ProtocolViolation,
+        RuntimeError::Unsupported | RuntimeError::Busy | RuntimeError::NotConnected => {
+            GenerationEndReason::ProtocolViolation
+        }
         RuntimeError::ContainmentFault => GenerationEndReason::ContainmentFault,
     }
 }
@@ -1006,6 +1113,7 @@ pub struct SimulatedWifiRuntime {
     ethernet_after_connect: Option<OwnedFd>,
     connect_mode: SimulatedConnectMode,
     disconnect: Option<DisconnectOutcome>,
+    power_save: Option<wlan_control_wire::PowerSaveMode>,
 }
 
 #[derive(Clone, Copy)]
@@ -1032,6 +1140,7 @@ impl SimulatedWifiRuntime {
             ethernet_after_connect: None,
             connect_mode: SimulatedConnectMode::None,
             disconnect: None,
+            power_save: None,
         }
     }
     pub fn publish_ethernet(&mut self, fd: OwnedFd) {
@@ -1171,6 +1280,20 @@ impl WifiRuntime for SimulatedWifiRuntime {
     async fn drive_disconnect_once(&mut self) -> Result<Option<DisconnectOutcome>, RuntimeError> {
         Ok(self.disconnect.take())
     }
+    fn begin_power_save(
+        &mut self,
+        mode: wlan_control_wire::PowerSaveMode,
+        _: Instant,
+    ) -> Result<(), RuntimeError> {
+        if self.power_save.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        self.power_save = Some(mode);
+        Ok(())
+    }
+    async fn drive_power_save_once(&mut self) -> Result<Option<()>, RuntimeError> {
+        Ok(self.power_save.take().map(|_| ()))
+    }
 }
 
 #[cfg(test)]
@@ -1274,6 +1397,54 @@ mod deadline_tests {
                 assert!(peer.try_receive_packet().unwrap().is_none());
             });
         }
+    }
+
+    #[test]
+    fn power_save_reply_waits_for_runtime_completion() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&executor, async {
+            let (policy, _policy_peer) = pair();
+            let (supervisor, _supervisor_peer) = pair();
+            let runtime = SimulatedWifiRuntime::new([2; 6]);
+            let mut server = PreparedServer::new(policy, supervisor, [1; 16], runtime)
+                .unwrap()
+                .post_lockdown_open_complete()
+                .unwrap();
+            server
+                .dispatch(Packet {
+                    generation: [1; 16],
+                    request_id: 7,
+                    message: Message::SetPowerSave {
+                        deadline: wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(
+                            1,
+                        ))
+                        .unwrap(),
+                        mode: wlan_control_wire::PowerSaveMode::Balanced,
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(server.power_save_request.map(|(id, _)| id), Some(7));
+            assert_eq!(
+                server.outbound.len(),
+                1,
+                "only Ready is queued before completion"
+            );
+            server.drive_runtime().await.unwrap();
+            assert!(server.power_save_request.is_none());
+            assert!(matches!(
+                decode(&server.outbound.back().unwrap().bytes)
+                    .unwrap()
+                    .message,
+                Message::SetPowerSaveReply(Reply {
+                    in_reply_to: 7,
+                    result: CommandReply::Success
+                })
+            ));
+        });
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
     io::{self, BufRead as _, Write as _},
     path::PathBuf,
 };
-use wlancfg_service::application::{self, Association, Reply, Request, Security};
+use wlancfg_service::application::{self, Association, PowerSaveMode, Reply, Request, Security};
 
 fn main() -> anyhow::Result<()> {
     let (socket, request) = parse(std::env::args().skip(1))?;
@@ -36,6 +36,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, Req
             no_more(args)?;
             Request::Disconnect
         }
+        "power-save" => {
+            let mode = match args.next().as_deref() {
+                Some("performance") => PowerSaveMode::Performance,
+                Some("balanced") => PowerSaveMode::Balanced,
+                _ => bail!("power-save mode must be performance or balanced"),
+            };
+            no_more(args)?;
+            Request::PowerSave(mode)
+        }
         "saved" => {
             no_more(args)?;
             Request::Saved
@@ -62,7 +71,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<(PathBuf, Req
             Request::Forget { ssid, security }
         }
         _ => bail!(
-            "usage: wlanctl [--socket PATH] scan|status|disconnect|saved|connect SSID open|wpa2|wpa3|forget SSID open|wpa2|wpa3"
+            "usage: wlanctl [--socket PATH] scan|status|disconnect|power-save performance|balanced|saved|connect SSID open|wpa2|wpa3|forget SSID open|wpa2|wpa3"
         ),
     };
     Ok((socket, request))
@@ -205,6 +214,23 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn power_save_accepts_only_explicit_supported_modes() {
+        assert_eq!(
+            parse(["power-save", "performance"].into_iter().map(str::to_owned))
+                .unwrap()
+                .1,
+            Request::PowerSave(PowerSaveMode::Performance)
+        );
+        assert_eq!(
+            parse(["power-save", "balanced"].into_iter().map(str::to_owned))
+                .unwrap()
+                .1,
+            Request::PowerSave(PowerSaveMode::Balanced)
+        );
+        assert!(parse(["power-save", "low"].into_iter().map(str::to_owned)).is_err());
+    }
+
     #[test]
     fn status_does_not_claim_network_or_internet_readiness() {
         let mut output = Vec::new();

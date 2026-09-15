@@ -418,6 +418,41 @@ association, DHCP, NSS DNS and both HTTPS gates but hit the VM deadline before
 safe shutdown: it is functional evidence, **not** lifecycle acceptance of this
 updated launcher.
 
+### Laptop power lifecycle contract
+
+The production launcher accepts `SIGUSR1` as a **suspend-preparation request**.
+It first closes policy admission, then terminates the network-service generation,
+then waits up to ten seconds for the Wi-Fi service's normal
+`ClientRuntime::shutdown` path to contain the MT7921. Only successful common
+child cleanup emits:
+
+```
+wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true
+```
+
+A failed or timed-out containment exits nonzero and never emits readiness. A
+platform power coordinator may suspend only after observing the launcher's
+successful exit and this marker. After resume it must start a new launcher; the
+new random Wi-Fi generation, new driver construction, and wlancfg's persisted
+desired network prevent reuse of old operation/key/DMA authority and permit
+automatic selection/reconnect.
+
+This is a real quiescence boundary, not a complete system-suspend integration.
+The repository does not yet contain the platform inhibitor/coordinator that
+orders all devices into an ACPI sleep state, nor an MT7921 WoWLAN wake contract,
+PCI D-state transition, or runtime-autosuspend owner. Those remain unsupported
+and must not be inferred from launcher restart. Connected-idle power saving is
+separate. `wlanctl power-save performance`
+requests the acknowledged awake state (0), while `wlanctl power-save balanced`
+requests firmware dynamic power saving (state 2), matching Fuchsia's
+Performance/Balanced policy distinction and pinned Linux MT7921's
+`vif->cfg.ps` mapping. The driver starts each association awake and a command
+succeeds only after firmware ACK and DMA reclaim. Physical idle-current,
+traffic wake, and repeated suspend/re-entry validation remain required. The
+Wi-Fi control process still has a 1 ms fallback service tick, so this is not a
+claim that the full process graph is tickless or that battery savings have been
+measured.
+
 ### Core-owned names and per-socket workers
 
 The socket binding now queries core TCP/UDP `get_info` for local and peer names

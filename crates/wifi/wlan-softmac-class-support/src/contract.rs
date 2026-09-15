@@ -227,6 +227,14 @@ pub trait WlanSoftmac {
         &mut self,
         request: WlanSoftmacBaseUpdateWmmParametersRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
+    /// Fuchsia PHY power policy subset. Default is explicit unsupported.
+    fn set_power_save_mode(
+        &mut self,
+        _context: OperationContext,
+        _enabled: bool,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
+    }
     /// Admission is not hardware completion. Retain context with queued frames
     /// and recheck it immediately before deferred hardware publication.
     fn queue_tx(
