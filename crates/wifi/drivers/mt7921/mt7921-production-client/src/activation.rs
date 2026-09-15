@@ -297,8 +297,8 @@ struct DmashdlIo<B: Backend> {
 }
 impl<B: Backend> DmashdlIo<B> {
     fn configure(&mut self) -> Result<(), String> {
-        let invariant = ensure_linux_dmashdl_invariant(self)
-            .map_err(|error| format!("{error:?}"))?;
+        let invariant =
+            ensure_linux_dmashdl_invariant(self).map_err(|error| format!("{error:?}"))?;
         if invariant.ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0
             || invariant.control_after & DMASHDL_BYPASS == 0
         {
@@ -860,6 +860,19 @@ pub(super) fn runtime_reinitialize<B: Backend>(
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    // The warm reset must establish the same scheduler bypass as cold
+    // activation (Linux mt792x_dma_disable), not assume sleep preserved it.
+    DmashdlIo {
+        wfdma: resources
+            .bar0
+            .slice(0xd4000, PAGE)
+            .map_err(|e| format!("{e:?}"))?,
+        dmashdl: resources
+            .bar0
+            .slice(0xd6000, PAGE)
+            .map_err(|e| format!("{e:?}"))?,
+    }
+    .configure()?;
     initialize_descriptors(&mut resources.dma)
         .map_err(|e| format!("initialize runtime descriptors: {e:?}"))?;
 
@@ -1137,6 +1150,11 @@ mod tests {
         let mut receive = crate::receive::RxRouting::default();
         let mut data = crate::receive::DataRx::default();
         let mut tx = crate::transmit::ClientTx::default();
+        resources
+            .bar0
+            .write_u32(0xd42b0, WFDMA_TX_DMASHDL_ENABLE)
+            .unwrap();
+        resources.bar0.write_u32(0xd6004, 0).unwrap();
 
         runtime_reinitialize(
             &mut resources,
@@ -1147,6 +1165,14 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            resources.bar0.read_u32(0xd42b0).unwrap() & WFDMA_TX_DMASHDL_ENABLE,
+            0
+        );
+        assert_eq!(
+            resources.bar0.read_u32(0xd6004).unwrap() & DMASHDL_BYPASS,
+            DMASHDL_BYPASS
+        );
         assert_eq!(mechanics.sequence(), 73);
         assert_eq!(mechanics.command_producer(), 0);
         assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & (1 << 1), 1 << 1);
