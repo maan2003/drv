@@ -295,6 +295,20 @@ struct DmashdlIo<B: Backend> {
     wfdma: MmioRegion<B>,
     dmashdl: MmioRegion<B>,
 }
+impl<B: Backend> DmashdlIo<B> {
+    fn configure(&mut self) -> Result<(), String> {
+        let invariant = ensure_linux_dmashdl_invariant(self)
+            .map_err(|error| format!("{error:?}"))?;
+        if invariant.ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0
+            || invariant.control_after & DMASHDL_BYPASS == 0
+        {
+            Err("DMASHDL invariant mismatch".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl<B: Backend> DmashdlInvariantIo for DmashdlIo<B> {
     type Error = drv_hardware::Error;
     fn read_ext0(&mut self) -> Result<u32, Self::Error> {
@@ -471,18 +485,11 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
     }
 
     fn configure_dmashdl(&mut self) -> Result<(), Self::Error> {
-        let invariant = ensure_linux_dmashdl_invariant(&mut DmashdlIo {
+        DmashdlIo {
             wfdma: self.region(0xd4000)?,
             dmashdl: self.region(0xd6000)?,
-        })
-        .map_err(|error| format!("{error:?}"))?;
-        if invariant.ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0
-            || invariant.control_after & DMASHDL_BYPASS == 0
-        {
-            Err("DMASHDL invariant mismatch".into())
-        } else {
-            Ok(())
         }
+        .configure()
     }
 
     fn route_rings(&mut self) -> Result<(), Self::Error> {
