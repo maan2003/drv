@@ -458,12 +458,16 @@ impl PowerSaveChange {
         enabled: bool,
         reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
     ) -> Result<Self, zx::Status> {
-        let command = mt7921_core::encode_client_post_assoc_power_state_command(
-            1,
-            0,
-            if enabled { 2 } else { 0 },
-        )
-        .map_err(|_| zx::Status::INVALID_ARGS)?;
+        // UNI_BSS_INFO_PS state 2 is only the station policy half of Linux's
+        // power path. Linux also gates every TX on mt76_connac_pm_ref and
+        // queues it behind mt792x_mcu_drv_pmctrl when firmware owns the HIF.
+        // Until that ownership/wake boundary is implemented, advertising
+        // Balanced would acknowledge a mode that can strand post-idle TX.
+        if enabled {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        let command = mt7921_core::encode_client_post_assoc_power_state_command(1, 0, 0)
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
         Ok(Self {
             context,
             enabled,
@@ -919,18 +923,23 @@ mod tests {
     }
 
     #[test]
-    fn power_policy_maps_performance_and_balanced_to_acknowledged_firmware_states() {
+    fn power_policy_keeps_performance_acknowledged_and_rejects_unwaked_balanced() {
         let now = Instant::now();
-        for (enabled, expected) in [(false, 0), (true, 2)] {
-            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
-                now + Duration::from_secs(1),
-            );
-            let (reply, _) = futures_channel::oneshot::channel();
-            let change = PowerSaveChange::new(context, enabled, reply).unwrap();
-            assert_eq!(&change.command()[52..54], &[21, 0]);
-            assert_eq!(change.command()[56], expected);
-            assert!(!change.complete());
-        }
+        let context = || {
+            wlan_softmac_class_support::conformance::operation_context(now + Duration::from_secs(1))
+                .0
+        };
+        let (reply, _) = futures_channel::oneshot::channel();
+        let change = PowerSaveChange::new(context(), false, reply).unwrap();
+        assert_eq!(&change.command()[52..54], &[21, 0]);
+        assert_eq!(change.command()[56], 0);
+        assert!(!change.complete());
+
+        let (reply, _) = futures_channel::oneshot::channel();
+        assert!(matches!(
+            PowerSaveChange::new(context(), true, reply),
+            Err(zx::Status::NOT_SUPPORTED)
+        ));
     }
 
     #[test]

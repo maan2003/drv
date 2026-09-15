@@ -442,13 +442,16 @@ The repository does not yet contain the platform inhibitor/coordinator that
 orders all devices into an ACPI sleep state, nor an MT7921 WoWLAN wake contract,
 PCI D-state transition, or runtime-autosuspend owner. Those remain unsupported
 and must not be inferred from launcher restart. Connected-idle power saving is
-separate. `wlanctl power-save performance`
-requests the acknowledged awake state (0), while `wlanctl power-save balanced`
-requests firmware dynamic power saving (state 2), matching Fuchsia's
-Performance/Balanced policy distinction and pinned Linux MT7921's
-`vif->cfg.ps` mapping. The driver starts each association awake and a command
-succeeds only after firmware ACK and DMA reclaim. Physical idle-current,
-traffic wake, and repeated suspend/re-entry validation remain required. The
+separate. `wlanctl power-save performance` requests the acknowledged awake
+state (0). `wlanctl power-save balanced` currently returns `unsupported`
+without changing firmware state. Pinned Linux's dynamic state (2) is coupled
+to a TX gate that queues traffic behind `mt792x_mcu_drv_pmctrl` whenever
+firmware owns the HIF; the native driver does not yet implement or track that
+wake/ownership boundary. Exposing state 2 alone caused post-idle TX to expire,
+so it fails closed rather than silently mapping Balanced to Performance. The
+driver starts each association awake and a Performance command succeeds only
+after firmware ACK and DMA reclaim. Physical idle-current, traffic wake, and
+repeated suspend/re-entry validation remain required. The
 Wi-Fi control process still has a 1 ms fallback service tick, so this is not a
 claim that the full process graph is tickless or that battery savings have been
 measured.
