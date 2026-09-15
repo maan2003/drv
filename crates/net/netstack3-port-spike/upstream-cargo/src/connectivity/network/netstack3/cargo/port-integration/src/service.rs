@@ -540,6 +540,7 @@ impl NetworkServiceEndpoint for DhcpService {
             EthernetDeviceEvent::LinkStateChanged(up) if up == self.link_up => {}
             EthernetDeviceEvent::LinkStateChanged(false) => {
                 self.link_up = false;
+                self.rt.borrow_mut().set_dynamic_ipv6_link_state(false);
                 self.clear_configuration(if self.dhcp_enabled {
                     DhcpStatus::Acquiring
                 } else {
@@ -553,6 +554,7 @@ impl NetworkServiceEndpoint for DhcpService {
             }
             EthernetDeviceEvent::LinkStateChanged(true) => {
                 self.link_up = true;
+                self.rt.borrow_mut().set_dynamic_ipv6_link_state(true);
                 if self.dhcp_enabled {
                     self.status = DhcpStatus::Acquiring;
                     let _ = self.resume.unbounded_send(());

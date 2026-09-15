@@ -158,8 +158,10 @@ exchange over owned Ethernet frames. The IPv6 tests use two production
 The exact facade limits are:
 
 - configuration owns at most one explicit address and two explicit routes
-  (on-link plus optional default) per IP version; IPv6 router solicitation and
-  discovered default routes are disabled in favor of that supplied route set;
+  (on-link plus optional default) per IP version; Ethernet starts in IPv6 host
+  mode with core-owned router solicitation, opaque-IID stable SLAAC, DAD, and
+  discovered-route lifetimes, while applying explicit IPv6 configuration
+  disables that dynamic mode;
 - `queue_capacity` bounds each external frame/event/readiness queue, aggregate
   pending UDP receive datagrams, the shared total of IPv4 and IPv6 UDP/TCP
   sockets, and each TCP listen backlog;

@@ -11,6 +11,7 @@ pub mod service;
 pub mod socket_provider;
 pub mod sockets;
 
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{self, Debug, Display};
@@ -44,8 +45,8 @@ use netstack3_core::device_socket::{
     DeviceSocketMetadata, EthernetHeaderParams, Protocol, TargetDevice,
 };
 use netstack3_core::ip::{
-    IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate, Ipv6DeviceConfigurationUpdate,
-    RouteDiscoveryConfigurationUpdate,
+    IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate, Ipv6DeviceConfiguration,
+    Ipv6DeviceConfigurationUpdate, RouteDiscoveryConfigurationUpdate, SlaacConfigurationUpdate,
 };
 use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
 use netstack3_core::udp::UdpRemotePort;
@@ -68,13 +69,13 @@ use netstack3_icmp_echo::{
     IcmpEchoBindingsContext, IcmpEchoBindingsTypes, IcmpEchoSettings, IcmpSocketId,
     ReceiveIcmpEchoError,
 };
-use netstack3_ip::device::IidSecret;
+use netstack3_ip::device::{IidGenerationConfiguration, IidSecret, StableSlaacAddressConfiguration};
 use netstack3_ip::nud::{LinkResolutionContext, LinkResolutionNotifier};
 use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
 };
 use netstack3_ip::{
-    IpRoutingBindingsTypes, MarksBindingsContext,
+    IpLayerEvent, IpRoutingBindingsTypes, MarksBindingsContext,
     socket::{IpSockCreationError, IpSockSendError},
 };
 const MAX_DHCP_DATAGRAM_LEN: usize = 1232;
@@ -312,6 +313,7 @@ fn udp_socket_info<A: net_types::ip::IpAddress, D>(
 struct Queues {
     tx: VecDeque<TxFrame>,
     events: VecDeque<String>,
+    ipv6_route_events: VecDeque<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>>,
     readiness: VecDeque<ReadinessEvent>,
 }
 
@@ -1025,10 +1027,16 @@ impl SocketOpsFilterBindingContext<DeviceId<Self>> for NativeBindingsCtx {
     }
 }
 
-impl<T: Debug> EventContext<T> for NativeBindingsCtx {
+impl<T: Debug + 'static> EventContext<T> for NativeBindingsCtx {
     fn on_event(&mut self, event: T) {
-        let event = format!("{event:?}");
-        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, event);
+        let rendered = format!("{event:?}");
+        let event: Box<dyn Any> = Box::new(event);
+        if let Ok(event) =
+            event.downcast::<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>>()
+        {
+            self.queues.ipv6_route_events.push_back(*event);
+        }
+        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, rendered);
     }
 }
 
@@ -1344,6 +1352,8 @@ pub struct Runtime {
     loopback: Option<LoopbackDeviceId<NativeBindingsCtx>>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
+    dynamic_ipv6: bool,
+    ipv6_discovered_routes: Vec<AddableEntry<Ipv6Addr, DeviceId<NativeBindingsCtx>>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
     storage_budget: Arc<StorageBudget>,
@@ -1354,8 +1364,8 @@ pub struct Runtime {
 impl Runtime {
     /// Creates and IPv4-enables one Ethernet interface with explicit identity.
     ///
-    /// IPv6 is enabled when an IPv6 address is first applied, preserving the
-    /// IPv4-only runtime's frame behavior.
+    /// IPv6 is enabled by [`Self::enable_dynamic_ipv6`] or when an explicit
+    /// IPv6 address is applied, preserving IPv4-only embeddings.
     pub fn new(
         queue_capacity: usize,
         entropy: impl IntoIterator<Item = u8>,
@@ -1452,6 +1462,8 @@ impl Runtime {
             loopback: None,
             ipv4_address: None,
             ipv6_address: None,
+            dynamic_ipv6: false,
+            ipv6_discovered_routes: Vec::new(),
             dns_servers: [None, None],
             next_socket: 0,
             // Separate active and passive populations each have a capacity-sized
@@ -1463,6 +1475,102 @@ impl Runtime {
             stack,
             bindings,
         })
+    }
+
+    fn dynamic_ipv6_configuration(enabled: bool) -> Ipv6DeviceConfigurationUpdate {
+        Ipv6DeviceConfigurationUpdate {
+            max_router_solicitations: Some(enabled.then_some(
+                Ipv6DeviceConfiguration::DEFAULT_MAX_RTR_SOLICITATIONS,
+            )),
+            slaac_config: SlaacConfigurationUpdate {
+                stable_address_configuration: Some(if enabled {
+                    StableSlaacAddressConfiguration::Enabled {
+                        iid_generation: IidGenerationConfiguration::Opaque {
+                            idgen_retries: StableSlaacAddressConfiguration::DEFAULT_IDGEN_RETRIES,
+                        },
+                    }
+                } else {
+                    StableSlaacAddressConfiguration::Disabled
+                }),
+                ..Default::default()
+            },
+            route_discovery_config: RouteDiscoveryConfigurationUpdate {
+                allow_default_route: Some(enabled),
+            },
+            ip_config: IpDeviceConfigurationUpdate {
+                ip_enabled: Some(enabled),
+                dad_transmits: Some(enabled.then_some(
+                    Ipv6DeviceConfiguration::DEFAULT_DUPLICATE_ADDRESS_DETECTION_TRANSMITS,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Enables IPv6 host autoconfiguration on the Ethernet interface.
+    pub fn enable_dynamic_ipv6(&mut self) {
+        if self.dynamic_ipv6 { return; }
+        self.dynamic_ipv6 = true;
+        self.set_dynamic_ipv6_link_state(true);
+    }
+
+    fn set_dynamic_ipv6_link_state(&mut self, up: bool) {
+        if !self.dynamic_ipv6 { return; }
+        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
+            &self.device.clone().into(), Self::dynamic_ipv6_configuration(up),
+        ).expect("Ethernet device accepts IPv6 link-state configuration");
+        self.process_ipv6_route_events();
+        if !up { self.ipv6_address = None; }
+    }
+
+    fn process_ipv6_route_events(&mut self) {
+        while let Some(event) = self.bindings.queues.ipv6_route_events.pop_front() {
+            match event {
+                IpLayerEvent::AddRoute(entry) => {
+                    if !self.ipv6_discovered_routes.contains(&entry) {
+                        self.ipv6_discovered_routes.push(entry);
+                    }
+                }
+                IpLayerEvent::RemoveRoutes { subnet, device, gateway } => {
+                    self.ipv6_discovered_routes.retain(|entry| {
+                        entry.subnet != subnet
+                            || entry.device != device
+                            || entry.gateway != gateway
+                    });
+                }
+                IpLayerEvent::MulticastForwarding(_) => {}
+            }
+        }
+        if !self.dynamic_ipv6 { return; }
+        let mut generation = Generation::initial();
+        let routes = self.ipv6_discovered_routes.iter().cloned().map(|entry| {
+            let route = entry.resolve_metric(RawMetric(0)).with_generation(generation);
+            generation = generation.next();
+            route
+        }).collect();
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
+        let table = api.main_table_id();
+        api.set_routes(&table, routes);
+    }
+
+    fn refresh_dynamic_ipv6_address(&mut self) {
+        if !self.dynamic_ipv6 { return; }
+        self.ipv6_address = self.stack.api(&mut self.bindings).device_ip::<Ipv6>()
+            .get_assigned_ip_addr_subnets(&self.device.clone().into())
+            .into_iter()
+            .find(|address| {
+                let bytes = address.addr().ipv6_bytes();
+                bytes[0] != 0xfe || bytes[1] & 0xc0 != 0x80
+            });
+    }
+
+    #[cfg(test)]
+    fn has_ipv6_default_route(&mut self) -> bool {
+        self.stack.api(&mut self.bindings).routes::<Ipv6>().fold_routes(
+            false,
+            |found, _table, entry| found || entry.subnet.prefix() == 0,
+        )
     }
 
     pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
@@ -1578,6 +1686,10 @@ impl Runtime {
                 SpecifiedAddr::new(Ipv6Addr::from_bytes(a)).ok_or(RuntimeError::InvalidAddress)
             })
             .transpose()?;
+        if self.dynamic_ipv6 {
+            self.set_dynamic_ipv6_link_state(false);
+            self.dynamic_ipv6 = false;
+        }
         self.revoke_ipv6();
         self.stack
             .api(&mut self.bindings)
@@ -1771,6 +1883,8 @@ impl Runtime {
                 },
                 Buf::new(frame.into_vec(), ..),
             );
+        self.process_ipv6_route_events();
+        self.refresh_dynamic_ipv6_address();
     }
 
     fn service_tx(&mut self, budget: usize) {
@@ -1814,6 +1928,8 @@ impl Runtime {
                 work += 1;
             }
         }
+        self.process_ipv6_route_events();
+        self.refresh_dynamic_ipv6_address();
         work
     }
 
@@ -2853,8 +2969,10 @@ impl NetworkServiceEndpoint for Runtime {
     }
 
     fn on_device_event(&mut self, event: EthernetDeviceEvent) {
-        if event == EthernetDeviceEvent::TransmitReady {
-            self.service_tx(1);
+        match event {
+            EthernetDeviceEvent::TransmitReady => self.service_tx(1),
+            EthernetDeviceEvent::ReceiveReady => {}
+            EthernetDeviceEvent::LinkStateChanged(up) => self.set_dynamic_ipv6_link_state(up),
         }
     }
 }
@@ -3067,6 +3185,118 @@ mod tests {
             }
         }
         panic!("IPv6 DAD traffic did not quiesce");
+    }
+
+    fn router_advertisement(
+        router_mac: Mac,
+        router_ip: Ipv6Addr,
+        prefix: Ipv6Addr,
+        lifetime_secs: u16,
+    ) -> EthernetFrame {
+        use netstack3_base::NetworkSerializationContext;
+        use packet::Serializer as _;
+        use packet_formats::ethernet::{
+            ETHERNET_MIN_BODY_LEN_NO_TAG, EtherType, EthernetFrameBuilder,
+        };
+        use packet_formats::icmp::ndp::options::{NdpOptionBuilder, PrefixInformation};
+        use packet_formats::icmp::ndp::{OptionSequenceBuilder, RouterAdvertisement};
+        use packet_formats::icmp::{IcmpPacketBuilder, IcmpZeroCode};
+        use packet_formats::ip::Ipv6Proto;
+        use packet_formats::ipv6::Ipv6PacketBuilder;
+
+        let all_nodes = Ipv6Addr::from_bytes([
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = PrefixInformation::new(
+            64,
+            true,
+            true,
+            u32::from(lifetime_secs),
+            u32::from(lifetime_secs),
+            prefix,
+        );
+        let options = [NdpOptionBuilder::PrefixInformation(prefix)];
+        let bytes = OptionSequenceBuilder::new(options.iter())
+            .into_serializer()
+            .wrap_in(IcmpPacketBuilder::<Ipv6, _>::new(
+                router_ip,
+                all_nodes,
+                IcmpZeroCode,
+                RouterAdvertisement::new(0, false, false, lifetime_secs, 0, 0),
+            ))
+            .wrap_in(Ipv6PacketBuilder::new(
+                router_ip,
+                all_nodes,
+                255,
+                Ipv6Proto::Icmpv6,
+            ))
+            .wrap_in(EthernetFrameBuilder::new(
+                router_mac,
+                Mac::new([0x33, 0x33, 0, 0, 0, 1]),
+                EtherType::Ipv6,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
+            ))
+            .serialize_vec_outer(&mut NetworkSerializationContext::default())
+            .unwrap()
+            .unwrap_b()
+            .into_inner();
+        EthernetFrame::try_from(bytes).unwrap()
+    }
+
+    #[test]
+    fn dynamic_ipv6_observes_dad_lifetimes_default_route_and_link_revocation() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_dynamic_ipv6();
+        let router_ip = Ipv6Addr::from_bytes([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = Ipv6Addr::from_bytes([
+            0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        runtime.receive_frame(router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            4,
+        ));
+        assert_eq!(runtime.ipv6_address(), None, "SLAAC address remains tentative during DAD");
+
+        runtime.set_now(NativeInstant::from_nanos(2_000_000_000));
+        runtime.dispatch_due(64);
+        let address = runtime.ipv6_address().expect("SLAAC address assigned after DAD");
+        assert_eq!(&address[..8], &prefix.ipv6_bytes()[..8]);
+
+        assert!(runtime.has_ipv6_default_route(), "router lifetime installs a default route");
+
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
+        assert_eq!(runtime.ipv6_address(), None, "link loss revokes the SLAAC generation");
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+
+        runtime.receive_frame(router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            4,
+        ));
+        runtime.set_now(NativeInstant::from_nanos(4_000_000_000));
+        runtime.dispatch_due(64);
+        assert!(runtime.ipv6_address().is_some(), "link return starts a new SLAAC generation");
+
+        runtime.set_now(NativeInstant::from_nanos(7_000_000_001));
+        runtime.dispatch_due(64);
+        assert_eq!(runtime.ipv6_address(), None, "advertised address lifetime expires");
+        assert!(
+            !runtime.has_ipv6_default_route(),
+            "router lifetime expires the discovered default route",
+        );
     }
 
     #[test]
