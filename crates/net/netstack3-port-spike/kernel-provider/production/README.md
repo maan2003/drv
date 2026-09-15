@@ -421,9 +421,11 @@ updated launcher.
 ### Laptop power lifecycle contract
 
 The production launcher accepts `SIGUSR1` as a **suspend-preparation request**.
-It first closes policy admission, then terminates the network-service generation,
-then waits up to ten seconds for the Wi-Fi service's normal
-`ClientRuntime::shutdown` path to contain the MT7921. Only successful common
+It first closes policy admission, then waits up to ten seconds for the Wi-Fi
+service's normal `ClientRuntime::shutdown` path to revoke its Ethernet endpoint
+and contain the MT7921. It then terminates the network-service generation.
+This order keeps external peer EOF from racing the driver's protocol stop;
+network and application capabilities are still revoked before successful common
 child cleanup emits:
 
 ```

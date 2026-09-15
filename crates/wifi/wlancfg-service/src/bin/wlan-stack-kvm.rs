@@ -65,12 +65,16 @@ fn requested_shutdown(now: Instant, deadline: Instant) -> Option<ShutdownCause> 
     }
 }
 
-fn completion_marker(cause: Option<ShutdownCause>, succeeded: bool) -> Option<&'static str> {
-    match (cause, succeeded) {
-        (Some(ShutdownCause::SuspendPreparation), true) => {
+fn completion_marker(
+    cause: Option<ShutdownCause>,
+    succeeded: bool,
+    network_revoked: bool,
+) -> Option<&'static str> {
+    match (cause, succeeded, network_revoked) {
+        (Some(ShutdownCause::SuspendPreparation), true, true) => {
             Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
         }
-        (Some(ShutdownCause::Ordinary), true) => {
+        (Some(ShutdownCause::Ordinary), true, true) => {
             Some("wlan_stack_driver_exit=0 hardware_stopped=true")
         }
         _ => None,
@@ -202,11 +206,22 @@ fn run() -> Result<(), String> {
     let mut shutdown_deadline = None;
     let mut policy_done = false;
     let mut driver_done = false;
+    let mut network_revoked = false;
     let result = loop {
         match driver_child.try_wait() {
             Ok(Some(status)) => {
                 driver_done = true;
-                if status.success() && shutdown_cause.is_some() {
+                if status.success()
+                    && network_revocation_due(shutdown_cause, driver_done, network_revoked)
+                {
+                    // The runtime has synchronously revoked its Ethernet peer
+                    // and certified hardware containment. Revoke the external
+                    // network capability now, before any completion marker.
+                    if let Err(error) = network.terminate() {
+                        break Err(format!("revoke network after driver stop: {error}"));
+                    }
+                    network_revoked = true;
+                    println!("wlan_stack_shutdown=network_revoked");
                     break Ok(());
                 }
                 let policy_detail = match policy_child.try_wait() {
@@ -258,14 +273,10 @@ fn run() -> Result<(), String> {
                     ShutdownCause::SuspendPreparation => "suspend-preparation",
                 }
             );
-            // Revoke the frame-only network generation before waiting for
-            // firmware/DMA containment. A suspend coordinator must never
-            // observe readiness while an Internet-facing process retains the
-            // old Ethernet generation.
-            if let Err(error) = network.terminate() {
-                break Err(format!("revoke network before shutdown: {error}"));
-            }
-            println!("wlan_stack_shutdown=network_revoked");
+            // Keep the network peer alive until policy EOF makes the driver
+            // revoke its own Ethernet endpoint. Closing the peer first is a
+            // protocol error to the callback bridge and can race orderly stop.
+            // The network child is still terminated before certification.
         }
 
         // Once revocation starts, never consume a queued Install and recreate
@@ -298,7 +309,7 @@ fn run() -> Result<(), String> {
         &mut network,
         result,
     );
-    if let Some(marker) = completion_marker(shutdown_cause, result.is_ok()) {
+    if let Some(marker) = completion_marker(shutdown_cause, result.is_ok(), network_revoked) {
         println!("{marker}");
     }
     result
@@ -317,6 +328,14 @@ fn wait_driver_after_policy_close(mut driver: Child, original: String) -> Result
 
 fn shutdown_timed_out(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn network_revocation_due(
+    shutdown_cause: Option<ShutdownCause>,
+    driver_stopped: bool,
+    network_revoked: bool,
+) -> bool {
+    shutdown_cause.is_some() && driver_stopped && !network_revoked
 }
 
 fn close_and_reap_driver(driver: &mut Child) -> Result<(String, bool), String> {
@@ -703,16 +722,30 @@ mod tests {
     }
 
     #[test]
+    fn network_peer_is_retained_until_driver_has_stopped() {
+        let cause = Some(ShutdownCause::SuspendPreparation);
+        assert!(!network_revocation_due(cause, false, false));
+        assert!(network_revocation_due(cause, true, false));
+        assert!(!network_revocation_due(cause, true, true));
+        assert!(!network_revocation_due(None, true, false));
+    }
+
+    #[test]
     fn failed_containment_never_authorizes_suspend() {
         assert_eq!(
-            completion_marker(Some(ShutdownCause::SuspendPreparation), false),
+            completion_marker(Some(ShutdownCause::SuspendPreparation), false, true),
             None
         );
         assert_eq!(
-            completion_marker(Some(ShutdownCause::SuspendPreparation), true),
+            completion_marker(Some(ShutdownCause::SuspendPreparation), true, true),
             Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
         );
-        assert_eq!(completion_marker(None, true), None);
+        assert_eq!(completion_marker(None, true, true), None);
+        assert_eq!(
+            completion_marker(Some(ShutdownCause::SuspendPreparation), true, false),
+            None,
+            "hardware success cannot certify suspend before network revocation"
+        );
     }
 
     #[test]

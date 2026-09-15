@@ -3064,6 +3064,42 @@ mod tests {
     }
 
     #[test]
+    fn external_ethernet_eof_before_stop_is_a_protocol_failure() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            effects.lock().unwrap().simulate_ap = true;
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime
+                .connect(
+                    connect_request(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let ethernet = runtime.take_ethernet_device().unwrap();
+            drop(ethernet);
+
+            let failure = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Err(error) = runtime.check_tasks() {
+                        break error;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                failure,
+                ConnectError::Driver(DriverError::MlmeTaskFailed)
+            ));
+            // This is containment after a protocol fault, not orderly stop.
+            assert!(runtime.reset_requested);
+            assert_eq!(runtime.shutdown().await, Err(zx::Status::INTERNAL));
+        });
+    }
+
+    #[test]
     fn terminal_shutdown_joins_mlme_without_running_queued_downcalls() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);
