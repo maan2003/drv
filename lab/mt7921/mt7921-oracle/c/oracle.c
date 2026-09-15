@@ -543,7 +543,8 @@ int oracle_key_v2(uint8_t bss_index, uint8_t wcid, uint8_t muar_index,
     out[19] = 16;
     memcpy(out + 20, retained ? retained_key : key, 16);
     if (retained) {
-        out[52] = 10; out[53] = 36; out[54] = key_id; out[55] = 16;
+        /* Linux does not assign key_id for the BIP entry; MMIE carries it. */
+        out[52] = 10; out[53] = 36; out[54] = 0; out[55] = 16;
         memcpy(out + 56, key, 16);
     }
     return 0;
