@@ -664,9 +664,9 @@ mod tests {
         wire::MonotonicDeadline::after(std::time::Duration::from_secs(30)).unwrap()
     }
 
-    const GENERATION: [u8; 16] = [7; 16];
+    pub(super) const GENERATION: [u8; 16] = [7; 16];
 
-    fn sockets() -> (OwnedFd, OwnedFd) {
+    pub(super) fn sockets() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) }, 0);
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
@@ -688,7 +688,7 @@ mod tests {
         }
     }
 
-    fn receive(fd: RawFd) -> Packet {
+    pub(super) fn receive(fd: RawFd) -> Packet {
         let mut bytes = [0; wire::MAX_PACKET];
         let size = unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) };
         assert!(size > 0, "recv: {}", io::Error::last_os_error());
@@ -773,7 +773,7 @@ mod tests {
         );
     }
 
-    fn send_packet(fd: RawFd, sequence: u64, message: Message, rights: &[RawFd]) {
+    pub(super) fn send_packet(fd: RawFd, sequence: u64, message: Message, rights: &[RawFd]) {
         let bytes = wire::encode(&Packet { generation: GENERATION, request_id: sequence, message }).unwrap();
         let mut iov = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
         let mut control = [0usize; 8];
