@@ -255,18 +255,21 @@ mod tests {
         }
         fn install_key(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanKeyConfiguration,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))
         }
         fn notify_association_complete(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanAssociationConfig,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))
         }
         fn clear_association(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseClearAssociationRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready(Ok(()))

@@ -40,14 +40,17 @@ pub(crate) enum Command {
         oneshot::Sender<Result<(), zx::Status>>,
     ),
     Key(
+        OperationContext,
         WlanKeyConfiguration,
         oneshot::Sender<Result<(), zx::Status>>,
     ),
     Association(
+        OperationContext,
         WlanAssociationConfig,
         oneshot::Sender<Result<(), zx::Status>>,
     ),
     ClearAssociation(
+        OperationContext,
         WlanSoftmacBaseClearAssociationRequest,
         oneshot::Sender<Result<(), zx::Status>>,
     ),
@@ -78,6 +81,9 @@ impl Command {
         match self {
             Self::Channel(context, ..)
             | Self::Join(context, ..)
+            | Self::Key(context, ..)
+            | Self::Association(context, ..)
+            | Self::ClearAssociation(context, ..)
             | Self::Transmit(context, ..)
             | Self::PassiveScan(context, ..)
             | Self::ActiveScan(context, ..) => Some(context),
@@ -108,13 +114,13 @@ impl Command {
             Self::Join(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::Key(_, reply) => {
+            Self::Key(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::Association(_, reply) => {
+            Self::Association(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
-            Self::ClearAssociation(_, reply) => {
+            Self::ClearAssociation(_, _, reply) => {
                 let _ = reply.send(Err(status));
             }
             Self::PassiveScan(_, _, reply) => {
@@ -334,20 +340,20 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::Key(request, reply) => {
-                let completion = self.device.install_key(request);
+            Command::Key(context, request, reply) => {
+                let completion = self.device.install_key(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::Association(request, reply) => {
-                let completion = self.device.notify_association_complete(request);
+            Command::Association(context, request, reply) => {
+                let completion = self.device.notify_association_complete(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));
             }
-            Command::ClearAssociation(request, reply) => {
-                let completion = self.device.clear_association(request);
+            Command::ClearAssociation(context, request, reply) => {
+                let completion = self.device.clear_association(context, request);
                 self.pending = Some(Box::pin(async move {
                     let _ = reply.send(completion.await);
                 }));

@@ -1527,8 +1527,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::Wl
     }
     fn install_key(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         configuration: fidl_softmac::WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready({
             let mut backend = self.backend.lock().unwrap();
             let ComposedBackend { effects, scan, .. } = &mut *backend;
@@ -1537,8 +1541,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::Wl
     }
     fn notify_association_complete(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         configuration: fidl_softmac::WlanAssociationConfig,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             let mut configuration = configuration;
             if let Some(profile) = self.support.association.as_ref() {
@@ -1565,8 +1573,12 @@ impl<E: Mt7921ClientEffects, S: Mt7921ClientScan> wlan_softmac_class_support::Wl
     }
     fn clear_association(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         request: fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready({
             let mut backend = self.backend.lock().unwrap();
             let ComposedBackend { effects, scan, .. } = &mut *backend;

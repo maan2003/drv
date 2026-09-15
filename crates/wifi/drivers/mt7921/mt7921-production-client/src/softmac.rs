@@ -362,20 +362,32 @@ impl WlanSoftmac for Mt7921Driver {
     }
     fn install_key(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         _: WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn notify_association_complete(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         _: WlanAssociationConfig,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready(Err(zx::Status::NOT_SUPPORTED))
     }
     fn clear_association(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         _: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready({
             // Firmware peer removal is not implemented yet. Never certify a
             // programmed (or uncertain) peer as cleared; the owner must contain.

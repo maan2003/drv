@@ -430,16 +430,19 @@ impl DeviceOps for HostMlmeDevice {
         key: &fidl_softmac::WlanKeyConfiguration,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        self.request(|reply| Command::Key(key.clone(), reply)).await
+        let context = self.execution.operation.borrow().clone();
+        self.request(|reply| Command::Key(context, key.clone(), reply))
+            .await
     }
     async fn notify_association_complete(
         &mut self,
         config: fidl_softmac::WlanAssociationConfig,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
+        let context = self.execution.operation.borrow().clone();
         eprintln!("client_association stage=configure_enter config={config:?}");
         let result = self
-            .request(|reply| Command::Association(config, reply))
+            .request(|reply| Command::Association(context, config, reply))
             .await;
         eprintln!("client_association stage=configure_complete result={result:?}");
         result
@@ -449,7 +452,8 @@ impl DeviceOps for HostMlmeDevice {
         request: &fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> Result<(), zx::Status> {
         self.execution.admit()?;
-        self.request(|reply| Command::ClearAssociation(request.clone(), reply))
+        let context = self.execution.operation.borrow().clone();
+        self.request(|reply| Command::ClearAssociation(context, request.clone(), reply))
             .await
     }
     async fn update_wmm_parameters(
@@ -1942,6 +1946,7 @@ mod tests {
         tx_contexts: Vec<OperationContext>,
         channel_contexts: Vec<OperationContext>,
         join_contexts: Vec<OperationContext>,
+        association_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
         suppress_auth_response: bool,
@@ -2135,23 +2140,29 @@ mod tests {
         }
         fn install_key(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_softmac::WlanKeyConfiguration,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            self.0.lock().unwrap().association_contexts.push(context);
             std::future::ready(record!(self, "key", ()))
         }
         fn notify_association_complete(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_softmac::WlanAssociationConfig,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+            self.0.lock().unwrap().association_contexts.push(context);
             std::future::ready(record!(self, "assoc", ()))
         }
         fn clear_association(
             &mut self,
+            context: crate::OperationContext,
             _: fidl_softmac::WlanSoftmacBaseClearAssociationRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             let completion = {
                 let mut effects = self.0.lock().unwrap();
                 effects.calls.push("clear");
+                effects.association_contexts.push(context);
                 effects.clear_completion.take()
             };
             async move {
@@ -2385,10 +2396,16 @@ mod tests {
             assert!(effects.lock().unwrap().calls.is_empty());
             epoch.revoke();
             let (reply, receiver) = oneshot::channel();
+            let cleanup = OperationEpoch::new();
             handle
                 .send(
-                    OperationEpoch::new(),
-                    Command::ClearAssociation(Default::default(), reply),
+                    cleanup.clone(),
+                    Command::ClearAssociation(
+                        cleanup
+                            .context(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                        Default::default(),
+                        reply,
+                    ),
                 )
                 .unwrap();
             actor.drive_once().await.unwrap();
@@ -2428,7 +2445,14 @@ mod tests {
             assert!(parent.is_live());
             let (reply, receiver) = oneshot::channel();
             handle
-                .send(parent, Command::ClearAssociation(Default::default(), reply))
+                .send(
+                    parent.clone(),
+                    Command::ClearAssociation(
+                        parent.context(now + std::time::Duration::from_secs(1)),
+                        Default::default(),
+                        reply,
+                    ),
+                )
                 .unwrap();
             actor.drive_once().await.unwrap();
             assert_eq!(receiver.await.unwrap(), Ok(()));
@@ -2538,6 +2562,75 @@ mod tests {
             actor.drive_once().await.unwrap();
             assert_eq!(receiver.await.unwrap(), Err(zx::Status::CANCELED));
             assert!(effects.lock().unwrap().channels.is_empty());
+        });
+    }
+
+    #[test]
+    fn association_mutations_reject_expiry_and_revocation_before_dispatch() {
+        run_local_test(async {
+            for kind in 0..3 {
+                let (fake, effects) = Fake::new(0);
+                let (mut actor, handle) = DriverActor::new(fake);
+                let epoch = OperationEpoch::new();
+                let command = |context, reply| match kind {
+                    0 => Command::Key(context, Default::default(), reply),
+                    1 => Command::Association(context, Default::default(), reply),
+                    _ => Command::ClearAssociation(context, Default::default(), reply),
+                };
+                let (reply, _) = oneshot::channel();
+                assert_eq!(
+                    handle.send(
+                        epoch.clone(),
+                        command(
+                            OperationContext::child(epoch.clone(), std::time::Instant::now()),
+                            reply
+                        )
+                    ),
+                    Err(zx::Status::TIMED_OUT),
+                );
+                let context = OperationContext::child(
+                    epoch.clone(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                let (reply, receiver) = oneshot::channel();
+                handle.send(epoch, command(context.clone(), reply)).unwrap();
+                context.revoke();
+                actor.drive_once().await.unwrap();
+                assert_eq!(receiver.await.unwrap(), Err(zx::Status::CANCELED));
+                assert!(effects.lock().unwrap().association_contexts.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn bridge_preserves_association_authority_and_original_deadline() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (mut bridge, mut actor, _) = parts(fake);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let context =
+                OperationContext::child(bridge.execution.epoch.borrow().clone(), deadline);
+            bridge.execution.operation.replace(context.clone());
+            actor
+                .run_until(async {
+                    bridge.install_key(&Default::default()).await?;
+                    bridge
+                        .notify_association_complete(Default::default())
+                        .await?;
+                    bridge.clear_association(&Default::default()).await
+                })
+                .await
+                .unwrap();
+            context.revoke();
+            let effects = effects.lock().unwrap();
+            assert_eq!(effects.association_contexts.len(), 3);
+            for received in &effects.association_contexts {
+                assert_eq!(received.deadline(), deadline);
+                assert_eq!(
+                    received.check(std::time::Instant::now()),
+                    Err(zx::Status::CANCELED)
+                );
+            }
         });
     }
 

@@ -927,8 +927,12 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn install_key(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         configuration: WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             if self.runtime_trace.is_some() {
                 eprintln!(
@@ -1064,8 +1068,12 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn notify_association_complete(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         configuration: WlanAssociationConfig,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             if self.associated {
                 return Err(zx::Status::BAD_STATE);
@@ -1221,8 +1229,12 @@ impl<B: Subsystems> WlanSoftmac for Ath11kClientDevice<B> {
     }
     fn clear_association(
         &mut self,
+        context: wlan_softmac_class_support::OperationContext,
         request: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        if let Err(status) = context.check(std::time::Instant::now()) {
+            return std::future::ready(Err(status));
+        }
         std::future::ready((|| {
             self.pending_association_security = None;
             self.igtk = None;
@@ -2047,6 +2059,7 @@ mod tests {
             ]
         );
         futures::executor::block_on(adapter.clear_association(
+            operation_context(),
             WlanSoftmacBaseClearAssociationRequest {
                 peer_addr: Some(PEER),
             },
@@ -2082,6 +2095,7 @@ mod tests {
 
         assert_eq!(
             futures::executor::block_on(adapter.clear_association(
+                operation_context(),
                 WlanSoftmacBaseClearAssociationRequest {
                     peer_addr: Some(PEER),
                 }
@@ -2106,6 +2120,7 @@ mod tests {
         );
         assert_eq!(
             futures::executor::block_on(adapter.clear_association(
+                operation_context(),
                 WlanSoftmacBaseClearAssociationRequest {
                     peer_addr: Some(PEER),
                 }
@@ -2151,21 +2166,26 @@ mod tests {
         adapter.device.backend_mut().clear();
         let vdev = adapter.vdev.unwrap();
 
-        futures::executor::block_on(adapter.notify_association_complete(open_association()))
-            .unwrap();
+        futures::executor::block_on(
+            adapter.notify_association_complete(operation_context(), open_association()),
+        )
+        .unwrap();
         adapter.set_link_up(true).unwrap();
         adapter.set_link_up(false).unwrap();
         assert_eq!(
-            futures::executor::block_on(adapter.install_key(WlanKeyConfiguration {
-                protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
-                cipher_oui: Some([0x00, 0x0f, 0xac]),
-                cipher_type: Some(4),
-                key_type: Some(fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise),
-                peer_addr: Some(PEER),
-                key_idx: Some(0),
-                key: Some(vec![0x55; 16]),
-                rsc: Some(0),
-            })),
+            futures::executor::block_on(adapter.install_key(
+                operation_context(),
+                WlanKeyConfiguration {
+                    protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
+                    cipher_oui: Some([0x00, 0x0f, 0xac]),
+                    cipher_type: Some(4),
+                    key_type: Some(fidl_fuchsia_wlan_ieee80211::KeyType::Pairwise),
+                    peer_addr: Some(PEER),
+                    key_idx: Some(0),
+                    key: Some(vec![0x55; 16]),
+                    rsc: Some(0),
+                }
+            )),
             Ok(())
         );
         assert_eq!(
@@ -2233,8 +2253,10 @@ mod tests {
     fn group_and_integrity_keys_decode_sme_wire_order_counters() {
         let mut adapter = ready_adapter();
         futures::executor::block_on(adapter.join_bss(operation_context(), join_request())).unwrap();
-        futures::executor::block_on(adapter.notify_association_complete(open_association()))
-            .unwrap();
+        futures::executor::block_on(
+            adapter.notify_association_complete(operation_context(), open_association()),
+        )
+        .unwrap();
         let mut key = WlanKeyConfiguration {
             protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
             cipher_oui: Some([0, 0x0f, 0xac]),
@@ -2246,7 +2268,7 @@ mod tests {
             rsc: Some(u64::from_be_bytes([2, 1, 0, 0, 0, 0, 0, 0])),
             ..Default::default()
         };
-        futures::executor::block_on(adapter.install_key(key.clone())).unwrap();
+        futures::executor::block_on(adapter.install_key(operation_context(), key.clone())).unwrap();
         assert!(matches!(
             adapter.device.backend().operations().last(),
             Some(Operation::DpInstallPeerKey(KeyConfig {
@@ -2257,14 +2279,14 @@ mod tests {
         ));
         key.rsc = Some(u64::from_be_bytes([0, 0, 0, 0, 0, 0, 1, 0]));
         assert_eq!(
-            futures::executor::block_on(adapter.install_key(key.clone())),
+            futures::executor::block_on(adapter.install_key(operation_context(), key.clone())),
             Err(zx::Status::INVALID_ARGS)
         );
         key.key_type = Some(fidl_fuchsia_wlan_ieee80211::KeyType::Igtk);
         key.cipher_type = Some(6);
         key.key_idx = Some(4);
         key.rsc = Some(u64::from_be_bytes([0, 0, 6, 5, 4, 3, 2, 1]));
-        futures::executor::block_on(adapter.install_key(key)).unwrap();
+        futures::executor::block_on(adapter.install_key(operation_context(), key)).unwrap();
         assert_eq!(adapter.igtk.as_ref().unwrap().receive_ipn, 0x0102_0304_0506);
     }
 
@@ -2290,7 +2312,10 @@ mod tests {
                 ac_vi_params: ac(),
                 ac_vo_params: ac(),
             });
-            futures::executor::block_on(adapter.notify_association_complete(association)).unwrap();
+            futures::executor::block_on(
+                adapter.notify_association_complete(operation_context(), association),
+            )
+            .unwrap();
             assert!(adapter.associated);
         }
     }
@@ -2303,7 +2328,9 @@ mod tests {
         let mut association = open_association();
         association.capability_info = Some(0x0431);
         assert_eq!(
-            futures::executor::block_on(adapter.notify_association_complete(association)),
+            futures::executor::block_on(
+                adapter.notify_association_complete(operation_context(), association)
+            ),
             Err(zx::Status::BAD_STATE)
         );
         assert!(adapter.device.backend().operations().is_empty());
@@ -2331,7 +2358,10 @@ mod tests {
 
         let mut association = open_association();
         association.capability_info = Some(0x0421);
-        futures::executor::block_on(adapter.notify_association_complete(association)).unwrap();
+        futures::executor::block_on(
+            adapter.notify_association_complete(operation_context(), association),
+        )
+        .unwrap();
         assert!(adapter.associated);
         assert!(!adapter.link_up);
         assert!(

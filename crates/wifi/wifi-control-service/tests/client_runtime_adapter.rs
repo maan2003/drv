@@ -117,18 +117,21 @@ impl WlanSoftmac for FakeSoftmac {
     }
     fn install_key(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))
     }
     fn notify_association_complete(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanAssociationConfig,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))
     }
     fn clear_association(
         &mut self,
+        _context: wlan_softmac_host::OperationContext,
         _: softmac::WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
         std::future::ready(Ok(()))

@@ -176,14 +176,17 @@ pub trait WlanSoftmac {
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn install_key(
         &mut self,
+        context: crate::OperationContext,
         configuration: WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn notify_association_complete(
         &mut self,
+        context: crate::OperationContext,
         configuration: WlanAssociationConfig,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
     fn clear_association(
         &mut self,
+        context: crate::OperationContext,
         request: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static;
 
@@ -326,6 +329,7 @@ mod tests {
         }
         fn install_key(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanKeyConfiguration,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready({
@@ -335,6 +339,7 @@ mod tests {
         }
         fn notify_association_complete(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanAssociationConfig,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready({
@@ -344,6 +349,7 @@ mod tests {
         }
         fn clear_association(
             &mut self,
+            _context: crate::OperationContext,
             _: WlanSoftmacBaseClearAssociationRequest,
         ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
             std::future::ready({
@@ -418,11 +424,15 @@ mod tests {
             .set_channel(context.clone(), Default::default())
             .await?;
         device.join_bss(context.clone(), Default::default()).await?;
-        device.install_key(Default::default()).await?;
         device
-            .notify_association_complete(Default::default())
+            .install_key(context.clone(), Default::default())
             .await?;
-        device.clear_association(Default::default()).await?;
+        device
+            .notify_association_complete(context.clone(), Default::default())
+            .await?;
+        device
+            .clear_association(context.clone(), Default::default())
+            .await?;
         device
             .start_passive_scan(context.clone(), Default::default())
             .await?;
