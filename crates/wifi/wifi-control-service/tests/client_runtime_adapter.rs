@@ -386,6 +386,38 @@ fn generic_runtime_publishes_one_generation_and_disconnect_revokes_it() {
             }
         );
         assert_eq!(fds.len(), 1);
+
+        // This driver uses the default unsupported power implementation.
+        // The refusal arrives asynchronously through the hardware actor and
+        // must not revoke an otherwise healthy network generation.
+        send(
+            &policy,
+            5,
+            Message::SetPowerSave {
+                deadline: wlan_control_wire::MonotonicDeadline::after(
+                    std::time::Duration::from_secs(10),
+                )
+                .unwrap(),
+                mode: wlan_control_wire::PowerSaveMode::Balanced,
+            },
+        );
+        drive_until(&mut server, || {
+            while let Some(packet) = policy.try_receive_packet().unwrap() {
+                if matches!(
+                    packet.packet.message,
+                    Message::SetPowerSaveReply(wlan_control_wire::Reply {
+                        in_reply_to: 5,
+                        result: CommandReply::Unsupported,
+                    })
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(!server.is_terminal());
+        assert!(!poll_hup(fds[0].as_raw_fd()));
     });
 }
 

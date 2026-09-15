@@ -610,7 +610,7 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
     overflow: Arc<AtomicBool>,
     connect_attempt: Option<ConnectAttempt>,
     scan_attempt: Option<ScanAttempt>,
-    power_save: Option<oneshot::Receiver<Result<(), zx::Status>>>,
+    power_save: Option<(OperationContext, oneshot::Receiver<Result<(), zx::Status>>)>,
     cleanup: Option<Cleanup>,
     connection: Option<Connection>,
     connection_events: VecDeque<fidl_sme::ConnectTransactionEvent>,
@@ -1451,22 +1451,30 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         if !matches!(self.connection, Some(Connection::Active(_))) || self.cleanup.is_some() {
             return Err(zx::Status::BAD_STATE);
         }
-        let context = OperationContext::child(self.service_epoch.clone(), deadline);
+        let context = OperationContext::child(self.epoch.clone(), deadline);
         let (reply, receiver) = oneshot::channel();
         self.hardware
-            .send(OwnerCommand::PowerSave(context, enabled, reply))?;
-        self.power_save = Some(receiver);
+            .send(OwnerCommand::PowerSave(context.clone(), enabled, reply))?;
+        self.power_save = Some((context, receiver));
         Ok(())
     }
 
     pub async fn drive_power_save_once(&mut self) -> Result<Option<()>, zx::Status> {
         self.check_tasks().map_err(|_| zx::Status::IO)?;
-        let Some(receiver) = self.power_save.as_mut() else {
+        let Some((context, receiver)) = self.power_save.as_mut() else {
             return Ok(None);
         };
         match receiver.try_recv() {
             Ok(Some(Ok(()))) => {
+                // Firmware may have acknowledged before disconnect revoked the
+                // association, with the reply still buffered in this channel.
+                let authority = context.check(Instant::now());
                 self.power_save = None;
+                authority?;
+                if self.cleanup.is_some() || !matches!(self.connection, Some(Connection::Active(_)))
+                {
+                    return Err(zx::Status::BAD_STATE);
+                }
                 Ok(Some(()))
             }
             Ok(Some(Err(status))) => {
@@ -3309,6 +3317,41 @@ mod tests {
             let ethernet = runtime.take_ethernet_device().unwrap();
             assert!(ethernet.properties().is_some());
             assert!(runtime.take_ethernet_device().is_none());
+        });
+    }
+
+    #[test]
+    fn power_success_cannot_cross_disconnect_revocation() {
+        run_local_test(async {
+            for acknowledge_first in [false, true] {
+                let (fake, _) = Fake::new(0);
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                let (_events, stream) = mpsc::channel(1);
+                runtime.connection = Some(Connection::Active(stream));
+                let deadline = Instant::now() + Duration::from_secs(2);
+                runtime.begin_power_save(true, deadline).unwrap();
+                let (context, _) = runtime.power_save.take().unwrap();
+                // Control the ACK delivery order while retaining the exact
+                // authority selected by real public admission.
+                let (reply, receiver) = oneshot::channel();
+                runtime.power_save = Some((context, receiver));
+                let mut reply = Some(reply);
+                if acknowledge_first {
+                    reply.take().unwrap().send(Ok(())).unwrap();
+                }
+                runtime
+                    .begin_disconnect(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)
+                    .unwrap();
+                if let Some(reply) = reply {
+                    reply.send(Ok(())).unwrap();
+                }
+                assert_eq!(
+                    runtime.drive_power_save_once().await,
+                    Err(zx::Status::CANCELED),
+                );
+                assert!(runtime.power_save.is_none());
+                runtime.shutdown().await.unwrap();
+            }
         });
     }
 

@@ -787,25 +787,27 @@ impl<R: WifiRuntime> ControlServer<R> {
                 self.end_generation(GenerationEndReason::Timeout)?;
                 return Ok(true);
             }
-            match self.runtime.drive_power_save_once().await {
-                Ok(Some(())) => {
-                    self.power_save_request = None;
-                    self.queue(
-                        Message::SetPowerSaveReply(Reply {
-                            in_reply_to: id,
-                            result: CommandReply::Success,
-                        }),
-                        None,
-                    )
-                    .map_err(terminal_service)?;
-                    return Ok(true);
-                }
+            let result = match self.runtime.drive_power_save_once().await {
+                Ok(Some(())) => CommandReply::Success,
                 Ok(None) => return Ok(progressed),
+                Err(RuntimeError::Busy) => CommandReply::Busy,
+                Err(RuntimeError::Unsupported) => CommandReply::Unsupported,
+                Err(RuntimeError::NotConnected) => CommandReply::NotConnected,
                 Err(error) => {
                     self.end_generation(runtime_end(error))?;
                     return Ok(true);
                 }
-            }
+            };
+            self.power_save_request = None;
+            self.queue(
+                Message::SetPowerSaveReply(Reply {
+                    in_reply_to: id,
+                    result,
+                }),
+                None,
+            )
+            .map_err(terminal_service)?;
+            return Ok(true);
         }
         if let Some(pending) = &self.disconnect_request {
             if pending
@@ -1113,7 +1115,7 @@ pub struct SimulatedWifiRuntime {
     ethernet_after_connect: Option<OwnedFd>,
     connect_mode: SimulatedConnectMode,
     disconnect: Option<DisconnectOutcome>,
-    power_save: Option<wlan_control_wire::PowerSaveMode>,
+    power_save: Option<Result<(), RuntimeError>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1282,17 +1284,17 @@ impl WifiRuntime for SimulatedWifiRuntime {
     }
     fn begin_power_save(
         &mut self,
-        mode: wlan_control_wire::PowerSaveMode,
+        _mode: wlan_control_wire::PowerSaveMode,
         _: Instant,
     ) -> Result<(), RuntimeError> {
         if self.power_save.is_some() {
             return Err(RuntimeError::Busy);
         }
-        self.power_save = Some(mode);
+        self.power_save = Some(Ok(()));
         Ok(())
     }
     async fn drive_power_save_once(&mut self) -> Result<Option<()>, RuntimeError> {
-        Ok(self.power_save.take().map(|_| ()))
+        self.power_save.take().transpose()
     }
 }
 
@@ -1406,44 +1408,53 @@ mod deadline_tests {
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&executor, async {
-            let (policy, _policy_peer) = pair();
-            let (supervisor, _supervisor_peer) = pair();
-            let runtime = SimulatedWifiRuntime::new([2; 6]);
-            let mut server = PreparedServer::new(policy, supervisor, [1; 16], runtime)
-                .unwrap()
-                .post_lockdown_open_complete()
-                .unwrap();
-            server
-                .dispatch(Packet {
-                    generation: [1; 16],
-                    request_id: 7,
-                    message: Message::SetPowerSave {
-                        deadline: wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(
-                            1,
-                        ))
-                        .unwrap(),
-                        mode: wlan_control_wire::PowerSaveMode::Balanced,
-                    },
-                })
-                .await
-                .unwrap();
-            assert_eq!(server.power_save_request.map(|(id, _)| id), Some(7));
-            assert_eq!(
-                server.outbound.len(),
-                1,
-                "only Ready is queued before completion"
-            );
-            server.drive_runtime().await.unwrap();
-            assert!(server.power_save_request.is_none());
-            assert!(matches!(
-                decode(&server.outbound.back().unwrap().bytes)
+            for (completion, expected) in [
+                (Ok(()), CommandReply::Success),
+                (Err(RuntimeError::Busy), CommandReply::Busy),
+                (Err(RuntimeError::Unsupported), CommandReply::Unsupported),
+                (Err(RuntimeError::NotConnected), CommandReply::NotConnected),
+            ] {
+                let (policy, _policy_peer) = pair();
+                let (supervisor, _supervisor_peer) = pair();
+                let runtime = SimulatedWifiRuntime::new([2; 6]);
+                let mut server = PreparedServer::new(policy, supervisor, [1; 16], runtime)
                     .unwrap()
-                    .message,
-                Message::SetPowerSaveReply(Reply {
-                    in_reply_to: 7,
-                    result: CommandReply::Success
-                })
-            ));
+                    .post_lockdown_open_complete()
+                    .unwrap();
+                server
+                    .dispatch(Packet {
+                        generation: [1; 16],
+                        request_id: 7,
+                        message: Message::SetPowerSave {
+                            deadline: wlan_control_wire::MonotonicDeadline::after(
+                                Duration::from_secs(1),
+                            )
+                            .unwrap(),
+                            mode: wlan_control_wire::PowerSaveMode::Balanced,
+                        },
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(server.power_save_request.map(|(id, _)| id), Some(7));
+                assert_eq!(
+                    server.outbound.len(),
+                    1,
+                    "only Ready is queued before completion"
+                );
+                server.runtime.power_save = Some(completion);
+                server.drive_runtime().await.unwrap();
+                assert!(!server.is_terminal());
+                assert!(server.power_save_request.is_none());
+                assert!(matches!(
+                    decode(&server.outbound.back().unwrap().bytes)
+                        .unwrap()
+                        .message,
+                    Message::SetPowerSaveReply(Reply {
+                        in_reply_to: 7,
+                        result
+                    }) if result == expected
+                ));
+            }
         });
     }
 

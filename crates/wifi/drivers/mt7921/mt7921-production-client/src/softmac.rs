@@ -74,6 +74,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
             || self.peer_join.is_some()
             || self.peer_association.is_some()
             || self.key_installation.is_some()
+            || self.power_save_change.is_some()
             || self.scan.is_some()
             || !self.tx.idle();
         pending.then(|| std::time::Instant::now() + std::time::Duration::from_millis(1))
