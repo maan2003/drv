@@ -5348,7 +5348,7 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	382	macro	MT_TOP_MISC	-	unmappe
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	383	macro	MT_TOP_MISC_FW_STATE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	385	macro	MT_MCU_WPDMA0_BASE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	386	macro	MT_MCU_WPDMA0	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	388	macro	MT_WFDMA_DUMMY_CR	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	388	macro	MT_WFDMA_DUMMY_CR	-	unmapped	post-wake reinit register identified; hardware integration pending
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	389	macro	MT_WFDMA_NEED_REINIT	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	391	macro	MT_CBTOP_RGU	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	392	macro	MT_CBTOP_RGU_WF_SUBSYS_RST	-	unmapped	-
