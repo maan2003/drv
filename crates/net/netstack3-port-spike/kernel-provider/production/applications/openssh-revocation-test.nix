@@ -163,11 +163,11 @@ runCommand "openssh-listener-revocation-test"
 
     set +e
     DRV_REVOKE_LISTENER=1 LD_PRELOAD=$PWD/revoke-listener.so \
-      ${patchedOpenSSH}/bin/sshd -D -e -f "$PWD/only-listener.conf" \
+      timeout 10 ${patchedOpenSSH}/bin/sshd -D -e -f "$PWD/only-listener.conf" \
       >only-listener.log 2>&1
     status=$?
     set -e
-    test "$status" -ne 0
+    test "$status" -eq 255
     test "$(grep -c 'Listener on fd .* terminated:' only-listener.log)" = 1
     grep -q 'No listening sockets remain' only-listener.log
     ! grep -q 'accept: Network is down' only-listener.log

@@ -1,6 +1,9 @@
 --- a/sshd.c
 +++ b/sshd.c
-@@ -1119,0 +1120,9 @@
+@@ -1117,6 +1117,15 @@
+ 			}
+ 		}
+ 		for (i = 0; i < num_listen_socks; i++) {
 +			/*
 +			 * A listener capability may be revoked while sshd is
 +			 * running.  POLLHUP and POLLNVAL are terminal for a
@@ -10,7 +13,13 @@
 +			 */
 +			if (pfd[i].revents & (POLLHUP|POLLNVAL))
 +				continue;
-@@ -1222,0 +1232,18 @@
+ 			if (!(pfd[i].revents & POLLIN))
+ 				continue;
+ 			fromlen = sizeof(from);
+@@ -1220,6 +1229,24 @@
+ 			 */
+ 			reseed_prngs();
+ 		}
 +
 +		/*
 +		 * Retire terminal listeners after processing this poll result so
@@ -29,3 +38,6 @@
 +		num_listen_socks = ret;
 +		if (num_listen_socks == 0 && !lameduck)
 +			fatal("No listening sockets remain");
+ 	}
+ }
+ 
