@@ -233,6 +233,12 @@ struct DeferredCommand {
     failed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoaderRebaseError {
+    CommandPending { slot: u16 },
+    ScatterPending,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoaderMechanics {
     sequence: u8,
@@ -283,6 +289,25 @@ impl LoaderMechanics {
     pub fn active_command_slot(&self) -> Option<u16> {
         self.pending_command
             .or_else(|| self.deferred_command.as_ref().map(|command| command.slot))
+    }
+
+    /// Rebase software cursors after a verified WPDMA reset.
+    ///
+    /// Sequence identity is intentionally preserved: firmware command
+    /// correlation must not reuse a sequence merely because transport ring
+    /// indices restarted. Published command/scatter ownership must be resolved
+    /// before the hardware reset and therefore makes rebasing illegal.
+    pub fn rebase_after_wpdma_reset(&mut self) -> Result<(), LoaderRebaseError> {
+        if let Some(slot) = self.active_command_slot() {
+            return Err(LoaderRebaseError::CommandPending { slot });
+        }
+        if self.pending_scatter.is_some() {
+            return Err(LoaderRebaseError::ScatterPending);
+        }
+        self.command_producer = 0;
+        self.rx_head = [0; 2];
+        self.fwdl_producer = 0;
+        Ok(())
     }
 
     /// Publish one driver-owned operation without waiting. Neither dropping a
@@ -2106,5 +2131,40 @@ mod tests {
         );
         assert!(io.ops.contains(&Op::Repost(McuRxIrqRing::Wm, 7)));
         assert!(io.ops.contains(&Op::Repost(McuRxIrqRing::Wm2, 7)));
+    }
+    #[test]
+    fn wpdma_rebase_preserves_sequence_and_zeros_all_cursors() {
+        let mut engine = LoaderMechanics::new(37);
+        engine.command_producer = 3;
+        engine.rx_head = [4, 5];
+        engine.fwdl_producer = 6;
+        assert_eq!(engine.rebase_after_wpdma_reset(), Ok(()));
+        assert_eq!(engine.sequence(), 37);
+        assert_eq!(engine.command_producer(), 0);
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm), 0);
+        assert_eq!(engine.rx_head(McuRxIrqRing::Wm2), 0);
+        assert_eq!(engine.fwdl_producer(), 0);
+    }
+
+    #[test]
+    fn wpdma_rebase_refuses_published_ownership() {
+        let mut command = LoaderMechanics::new(0);
+        command.pending_command = Some(2);
+        assert_eq!(
+            command.rebase_after_wpdma_reset(),
+            Err(LoaderRebaseError::CommandPending { slot: 2 })
+        );
+
+        let mut scatter = LoaderMechanics::new(0);
+        scatter.pending_scatter = Some(PendingScatter {
+            part: FirmwareImagePart::Patch,
+            sequence: 2,
+            slot: 1,
+            producer: 2,
+        });
+        assert_eq!(
+            scatter.rebase_after_wpdma_reset(),
+            Err(LoaderRebaseError::ScatterPending)
+        );
     }
 }

@@ -39,18 +39,17 @@ use drv_hardware_backends::{
     LinuxVfio, LinuxVfioError, LinuxVfioPciCapabilities, LockedLinuxVfioPciCapabilities, PciControl,
 };
 use firmware_loader::ProductionFirmwareLoader;
+#[cfg(test)]
+use mt7921_core::acquire_driver_ownership;
 use mt7921_core::{
     ActivationFailure, ActivationStage, ActivationState, FirmwareLoaderError, FirmwareLoaderReport,
     MT7921_DATA_RX_RING_COUNT, MT7921_LOADER_COMMAND_MAX_BYTES, MT7921_MCU_RX_BUFFER_BYTES,
 };
-#[cfg(test)]
-use mt7921_core::{OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN, acquire_driver_ownership};
-#[cfg(test)]
-use std::time::Duration;
+use mt7921_core::{OwnershipTransport, PCIE_LPCR_HOST_CLR_OWN};
 use std::{
     fmt,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const PAGE: usize = 4096;
@@ -427,13 +426,11 @@ struct AcquireFailure {
     ledger: AcquisitionLedger,
 }
 
-#[cfg(test)]
 struct DriverOwnershipIo<B: Backend> {
     conn: MmioRegion<B>,
     start: Instant,
 }
 
-#[cfg(test)]
 impl<B: Backend> OwnershipTransport for DriverOwnershipIo<B> {
     type Error = drv_hardware::Error;
 
@@ -455,6 +452,13 @@ impl<B: Backend> OwnershipTransport for DriverOwnershipIo<B> {
 
     fn sleep_ms(&mut self, milliseconds: u64) {
         std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
+impl<B: Backend> mt7921_core::OwnershipRoundTripTransport for DriverOwnershipIo<B> {
+    fn write_set_own(&mut self) -> Result<(), Self::Error> {
+        self.conn
+            .write_u32(0x10, mt7921_core::PCIE_LPCR_HOST_SET_OWN)
     }
 }
 
@@ -820,6 +824,153 @@ impl Mt7921HardwareSession {
         result
     }
 
+    fn now_ms(&self) -> u64 {
+        self.start
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn poll_driver_ownership(
+        &mut self,
+        wake: &mut mt7921_core::DriverOwnershipWake,
+        epoch: u64,
+    ) -> Result<mt7921_core::DriverOwnershipWakeProgress, String> {
+        let conn = self
+            .resources
+            .as_ref()
+            .expect("live resources")
+            .bar0
+            .slice(0xe0000, 4096)
+            .map_err(|e| format!("slice ownership: {e:?}"))?;
+        wake.poll(
+            &mut DriverOwnershipIo {
+                conn,
+                start: self.start,
+            },
+            epoch,
+        )
+        .map_err(|e| format!("driver ownership: {e:?}"))
+    }
+
+    fn poll_firmware_ownership(
+        &mut self,
+        sleep: &mut mt7921_core::FirmwareOwnershipSleep,
+        epoch: u64,
+    ) -> Result<mt7921_core::DriverOwnershipWakeProgress, String> {
+        let conn = self
+            .resources
+            .as_ref()
+            .expect("live resources")
+            .bar0
+            .slice(0xe0000, 4096)
+            .map_err(|e| format!("slice ownership: {e:?}"))?;
+        sleep
+            .poll(
+                &mut DriverOwnershipIo {
+                    conn,
+                    start: self.start,
+                },
+                epoch,
+            )
+            .map_err(|e| format!("firmware ownership: {e:?}"))
+    }
+
+    fn enable_power_wake_sources(&mut self) -> Result<(), String> {
+        let resources = self.resources.as_mut().expect("live resources");
+        let wake = resources
+            .bar0
+            .read_u32(0xd41f4)
+            .map_err(|e| format!("read wake source: {e:?}"))?;
+        if wake == u32::MAX {
+            return Err("wake source returned all ones".into());
+        }
+        resources
+            .bar0
+            .write_u32(0xd41f4, wake | 1)
+            .map_err(|e| format!("enable wake source: {e:?}"))?;
+        if resources
+            .bar0
+            .read_u32(0xd41f4)
+            .map_err(|e| format!("verify wake source: {e:?}"))?
+            != wake | 1
+        {
+            return Err("wake source enable did not latch".into());
+        }
+        let host = resources
+            .bar0
+            .read_u32(0xd4204)
+            .map_err(|e| format!("read host mask: {e:?}"))?;
+        if host == u32::MAX {
+            return Err("host mask returned all ones".into());
+        }
+        let expected = mt7921_core::McuRxIrqTopology::firmware().mask()
+            | mt7921_core::MT7921_DATA_RX_IRQ_BIT
+            | (1 << 29);
+        resources
+            .bar0
+            .write_u32(0xd4204, expected)
+            .map_err(|e| format!("enable wake IRQ: {e:?}"))?;
+        if resources
+            .bar0
+            .read_u32(0xd4204)
+            .map_err(|e| format!("verify wake IRQ: {e:?}"))?
+            != expected
+        {
+            return Err("host wake IRQ enable did not latch".into());
+        }
+        Ok(())
+    }
+
+    fn wpdma_needs_reinit(&mut self) -> Result<bool, String> {
+        let value = self
+            .resources
+            .as_mut()
+            .expect("live resources")
+            .bar0
+            .read_u32(0x2120)
+            .map_err(|e| format!("read WFDMA dummy: {e:?}"))?;
+        if value == u32::MAX {
+            Err("WFDMA dummy returned all ones".into())
+        } else {
+            Ok(value & (1 << 1) == 0)
+        }
+    }
+
+    fn runtime_reinitialize(
+        &mut self,
+        data_rx: &mut receive::DataRx,
+        tx: &mut transmit::ClientTx,
+    ) -> Result<(), String> {
+        activation::runtime_reinitialize(
+            self.resources.as_mut().expect("live resources"),
+            &mut self.mcu.0,
+            &mut self.receive,
+            data_rx,
+            tx,
+        )
+    }
+
+    fn attempt_driver_ownership_for_stop(&mut self) {
+        let Ok(conn) = self
+            .resources
+            .as_ref()
+            .expect("live resources")
+            .bar0
+            .slice(0xe0000, 4096)
+        else {
+            return;
+        };
+        let _ = mt7921_core::acquire_driver_ownership(
+            &mut DriverOwnershipIo {
+                conn,
+                start: Instant::now(),
+            },
+            |_| {},
+        );
+    }
+
     /// Progress containment from the first unverified milestone.
     ///
     /// Failures retain the complete resource graph and PCI owner so callers
@@ -944,6 +1095,14 @@ pub fn run_firmware_bootstrap(
     }
 }
 
+#[derive(Debug)]
+enum HifPowerState {
+    DriverOwned,
+    Sleeping(mt7921_core::FirmwareOwnershipSleep),
+    FirmwareOwned,
+    Waking(mt7921_core::DriverOwnershipWake),
+}
+
 /// An exclusively owned, initialized MT7921 device. Construction completes
 /// firmware loading and initial EEPROM/CLC setup, before MAC initialization;
 /// channel-domain and radio setup remain pending. It is not an unchecked
@@ -971,6 +1130,9 @@ pub struct Mt7921Driver {
     associated_qos: Option<bool>,
     power_save_change: Option<peer::PowerSaveChange>,
     power_save_enabled: bool,
+    hif_state: HifPowerState,
+    hif_epoch: u64,
+    irq_wake_pending: bool,
     key_installation: Option<peer::KeyInstallation>,
     ptk: Option<peer::ClientKey>,
     gtk: Option<peer::ClientKey>,
@@ -1043,6 +1205,9 @@ impl Mt7921Driver {
                     associated_qos: None,
                     power_save_change: None,
                     power_save_enabled: false,
+                    hif_state: HifPowerState::DriverOwned,
+                    hif_epoch: 1,
+                    irq_wake_pending: false,
                     key_installation: None,
                     ptk: None,
                     gtk: None,

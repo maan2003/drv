@@ -261,6 +261,14 @@ impl RxRouting {
         self.pending = None;
         self.events.clear();
     }
+
+    /// Revoke every pre-reset occurrence before rebuilding ring authority.
+    pub(super) fn rebase_after_wpdma_reset(&mut self) {
+        self.live.store(false, Ordering::Release);
+        self.pending = None;
+        self.events.clear();
+        *self = Self::default();
+    }
 }
 
 impl Drop for RxRouting {
@@ -280,6 +288,11 @@ pub(super) struct DataRx {
 }
 
 impl DataRx {
+    pub(super) fn rebase_after_wpdma_reset(&mut self) {
+        self.head = 0;
+        self.discard_until_last = false;
+    }
+
     /// Data ring 2 is independent of the firmware response IRQ mask. Enable
     /// it only after firmware initialization, when the protocol owner starts.
     pub fn enable<B: drv_hardware::Backend>(
@@ -795,5 +808,28 @@ mod tests {
             Err(Error::Limit)
         ));
         assert!(routing.take_event().is_none());
+    }
+    #[test]
+    fn wpdma_rebase_revokes_escaped_occurrences_and_resets_data_cursor() {
+        let mut routing = RxRouting::default();
+        let escaped = ReceivedEvent {
+            occurrence: Occurrence {
+                slot: Slot::new(McuRxIrqRing::Wm, 0).unwrap(),
+                generation: 1,
+            },
+            live: Arc::clone(&routing.live),
+            route: None,
+        };
+        routing.rebase_after_wpdma_reset();
+        assert!(matches!(escaped.into_route(), Err(Error::StaleHandle)));
+        assert!(routing.live.load(Ordering::Acquire));
+
+        let mut data = DataRx {
+            head: 17,
+            discard_until_last: true,
+        };
+        data.rebase_after_wpdma_reset();
+        assert_eq!(data.head, 0);
+        assert!(!data.discard_until_last);
     }
 }

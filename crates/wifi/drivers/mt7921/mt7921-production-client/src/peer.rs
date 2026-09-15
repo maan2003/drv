@@ -458,16 +458,15 @@ impl PowerSaveChange {
         enabled: bool,
         reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
     ) -> Result<Self, zx::Status> {
-        // UNI_BSS_INFO_PS state 2 is only the station policy half of Linux's
-        // power path. Linux also gates every TX on mt76_connac_pm_ref and
-        // queues it behind mt792x_mcu_drv_pmctrl when firmware owns the HIF.
-        // Until that ownership/wake boundary is implemented, advertising
-        // Balanced would acknowledge a mode that can strand post-idle TX.
-        if enabled {
-            return Err(zx::Status::NOT_SUPPORTED);
-        }
-        let command = mt7921_core::encode_client_post_assoc_power_state_command(1, 0, 0)
-            .map_err(|_| zx::Status::INVALID_ARGS)?;
+        // State 2 is sent while the driver still owns HIF. The outer driver
+        // acknowledges this change only after wake sources are armed and the
+        // firmware-ownership handshake completes.
+        let command = mt7921_core::encode_client_post_assoc_power_state_command(
+            1,
+            0,
+            if enabled { 2 } else { 0 },
+        )
+        .map_err(|_| zx::Status::INVALID_ARGS)?;
         Ok(Self {
             context,
             enabled,
@@ -807,15 +806,7 @@ mod tests {
             )));
             let idle = crate::transmit::ClientTx::default();
             let expected: &[Option<u8>] = if qos {
-                &[
-                    Some(2),
-                    Some(2),
-                    Some(3),
-                    None,
-                    Some(2),
-                    Some(3),
-                    None,
-                ]
+                &[Some(2), Some(2), Some(3), None, Some(2), Some(3), None]
             } else {
                 &[Some(2), Some(2), Some(3), Some(2), Some(3), None]
             };
@@ -923,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn power_policy_keeps_performance_acknowledged_and_rejects_unwaked_balanced() {
+    fn power_policy_encodes_performance_and_balanced_states() {
         let now = Instant::now();
         let context = || {
             wlan_softmac_class_support::conformance::operation_context(now + Duration::from_secs(1))
@@ -936,10 +927,9 @@ mod tests {
         assert!(!change.complete());
 
         let (reply, _) = futures_channel::oneshot::channel();
-        assert!(matches!(
-            PowerSaveChange::new(context(), true, reply),
-            Err(zx::Status::NOT_SUPPORTED)
-        ));
+        let balanced = PowerSaveChange::new(context(), true, reply).unwrap();
+        assert_eq!(&balanced.command()[52..54], &[21, 0]);
+        assert_eq!(balanced.command()[56], 2);
     }
 
     #[test]

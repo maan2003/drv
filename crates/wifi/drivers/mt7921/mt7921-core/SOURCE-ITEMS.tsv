@@ -5253,14 +5253,14 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	270	macro	MT_WFDMA0_BUSY_ENA_TX
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	271	macro	MT_WFDMA0_BUSY_ENA_TX_FIFO1	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	272	macro	MT_WFDMA0_BUSY_ENA_RX_FIFO	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	274	macro	MT_MCU_CMD	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	275	macro	MT_MCU_CMD_WAKE_RX_PCIE	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	275	macro	MT_MCU_CMD_WAKE_RX_PCIE	Mt7921HardwareSession::enable_power_wake_sources, activation::runtime_reinitialize	source-shaped	exact bit 0 at fixed BAR d41f4
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	276	macro	MT_MCU_CMD_STOP_DMA_FW_RELOAD	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	277	macro	MT_MCU_CMD_STOP_DMA	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	278	macro	MT_MCU_CMD_RESET_DONE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	279	macro	MT_MCU_CMD_RECOVERY_DONE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	280	macro	MT_MCU_CMD_NORMAL_STATE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	281	macro	MT_MCU_CMD_ERROR_MASK	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	283	macro	MT_MCU2HOST_SW_INT_ENA	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	283	macro	MT_MCU2HOST_SW_INT_ENA	Mt7921HardwareSession::enable_power_wake_sources, activation::runtime_reinitialize	source-shaped	exact fixed BAR d41f4 read-modify-write and readback
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	285	macro	MT_WFDMA0_HOST_INT_STA	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	286	macro	HOST_RX_DONE_INT_STS0	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	287	macro	HOST_RX_DONE_INT_STS2	-	unmapped	-
@@ -5299,7 +5299,7 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	321	macro	HOST_RX_COHERENT_EN	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	322	macro	HOST_TX_COHERENT_EN	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	323	macro	MCU2HOST_SW_INT_ENA	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	324	macro	HOST_TX_DONE_INT_ENA18	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	326	macro	MT_INT_MCU_CMD	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	326	macro	MT_INT_MCU_CMD	Mt7921HardwareSession::enable_power_wake_sources, activation::runtime_reinitialize	source-shaped	exact host interrupt bit 29 retained with firmware and data RX sources
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	328	macro	MT_WFDMA0_RST_DTX_PTR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	329	macro	MT_WFDMA0_RST_DRX_PTR	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	330	macro	MT_WFDMA0_INT_RX_PRI	-	unmapped	-
@@ -5348,8 +5348,8 @@ drivers/net/wireless/mediatek/mt76/mt792x_regs.h	382	macro	MT_TOP_MISC	-	unmappe
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	383	macro	MT_TOP_MISC_FW_STATE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	385	macro	MT_MCU_WPDMA0_BASE	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	386	macro	MT_MCU_WPDMA0	-	unmapped	-
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	388	macro	MT_WFDMA_DUMMY_CR	-	unmapped	post-wake reinit register identified; hardware integration pending
-drivers/net/wireless/mediatek/mt76/mt792x_regs.h	389	macro	MT_WFDMA_NEED_REINIT	-	unmapped	-
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	388	macro	MT_WFDMA_DUMMY_CR	Mt7921HardwareSession::wpdma_needs_reinit, activation::runtime_reinitialize	source-shaped	physical 54000120 fixed-maps to BAR 2120
+drivers/net/wireless/mediatek/mt76/mt792x_regs.h	389	macro	MT_WFDMA_NEED_REINIT	Mt7921HardwareSession::wpdma_needs_reinit, activation::runtime_reinitialize	source-shaped	bit 1 clear triggers reset; rebuilt engine sets and verifies healthy
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	391	macro	MT_CBTOP_RGU	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	392	macro	MT_CBTOP_RGU_WF_SUBSYS_RST	-	unmapped	-
 drivers/net/wireless/mediatek/mt76/mt792x_regs.h	393	macro	MT_CBTOP_RGU_WF_SUBSYS_RST_WF_WHOLE_PATH	-	unmapped	-

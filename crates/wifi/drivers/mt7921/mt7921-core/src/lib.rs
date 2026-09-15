@@ -1807,6 +1807,80 @@ pub trait OwnershipRoundTripTransport: OwnershipTransport {
     fn write_set_own(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Nonblocking inverse of [`DriverOwnershipWake`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareOwnershipSleep {
+    authority: DriverOwnershipWakeAuthority,
+    attempts: u8,
+    attempt_deadline_ms: u64,
+    next_poll_ms: u64,
+}
+
+impl FirmwareOwnershipSleep {
+    pub fn new(
+        authority: DriverOwnershipWakeAuthority,
+        now_ms: u64,
+    ) -> Result<Self, DriverOwnershipWakeError<core::convert::Infallible>> {
+        if now_ms >= authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+        Ok(Self {
+            authority,
+            attempts: 0,
+            attempt_deadline_ms: now_ms,
+            next_poll_ms: now_ms,
+        })
+    }
+
+    pub fn poll<T: OwnershipRoundTripTransport>(
+        &mut self,
+        transport: &mut T,
+        epoch: u64,
+    ) -> Result<DriverOwnershipWakeProgress, DriverOwnershipWakeError<T::Error>> {
+        if epoch != self.authority.epoch {
+            return Err(DriverOwnershipWakeError::Revoked);
+        }
+        let now = transport.now_ms();
+        if now >= self.authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+        if self.attempts == 0 || now >= self.attempt_deadline_ms {
+            if self.attempts == DRIVER_OWN_ATTEMPTS {
+                return Err(DriverOwnershipWakeError::Deadline);
+            }
+            transport
+                .write_set_own()
+                .map_err(DriverOwnershipWakeError::Transport)?;
+            self.attempts += 1;
+            self.attempt_deadline_ms = now
+                .saturating_add(DRIVER_OWN_ATTEMPT_MS)
+                .min(self.authority.deadline_ms);
+            self.next_poll_ms = now;
+        }
+        if now < self.next_poll_ms {
+            return Ok(DriverOwnershipWakeProgress::Pending {
+                next_poll_ms: self.next_poll_ms,
+            });
+        }
+        let raw = transport
+            .read_low_power_control()
+            .map_err(DriverOwnershipWakeError::Transport)?;
+        if raw == u32::MAX || raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
+            return Err(DriverOwnershipWakeError::UnexpectedState(raw));
+        }
+        if raw & PCIE_LPCR_HOST_OWN_SYNC != 0 {
+            return Ok(DriverOwnershipWakeProgress::Acquired);
+        }
+        self.next_poll_ms = now
+            .saturating_add(DRIVER_OWN_POLL_MS)
+            .min(self.attempt_deadline_ms)
+            .min(self.authority.deadline_ms);
+        Ok(DriverOwnershipWakeProgress::Pending {
+            next_poll_ms: self.next_poll_ms,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnershipState {
     DriverOwned,
@@ -13500,6 +13574,29 @@ mod tests {
             fail_set_after_write: false,
             aspm_delays: Vec::new(),
         }
+    }
+
+    #[test]
+    fn deferred_firmware_sleep_is_bounded_and_epoch_guarded() {
+        let authority = DriverOwnershipWakeAuthority {
+            epoch: 9,
+            deadline_ms: 501,
+        };
+        let mut sleep = FirmwareOwnershipSleep::new(authority, 0).unwrap();
+        let mut transport = round_trip_fake(OwnershipState::DriverOwned);
+        assert_eq!(
+            sleep.poll(&mut transport, 8),
+            Err(DriverOwnershipWakeError::Revoked)
+        );
+        assert_eq!(transport.set_writes, 0);
+        assert_eq!(transport.reads, 0);
+        assert_eq!(
+            sleep.poll(&mut transport, 9),
+            Ok(DriverOwnershipWakeProgress::Acquired)
+        );
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.reads, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
     }
 
     #[test]
