@@ -411,6 +411,11 @@ impl FirmwareCommands {
         !self.failed && self.remaining.is_empty() && self.pending.is_none()
     }
 
+    #[cfg(test)]
+    pub(super) fn queued_command(&self, index: usize) -> Option<&[u8]> {
+        self.remaining.get(index).map(|(bytes, _)| bytes.as_slice())
+    }
+
     pub(super) fn drive<B: Backend>(
         &mut self,
         resources: &mut crate::OwnedHardwareResources<B>,

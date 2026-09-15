@@ -366,7 +366,10 @@ impl PeerAssociation {
         }
         commands.extend([
             (
-                encode(encode_client_post_assoc_power_state_command(1, 0, 0))?,
+                // Linux mt7921 uses firmware dynamic power saving for a
+                // power-save-enabled associated vif. The acknowledged tag
+                // handles traffic wakeups; it is not a pretend host idle bit.
+                encode(encode_client_post_assoc_power_state_command(1, 0, 2))?,
                 RadioResponse::Unified(2),
             ),
             (
@@ -706,6 +709,12 @@ mod tests {
             let (reply, _receiver) = futures_channel::oneshot::channel();
             let mut association =
                 PeerAssociation::new(context.clone(), &bss, 100, configuration, reply).unwrap();
+            // After the optional WMM command, association publishes and waits
+            // for UNI_BSS_INFO_PS dynamic-power state (2), not full power (0).
+            let power_index = usize::from(qos) + 1;
+            let power = association.commands.queued_command(power_index).unwrap();
+            assert_eq!(&power[52..54], &[21, 0]);
+            assert_eq!(power[56], 2);
             let mut mechanics = LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
             let mut busy = crate::transmit::ClientTx::default();

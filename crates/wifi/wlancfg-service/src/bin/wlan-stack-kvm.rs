@@ -23,14 +23,23 @@ const DRIVER_SUPERVISOR_FD: RawFd = 6;
 const APPLICATION_FD: RawFd = 5;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
 }
 
+extern "C" fn request_suspend(_: libc::c_int) {
+    SUSPEND_REQUESTED.store(true, Ordering::Release);
+}
+
 fn install_signal_handlers() -> Result<(), String> {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        if unsafe { libc::signal(signal, request_stop as *const () as usize) } == libc::SIG_ERR {
+    for (signal, handler) in [
+        (libc::SIGINT, request_stop as *const () as usize),
+        (libc::SIGTERM, request_stop as *const () as usize),
+        (libc::SIGUSR1, request_suspend as *const () as usize),
+    ] {
+        if unsafe { libc::signal(signal, handler) } == libc::SIG_ERR {
             return Err(format!(
                 "install launcher signal handler: {}",
                 std::io::Error::last_os_error()
@@ -38,6 +47,34 @@ fn install_signal_handlers() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownCause {
+    Ordinary,
+    SuspendPreparation,
+}
+
+fn requested_shutdown(now: Instant, deadline: Instant) -> Option<ShutdownCause> {
+    if SUSPEND_REQUESTED.load(Ordering::Acquire) {
+        Some(ShutdownCause::SuspendPreparation)
+    } else if STOP_REQUESTED.load(Ordering::Acquire) || now >= deadline {
+        Some(ShutdownCause::Ordinary)
+    } else {
+        None
+    }
+}
+
+fn completion_marker(cause: Option<ShutdownCause>, succeeded: bool) -> Option<&'static str> {
+    match (cause, succeeded) {
+        (Some(ShutdownCause::SuspendPreparation), true) => {
+            Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
+        }
+        (Some(ShutdownCause::Ordinary), true) => {
+            Some("wlan_stack_driver_exit=0 hardware_stopped=true")
+        }
+        _ => None,
+    }
 }
 
 fn main() {
@@ -161,7 +198,7 @@ fn run() -> Result<(), String> {
     );
 
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
-    let mut stopping = false;
+    let mut shutdown_cause = None;
     let mut shutdown_deadline = None;
     let mut policy_done = false;
     let mut driver_done = false;
@@ -169,8 +206,7 @@ fn run() -> Result<(), String> {
         match driver_child.try_wait() {
             Ok(Some(status)) => {
                 driver_done = true;
-                if status.success() && stopping {
-                    println!("wlan_stack_driver_exit=0 hardware_stopped=true");
+                if status.success() && shutdown_cause.is_some() {
                     break Ok(());
                 }
                 let policy_detail = match policy_child.try_wait() {
@@ -190,7 +226,7 @@ fn run() -> Result<(), String> {
             match policy_child.try_wait() {
                 Ok(Some(status)) => {
                     policy_done = true;
-                    if !stopping {
+                    if shutdown_cause.is_none() {
                         break Err(format!("wlancfg service exited unexpectedly: {status}"));
                     }
                 }
@@ -203,8 +239,10 @@ fn run() -> Result<(), String> {
             break Err("MT7921 orderly shutdown timed out".into());
         }
 
-        if !stopping && (Instant::now() >= deadline || STOP_REQUESTED.load(Ordering::Acquire)) {
-            stopping = true;
+        if shutdown_cause.is_none()
+            && let Some(cause) = requested_shutdown(Instant::now(), deadline)
+        {
+            shutdown_cause = Some(cause);
             shutdown_deadline = Some(Instant::now() + Duration::from_secs(10));
             if !policy_done {
                 if let Err(error) = policy_child.kill() {
@@ -213,16 +251,34 @@ fn run() -> Result<(), String> {
                 let _ = policy_child.wait();
                 policy_done = true;
             }
-            println!("wlan_stack_shutdown=policy_closed");
+            println!(
+                "wlan_stack_shutdown=policy_closed cause={}",
+                match cause {
+                    ShutdownCause::Ordinary => "ordinary",
+                    ShutdownCause::SuspendPreparation => "suspend-preparation",
+                }
+            );
+            // Revoke the frame-only network generation before waiting for
+            // firmware/DMA containment. A suspend coordinator must never
+            // observe readiness while an Internet-facing process retains the
+            // old Ethernet generation.
+            if let Err(error) = network.terminate() {
+                break Err(format!("revoke network before shutdown: {error}"));
+            }
+            println!("wlan_stack_shutdown=network_revoked");
         }
 
-        match lifecycle.receive(&mut network) {
-            Ok(Some(update)) => println!("wlan_stack_network_lifecycle={update:?}"),
-            Ok(None) => {}
-            Err(error) => break Err(error),
+        // Once revocation starts, never consume a queued Install and recreate
+        // an old Ethernet generation while firmware containment is pending.
+        if shutdown_cause.is_none() {
+            match lifecycle.receive(&mut network) {
+                Ok(Some(update)) => println!("wlan_stack_network_lifecycle={update:?}"),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
         }
         match network.poll_exit() {
-            Ok(Some(exit)) if !stopping => {
+            Ok(Some(exit)) if shutdown_cause.is_none() => {
                 break Err(format!(
                     "network-service generation {} exited success={}",
                     exit.generation, exit.success
@@ -234,14 +290,18 @@ fn run() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(1));
     };
 
-    finish_children(
+    let result = finish_children(
         &mut policy_child,
         policy_done,
         &mut driver_child,
         driver_done,
         &mut network,
         result,
-    )
+    );
+    if let Some(marker) = completion_marker(shutdown_cause, result.is_ok()) {
+        println!("{marker}");
+    }
+    result
 }
 
 fn usage() -> String {
@@ -547,6 +607,46 @@ mod tests {
         assert!(forced);
         assert!(detail.contains("timed out; killed and reaped success=false"));
         assert!(!driver.try_wait().unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn suspend_request_has_priority_and_deadline_is_ordinary_shutdown() {
+        let now = Instant::now();
+        STOP_REQUESTED.store(false, Ordering::Release);
+        SUSPEND_REQUESTED.store(false, Ordering::Release);
+        assert_eq!(
+            requested_shutdown(now, now + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            requested_shutdown(now, now),
+            Some(ShutdownCause::Ordinary)
+        );
+        STOP_REQUESTED.store(true, Ordering::Release);
+        assert_eq!(
+            requested_shutdown(now, now + Duration::from_secs(1)),
+            Some(ShutdownCause::Ordinary)
+        );
+        SUSPEND_REQUESTED.store(true, Ordering::Release);
+        assert_eq!(
+            requested_shutdown(now, now + Duration::from_secs(1)),
+            Some(ShutdownCause::SuspendPreparation)
+        );
+        STOP_REQUESTED.store(false, Ordering::Release);
+        SUSPEND_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn failed_containment_never_authorizes_suspend() {
+        assert_eq!(
+            completion_marker(Some(ShutdownCause::SuspendPreparation), false),
+            None
+        );
+        assert_eq!(
+            completion_marker(Some(ShutdownCause::SuspendPreparation), true),
+            Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
+        );
+        assert_eq!(completion_marker(None, true), None);
     }
 
     #[test]
