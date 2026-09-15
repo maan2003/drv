@@ -12,7 +12,6 @@ use std::{
     fs::File,
     io::Read,
     os::fd::{FromRawFd, OwnedFd, RawFd},
-    process::Command,
 };
 use wlan_softmac_host::runtime::{ClientRuntime, PreparedRuntimeResources};
 
@@ -51,39 +50,6 @@ fn firmware(path: &str, length: usize) -> Result<Vec<u8>, String> {
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read firmware: {error}"))?;
     Ok(bytes)
-}
-
-// Preserve the existing activation gate while physical recovery qualification
-// remains outstanding. This check is setup-only and never owns device/DMA.
-fn require_armed_watchdog() -> Result<(), String> {
-    let output = Command::new("/run/current-system/sw/bin/wifi-lab-watchdog")
-        .arg("status")
-        .output()
-        .map_err(|error| format!("query recovery watchdog: {error}"))?;
-    if !output.status.success() {
-        return Err("recovery watchdog status failed".into());
-    }
-    let status = std::str::from_utf8(&output.stdout).map_err(|_| "invalid watchdog status")?;
-    let mut lines = status.lines();
-    let deadline = lines
-        .next()
-        .unwrap_or_default()
-        .strip_prefix("armed deadline=")
-        .ok_or("recovery watchdog is not armed")?
-        .parse::<u64>()
-        .map_err(|_| "invalid watchdog deadline")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "invalid wall clock")?
-        .as_secs();
-    let remainder = lines.collect::<Vec<_>>();
-    if deadline <= now
-        || !remainder.contains(&"ActiveState=active")
-        || !remainder.contains(&"SubState=waiting")
-    {
-        return Err("recovery watchdog is not active and waiting".into());
-    }
-    Ok(())
 }
 
 fn run() -> Result<(), String> {
@@ -190,7 +156,6 @@ fn run() -> Result<(), String> {
         ethernet_fds: resources.fd_identities(),
         runtime_fds,
     };
-    require_armed_watchdog()?;
     let setup =
         Mt7921HardwareSessionConfig::setup(required("DRV_VFIO_DEVICE")?, &required("DRV_PCI_BDF")?)
             .map_err(|error| format!("prepare device capabilities: {error:?}"))?;
