@@ -15,6 +15,7 @@ pub(super) struct ObservedBss {
     pub bssid: [u8; 6],
     pub channel: CandidateChannel,
     pub beacon_period: u16,
+    dtim_period: Option<u8>,
     observed_at: Instant,
     basic_rates: u16,
     legacy_rates: u16,
@@ -36,6 +37,7 @@ impl ObservedBss {
             return None;
         }
         let mut rates = Vec::new();
+        let mut dtim_period = None;
         let mut ies = &bytes[36..];
         while !ies.is_empty() {
             let header = ies.get(..2)?;
@@ -45,6 +47,18 @@ impl ObservedBss {
                     return None;
                 }
                 rates.extend_from_slice(body);
+            }
+            if header[0] == 5 {
+                // TIM is beacon provenance, never an invented probe-response
+                // default. Count must be smaller than the advertised period.
+                if control & 0x00fc != 0x0080
+                    || body.len() < 4
+                    || body[1] == 0
+                    || body[0] >= body[1]
+                    || dtim_period.replace(body[1]).is_some()
+                {
+                    return None;
+                }
             }
             ies = &ies[2 + usize::from(header[1])..];
         }
@@ -75,6 +89,7 @@ impl ObservedBss {
         Some(Self {
             bssid,
             beacon_period,
+            dtim_period,
             observed_at: now,
             basic_rates,
             legacy_rates,
@@ -97,6 +112,36 @@ impl ObservedBss {
 
     pub fn fresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.observed_at) < Duration::from_secs(30)
+    }
+}
+
+/// Linux DECLARE_EWMA(rssi, 10, 8), retained for the selected interface.
+/// Only addressed authentication/association responses contribute, not scans.
+#[derive(Default)]
+pub(super) struct AssociationRssi(u32);
+
+impl AssociationRssi {
+    pub fn observe(&mut self, frame: &Connac2RxFrame, local: [u8; 6], peer: [u8; 6]) {
+        let bytes = &frame.bytes;
+        if bytes.len() < 24
+            || frame.rssi_dbm > 0
+            || !matches!(bytes[0] & 0xfc, 0xb0 | 0x10)
+            || bytes[4..10] != local
+            || bytes[10..16] != peer
+            || bytes[16..22] != peer
+        {
+            return;
+        }
+        let sample = u32::from(-i16::from(frame.rssi_dbm) as u16) << 10;
+        self.0 = if self.0 == 0 {
+            sample
+        } else {
+            (7 * self.0 + sample) >> 3
+        };
+    }
+
+    pub fn rcpi(&self) -> u8 {
+        (220 - 2 * (self.0 >> 10) as i16).clamp(0, 220) as u8
     }
 }
 
@@ -172,6 +217,230 @@ impl PeerJoin {
     }
 }
 
+/// Linux association activation: BSS/RLM, peer accounting reset, then
+/// associated STA and BSS callbacks. Completing this does not open the port.
+pub(super) struct PeerAssociation {
+    pub context: wlan_softmac_class_support::OperationContext,
+    pub qos: bool,
+    bss: FirmwareCommands,
+    clear: MacPreparation,
+    commands: FirmwareCommands,
+    pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
+}
+
+impl PeerAssociation {
+    pub fn new(
+        context: wlan_softmac_class_support::OperationContext,
+        bss: &ObservedBss,
+        rcpi: u8,
+        configuration: wlan_softmac_class_support::WlanAssociationConfig,
+        reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
+    ) -> Result<Self, zx::Status> {
+        use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, WlanBand};
+        use mt7921_core::*;
+        let band = if bss.channel.band == PhysicalBand::Ghz2 {
+            0
+        } else {
+            1
+        };
+        let primary = configuration.primary.ok_or(zx::Status::INVALID_ARGS)?;
+        let expected_band = if band == 0 {
+            WlanBand::TwoGhz
+        } else {
+            WlanBand::FiveGhz
+        };
+        if configuration.bssid != Some(bss.bssid)
+            || primary.band != expected_band
+            || u16::from(primary.number) != bss.channel.number
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        if configuration.bandwidth != Some(ChannelBandwidth::Cbw20)
+            || configuration.ht_cap.is_some()
+            || configuration.vht_cap.is_some()
+        {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        let secondary = configuration
+            .vht_secondary_80_channel
+            .ok_or(zx::Status::INVALID_ARGS)?;
+        if secondary.band != primary.band || secondary.number != 0 {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let qos = configuration.qos.ok_or(zx::Status::INVALID_ARGS)?;
+        if qos != configuration.wmm_params.is_some() {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let rates = configuration.rates.ok_or(zx::Status::INVALID_ARGS)?;
+        if rates
+            .iter()
+            .any(|rate| !OFDM_RATES.contains(&(rate & 0x7f)))
+        {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        let (basic_rates, legacy_rates) = linux_legacy_rate_context_reference(band, &rates)
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+        let aid = configuration.aid.ok_or(zx::Status::INVALID_ARGS)?;
+        let dtim = bss.dtim_period.ok_or(zx::Status::BAD_STATE)?;
+        let encode = |result: Result<Vec<u8>, String>| result.map_err(|_| zx::Status::INVALID_ARGS);
+        let bss_commands = [
+            (
+                encode(encode_client_bss_command(
+                    1,
+                    0,
+                    bss.bssid,
+                    bss.channel.number,
+                    bss.beacon_period,
+                    dtim,
+                    qos,
+                    true,
+                ))?,
+                RadioResponse::Unified(2),
+            ),
+            (
+                encode(encode_client_post_assoc_rlm_command(
+                    1,
+                    0,
+                    ClientPhysicalChannel {
+                        band,
+                        primary: bss.channel.number,
+                        center: bss.channel.number,
+                        center2: 0,
+                        bandwidth: 0,
+                    },
+                ))?,
+                RadioResponse::Unified(2),
+            ),
+        ];
+        let mut commands = std::collections::VecDeque::from([(
+            encode(encode_legacy_wme_add_wcid_command(
+                1,
+                0,
+                1,
+                aid,
+                bss.bssid,
+                rcpi,
+                basic_rates,
+                legacy_rates,
+                None,
+                None,
+                0,
+                band,
+                qos,
+            ))?,
+            RadioResponse::Unified(3),
+        )]);
+        if let Some(wmm) = configuration.wmm_params {
+            let mut ac = [ClientEdcaAc {
+                cw_min: 0,
+                cw_max: 0,
+                txop: 0,
+                aifs: 0,
+                acm: false,
+            }; 4];
+            for (output, input) in ac.iter_mut().zip([
+                wmm.ac_vo_params,
+                wmm.ac_vi_params,
+                wmm.ac_be_params,
+                wmm.ac_bk_params,
+            ]) {
+                if input.ecw_min > 15 || input.ecw_max > 15 || input.ecw_min > input.ecw_max {
+                    return Err(zx::Status::INVALID_ARGS);
+                }
+                *output = ClientEdcaAc {
+                    cw_min: (1u16 << input.ecw_min) - 1,
+                    cw_max: (1u16 << input.ecw_max) - 1,
+                    txop: input.txop_limit,
+                    aifs: u16::from(input.aifsn),
+                    acm: input.acm,
+                };
+            }
+            commands.push_back((
+                encode(encode_client_edca_command(
+                    1,
+                    0,
+                    ClientEdcaParameters { ac },
+                ))?,
+                RadioResponse::None,
+            ));
+        }
+        commands.extend([
+            (
+                encode(encode_client_post_assoc_power_state_command(1, 0, 0))?,
+                RadioResponse::Unified(2),
+            ),
+            (
+                encode(encode_client_post_assoc_interface_wcid_command(
+                    1, 0, bss.bssid,
+                ))?,
+                RadioResponse::Unified(3),
+            ),
+            (
+                encode(encode_client_post_assoc_beacon_timing_command(
+                    1,
+                    0,
+                    bss.beacon_period,
+                    dtim,
+                ))?,
+                RadioResponse::Unified(2),
+            ),
+            (
+                encode(encode_client_post_assoc_rx_filter_command(1))?,
+                RadioResponse::None,
+            ),
+        ]);
+        Ok(Self {
+            context,
+            qos,
+            bss: FirmwareCommands::new(bss_commands.into()),
+            clear: MacPreparation::for_wcid(1),
+            commands: FirmwareCommands::new(commands),
+            reply: Some(reply),
+        })
+    }
+
+    pub fn complete(&self) -> bool {
+        self.bss.ready() && self.clear.complete() && self.commands.ready()
+    }
+
+    /// Called only after the management owner relinquishes its MCU/ROC work.
+    pub fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        management: &crate::transmit::ManagementTx,
+        start: Instant,
+        now: Instant,
+    ) -> Result<bool, zx::Status> {
+        self.context.check(now)?;
+        if !management.idle() {
+            return Ok(false);
+        }
+        if !self.bss.ready() {
+            return self.bss.drive(
+                resources,
+                mechanics,
+                receive,
+                start,
+                now,
+                Some(&self.context),
+            );
+        }
+        if !self.clear.complete() {
+            return self.clear.drive(&resources.bar0, now);
+        }
+        self.commands.drive(
+            resources,
+            mechanics,
+            receive,
+            start,
+            now,
+            Some(&self.context),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,12 +457,263 @@ mod tests {
         bytes[32..34].copy_from_slice(&100u16.to_le_bytes());
         bytes[34] = 1;
         bytes.extend_from_slice(&[1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108]);
+        bytes.extend_from_slice(&[5, 4, 0, 2, 0, 0]);
         Connac2RxFrame {
             bytes,
             band: PhysicalBand::Ghz5,
             channel: 149,
             rssi_dbm: -60,
             pn: None,
+        }
+    }
+
+    fn association_configuration() -> wlan_softmac_class_support::WlanAssociationConfig {
+        use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand};
+        wlan_softmac_class_support::WlanAssociationConfig {
+            bssid: Some([2, 3, 4, 5, 6, 7]),
+            aid: Some(42),
+            qos: Some(false),
+            primary: Some(ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 149,
+            }),
+            bandwidth: Some(ChannelBandwidth::Cbw20),
+            vht_secondary_80_channel: Some(ChannelNumber {
+                band: WlanBand::FiveGhz,
+                number: 0,
+            }),
+            rates: Some(vec![0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn association_rssi_uses_addressed_authentication_history_not_beacons() {
+        let local = [2, 7, 6, 5, 4, 3];
+        let peer = [2, 3, 4, 5, 6, 7];
+        let mut rssi = AssociationRssi::default();
+        let mut frame = advertisement();
+        rssi.observe(&frame, local, peer);
+        assert_eq!(rssi.rcpi(), 220);
+        frame.bytes[0] = 0xb0;
+        rssi.observe(&frame, local, peer); // broadcast destination
+        assert_eq!(rssi.rcpi(), 220);
+        frame.bytes[4..10].copy_from_slice(&local);
+        rssi.observe(&frame, local, peer); // -60 dBm
+        assert_eq!(rssi.rcpi(), 100);
+        frame.bytes[0] = 0x10;
+        frame.rssi_dbm = -68;
+        rssi.observe(&frame, local, peer); // (7*60 + 68)/8 = 61
+        assert_eq!(rssi.rcpi(), 98);
+        frame.rssi_dbm = 1;
+        rssi.observe(&frame, local, peer);
+        assert_eq!(rssi.rcpi(), 98);
+        frame.rssi_dbm = -100;
+        frame.bytes[10] ^= 2;
+        rssi.observe(&frame, local, peer);
+        assert_eq!(rssi.rcpi(), 98);
+    }
+
+    #[test]
+    fn association_requires_selected_bss_timing_and_supported_negotiation() {
+        let now = Instant::now();
+        for invalid in 0..5 {
+            let mut bss = ObservedBss::from_rx(&advertisement(), now).unwrap();
+            assert_eq!(bss.dtim_period, Some(2));
+            let mut configuration = association_configuration();
+            match invalid {
+                0 => bss.dtim_period = None,
+                1 => configuration.bssid = Some([2; 6]),
+                2 => configuration.aid = Some(0),
+                3 => configuration.qos = Some(true), // no WMM parameters
+                _ => configuration.rates = Some(vec![0x82]), // not our advertised OFDM rates
+            }
+            let (reply, _) = futures_channel::oneshot::channel();
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(1),
+            );
+            assert!(PeerAssociation::new(context, &bss, 100, configuration, reply).is_err());
+        }
+        let mut frame = advertisement();
+        let period = frame.bytes.len() - 3;
+        frame.bytes[period] = 0;
+        assert!(ObservedBss::from_rx(&frame, now).is_none());
+    }
+
+    #[test]
+    fn association_orders_firmware_phases_and_requires_ack_plus_dma_consumption() {
+        for (qos, reject_sta) in [(false, false), (true, false), (true, true)] {
+            let (device, log, model) =
+                DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+            let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+            resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+            let now = Instant::now();
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
+            let bss = ObservedBss::from_rx(&advertisement(), now).unwrap();
+            let mut configuration = association_configuration();
+            if qos {
+                configuration.qos = Some(true);
+                let ac = fidl_fuchsia_wlan_driver::WlanWmmAccessCategoryParameters {
+                    ecw_min: 3,
+                    ecw_max: 4,
+                    aifsn: 2,
+                    txop_limit: 0,
+                    acm: false,
+                };
+                configuration.wmm_params = Some(fidl_fuchsia_wlan_driver::WlanWmmParameters {
+                    apsd: false,
+                    ac_vo_params: ac,
+                    ac_vi_params: ac,
+                    ac_be_params: ac,
+                    ac_bk_params: ac,
+                });
+            }
+            let (reply, _receiver) = futures_channel::oneshot::channel();
+            let mut association =
+                PeerAssociation::new(context.clone(), &bss, 100, configuration, reply).unwrap();
+            let mut mechanics = LoaderMechanics::default();
+            let mut receive = crate::receive::RxRouting::default();
+            let mut busy = crate::transmit::ManagementTx::default();
+            let mut auth = vec![0; 30];
+            auth[0] = 0xb0;
+            auth[4..10].copy_from_slice(&bss.bssid);
+            busy.enqueue(context, &auth, 12, bss.channel).unwrap();
+            assert!(
+                !association
+                    .drive(
+                        &mut resources,
+                        &mut mechanics,
+                        &mut receive,
+                        &busy,
+                        now,
+                        now
+                    )
+                    .unwrap()
+            );
+            assert!(!log.borrow().iter().any(|op| matches!(
+                op,
+                Operation::WriteU32 {
+                    offset: 0xd4418,
+                    ..
+                }
+            )));
+            let idle = crate::transmit::ManagementTx::default();
+            let expected: &[Option<u8>] = if qos {
+                &[
+                    Some(2),
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(2),
+                    Some(3),
+                    Some(2),
+                    None,
+                ]
+            } else {
+                &[Some(2), Some(2), Some(3), Some(2), Some(3), Some(2), None]
+            };
+            let mut published = 0;
+            let mut rx_slot = 0usize;
+            let mut rejected = false;
+            for _ in 0..100 {
+                let result = association.drive(
+                    &mut resources,
+                    &mut mechanics,
+                    &mut receive,
+                    &idle,
+                    now,
+                    now,
+                );
+                if reject_sta && published == 3 {
+                    assert_eq!(result, Err(zx::Status::IO_DATA_INTEGRITY));
+                    rejected = true;
+                    break;
+                }
+                result.unwrap();
+                if association.complete() {
+                    break;
+                }
+                let Some(slot) = mechanics.active_command_slot() else {
+                    continue;
+                };
+                if usize::from(slot) != published {
+                    continue;
+                }
+                let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+                resources
+                    .dma
+                    .mcu_tx_ring
+                    .read(usize::from(slot) * DMA_DESCRIPTOR_LEN, &mut descriptor)
+                    .unwrap();
+                if let Some(cid) = expected[published] {
+                    let mut response = vec![0; 44];
+                    response[24..26].copy_from_slice(&20u16.to_le_bytes());
+                    response[28] = 1;
+                    response[29] = mechanics.sequence();
+                    response[36] = if reject_sta && published == 2 { 2 } else { cid };
+                    let address = resources
+                        .dma
+                        .mcu_rx_buffers
+                        .device_address(rx_slot * mt7921_core::MT7921_MCU_RX_BUFFER_BYTES)
+                        .unwrap()
+                        .bits();
+                    let rx = DmaDescriptor {
+                        buf0: address as u32,
+                        ctrl: (1 << 31) | (1 << 30) | (44 << 16),
+                        buf1: 0,
+                        info: 0,
+                    };
+                    model.write_dma(address, response);
+                    model.write_dma(
+                        resources
+                            .dma
+                            .mcu_rx_ring
+                            .device_address(rx_slot * DMA_DESCRIPTOR_LEN)
+                            .unwrap()
+                            .bits(),
+                        rx.to_le_bytes().to_vec(),
+                    );
+                    rx_slot += 1;
+                    association
+                        .drive(
+                            &mut resources,
+                            &mut mechanics,
+                            &mut receive,
+                            &idle,
+                            now,
+                            now,
+                        )
+                        .unwrap();
+                    assert_eq!(mechanics.active_command_slot(), Some(slot)); // ACK alone cannot reclaim
+                    assert!(!association.complete());
+                }
+                let control = u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) | (1 << 31);
+                descriptor[4..8].copy_from_slice(&control.to_le_bytes());
+                model.write_dma(
+                    resources
+                        .dma
+                        .mcu_tx_ring
+                        .device_address(usize::from(slot) * DMA_DESCRIPTOR_LEN)
+                        .unwrap()
+                        .bits(),
+                    descriptor.to_vec(),
+                );
+                resources
+                    .bar0
+                    .write_u32(0xd441c, u32::from(slot) + 1)
+                    .unwrap();
+                published += 1;
+            }
+            if reject_sta {
+                assert!(rejected);
+                assert!(!association.complete());
+            } else {
+                assert!(association.complete());
+                assert_eq!(published, expected.len());
+                assert_eq!(association.qos, qos);
+            }
         }
     }
 

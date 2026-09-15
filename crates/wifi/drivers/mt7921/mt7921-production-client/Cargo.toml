@@ -23,5 +23,6 @@ zeroize = "=1.8.2"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }
 
 [dev-dependencies]
+fidl-fuchsia-wlan-driver = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/sdk/fidl/fuchsia.wlan.driver" }
 wlan-softmac-class-support = { path = "../../../wlan-softmac-class-support", features = ["conformance"] }
 drv-hardware-backends = { path = "../../../../platform/hardware-backends" }

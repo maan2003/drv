@@ -10,11 +10,13 @@ been exercised with the assigned MT7921 inside KVM through the production CLI.
 Regulatory input is a hash-verified inherited database; the chip owner retains
 its immutable world-domain policy. Passive scan does not grant transmit
 authority. Bounded 20 MHz channel tuning and preauthentication peer setup are
-implemented and model-tested; neither has physical acceptance yet. Bounded
-unprotected management TX now waits for a matching firmware JOIN-ROC grant and
-retains DMA through descriptor, token and status completion; it has model coverage
-only. Active scan, scan cancellation, peer removal, key configuration,
-association completion, protected/data TX and MAC override remain unavailable. Earlier Internet
+implemented and have exercised authentication and association on the assigned
+radio through the production CLI in KVM. Bounded unprotected management TX
+waits for a matching firmware JOIN-ROC grant and retains DMA through descriptor,
+token and status completion. Non-HT 20 MHz association setup has reached EAPOL
+reception; the connection then fails because data TX remains unsupported.
+This is not WPA3/SAE or secure-link acceptance. Active scan, scan cancellation,
+peer removal, key configuration, protected/data TX and MAC override remain unavailable. Earlier Internet
 demonstrations used the retired implementation and are not acceptance of this
 replacement.
 

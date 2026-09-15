@@ -7,9 +7,10 @@ connectivity through Fuchsia WLAN components and separately sandboxed Netstack3.
 The current cutover removes that binary-local implementation: a typed driver
 owns hardware/DMA inside the MLME/SME process and its exact capability sandbox.
 Firmware initialization, passive scanning/RX and containment have been
-exercised with the assigned MT7921 inside KVM. Association, TX and Internet
-remain unimplemented in this owner; full physical acceptance remains
-outstanding. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
+exercised with the assigned MT7921 inside KVM. The replacement also reaches
+authentication, non-HT association setup and EAPOL reception through the
+production CLI. Key installation, data TX and Internet remain unavailable in
+this owner; secure-link and full physical acceptance remain outstanding. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
 mode; it remains a bring-up target, not production-ready.
 Legacy Wasm/WIT probes and Bluetooth scaffolding remain in the tree; they are
 not the production direction and are not extended by this architecture.

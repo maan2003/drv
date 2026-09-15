@@ -7890,8 +7890,7 @@ fn encode_client_edca_command_with_qos(
         return Err("client EDCA identity escaped the single station VIF".into());
     }
     if params.ac.iter().any(|ac| {
-        ac.cw_min == 0
-            || ac.cw_max < ac.cw_min
+        (if ac.cw_max == 0 { 10 } else { ac.cw_max }) < (if ac.cw_min == 0 { 5 } else { ac.cw_min })
             || ac.aifs == 0
             || ac.aifs > 15
             || ac.cw_max > 0x7fff
@@ -7905,11 +7904,21 @@ fn encode_client_edca_command_with_qos(
     for (ac, slot) in [3usize, 2, 0, 1].into_iter().enumerate() {
         let value = params.ac[ac];
         let offset = slot * 10;
-        payload[offset..offset + 2].copy_from_slice(&value.cw_min.to_le_bytes());
-        payload[offset + 2..offset + 4].copy_from_slice(&value.cw_max.to_le_bytes());
+        let cw_min = if value.cw_min == 0 {
+            5u16
+        } else {
+            value.cw_min
+        };
+        let cw_max = if value.cw_max == 0 {
+            10u16
+        } else {
+            value.cw_max
+        };
+        payload[offset..offset + 2].copy_from_slice(&cw_min.to_le_bytes());
+        payload[offset + 2..offset + 4].copy_from_slice(&cw_max.to_le_bytes());
         payload[offset + 4..offset + 6].copy_from_slice(&value.txop.to_le_bytes());
         payload[offset + 6..offset + 8].copy_from_slice(&value.aifs.to_le_bytes());
-        payload[offset + 9] = u8::from(value.acm);
+        // Linux leaves guardtime and ACM zero; admission control is host policy.
     }
     payload[40] = bss_index;
     payload[41] = u8::from(qos);
@@ -10778,6 +10787,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn edca_uses_linux_zero_window_fallbacks_and_leaves_acm_reserved() {
+        let command = encode_client_edca_command(
+            1,
+            0,
+            ClientEdcaParameters {
+                ac: [ClientEdcaAc {
+                    cw_min: 0,
+                    cw_max: 0,
+                    txop: 0,
+                    aifs: 2,
+                    acm: true,
+                }; 4],
+            },
+        )
+        .unwrap();
+        for ac in command[64..104].chunks_exact(10) {
+            assert_eq!(ac, &[5, 0, 10, 0, 0, 0, 2, 0, 0, 0]);
+        }
     }
 
     #[test]
