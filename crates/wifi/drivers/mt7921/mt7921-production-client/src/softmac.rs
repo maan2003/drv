@@ -132,9 +132,17 @@ impl ClientRuntimeDriver for Mt7921Driver {
                             .mac_address
                             .ok_or(zx::Status::BAD_STATE)?,
                         self.joined.as_ref().map(|bss| bss.bssid),
+                        &mut self.ptk,
+                        &mut self.gtk,
+                        &mut self.igtk,
+                        self.pmf,
                     ),
                     mt7921_core::McuRxRoute::TxFree(free) => self.tx.tx_free(free)?,
-                    mt7921_core::McuRxRoute::TxStatus(status) => self.tx.tx_status(status)?,
+                    mt7921_core::McuRxRoute::TxStatus(statuses) => {
+                        for status in statuses {
+                            self.tx.tx_status(status)?;
+                        }
+                    }
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
                         if let Ok(grant) = mt7921_core::parse_client_join_roc_grant(&bytes.bytes) {
                             self.tx.roc_grant(grant, std::time::Instant::now())?;
@@ -184,6 +192,35 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     self.peer_association = None;
                 }
             }
+            if let Some(installation) = self.key_installation.as_mut() {
+                progressed |= installation.drive(
+                    resources,
+                    &mut self.session.mcu.0,
+                    &mut self.session.receive,
+                    &self.tx,
+                    self.session.start,
+                    std::time::Instant::now(),
+                )?;
+                if installation.complete() {
+                    installation.context.check(std::time::Instant::now())?;
+                    let target = if installation.management {
+                        &mut self.igtk
+                    } else if installation.group {
+                        &mut self.gtk
+                    } else {
+                        &mut self.ptk
+                    };
+                    *target = installation.key.take();
+                    eprintln!(
+                        "mt7921_key_install stage=acknowledged group={} management={}",
+                        installation.group, installation.management
+                    );
+                    if let Some(reply) = installation.reply.take() {
+                        let _ = reply.send(Ok(()));
+                    }
+                    self.key_installation = None;
+                }
+            }
             Ok(progressed)
         })();
         if let Err(status) = result {
@@ -202,6 +239,11 @@ impl ClientRuntimeDriver for Mt7921Driver {
             {
                 let _ = reply.send(Err(status));
             }
+            if let Some(installation) = self.key_installation.as_mut()
+                && let Some(reply) = installation.reply.take()
+            {
+                let _ = reply.send(Err(status));
+            }
             self.current_channel = None;
             self.session.lifecycle = SessionLifecycle::Closing;
             self.upcalls = None;
@@ -210,11 +252,18 @@ impl ClientRuntimeDriver for Mt7921Driver {
     }
 
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
-        if up {
-            Err(zx::Status::NOT_SUPPORTED)
-        } else {
-            Ok(())
+        if up
+            && (self.associated_qos.is_none()
+                || self.ptk.is_none()
+                || self.gtk.is_none()
+                || self.igtk.is_none()
+                || self.key_installation.is_some()
+                || self.session.lifecycle != SessionLifecycle::ProtocolStarted)
+        {
+            return Err(zx::Status::BAD_STATE);
         }
+        self.controlled_port_open = up;
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), zx::Status> {
@@ -287,7 +336,17 @@ impl WlanSoftmac for Mt7921Driver {
         Ok(Default::default())
     }
     fn query_security_support(&mut self) -> Result<SecuritySupport, zx::Status> {
-        Ok(Default::default())
+        Ok(SecuritySupport {
+            sae: Some(fidl_fuchsia_wlan_common::SaeFeature {
+                driver_handler_supported: Some(false),
+                sme_handler_supported: Some(true),
+                hash_to_element_supported: Some(false),
+            }),
+            mfp: Some(fidl_fuchsia_wlan_common::MfpFeature {
+                supported: Some(true),
+            }),
+            owe: None,
+        })
     }
     fn query_spectrum_management_support(
         &mut self,
@@ -400,12 +459,58 @@ impl WlanSoftmac for Mt7921Driver {
     fn install_key(
         &mut self,
         context: wlan_softmac_class_support::OperationContext,
-        _: WlanKeyConfiguration,
+        mut configuration: WlanKeyConfiguration,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        if let Err(status) = context.check(std::time::Instant::now()) {
-            return std::future::ready(Err(status));
-        }
-        std::future::ready(Err(zx::Status::NOT_SUPPORTED))
+        // Cover validation failures as well as successful firmware publication.
+        let bytes = zeroize::Zeroizing::new(configuration.key.take().unwrap_or_default());
+        let result = (|| {
+            context.check(std::time::Instant::now())?;
+            if self.session.lifecycle != SessionLifecycle::ProtocolStarted
+                || self.associated_qos.is_none()
+            {
+                return Err(zx::Status::BAD_STATE);
+            }
+            if self.key_installation.is_some() || self.peer_association.is_some() {
+                return Err(zx::Status::SHOULD_WAIT);
+            }
+            let bss = self.joined.as_ref().ok_or(zx::Status::BAD_STATE)?;
+            let (reply, receiver) = futures_channel::oneshot::channel();
+            let installation = crate::peer::KeyInstallation::new(
+                context,
+                bss.bssid,
+                configuration,
+                bytes,
+                self.gtk.as_ref(),
+                reply,
+            )?;
+            let installed = if installation.management {
+                self.igtk.as_ref()
+            } else if installation.group {
+                self.gtk.as_ref()
+            } else {
+                self.ptk.as_ref()
+            };
+            if let Some(installed) = installed {
+                let requested = installation
+                    .key
+                    .as_ref()
+                    .expect("new installation owns key");
+                // Do not reset firmware TX PN or host replay counters on a
+                // retransmitted handshake, including one changing only key ID.
+                if installed.bytes.as_slice() == requested.bytes.as_slice() {
+                    if installed.index != requested.index {
+                        return Err(zx::Status::INVALID_ARGS);
+                    }
+                    if let Some(reply) = installation.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    return Ok(receiver);
+                }
+            }
+            self.key_installation = Some(installation);
+            Ok(receiver)
+        })();
+        async move { result?.await.unwrap_or(Err(zx::Status::CANCELED)) }
     }
     fn notify_association_complete(
         &mut self,
@@ -568,6 +673,7 @@ impl WlanSoftmac for Mt7921Driver {
             || self.channel_change.is_some()
             || self.peer_join.is_some()
             || self.peer_association.is_some()
+            || self.key_installation.is_some()
         {
             return Err(zx::Status::SHOULD_WAIT);
         }
@@ -577,27 +683,42 @@ impl WlanSoftmac for Mt7921Driver {
             .nic_capability
             .mac_address
             .ok_or(zx::Status::BAD_STATE)?;
+        if bytes.first() == Some(&0) {
+            self.pmf = crate::security::association_pmf(bytes)?;
+        }
+        let data = bytes.first().is_some_and(|fc| fc & 0x0c == 8);
+        let protected = flags.contains(WlanTxInfoFlags::PROTECTED)
+            || bytes.get(1).is_some_and(|fc| fc & 0x40 != 0);
         if self.current_channel != Some(peer.channel)
             || bytes.get(4..10) != Some(peer.bssid.as_slice())
             || bytes.get(10..16) != Some(local.as_slice())
-            || bytes.get(16..22) != Some(peer.bssid.as_slice())
+            || (!data && bytes.get(16..22) != Some(peer.bssid.as_slice()))
         {
             return Err(zx::Status::INVALID_ARGS);
         }
-        if flags.contains(WlanTxInfoFlags::PROTECTED) {
-            return Err(zx::Status::NOT_SUPPORTED);
+        if protected && (self.ptk.is_none() || (data && !self.controlled_port_open)) {
+            return Err(zx::Status::BAD_STATE);
         }
-        if bytes.first().is_some_and(|fc| fc & 0x0c == 8) {
+        if data {
             if self.associated_qos.is_none() {
                 return Err(zx::Status::BAD_STATE);
             }
-            eprintln!(
-                "mt7921_control_port_tx stage=admission bytes={}",
-                bytes.len()
-            );
+            if !protected {
+                eprintln!(
+                    "mt7921_control_port_tx stage=admission bytes={}",
+                    bytes.len()
+                );
+            }
         }
-        self.tx
-            .enqueue(context, bytes, peer.management_rate(), peer.channel)
+        if protected {
+            let mut frame = zeroize::Zeroizing::new(bytes.to_vec());
+            frame[1] |= 0x40;
+            self.tx
+                .enqueue(context, &frame, peer.management_rate(), peer.channel)
+        } else {
+            self.tx
+                .enqueue(context, bytes, peer.management_rate(), peer.channel)
+        }
     }
 }
 
@@ -646,12 +767,19 @@ fn deliver_raw_rx(
     rssi: &mut crate::peer::AssociationRssi,
     local: [u8; 6],
     peer: Option<[u8; 6]>,
+    ptk: &mut Option<crate::peer::ClientKey>,
+    gtk: &mut Option<crate::peer::ClientKey>,
+    igtk: &mut Option<crate::peer::ClientKey>,
+    pmf: bool,
 ) {
     use fidl_fuchsia_wlan_ieee80211::{ChannelBandwidth, ChannelNumber, WlanBand, WlanPhyType};
     use fidl_fuchsia_wlan_softmac::{WlanRxInfoFlags, WlanRxInfoValid};
-    let Ok(frame) = mt7921_core::parse_connac2_rx_frame(bytes) else {
+    let Ok(mut frame) = mt7921_core::parse_connac2_rx_frame(bytes) else {
         return;
     };
+    if !crate::security::accept_rx(bytes, &mut frame, local, peer, ptk, gtk, igtk, pmf) {
+        return;
+    }
     if let Some(peer) = peer {
         rssi.observe(&frame, local, peer);
     }
@@ -721,6 +849,10 @@ mod tests {
             &mut Default::default(),
             [0; 6],
             None,
+            &mut None,
+            &mut None,
+            &mut None,
+            false,
         );
         assert_eq!(upcalls.0.len(), 1);
         let (frame, info) = &upcalls.0[0];
@@ -743,6 +875,10 @@ mod tests {
             &mut Default::default(),
             [0; 6],
             None,
+            &mut None,
+            &mut None,
+            &mut None,
+            false,
         );
         deliver_raw_rx(
             &mut upcalls,
@@ -751,6 +887,10 @@ mod tests {
             &mut Default::default(),
             [0; 6],
             None,
+            &mut None,
+            &mut None,
+            &mut None,
+            false,
         );
         assert_eq!(upcalls.0.len(), 1);
     }

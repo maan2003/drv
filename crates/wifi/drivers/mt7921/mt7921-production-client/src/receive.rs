@@ -558,11 +558,11 @@ mod tests {
                 pair_word: Some(0x8004c000),
                 info_word: 1,
             }),
-            McuRxRoute::TxStatus(mt7921_core::Mt7921TxStatus {
+            McuRxRoute::TxStatus(vec![mt7921_core::Mt7921TxStatus {
                 wcid: 7,
                 pid: 9,
                 acked: true,
-            }),
+            }]),
             McuRxRoute::Firmware(response.clone()),
         ];
         for (slot, event) in events.iter().enumerate() {

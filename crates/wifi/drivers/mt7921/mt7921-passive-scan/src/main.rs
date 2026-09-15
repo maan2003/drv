@@ -161,6 +161,10 @@ fn run() -> Result<(), String> {
         },
     )
     .map_err(|error| format!("verify firmware: {error:?}"))?;
+    // BoringSSL explicitly separates its CPU/RNG/fork-detection setup from
+    // sandboxed use. SAE must not lazily probe madvise(-1)/WIPEONFORK after
+    // lockdown. This initializes no protocol keys and broadens no authority.
+    unsafe { bssl_sys::CRYPTO_pre_sandbox_init() };
     let before = linux_self_sandbox::open_fd_snapshot().map_err(|error| error.to_string())?;
     let executor = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -213,12 +217,25 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        let security = wlan_softmac_host::WlanSoftmac::query_security_support(&mut driver)
+            .map_err(|error| error.to_string())?;
+        let spectrum =
+            wlan_softmac_host::WlanSoftmac::query_spectrum_management_support(&mut driver)
+                .map_err(|error| error.to_string())?;
+        let mut sme_config = wlan_sme::client::ClientConfig::default();
+        sme_config.wpa3_supported = security.mfp.as_ref().and_then(|mfp| mfp.supported)
+            == Some(true)
+            && security
+                .sae
+                .as_ref()
+                .and_then(|sae| sae.sme_handler_supported)
+                == Some(true);
         let runtime = ClientRuntime::new_with_prepared_resources(
             driver,
-            wlan_sme::client::ClientConfig::default(),
+            sme_config,
             device_info,
-            Default::default(),
-            Default::default(),
+            security,
+            spectrum,
             fuchsia_inspect::Inspector::default(),
             resources,
         )

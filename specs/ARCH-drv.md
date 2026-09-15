@@ -2,16 +2,14 @@
 
 ## Status
 
-MT7921 previously demonstrated userspace Wi-Fi association and Internet
-connectivity through Fuchsia WLAN components and separately sandboxed Netstack3.
-The current cutover removes that binary-local implementation: a typed driver
-owns hardware/DMA inside the MLME/SME process and its exact capability sandbox.
-Firmware initialization, passive scanning/RX and containment have been
-exercised with the assigned MT7921 inside KVM. The replacement also reaches
-authentication, non-HT association setup and EAPOL reception through the
-production CLI. Key installation, data TX and Internet remain unavailable in
-this owner; secure-link and full physical acceptance remain outstanding. Redwood WCN6750 has also proved Internet connectivity in its operator diagnostic
-mode; it remains a bring-up target, not production-ready.
+MT7921's typed hardware/DMA owner now demonstrates WPA3 SAE association,
+PTK/GTK/IGTK installation and protected traffic through the production CLI,
+same-process Fuchsia MLME/SME and separately sandboxed Netstack3. Physical KVM
+validation with kernel Internet disabled has exercised DHCP, encrypted DNS,
+verified HTTPS content and safe hardware shutdown/native-driver restoration.
+This establishes the replacement's Internet path, not everyday production
+readiness. Redwood WCN6750 has also proved Internet connectivity in its operator
+diagnostic mode; it remains a bring-up target, not production-ready.
 Legacy Wasm/WIT probes and Bluetooth scaffolding remain in the tree; they are
 not the production direction and are not extended by this architecture.
 

@@ -57,7 +57,7 @@ mod mcu_rx {
     pub enum McuRxRoute {
         Normal(Vec<u8>),
         TxFree(Mt7921TxFree),
-        TxStatus(Mt7921TxStatus),
+        TxStatus(Vec<Mt7921TxStatus>),
         Firmware(FirmwareRx),
     }
 
@@ -399,7 +399,7 @@ mod mcu_rx {
                 .map_err(|_| error(ring, slot, control, McuRxParserKind::TxFree));
         }
         if packet_type == 0 && length >= 40 && (rxd0 & 0xffff) as usize == length {
-            return parse_mt7921_tx_status(bytes)
+            return super::parse_mt7921_tx_status_batch(bytes)
                 .map(McuRxRoute::TxStatus)
                 .map_err(|_| error(ring, slot, control, McuRxParserKind::TxStatus));
         }
@@ -6983,7 +6983,31 @@ pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCo
     let bytes = bytes
         .get(..reported_len)
         .ok_or(Mt7921TxCompletionError::Truncated)?;
-    let txs = bytes.get(8..40).ok_or(Mt7921TxCompletionError::Truncated)?;
+    parse_tx_status_record(&bytes[8..40])
+}
+
+/// Firmware batches 32-byte status records after one eight-byte envelope.
+pub fn parse_mt7921_tx_status_batch(
+    bytes: &[u8],
+) -> Result<Vec<Mt7921TxStatus>, Mt7921TxCompletionError> {
+    let header = bytes.get(..8).ok_or(Mt7921TxCompletionError::Truncated)?;
+    if mt7921_packet_type(bytes) != Some(0) {
+        return Err(Mt7921TxCompletionError::WrongPacketType);
+    }
+    let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
+    if !(40..=2048).contains(&length) || (length - 8) % 32 != 0 {
+        return Err(Mt7921TxCompletionError::InvalidFormat);
+    }
+    let records = bytes
+        .get(8..length)
+        .ok_or(Mt7921TxCompletionError::Truncated)?;
+    records
+        .chunks_exact(32)
+        .map(parse_tx_status_record)
+        .collect()
+}
+
+fn parse_tx_status_record(txs: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCompletionError> {
     let dword = |index: usize| {
         u32::from_le_bytes(
             txs[index * 4..index * 4 + 4]
@@ -7004,7 +7028,6 @@ pub fn parse_mt7921_tx_status(bytes: &[u8]) -> Result<Mt7921TxStatus, Mt7921TxCo
         acked: dword(0) & (0x7 << 16) == 0,
     })
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mt7921AuthRx {
     pub receiver: [u8; 6],

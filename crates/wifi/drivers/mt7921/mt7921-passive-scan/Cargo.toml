@@ -9,6 +9,7 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+bssl-sys = { path = "../../../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/third_party/boringssl/rust/bssl-sys" }
 tokio = { version = "=1.52.3", features = ["rt", "net", "time"] }
 libc = "=0.2.189"
 linux-self-sandbox = { path = "../../../../platform/linux-self-sandbox" }

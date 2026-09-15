@@ -17,6 +17,7 @@ mod receive;
 pub use receive::ReceivedEvent;
 mod peer;
 mod radio;
+mod security;
 mod setup_inputs;
 mod softmac;
 mod transmit;
@@ -968,6 +969,12 @@ pub struct Mt7921Driver {
     joined: Option<peer::ObservedBss>,
     peer_association: Option<peer::PeerAssociation>,
     associated_qos: Option<bool>,
+    key_installation: Option<peer::KeyInstallation>,
+    ptk: Option<peer::ClientKey>,
+    gtk: Option<peer::ClientKey>,
+    igtk: Option<peer::ClientKey>,
+    controlled_port_open: bool,
+    pmf: bool,
     association_rssi: peer::AssociationRssi,
     tx: transmit::ClientTx,
     next_scan_id: u64,
@@ -1032,6 +1039,12 @@ impl Mt7921Driver {
                     joined: None,
                     peer_association: None,
                     associated_qos: None,
+                    key_installation: None,
+                    ptk: None,
+                    gtk: None,
+                    igtk: None,
+                    controlled_port_open: false,
+                    pmf: false,
                     association_rssi: Default::default(),
                     tx: transmit::ClientTx::default(),
                     next_scan_id: 1,

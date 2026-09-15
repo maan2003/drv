@@ -11,14 +11,17 @@ Regulatory input is a hash-verified inherited database; the chip owner retains
 its immutable world-domain policy. Passive scan does not grant transmit
 authority. Bounded 20 MHz channel tuning and preauthentication peer setup are
 implemented and have exercised authentication and association on the assigned
-radio through the production CLI in KVM. Bounded unprotected management TX
-waits for a matching firmware JOIN-ROC grant and retains DMA through descriptor,
-token and status completion. Non-HT 20 MHz association setup has reached EAPOL
-reception; the connection then fails because data TX remains unsupported.
-This is not WPA3/SAE or secure-link acceptance. Active scan, scan cancellation,
-peer removal, key configuration, protected/data TX and MAC override remain unavailable. Earlier Internet
-demonstrations used the retired implementation and are not acceptance of this
-replacement.
+radio through the production CLI in KVM. Bounded management TX waits for a
+matching firmware JOIN-ROC grant. DMA reuse requires returned descriptors and
+firmware tokens; missing acknowledgment reports expire without claiming an ACK,
+and their PIDs remain retired until reset. The owner installs PTK/GTK/IGTK through
+acknowledged firmware commands, enforces receive integrity/replay checks and
+gates protected data on the controlled port. Physical validation has exercised
+WPA3 SAE, DHCP, encrypted DNS and HTTPS through separately sandboxed Netstack3
+with kernel Internet disabled, followed by safe hardware shutdown and native
+restoration. Active scan, scan cancellation, peer removal and MAC override
+remain unavailable; sustained operation, reconnect and power-management
+acceptance remain separate from this bounded Internet proof.
 
 The policy daemon owns persistence and network intent, and drives the pinned
 Fuchsia selector/state machine over bounded, fd-free control IPC. Application

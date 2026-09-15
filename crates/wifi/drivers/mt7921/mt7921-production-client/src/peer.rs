@@ -441,6 +441,139 @@ impl PeerAssociation {
     }
 }
 
+/// Host replay state and secret material are scoped to this association.
+/// GTK bytes are also needed by the firmware's combined GTK/IGTK update.
+pub(super) struct ClientKey {
+    pub index: u8,
+    pub bytes: zeroize::Zeroizing<Vec<u8>>,
+    pub rx_pn: [u64; 16],
+    pub management_rx_pn: u64,
+}
+
+pub(super) struct KeyInstallation {
+    pub context: wlan_softmac_class_support::OperationContext,
+    pub group: bool,
+    pub management: bool,
+    pub key: Option<ClientKey>,
+    commands: FirmwareCommands,
+    pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
+}
+
+impl KeyInstallation {
+    pub fn new(
+        context: wlan_softmac_class_support::OperationContext,
+        bssid: [u8; 6],
+        configuration: wlan_softmac_class_support::WlanKeyConfiguration,
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+        gtk: Option<&ClientKey>,
+        reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
+    ) -> Result<Self, zx::Status> {
+        use fidl_fuchsia_wlan_ieee80211::KeyType;
+        use fidl_fuchsia_wlan_softmac::WlanProtection;
+        context.check(Instant::now())?;
+        let management = configuration.key_type == Some(KeyType::Igtk);
+        if configuration.cipher_oui != Some([0, 0x0f, 0xac])
+            || configuration.cipher_type != Some(if management { 6 } else { 4 })
+            || configuration.protection != Some(WlanProtection::RxTx)
+        {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        let index = configuration.key_idx.ok_or(zx::Status::INVALID_ARGS)?;
+        let group = match configuration.key_type {
+            Some(KeyType::Pairwise) if index == 0 && configuration.peer_addr == Some(bssid) => {
+                false
+            }
+            Some(KeyType::Group) if index <= 3 && configuration.peer_addr == Some([0xff; 6]) => {
+                true
+            }
+            Some(KeyType::Igtk)
+                if matches!(index, 4 | 5) && configuration.peer_addr == Some([0xff; 6]) =>
+            {
+                true
+            }
+            _ => return Err(zx::Status::INVALID_ARGS),
+        };
+        let rsc = configuration.rsc.ok_or(zx::Status::INVALID_ARGS)?;
+        // SME's GTK RSC preserves the EAPOL octets in a big-endian u64;
+        // CCMP's packet number has little-endian wire order.
+        let pn = if management {
+            let wire = rsc.to_be_bytes();
+            if wire[..2] != [0; 2] {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let mut ipn = [0; 8];
+            ipn[..6].copy_from_slice(&wire[2..]);
+            u64::from_le_bytes(ipn)
+        } else if group {
+            u64::from_le_bytes(rsc.to_be_bytes())
+        } else {
+            rsc
+        };
+        if bytes.len() != 16 || pn > 0x0000_ffff_ffff_ffff {
+            return Err(zx::Status::INVALID_ARGS);
+        }
+        // Linux selects the peer WCID for PTK and the VIF WCID for GTK.
+        let command = mt7921_core::encode_key_v2_command(
+            1,
+            0,
+            if group { 19 } else { 1 },
+            if group { 0x0e } else { 0 },
+            index,
+            &bytes,
+            if management {
+                let gtk = gtk.ok_or(zx::Status::BAD_STATE)?;
+                Some((gtk.index, gtk.bytes.as_slice()))
+            } else {
+                None
+            },
+        )
+        .map_err(|_| zx::Status::INVALID_ARGS)?;
+        Ok(Self {
+            context,
+            group,
+            management,
+            key: Some(ClientKey {
+                index,
+                bytes,
+                rx_pn: [pn; 16],
+                management_rx_pn: pn,
+            }),
+            commands: FirmwareCommands::new(
+                [(command.as_bytes().to_vec(), RadioResponse::Unified(3))].into(),
+            ),
+            reply: Some(reply),
+        })
+    }
+
+    pub fn complete(&self) -> bool {
+        self.commands.ready()
+    }
+
+    pub fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        tx: &crate::transmit::ClientTx,
+        start: Instant,
+        now: Instant,
+    ) -> Result<bool, zx::Status> {
+        self.context.check(now)?;
+        // Finish the unprotected handshake TX before switching its key state.
+        if !tx.idle() {
+            return Ok(false);
+        }
+        self.commands.drive(
+            resources,
+            mechanics,
+            receive,
+            start,
+            now,
+            Some(&self.context),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

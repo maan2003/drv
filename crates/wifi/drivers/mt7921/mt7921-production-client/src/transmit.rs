@@ -19,6 +19,8 @@ struct QueuedFrame {
     context: OperationContext,
     bytes: zeroize::Zeroizing<Vec<u8>>,
     control_port: bool,
+    data: bool,
+    tid: u8,
     rate: u8,
     channel: mt7921_core::CandidateChannel,
 }
@@ -62,6 +64,7 @@ pub(super) struct ClientTx {
     producer: u16,
     next_token: u16,
     next_pid: u8,
+    retired_pids: [bool; 127],
     failed: bool,
     roc: Option<Roc>,
     next_roc_token: u8,
@@ -75,6 +78,7 @@ impl Default for ClientTx {
             producer: 0,
             next_token: 0,
             next_pid: 3,
+            retired_pids: [false; 127],
             failed: false,
             roc: None,
             next_roc_token: 1,
@@ -116,26 +120,48 @@ impl ClientTx {
         {
             return Err(zx::Status::NOT_SUPPORTED);
         }
-        let control_port = matches!(bytes[0], 0x08 | 0x88);
-        if control_port {
+        let data = matches!(bytes[0], 0x08 | 0x88);
+        let header = if bytes[0] == 0x88 { 26 } else { 24 };
+        let control_port =
+            data && bytes.get(header..header + 8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
+        if data {
             let header = if bytes[0] == 0x88 { 26 } else { 24 };
-            if bytes[1] & !0x08 != 1
-                || bytes.get(header..header + 8) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
-                || bytes.len() < header + 12
+            if bytes[1] & !(0x08 | 0x40) != 1
+                || (!control_port && bytes[1] & 0x40 == 0)
+                || (control_port && bytes[1] & 0x40 != 0)
+                || bytes.len() < header + 8
                 || (header == 26 && u16::from_le_bytes([bytes[24], bytes[25]]) > 7)
             {
                 return Err(zx::Status::NOT_SUPPORTED);
             }
-        } else if !matches!(bytes[0], 0x00 | 0xb0 | 0xa0 | 0xc0) || bytes[1] & !0x08 != 0 {
+        } else if !matches!(bytes[0], 0x00 | 0xb0 | 0xa0 | 0xc0 | 0xd0)
+            || bytes[1] & !(0x08 | 0x40) != 0
+            || (bytes[1] & 0x40 != 0 && !matches!(bytes[0], 0xa0 | 0xc0 | 0xd0))
+        {
             return Err(zx::Status::NOT_SUPPORTED);
         }
         if bytes[0] == 0xb0 && bytes.len() < 30 || bytes[0] == 0 && bytes.len() < 28 {
             return Err(zx::Status::INVALID_ARGS);
         }
+        let tid = if data && header == 26 {
+            bytes[24] & 7
+        } else if control_port {
+            7
+        } else {
+            0
+        };
+        let bytes = if data && !control_port {
+            mt7921_core::client_data_mpdu_to_ethernet(bytes)
+                .map_err(|_| zx::Status::INVALID_ARGS)?
+        } else {
+            bytes.to_vec()
+        };
         self.queue.push_back(QueuedFrame {
             context,
-            bytes: zeroize::Zeroizing::new(bytes.to_vec()),
+            bytes: zeroize::Zeroizing::new(bytes),
             control_port,
+            data,
+            tid,
             rate,
             channel,
         });
@@ -223,7 +249,7 @@ impl ClientTx {
             let mut progressed = false;
             if self.roc.is_none()
                 && let Some(frame) = self.queue.front()
-                && !frame.control_port
+                && !frame.data
             {
                 frame.context.check(now)?;
                 let duration = if frame.bytes[0] == 0xb0 && frame.bytes[24..26] == [3, 0] {
@@ -361,16 +387,6 @@ impl ClientTx {
             // Revocation never frees a published DMA buffer. Propagate the
             // fault to containment while retaining this entire pending entry.
             pending.frame.context.check(now)?;
-            if now >= pending.deadline {
-                eprintln!(
-                    "mt7921_tx_timeout stage=dma control_port={} descriptor_done={} freed={} status={:?}",
-                    pending.frame.control_port,
-                    pending.descriptor_done,
-                    pending.freed,
-                    pending.status
-                );
-                return Err(zx::Status::TIMED_OUT);
-            }
             let didx = resources
                 .bar0
                 .read_u32(0xd430c)
@@ -389,8 +405,29 @@ impl ClientTx {
                 && didx == u32::from(pending.next)
                 && descriptor.is_dma_done();
             pending.descriptor_done |= changed;
-            if !(pending.descriptor_done && pending.freed && pending.status.is_some()) {
+            // Observe ownership one last time before the drain deadline.
+            // TXS is acknowledgment telemetry, not DMA ownership proof.
+            if !(pending.descriptor_done && pending.freed) {
+                if now >= pending.deadline {
+                    eprintln!(
+                        "mt7921_tx_timeout stage=dma descriptor_done={} freed={}",
+                        pending.descriptor_done, pending.freed
+                    );
+                    return Err(zx::Status::TIMED_OUT);
+                }
                 return Ok(changed);
+            }
+            if pending.status.is_none() {
+                if now < pending.deadline {
+                    return Ok(changed);
+                }
+                // A late TXS must never alias a later packet. Keep this PID
+                // unavailable for the rest of the hardware session.
+                self.retired_pids[usize::from(pending.pid)] = true;
+                eprintln!(
+                    "mt7921_tx_status stage=expired_unconfirmed pid={}",
+                    pending.pid
+                );
             }
             resources
                 .dma
@@ -412,8 +449,8 @@ impl ClientTx {
                 .map_err(|_| zx::Status::IO)?;
             if pending.frame.control_port {
                 eprintln!(
-                    "mt7921_control_port_tx stage=reclaimed acked={}",
-                    pending.status.unwrap()
+                    "mt7921_control_port_tx stage=reclaimed acked={:?}",
+                    pending.status
                 );
             }
             self.pending = None;
@@ -423,7 +460,7 @@ impl ClientTx {
             return Ok(false);
         };
         frame.context.check(now)?;
-        if !frame.control_port && grant_until.is_none_or(|deadline| now >= deadline) {
+        if !frame.data && grant_until.is_none_or(|deadline| now >= deadline) {
             return Ok(false);
         }
         let txwi_iova = resources
@@ -438,20 +475,24 @@ impl ClientTx {
             .device_address(0)
             .map_err(|_| zx::Status::IO)?
             .bits();
-        let encoded = if frame.control_port {
-            let qos = frame.bytes[0] == 0x88;
-            // Linux assigns control-port traffic priority7 even without a
-            // QoS header. A supplied QoS header carries its own TID.
-            let tid = if qos { frame.bytes[24] & 7 } else { 7 };
+        let Some(pid) = (0..124u16)
+            .map(|offset| (((u16::from(self.next_pid) - 3 + offset) % 124) + 3) as u8)
+            .find(|pid| !self.retired_pids[usize::from(*pid)])
+        else {
+            return Err(zx::Status::NO_RESOURCES);
+        };
+        self.next_pid = pid;
+        let mut encoded = if frame.data {
+            let qos = frame.control_port && frame.bytes[0] == 0x88;
             let txwi = mt7921_core::encode_client_data_txwi(
                 frame.bytes.len(),
                 frame_iova,
                 self.next_token,
                 self.next_pid,
-                true,
-                false,
+                frame.control_port,
+                !frame.control_port,
                 qos,
-                tid,
+                frame.tid,
                 1,
                 frame.rate,
             )
@@ -483,6 +524,10 @@ impl ClientTx {
             )
             .map_err(|_| zx::Status::INVALID_ARGS)?
         };
+        if !frame.data && frame.bytes[1] & 0x40 != 0 {
+            // Linux MT_TXD3_PROTECT_FRAME selects the peer's ACKed CCMP key.
+            encoded.txwi[12] |= 2;
+        }
         let didx = resources
             .bar0
             .read_u32(0xd430c)
@@ -536,9 +581,7 @@ impl ClientTx {
             .map_err(|_| zx::Status::IO)?;
         // Hardware API orders the prior coherent DMA writes before MMIO.
         pending.frame.context.check(Instant::now())?;
-        if !pending.frame.control_port
-            && grant_until.is_none_or(|deadline| Instant::now() >= deadline)
-        {
+        if !pending.frame.data && grant_until.is_none_or(|deadline| Instant::now() >= deadline) {
             return Err(zx::Status::TIMED_OUT);
         }
         resources
@@ -583,6 +626,20 @@ mod tests {
                 .bits(),
             bytes.to_vec(),
         );
+    }
+
+    #[test]
+    fn batched_status_routes_the_second_pid() {
+        let mut packet = vec![0u8; 72];
+        packet[..4].copy_from_slice(&72u32.to_le_bytes());
+        packet[16..20].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        packet[20..24].copy_from_slice(&(3u32 << 24).to_le_bytes());
+        packet[48..52].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        packet[52..56].copy_from_slice(&(4u32 << 24).to_le_bytes());
+        let statuses = mt7921_core::parse_mt7921_tx_status_batch(&packet).unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[1].pid, 4);
+        assert!(statuses[1].acked);
     }
 
     #[test]
@@ -936,6 +993,60 @@ mod tests {
             .unwrap();
             assert_eq!(tx.pending.as_ref().unwrap().status, None);
         }
+    }
+
+    #[test]
+    fn missing_status_expires_only_after_dma_return_and_retires_pid() {
+        let (device, _, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
+        let mut tx = ClientTx::default();
+        tx.enqueue(context, &frame(), 12, channel()).unwrap();
+        tx.drive_dma(&mut resources, now, Some(now + Duration::from_secs(1)))
+            .unwrap();
+        let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+        resources
+            .dma
+            .management_tx_ring
+            .read(0, &mut descriptor)
+            .unwrap();
+        descriptor[7] |= 0x80;
+        model.write_dma(
+            resources
+                .dma
+                .management_tx_ring
+                .device_address(0)
+                .unwrap()
+                .bits(),
+            descriptor.to_vec(),
+        );
+        resources.bar0.write_u32(0xd430c, 1).unwrap();
+        tx.tx_free(Mt7921TxFree {
+            wcid: Some(1),
+            token: 0,
+            dropped: true,
+            attempts: 15,
+            status: 1,
+            pair_word: None,
+            info_word: 0,
+        })
+        .unwrap();
+        tx.drive_dma(&mut resources, now + Duration::from_secs(1), None)
+            .unwrap();
+        assert!(tx.pending.is_none());
+        assert!(tx.retired_pids[3]);
+        assert!(!tx.failed);
+        tx.tx_status(Mt7921TxStatus {
+            wcid: 1,
+            pid: 3,
+            acked: true,
+        })
+        .unwrap();
+        assert!(tx.retired_pids[3]);
     }
 
     #[test]
