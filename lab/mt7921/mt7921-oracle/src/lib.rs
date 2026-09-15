@@ -1678,7 +1678,7 @@ mod tests {
             let mut frame = vec![0; usize::from(frame_len)];
             frame[0..2].copy_from_slice(&(u16::from(subtype) << 4).to_le_bytes());
             let rust = mt7921_core::encode_client_management_tx(
-                &frame, u64::from(txwi_iova), u64::from(frame_iova), token, pid).unwrap();
+                &frame, u64::from(txwi_iova), u64::from(frame_iova), token, pid, 19, 12).unwrap();
             let c = c_management_txwi(
                 frame_len, frame_iova, token, pid, subtype);
             prop_assert_eq!(rust.txwi, c);
@@ -1788,7 +1788,7 @@ mod tests {
             let start = mt7921_core::encode_passive_mcu_command(
                 &mt7921_core::PassiveMcuCommand::StartScan {
                     scan_sequence,
-                    channel: candidate,
+                    channels: vec![candidate],
                 },
                 sequence,
             ).unwrap();
