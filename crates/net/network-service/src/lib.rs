@@ -6,7 +6,7 @@ use netstack3_port_integration::{
     Runtime, RuntimeError, NativeSocketAddress, NativeIpAddress,
     sockets::{TcpSocket, IpVersion, Connection},
     dns_bridge::DnsLookupHandle,
-    service::{DhcpService, DhcpStatus},
+    service::DhcpService,
 };
 use netstack3_port_spike::{
     EthernetEventSource, EthernetRunner, NetworkServiceEndpoint,
@@ -28,6 +28,7 @@ mod resolver;
 pub use provider::run_provider;
 mod ethernet_device;
 mod lifecycle;
+mod link_control;
 mod supervisor;
 
 pub use child::run;

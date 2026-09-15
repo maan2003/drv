@@ -11,7 +11,7 @@ use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU64;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
 const CLAIM: libc::c_ulong = 0x8008B301;
@@ -28,9 +28,13 @@ pub fn run_provider(
     ethernet_mac: Option<[u8; 6]>,
     bootstrap: bool,
     resolver: bool,
+    link_control: bool,
 ) -> Result<(), String> {
     if bootstrap && ethernet_mac.is_none() {
-        return Err("bootstrap requires an Ethernet capability".into());
+        return Err("bootstrap requires an Ethernet identity".into());
+    }
+    if link_control && ethernet_mac.is_none() {
+        return Err("link control requires an Ethernet identity".into());
     }
     // FD3 owns the socket namespace; optional FD4 owns only Ethernet frames.
     if unsafe { libc::fcntl(3, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
@@ -56,7 +60,7 @@ pub fn run_provider(
         mac,
     );
     let sockets = network.sockets();
-    let mut ethernet = if ethernet_mac.is_some() {
+    let mut ethernet = if ethernet_mac.is_some() && !link_control {
         let mut kind = 0i32;
         let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
         if unsafe {
@@ -101,7 +105,12 @@ pub fn run_provider(
     } else {
         None
     };
-    crate::child::provider_setup(ethernet.is_some(), bootstrap, resolver)?;
+    crate::child::provider_setup(ethernet.is_some(), bootstrap, resolver, link_control)?;
+    // SAFETY: setup retains this inherited descriptor exclusively for this
+    // provider. Keep its ownership explicit for every ancillary operation.
+    let link_control = link_control.then(|| unsafe {
+        OwnedFd::from_raw_fd(crate::link_control::CONTROL_FD)
+    });
     // SAFETY: provider_setup created FD6; it lives for this entire service loop.
     let poller = unsafe { std::os::fd::BorrowedFd::borrow_raw(6) };
     let mut resolver_server = resolver_listener
@@ -111,6 +120,10 @@ pub fn run_provider(
 
     if bootstrap {
         crate::child::provider_bootstrap_ready()?;
+        // Readiness certifies the initialized core, loopback, registration
+        // namespace and sandbox. Physical address acquisition is deliberately
+        // not part of provider availability.
+        crate::child::provider_bootstrap_network_ready()?;
     }
     eprintln!(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
@@ -123,6 +136,24 @@ pub fn run_provider(
         return Err(io::Error::last_os_error().to_string());
     }
     const ETHERNET_TOKEN: u64 = u64::MAX;
+    const LINK_CONTROL_TOKEN: u64 = u64::MAX - 1;
+    if let Some(control) = &link_control {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+            u64: LINK_CONTROL_TOKEN,
+        };
+        if unsafe {
+            libc::epoll_ctl(
+                6,
+                libc::EPOLL_CTL_ADD,
+                control.as_raw_fd(),
+                &mut event,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
     let mut frame_events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32;
     if let Some(frame) = &ethernet {
         let mut event = libc::epoll_event {
@@ -134,9 +165,9 @@ pub fn run_provider(
         }
     }
     let mut pending_frame = None;
-    let mut ethernet_active = ethernet.is_some();
     let mut last_network_snapshot = None;
-    let mut bootstrap_pending = bootstrap;
+    let mut active_link_generation = None;
+    let mut last_link_generation = 0u64;
     let mut workers: HashMap<u64, SocketWorker> = HashMap::new();
     let start = Instant::now();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
@@ -151,8 +182,111 @@ pub fn run_provider(
                 if let Some(frame) = &mut ethernet {
                     frame.notify_epoll(event.events);
                 }
-            } else if event.u64 != 0 && event.u64 != crate::resolver::TOKEN {
+            } else if event.u64 != 0
+                && event.u64 != crate::resolver::TOKEN
+                && event.u64 != LINK_CONTROL_TOKEN
+            {
                 ready.push(event.u64);
+            }
+        }
+        if let Some(control) = &link_control
+            && events[..event_count]
+            .iter()
+            .any(|event| event.u64 == LINK_CONTROL_TOKEN)
+        {
+            loop {
+                let Some(request) = crate::link_control::receive_request(
+                    control.as_fd(),
+                )? else {
+                    break;
+                };
+                let generation = match &request {
+                    crate::link_control::Request::Attach { generation, .. }
+                    | crate::link_control::Request::Detach { generation } => *generation,
+                };
+                let valid = match &request {
+                    crate::link_control::Request::Attach { generation, .. } => {
+                        *generation > last_link_generation
+                    }
+                    crate::link_control::Request::Detach { generation } => {
+                        active_link_generation == Some(*generation)
+                    }
+                };
+                if !valid {
+                    crate::link_control::send_ack(
+                        control.as_fd(),
+                        generation,
+                        crate::link_control::AckStatus::Rejected,
+                    )?;
+                    continue;
+                }
+
+                if let Some(old) = ethernet.take() {
+                    unsafe {
+                        libc::epoll_ctl(6, libc::EPOLL_CTL_DEL, old.raw_fd(), std::ptr::null_mut());
+                    }
+                    network.on_device_event(
+                        netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false),
+                    );
+                    pending_frame = None;
+                    drop(old);
+                }
+                match request {
+                    crate::link_control::Request::Attach { generation, frame } => {
+                        // The trusted supervisor validates connected AF_UNIX
+                        // SOCK_SEQPACKET direction and nonblocking mode before
+                        // this capability enters the private channel.
+                        if unsafe { libc::dup3(frame.as_raw_fd(), 4, libc::O_CLOEXEC) } < 0 {
+                            return Err(format!(
+                                "install Ethernet capability: {}",
+                                io::Error::last_os_error()
+                            ));
+                        }
+                        drop(frame);
+                        let mut installed = unsafe {
+                            crate::ServiceEthernetDevice::from_frame_fd(
+                                OwnedFd::from_raw_fd(4),
+                                mac,
+                            )
+                        };
+                        let mut event = libc::epoll_event {
+                            events: frame_events,
+                            u64: ETHERNET_TOKEN,
+                        };
+                        if unsafe {
+                            libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, installed.raw_fd(), &mut event)
+                        } < 0
+                        {
+                            return Err(io::Error::last_os_error().to_string());
+                        }
+                        installed.notify_epoll(libc::EPOLLIN as u32);
+                        ethernet = Some(installed);
+                        active_link_generation = Some(generation);
+                        last_link_generation = generation;
+                    }
+                    crate::link_control::Request::Detach { .. } => {
+                        if unsafe {
+                            libc::dup3(
+                                crate::link_control::FRAME_RESERVATION_FD,
+                                4,
+                                libc::O_CLOEXEC,
+                            )
+                        } < 0
+                        {
+                            return Err(format!(
+                                "reserve offline Ethernet slot: {}",
+                                io::Error::last_os_error()
+                            ));
+                        }
+                        active_link_generation = None;
+                    }
+                }
+                crate::link_control::send_ack(
+                    control.as_fd(),
+                    generation,
+                    crate::link_control::AckStatus::Applied,
+                )?;
+                progress = true;
             }
         }
         if events[..event_count].iter().any(|event| event.u64 == 0) {
@@ -197,11 +331,12 @@ pub fn run_provider(
             }
         }
 
+        let mut close_frame = false;
         if let Some(frame) = &mut ethernet {
             while let Some(event) = frame.take_event() {
                 if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
                     pending_frame = None;
-                    ethernet_active = false;
+                    close_frame = true;
                     // Retain the service and localhost sockets after link loss.
                     unsafe {
                         libc::epoll_ctl(
@@ -215,7 +350,7 @@ pub fn run_provider(
                 network.on_device_event(event);
                 progress = true;
             }
-            for _ in 0..if ethernet_active { 64 } else { 0 } {
+            for _ in 0..if close_frame { 0 } else { 64 } {
                 let Some(packet) = frame.receive() else { break };
                 network
                     .receive_frame(packet)
@@ -223,9 +358,25 @@ pub fn run_provider(
                 progress = true;
             }
         }
+        if close_frame {
+            ethernet = None;
+            if link_control.is_some() && unsafe {
+                libc::dup3(
+                    crate::link_control::FRAME_RESERVATION_FD,
+                    4,
+                    libc::O_CLOEXEC,
+                )
+            } < 0
+            {
+                return Err(format!(
+                    "reserve offline Ethernet slot: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+        }
         progress |= network.poll_at(start.elapsed(), 64) != 0;
         if let Some(frame) = &mut ethernet {
-            for _ in 0..if ethernet_active { 64 } else { 0 } {
+            for _ in 0..64 {
                 let Some(packet) = pending_frame.take().or_else(|| network.take_transmit()) else {
                     break;
                 };
@@ -243,7 +394,7 @@ pub fn run_provider(
                 } else {
                     0
                 };
-            if ethernet_active && wanted != frame_events {
+            if wanted != frame_events {
                 let mut event = libc::epoll_event {
                     events: wanted,
                     u64: ETHERNET_TOKEN,
@@ -271,11 +422,6 @@ pub fn run_provider(
                     snapshot.1, snapshot.2, snapshot.3,
                 );
                 last_network_snapshot = Some(snapshot);
-            }
-            if bootstrap_pending && status == netstack3_port_integration::service::DhcpStatus::Bound
-            {
-                crate::child::provider_bootstrap_network_ready()?;
-                bootstrap_pending = false;
             }
         }
         let listeners: Vec<_> = workers

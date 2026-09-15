@@ -29,7 +29,7 @@ fn socket_option(fd: RawFd, option: i32) -> Result<i32, String> {
     Ok(value)
 }
 
-fn validate_seqpacket(fd: RawFd) -> Result<(), String> {
+pub(crate) fn validate_seqpacket(fd: RawFd) -> Result<(), String> {
     if socket_option(fd, SO_DOMAIN)? != libc::AF_UNIX
         || socket_option(fd, libc::SO_TYPE)? != libc::SOCK_SEQPACKET
     {
@@ -66,7 +66,7 @@ pub enum WifiLifecycleUpdate {
     Installed {
         wifi_generation: [u8; 16],
         ethernet_generation: u64,
-        network_generation: u64,
+        provider_generation: u64,
     },
     Revoked {
         wifi_generation: [u8; 16],
@@ -188,8 +188,9 @@ impl WifiLifecycleReceiver {
             {
                 return Err(wifi_supervisor_wire::WireError::InvalidLength.to_string());
             }
-            supervisor.terminate()?;
-            self.active = None;
+            if let Some(active) = self.active.take() {
+                supervisor.revoke_generation(active.ethernet)?;
+            }
             self.closed = true;
             return Ok(Some(WifiLifecycleUpdate::ChannelClosed));
         }
@@ -222,13 +223,13 @@ impl WifiLifecycleReceiver {
                 // A failed launch must not permit replay or an identity swap.
                 self.wifi_identity = Some(message.wifi_generation);
                 self.last_ethernet = Some(message.ethernet_generation);
-                // Replacement first commits revocation of the old local
-                // generation. If launching the new child fails, the receiver
-                // must not continue to describe the terminated old pair as
-                // active.
-                supervisor.terminate()?;
-                self.active = None;
-                let network_generation = supervisor.install_generation(frame)?;
+                // The persistent provider acknowledges revocation of any old
+                // link and installation of this descriptor before ownership is
+                // reported to Wi-Fi.
+                let provider_generation = supervisor.attach_generation(
+                    message.ethernet_generation,
+                    frame,
+                )?;
                 self.active = Some(ActiveGeneration {
                     wifi: message.wifi_generation,
                     ethernet: message.ethernet_generation,
@@ -236,7 +237,7 @@ impl WifiLifecycleReceiver {
                 Ok(Some(WifiLifecycleUpdate::Installed {
                     wifi_generation: message.wifi_generation,
                     ethernet_generation: message.ethernet_generation,
-                    network_generation,
+                    provider_generation,
                 }))
             }
             LifecycleKind::Revoke => {
@@ -251,7 +252,7 @@ impl WifiLifecycleReceiver {
                 {
                     return Err("Wi-Fi lifecycle Revoke does not match active generation".into());
                 }
-                supervisor.terminate()?;
+                supervisor.revoke_generation(message.ethernet_generation)?;
                 self.active = None;
                 Ok(Some(WifiLifecycleUpdate::Revoked {
                     wifi_generation: message.wifi_generation,

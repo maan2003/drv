@@ -132,6 +132,42 @@ fn append_fd_and_flags(filter: &mut Vec<SockFilter>, syscall: i64, fd: RawFd, fl
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
+
+fn append_three_arg_fd_and_flags(
+    filter: &mut Vec<SockFilter>,
+    syscall: i64,
+    fd: RawFd,
+    flags: i32,
+) {
+    filter.push(jump(syscall as u32, 0, 11));
+    filter.push(arg(0));
+    filter.push(jump(fd as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(0));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(2));
+    filter.push(jump(flags as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
+fn append_link_dup3(filter: &mut Vec<SockFilter>) {
+    filter.push(jump(libc::SYS_dup3 as u32, 0, 11));
+    filter.push(arg(1));
+    filter.push(jump(4, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg_high(1));
+    filter.push(jump(0, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(arg(2));
+    filter.push(jump(libc::O_CLOEXEC as u32, 1, 0));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+}
+
 fn append_accept4(filter: &mut Vec<SockFilter>, listener_fd: RawFd) {
     filter.push(jump(libc::SYS_accept4 as u32, 0, 7));
     filter.push(arg(0));
@@ -894,14 +930,112 @@ mod tests {
             "ethernet-publish" => [libc::SYS_ioctl, 4, 0xC038B302, 0],
             "ethernet-send-wrong-flags" => [libc::SYS_sendto, 4, 0, 0],
             "ethernet-recv-wrong-flags" => [libc::SYS_recvfrom, 4, 0, 0],
+            "link-control-read" => [libc::SYS_read, crate::link_control::CONTROL_FD as i64, 0, 0],
+            "link-control-write" => [libc::SYS_write, crate::link_control::CONTROL_FD as i64, 0, 0],
+            "frame-reservation-read" => [libc::SYS_read, crate::link_control::FRAME_RESERVATION_FD as i64, 0, 0],
             _ => panic!("unknown denial"),
         };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
-        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"));
+        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"), true);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 51);
         unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3], 0usize, 0usize, 0usize); }
         child_exit(52);
+    }
+
+    #[test]
+    fn provider_link_control_filter_fixture() {
+        if std::env::var_os("DRV_PROVIDER_LINK_CONTROL_FIXTURE").is_none() {
+            return;
+        }
+        let mut control = [-1; 2];
+        let mut frame = [-1; 2];
+        child_require(unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                control.as_mut_ptr(),
+            )
+        } == 0, 53);
+        child_require(unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                frame.as_mut_ptr(),
+            )
+        } == 0, 54);
+        let control_sender = unsafe { OwnedFd::from_raw_fd(control[0]) };
+        let control_receiver = unsafe { OwnedFd::from_raw_fd(control[1]) };
+        let frame_sender = unsafe { OwnedFd::from_raw_fd(frame[0]) };
+        let _frame_peer = unsafe { OwnedFd::from_raw_fd(frame[1]) };
+        child_require(
+            crate::link_control::send_attach(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(control_sender.as_raw_fd()) },
+                9,
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(frame_sender.as_raw_fd()) },
+            ).is_ok(),
+            55,
+        );
+        child_require(
+            unsafe { libc::dup2(control_receiver.as_raw_fd(), crate::link_control::CONTROL_FD) }
+                == crate::link_control::CONTROL_FD,
+            56,
+        );
+        child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 57);
+        let filter = provider_filter(true, true);
+        let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+        child_require(
+            unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0,
+            58,
+        );
+        let request = crate::link_control::receive_request(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(crate::link_control::CONTROL_FD) },
+        );
+        let Ok(Some(crate::link_control::Request::Attach { generation: 9, frame })) = request else {
+            child_exit(59);
+        };
+        child_require(unsafe { libc::dup3(frame.as_raw_fd(), 4, libc::O_CLOEXEC) } == 4, 60);
+        child_require(
+            crate::link_control::send_ack(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(crate::link_control::CONTROL_FD) },
+                9,
+                crate::link_control::AckStatus::Applied,
+            ).is_ok(),
+            61,
+        );
+        child_require(
+            unsafe {
+                libc::sendto(
+                    4,
+                    b"frame".as_ptr().cast(),
+                    5,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    std::ptr::null(),
+                    0,
+                )
+            } == 5,
+            62,
+        );
+        child_exit(0);
+    }
+
+    #[test]
+    fn provider_filter_allows_scoped_link_control_descriptor_replacement() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child::tests::provider_link_control_filter_fixture",
+                "--nocapture",
+            ])
+            .env("DRV_PROVIDER_LINK_CONTROL_FIXTURE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success(), "filtered link control failed: {status}");
     }
 
     #[test]
@@ -910,7 +1044,8 @@ mod tests {
         for operation in ["socket", "read-registration", "write-registration", "read-epoll",
             "claim-wrong-fd", "control-registration", "control-epoll", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
             "ethernet-read", "ethernet-write", "ethernet-publish", "ethernet-control",
-            "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags"] {
+            "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags",
+            "link-control-read", "link-control-write", "frame-reservation-read"] {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "child::tests::provider_filter_denial_fixture", "--nocapture"])
                 .env("DRV_PROVIDER_FILTER_DENIAL", operation)
@@ -930,7 +1065,11 @@ mod tests {
         let _peer = duplicate(pair[1]); // dup2 below may replace the original peer FD.
         child_require(unsafe { libc::send(pair[1], b"ARP".as_ptr().cast(), 3, 0) } == 3, 61);
         child_require(unsafe { libc::dup2(frame.as_raw_fd(), 4) } == 4, 62);
-        let filter = provider_filter(true);
+        // Without link control, these descriptor numbers remain available
+        // for ordinary application endpoints.
+        child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 8) } == 8, 68);
+        child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 9) } == 9, 69);
+        let filter = provider_filter(true, false);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 63);
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 64);
@@ -940,6 +1079,8 @@ mod tests {
         child_require(&data == b"ARP", 66);
         child_require(unsafe { libc::send(4, data.as_ptr().cast(), 3,
             libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } == 3, 67);
+        child_require(unsafe { libc::read(8, data.as_mut_ptr().cast(), 3) } == 3, 70);
+        child_require(unsafe { libc::write(9, data.as_ptr().cast(), 3) } == 3, 71);
         child_exit(0);
     }
 
@@ -1398,19 +1539,26 @@ mod tests {
 // The provider endpoint is opened in the served network namespace before
 // setup creates the child's empty network namespace. Possession of fd 3,
 // not the child's namespace or privilege, authorizes this single session.
-pub(crate) fn provider_setup(ethernet: bool, bootstrap: bool, resolver: bool) -> Result<(), String> {
+pub(crate) fn provider_setup(
+    ethernet: bool,
+    bootstrap: bool,
+    resolver: bool,
+    link_control: bool,
+) -> Result<(), String> {
     unsafe {
-        if !ethernet { close(4); }
+        if !ethernet && !link_control { close(4); }
         if !bootstrap { close(5); }
+        if !resolver { close(7); }
+        if !link_control { close(crate::link_control::CONTROL_FD); }
     }
-    setup(unsafe { getppid() }, if resolver { 8 } else { 6 })?;
+    setup(unsafe { getppid() }, if link_control { 9 } else if resolver { 7 } else { 6 })?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
     if epoll != EPOLL_FD {
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
-    let mut filter = provider_filter(ethernet);
+    let mut filter = provider_filter(ethernet || link_control, link_control);
     if resolver {
         // Add the only new syscall authority: accept from the pre-bound resolver listener.
         let mut accept = Vec::new();
@@ -1421,7 +1569,7 @@ pub(crate) fn provider_setup(ethernet: bool, bootstrap: bool, resolver: bool) ->
     syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
 }
 
-fn provider_filter(ethernet: bool) -> Vec<SockFilter> {
+fn provider_filter(ethernet: bool, link_control: bool) -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
@@ -1439,6 +1587,37 @@ fn provider_filter(ethernet: bool) -> Vec<SockFilter> {
             filter.push(jump(4, 0, 1));
             filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
             filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+        }
+    }
+    if link_control {
+        // The inherited private control channel is the sole descriptor ingress.
+        // recvmsg/sendmsg are restricted to it and dup3 may only replace frame FD4.
+        append_three_arg_fd_and_flags(
+            &mut filter,
+            libc::SYS_recvmsg,
+            crate::link_control::CONTROL_FD,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        );
+        append_three_arg_fd_and_flags(
+            &mut filter,
+            libc::SYS_sendmsg,
+            crate::link_control::CONTROL_FD,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        );
+        append_link_dup3(&mut filter);
+        // Neither the typed control channel nor its inert frame-slot reservation
+        // may be used as unframed application byte streams.
+        for protected_fd in [
+            crate::link_control::CONTROL_FD,
+            crate::link_control::FRAME_RESERVATION_FD,
+        ] {
+            for syscall in [libc::SYS_read, libc::SYS_write] {
+                filter.push(jump(syscall as u32, 0, 3));
+                filter.push(arg(0));
+                filter.push(jump(protected_fd as u32, 0, 1));
+                filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+                filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+            }
         }
     }
     filter.push(jump(libc::SYS_ioctl as u32, 0, 12));
