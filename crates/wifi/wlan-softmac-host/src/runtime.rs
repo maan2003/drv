@@ -3937,6 +3937,55 @@ mod tests {
     }
 
     #[test]
+    fn ap_deauthentication_keeps_cleanup_authority_until_driver_completion() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut effects = effects.lock().unwrap();
+                effects.simulate_ap = true;
+                effects.retry_cleanup = true;
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime.connect(
+                connect_request(), Instant::now() + Duration::from_secs(1),
+            ).await.unwrap();
+            let (completion, receiver) = oneshot::channel();
+            effects.lock().unwrap().clear_completion = Some(receiver);
+            let peer = connect_request().bss_description.bssid;
+            let mut deauth = vec![0xc0, 0, 0, 0];
+            deauth.extend_from_slice(&device_info().sta_addr);
+            deauth.extend_from_slice(&peer);
+            deauth.extend_from_slice(&peer);
+            deauth.extend_from_slice(&[0, 0, 3, 0]);
+            effects.lock().unwrap().upcalls.as_mut().unwrap().recv(deauth, rx_info());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !effects.lock().unwrap().calls.contains(&"clear") {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            // Give SME its turns while the real MLME is blocked on the
+            // owned device completion. No terminal event may escape yet.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            let early_event = runtime.next_connection_event().unwrap();
+            assert!(early_event.is_none(), "terminal event escaped pending peer cleanup");
+            let context = effects.lock().unwrap().association_contexts.last().unwrap().clone();
+            assert!(context.check(Instant::now()).is_ok());
+            completion.send(Ok(())).unwrap();
+            drain_mlme(&mut runtime).await;
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
+            ));
+            runtime.disconnect(
+                fidl_sme::UserDisconnectReason::FailedToConnect,
+                Instant::now() + Duration::from_secs(1),
+            ).await.unwrap();
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn firmware_connection_loss_is_capability_and_peer_scoped() {
         run_local_test(async {
             for offload in [false, true] {
