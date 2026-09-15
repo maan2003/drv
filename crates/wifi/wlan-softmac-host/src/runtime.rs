@@ -3064,38 +3064,43 @@ mod tests {
     }
 
     #[test]
-    fn external_ethernet_eof_before_stop_is_a_protocol_failure() {
+    fn external_ethernet_peer_must_outlive_protocol_stop() {
         run_local_test(async {
-            let (fake, effects) = Fake::new(0);
-            effects.lock().unwrap().simulate_ap = true;
-            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
-            runtime
-                .connect(
-                    connect_request(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
+            for close_before_stop in [true, false] {
+                let (fake, effects) = Fake::new(0);
+                effects.lock().unwrap().simulate_ap = true;
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                runtime
+                    .connect(connect_request(), Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                let ethernet = runtime.take_ethernet_device().unwrap();
+                if !close_before_stop {
+                    // Retaining the external peer permits ordinary protocol
+                    // stop and hardware containment before network revocation.
+                    assert_eq!(runtime.shutdown().await, Ok(()));
+                    assert!(!runtime.reset_requested);
+                    drop(ethernet);
+                    continue;
+                }
+                drop(ethernet);
+                let failure = tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if let Err(error) = runtime.check_tasks() {
+                            break error;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
                 .await
                 .unwrap();
-            let ethernet = runtime.take_ethernet_device().unwrap();
-            drop(ethernet);
-
-            let failure = tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if let Err(error) = runtime.check_tasks() {
-                        break error;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(matches!(
-                failure,
-                ConnectError::Driver(DriverError::MlmeTaskFailed)
-            ));
-            // This is containment after a protocol fault, not orderly stop.
-            assert!(runtime.reset_requested);
-            assert_eq!(runtime.shutdown().await, Err(zx::Status::INTERNAL));
+                assert!(matches!(
+                    failure,
+                    ConnectError::Driver(DriverError::MlmeTaskFailed)
+                ));
+                assert!(runtime.reset_requested);
+                assert_eq!(runtime.shutdown().await, Err(zx::Status::INTERNAL));
+            }
         });
     }
 

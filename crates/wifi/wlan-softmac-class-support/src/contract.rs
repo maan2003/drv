@@ -237,6 +237,7 @@ pub trait WlanSoftmac {
     }
     /// Admission is not hardware completion. Retain context with queued frames
     /// and recheck it immediately before deferred hardware publication.
+    /// `NO_RESOURCES` rejects this frame without admission and may be retried.
     fn queue_tx(
         &mut self,
         context: crate::OperationContext,

@@ -211,9 +211,7 @@ fn run() -> Result<(), String> {
         match driver_child.try_wait() {
             Ok(Some(status)) => {
                 driver_done = true;
-                if status.success()
-                    && network_revocation_due(shutdown_cause, driver_done, network_revoked)
-                {
+                if status.success() && shutdown_cause.is_some() {
                     // The runtime has synchronously revoked its Ethernet peer
                     // and certified hardware containment. Revoke the external
                     // network capability now, before any completion marker.
@@ -328,14 +326,6 @@ fn wait_driver_after_policy_close(mut driver: Child, original: String) -> Result
 
 fn shutdown_timed_out(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
-}
-
-fn network_revocation_due(
-    shutdown_cause: Option<ShutdownCause>,
-    driver_stopped: bool,
-    network_revoked: bool,
-) -> bool {
-    shutdown_cause.is_some() && driver_stopped && !network_revoked
 }
 
 fn close_and_reap_driver(driver: &mut Child) -> Result<(String, bool), String> {
@@ -719,15 +709,6 @@ mod tests {
         );
         STOP_REQUESTED.store(false, Ordering::Release);
         SUSPEND_REQUESTED.store(false, Ordering::Release);
-    }
-
-    #[test]
-    fn network_peer_is_retained_until_driver_has_stopped() {
-        let cause = Some(ShutdownCause::SuspendPreparation);
-        assert!(!network_revocation_due(cause, false, false));
-        assert!(network_revocation_due(cause, true, false));
-        assert!(!network_revocation_due(cause, true, true));
-        assert!(!network_revocation_due(None, true, false));
     }
 
     #[test]
