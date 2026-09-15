@@ -201,7 +201,8 @@ remain distinct. Status/disconnect must not wait behind a blocking connect
 handler. Slow observers may resynchronize from a snapshot; safety-critical
 completion must not silently disappear.
 
-WLCP v2 carries checked absolute Linux CLOCK_MONOTONIC deadlines on commands,
+WLCP v3 carries checked absolute Linux CLOCK_MONOTONIC deadlines and explicit
+Performance/Balanced power policy; v2 introduced checked deadlines on commands,
 rejects expired commands before runtime admission, and bounds pending reply
 drain and outbound delivery. Both peers must share the same monotonic time
 namespace. Application admission starts the policy budget before queueing and

@@ -366,10 +366,9 @@ impl PeerAssociation {
         }
         commands.extend([
             (
-                // Linux mt7921 uses firmware dynamic power saving for a
-                // power-save-enabled associated vif. The acknowledged tag
-                // handles traffic wakeups; it is not a pretend host idle bit.
-                encode(encode_client_post_assoc_power_state_command(1, 0, 2))?,
+                // Association starts awake. Fuchsia PHY power policy may
+                // request acknowledged dynamic saving after SME connects.
+                encode(encode_client_post_assoc_power_state_command(1, 0, 0))?,
                 RadioResponse::Unified(2),
             ),
             (
@@ -451,6 +450,62 @@ pub(super) struct ClientKey {
     pub bytes: zeroize::Zeroizing<Vec<u8>>,
     pub rx_pn: [u64; 16],
     pub management_rx_pn: u64,
+}
+
+pub(super) struct PowerSaveChange {
+    pub context: wlan_softmac_class_support::OperationContext,
+    pub enabled: bool,
+    commands: FirmwareCommands,
+    pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
+}
+
+impl PowerSaveChange {
+    pub fn new(
+        context: wlan_softmac_class_support::OperationContext,
+        enabled: bool,
+        reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
+    ) -> Result<Self, zx::Status> {
+        let command = mt7921_core::encode_client_post_assoc_power_state_command(
+            1,
+            0,
+            if enabled { 2 } else { 0 },
+        )
+        .map_err(|_| zx::Status::INVALID_ARGS)?;
+        Ok(Self {
+            context,
+            enabled,
+            commands: FirmwareCommands::new([(command, RadioResponse::Unified(2))].into()),
+            reply: Some(reply),
+        })
+    }
+
+    pub fn complete(&self) -> bool {
+        self.commands.ready()
+    }
+
+    pub fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        start: Instant,
+        now: Instant,
+    ) -> Result<bool, zx::Status> {
+        self.context.check(now)?;
+        self.commands.drive(
+            resources,
+            mechanics,
+            receive,
+            start,
+            now,
+            Some(&self.context),
+        )
+    }
+
+    #[cfg(test)]
+    fn command(&self) -> &[u8] {
+        self.commands.queued_command(0).unwrap()
+    }
 }
 
 pub(super) struct KeyInstallation {
@@ -709,12 +764,12 @@ mod tests {
             let (reply, _receiver) = futures_channel::oneshot::channel();
             let mut association =
                 PeerAssociation::new(context.clone(), &bss, 100, configuration, reply).unwrap();
-            // After the optional WMM command, association publishes and waits
-            // for UNI_BSS_INFO_PS dynamic-power state (2), not full power (0).
+            // Association explicitly starts awake; policy changes are a
+            // separate acknowledged firmware operation after connection.
             let power_index = usize::from(qos) + 1;
             let power = association.commands.queued_command(power_index).unwrap();
             assert_eq!(&power[52..54], &[21, 0]);
-            assert_eq!(power[56], 2);
+            assert_eq!(power[56], 0);
             let mut mechanics = LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
             let mut busy = crate::transmit::ClientTx::default();
@@ -856,6 +911,21 @@ mod tests {
                 assert_eq!(published, expected.len());
                 assert_eq!(association.qos, qos);
             }
+        }
+    }
+
+    #[test]
+    fn power_policy_maps_performance_and_balanced_to_acknowledged_firmware_states() {
+        let now = Instant::now();
+        for (enabled, expected) in [(false, 0), (true, 2)] {
+            let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(1),
+            );
+            let (reply, _) = futures_channel::oneshot::channel();
+            let change = PowerSaveChange::new(context, enabled, reply).unwrap();
+            assert_eq!(&change.command()[52..54], &[21, 0]);
+            assert_eq!(change.command()[56], expected);
+            assert!(!change.complete());
         }
     }
 

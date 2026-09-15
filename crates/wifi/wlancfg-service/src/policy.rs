@@ -9,8 +9,8 @@
 use crate::{
     HostControlClient, ParkedHostControlClient,
     application::{
-        ApplicationCommand, Association, Network, ParkedApplicationServer, Reply, Request,
-        Security, Status,
+        ApplicationCommand, Association, Network, ParkedApplicationServer, PowerSaveMode, Reply,
+        Request, Security, Status,
     },
 };
 use anyhow::Context as _;
@@ -408,6 +408,16 @@ async fn handle(
             wait_for_connection(state, cancelled).await
         }
         Request::Status => Reply::Status(policy_status(&state.borrow())),
+        Request::PowerSave(mode) => {
+            let mode = match mode {
+                PowerSaveMode::Performance => wlan_control_wire::PowerSaveMode::Performance,
+                PowerSaveMode::Balanced => wlan_control_wire::PowerSaveMode::Balanced,
+            };
+            match control.set_power_save(deadline, mode).await {
+                Ok(()) => Reply::Ok,
+                Err(error) => Reply::Error(error.to_string()),
+            }
+        }
         Request::Disconnect => {
             state.borrow_mut().desired = None;
             disconnect_machine(

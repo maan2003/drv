@@ -26,7 +26,7 @@ use fidl_fuchsia_wlan_sme as sme;
 use std::fmt;
 
 pub const MAGIC: [u8; 4] = *b"WLCP";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 36;
 pub const MAX_PACKET: usize = 8192;
 pub const MAX_BSS_IE_LEN: usize = 4096;
@@ -114,6 +114,13 @@ pub enum CommandReply {
     Unsupported,
 }
 
+/// Fuchsia DeviceMonitor power policy subset supported by MT7921.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerSaveMode {
+    Performance,
+    Balanced,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GenerationEndReason {
     Shutdown,
@@ -154,6 +161,11 @@ pub enum Message {
         request: sme::RoamRequest,
     },
     RoamReply(Reply<CommandReply>),
+    SetPowerSave {
+        deadline: MonotonicDeadline,
+        mode: PowerSaveMode,
+    },
+    SetPowerSaveReply(Reply<CommandReply>),
     Event(sme::ConnectTransactionEvent),
     /// Terminal for the entire Wi-Fi service generation. On receipt, a
     /// transport must fail all pending requests, close every event stream, and
@@ -196,6 +208,14 @@ impl fmt::Debug for Message {
                 .field("bssid", &request.bss_description.bssid)
                 .finish(),
             Self::RoamReply(reply) => f.debug_tuple("RoamReply").field(reply).finish(),
+            Self::SetPowerSave { deadline, mode } => f
+                .debug_struct("SetPowerSave")
+                .field("deadline", deadline)
+                .field("mode", mode)
+                .finish(),
+            Self::SetPowerSaveReply(reply) => {
+                f.debug_tuple("SetPowerSaveReply").field(reply).finish()
+            }
             Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
             Self::DeadlineExceeded(reply) => {
                 f.debug_tuple("DeadlineExceeded").field(reply).finish()
@@ -211,7 +231,8 @@ impl Message {
             Self::Scan { deadline, .. }
             | Self::Connect { deadline, .. }
             | Self::Disconnect { deadline, .. }
-            | Self::Roam { deadline, .. } => Some(*deadline),
+            | Self::Roam { deadline, .. }
+            | Self::SetPowerSave { deadline, .. } => Some(*deadline),
             _ => None,
         }
     }
@@ -222,6 +243,7 @@ impl Message {
             Self::ConnectReply(reply) => Some(reply.in_reply_to),
             Self::DisconnectReply(reply) => Some(reply.in_reply_to),
             Self::RoamReply(reply) => Some(reply.in_reply_to),
+            Self::SetPowerSaveReply(reply) => Some(reply.in_reply_to),
             Self::DeadlineExceeded(reply) => Some(reply.in_reply_to),
             _ => None,
         }
@@ -306,6 +328,8 @@ const GENERATION_END: u16 = 9;
 const SCAN: u16 = 11;
 const SCAN_REPLY: u16 = 12;
 const DEADLINE_EXCEEDED: u16 = 13;
+const SET_POWER_SAVE: u16 = 14;
+const SET_POWER_SAVE_REPLY: u16 = 15;
 
 /// Number of file descriptors the policy transport must attach to this message.
 /// Policy transport bindings must use kernel operations without an ancillary
@@ -435,6 +459,21 @@ fn encode_message(message: &Message) -> Result<(u16, Vec<u8>), Error> {
             })?;
             ROAM_REPLY
         }
+        Message::SetPowerSave { deadline, mode } => {
+            put_u64(&mut w, deadline.into_nanos());
+            w.push(match mode {
+                PowerSaveMode::Performance => 0,
+                PowerSaveMode::Balanced => 1,
+            });
+            SET_POWER_SAVE
+        }
+        Message::SetPowerSaveReply(v) => {
+            enc_reply(&mut w, v, |w, v| {
+                w.push(command_reply(*v));
+                Ok(())
+            })?;
+            SET_POWER_SAVE_REPLY
+        }
         Message::Event(v) => {
             enc_event(&mut w, v)?;
             EVENT
@@ -476,6 +515,17 @@ fn decode_message(kind: u16, r: &mut Reader<'_>) -> Result<Message, Error> {
             },
         },
         ROAM_REPLY => Message::RoamReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?),
+        SET_POWER_SAVE => Message::SetPowerSave {
+            deadline: MonotonicDeadline::from_nanos(r.u64()?)?,
+            mode: match r.u8()? {
+                0 => PowerSaveMode::Performance,
+                1 => PowerSaveMode::Balanced,
+                value => return Err(Error::UnknownDiscriminant("PowerSaveMode", value.into())),
+            },
+        },
+        SET_POWER_SAVE_REPLY => {
+            Message::SetPowerSaveReply(dec_reply(r, |r| dec_command_reply(r.u8()?))?)
+        }
         EVENT => Message::Event(dec_event(r)?),
         GENERATION_END => Message::GenerationEnd(dec_generation_end(r.u8()?)?),
         DEADLINE_EXCEEDED => Message::DeadlineExceeded(dec_reply(r, |_| Ok(()))?),
@@ -1343,6 +1393,15 @@ mod tests {
                 },
             },
             Message::RoamReply(reply(CommandReply::NotConnected)),
+            Message::SetPowerSave {
+                deadline: deadline(),
+                mode: PowerSaveMode::Performance,
+            },
+            Message::SetPowerSave {
+                deadline: deadline(),
+                mode: PowerSaveMode::Balanced,
+            },
+            Message::SetPowerSaveReply(reply(CommandReply::Success)),
             Message::GenerationEnd(GenerationEndReason::Shutdown),
             Message::GenerationEnd(GenerationEndReason::Timeout),
             Message::GenerationEnd(GenerationEndReason::DriverFault),
@@ -1403,7 +1462,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes.len(), 36);
-        assert_eq!(&bytes[4..6], &[2, 0]);
+        assert_eq!(&bytes[4..6], &[3, 0]);
         assert_eq!(&bytes[6..8], &[1, 0]);
         assert_eq!(&bytes[8..12], &[0; 4]);
         assert_eq!(&bytes[12..28], &[0xab; 16]);

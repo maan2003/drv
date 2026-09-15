@@ -192,6 +192,23 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     self.peer_association = None;
                 }
             }
+            if let Some(change) = self.power_save_change.as_mut() {
+                progressed |= change.drive(
+                    resources,
+                    &mut self.session.mcu.0,
+                    &mut self.session.receive,
+                    self.session.start,
+                    std::time::Instant::now(),
+                )?;
+                if change.complete() {
+                    change.context.check(std::time::Instant::now())?;
+                    self.power_save_enabled = change.enabled;
+                    if let Some(reply) = change.reply.take() {
+                        let _ = reply.send(Ok(()));
+                    }
+                    self.power_save_change = None;
+                }
+            }
             if let Some(installation) = self.key_installation.as_mut() {
                 progressed |= installation.drive(
                     resources,
@@ -241,6 +258,11 @@ impl ClientRuntimeDriver for Mt7921Driver {
             }
             if let Some(installation) = self.key_installation.as_mut()
                 && let Some(reply) = installation.reply.take()
+            {
+                let _ = reply.send(Err(status));
+            }
+            if let Some(change) = self.power_save_change.as_mut()
+                && let Some(reply) = change.reply.take()
             {
                 let _ = reply.send(Err(status));
             }
@@ -547,6 +569,34 @@ impl WlanSoftmac for Mt7921Driver {
         })();
         async move { result?.await.unwrap_or(Err(zx::Status::CANCELED)) }
     }
+    fn set_power_save_mode(
+        &mut self,
+        context: wlan_softmac_class_support::OperationContext,
+        enabled: bool,
+    ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
+        let result = (|| {
+            context.check(std::time::Instant::now())?;
+            if self.session.lifecycle != SessionLifecycle::ProtocolStarted
+                || self.joined.is_none()
+                || self.associated_qos.is_none()
+                || !self.controlled_port_open
+            {
+                return Err(zx::Status::BAD_STATE);
+            }
+            if self.power_save_change.is_some()
+                || self.peer_association.is_some()
+                || self.key_installation.is_some()
+            {
+                return Err(zx::Status::SHOULD_WAIT);
+            }
+            let (reply, receiver) = futures_channel::oneshot::channel();
+            self.power_save_change =
+                Some(crate::peer::PowerSaveChange::new(context, enabled, reply)?);
+            Ok(receiver)
+        })();
+        async move { result?.await.unwrap_or(Err(zx::Status::CANCELED)) }
+    }
+
     fn clear_association(
         &mut self,
         context: wlan_softmac_class_support::OperationContext,

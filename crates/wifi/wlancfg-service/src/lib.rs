@@ -58,6 +58,10 @@ enum OwnerCommand {
     Roam {
         request: sme::RoamRequest,
     },
+    PowerSave {
+        mode: wire::PowerSaveMode,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Scan {
         request: sme::ScanRequest,
         reply: oneshot::Sender<anyhow::Result<ClientSmeScanResult>>,
@@ -80,6 +84,7 @@ enum Pending {
     },
     Disconnect(oneshot::Sender<anyhow::Result<()>>),
     Roam,
+    PowerSave(oneshot::Sender<anyhow::Result<()>>),
     Scan(oneshot::Sender<anyhow::Result<ClientSmeScanResult>>),
 }
 
@@ -237,6 +242,16 @@ impl HostControlClient {
                 Err(anyhow!("WLAN control generation ended"))
             }
         }
+    }
+    pub async fn set_power_save(
+        &self,
+        deadline: wire::MonotonicDeadline,
+        mode: wire::PowerSaveMode,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.submit(deadline, OwnerCommand::PowerSave { mode, reply: tx })?;
+        rx.await
+            .context("control generation ended during power-save change")?
     }
 }
 
@@ -412,6 +427,10 @@ impl Owner {
             }
             OwnerCommand::Disconnect { reason, reply } => (Message::Disconnect { deadline, reason }, Pending::Disconnect(reply)),
             OwnerCommand::Roam { request } => (Message::Roam { deadline, request }, Pending::Roam),
+            OwnerCommand::PowerSave { mode, reply } => (
+                Message::SetPowerSave { deadline, mode },
+                Pending::PowerSave(reply),
+            ),
             OwnerCommand::Scan { request, reply } => (Message::Scan { deadline, request }, Pending::Scan(reply)),
         };
         let bytes = wire::encode(&Packet { generation: self.generation, request_id: id, message })
@@ -486,6 +505,7 @@ impl Owner {
                     let _ = reply.send(Err(anyhow!("scan deadline exceeded before execution")));
                 }
                 Pending::Disconnect(_) => return Err("disconnect deadline exceeded without quiescence".into()),
+                Pending::PowerSave(_) => return Err("power-save deadline exceeded without completion".into()),
                 Pending::Roam => return Err("roam deadline exceeded".into()),
             }
             return Ok(());
@@ -508,6 +528,10 @@ impl Owner {
                     return Err(error.to_string());
                 }
                 self.transaction = None;
+                let _ = reply.send(result);
+            }
+            (Pending::PowerSave(reply), Message::SetPowerSaveReply(reply_body)) => {
+                let result = command_result(reply_body.result, "power-save change");
                 let _ = reply.send(result);
             }
             (Pending::Roam, Message::RoamReply(reply_body)) => {
@@ -539,6 +563,7 @@ impl Owner {
                 Pending::Connect { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
                 Pending::Disconnect(reply) => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
                 Pending::Scan(reply) => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
+                Pending::PowerSave(reply) => { let _ = reply.send(Err(anyhow!(reason.clone()))); }
                 Pending::Roam => {}
             }
         }
