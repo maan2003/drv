@@ -1193,6 +1193,7 @@ dependencies = [
  "wifi-supervisor-wire",
  "wlan-control-wire",
  "wlan-softmac-host",
+ "zx",
 ]
 
 [[package]]
