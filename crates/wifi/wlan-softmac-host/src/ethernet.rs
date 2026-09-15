@@ -81,7 +81,16 @@ struct SeqpacketFrameEndpoint {
 impl SeqpacketFrameEndpoint {
     fn discard_frames(&mut self) {
         let mut bytes = [0u8; 1515];
-        while unsafe { recv(self.raw_fd(), bytes.as_mut_ptr(), bytes.len(), MSG_DONTWAIT) } > 0 {}
+        // Use the same fd-bound receive contract as normal frame delivery.
+        while unsafe {
+            recv(
+                self.raw_fd(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                MSG_DONTWAIT | MSG_TRUNC,
+            )
+        } > 0
+        {}
         bytes.fill(0);
         self.receive_notified = false;
         self.transmit_blocked = false;
