@@ -233,6 +233,131 @@ pub(super) struct RadioPreparation {
     station: MacPreparation,
 }
 
+pub(super) enum ControlOperation {
+    Channel(ChannelChange),
+    Join(crate::peer::PeerJoin),
+    Scan(PassiveScan),
+    Association(crate::peer::PeerAssociation),
+    Power(crate::peer::PowerSaveChange),
+    Key(crate::peer::KeyInstallation),
+}
+
+impl ControlOperation {
+    fn context(&self) -> &wlan_softmac_class_support::OperationContext {
+        match self {
+            Self::Channel(operation) => &operation.context,
+            Self::Join(operation) => &operation.context,
+            Self::Scan(operation) => &operation.context,
+            Self::Association(operation) => &operation.context,
+            Self::Power(operation) => &operation.context,
+            Self::Key(operation) => &operation.context,
+        }
+    }
+
+    fn fail(&mut self, status: zx::Status) {
+        match self {
+            Self::Channel(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Join(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Scan(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Association(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Power(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Key(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+        }
+    }
+}
+
+/// Admission-ordered ownership for runtime control effects. The actual
+/// operation and its sole authority move together through queued and active
+/// states, so a selected kind can never be detached from its payload.
+#[derive(Default)]
+pub(super) struct ControlScheduler {
+    pub(super) active: Option<ControlOperation>,
+    queued: VecDeque<ControlOperation>,
+}
+
+impl ControlScheduler {
+    pub(super) fn admit(&mut self, operation: ControlOperation) -> Result<(), zx::Status> {
+        let duplicate = self
+            .iter()
+            .any(|existing| std::mem::discriminant(existing) == std::mem::discriminant(&operation));
+        if duplicate {
+            return Err(zx::Status::SHOULD_WAIT);
+        }
+        self.queued.push_back(operation);
+        Ok(())
+    }
+
+    pub(super) fn activate(&mut self, now: Instant) -> Result<(), zx::Status> {
+        if self.active.is_none() {
+            self.active = self.queued.pop_front();
+        }
+        if let Some(active) = self.active.as_ref() {
+            active.context().check(now)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &ControlOperation> {
+        self.active.iter().chain(self.queued.iter())
+    }
+
+    pub(super) fn has_queued(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    pub(super) fn complete(&mut self) -> Result<(), zx::Status> {
+        self.active.take().map(|_| ()).ok_or(zx::Status::BAD_STATE)
+    }
+
+    pub(super) fn yield_after_completed_power_command(&mut self) -> Result<(), zx::Status> {
+        if !matches!(self.active.as_ref(),
+            Some(ControlOperation::Power(change)) if change.enabled && change.complete())
+        {
+            return Err(zx::Status::BAD_STATE);
+        }
+        self.queued
+            .push_back(self.active.take().expect("completed power operation"));
+        Ok(())
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.active.is_some() || !self.queued.is_empty()
+    }
+
+    pub(super) fn fail_all(&mut self, status: zx::Status) {
+        if let Some(mut active) = self.active.take() {
+            active.fail(status);
+        }
+        for mut operation in self.queued.drain(..) {
+            operation.fail(status);
+        }
+    }
+}
+
 /// Shared MCU transaction progression; protocol replies stay in the operation
 /// that owns this sequence, never in this transport-only state.
 pub(super) struct FirmwareCommands {
@@ -492,6 +617,9 @@ impl FirmwareCommands {
             self.pending = None;
             return Ok(true);
         }
+        if mechanics.active_command_slot().is_some() {
+            return Ok(false);
+        }
         if let Some((bytes, expected)) = self.remaining.pop_front() {
             let mut views = resources
                 .active_mcu_views(receive, start)
@@ -718,6 +846,199 @@ mod tests {
     use super::*;
     use crate::OwnedHardwareResources;
     use drv_hardware_backends::{DeterministicBackend, Operation};
+
+    fn control_context(deadline: Instant) -> wlan_softmac_class_support::OperationContext {
+        wlan_softmac_class_support::conformance::operation_context(deadline).0
+    }
+
+    fn power_control(context: wlan_softmac_class_support::OperationContext) -> ControlOperation {
+        let (reply, _) = futures_channel::oneshot::channel();
+        ControlOperation::Power(crate::peer::PowerSaveChange::new(context, true, reply).unwrap())
+    }
+
+    fn key_control(context: wlan_softmac_class_support::OperationContext) -> ControlOperation {
+        use wlan_softmac_class_support::WlanKeyConfiguration;
+        let (reply, _) = futures_channel::oneshot::channel();
+        ControlOperation::Key(
+            crate::peer::KeyInstallation::new(
+                context,
+                [4; 6],
+                WlanKeyConfiguration {
+                    key_type: Some(fidl_fuchsia_wlan_ieee80211::KeyType::Group),
+                    key_idx: Some(2),
+                    peer_addr: Some([0xff; 6]),
+                    cipher_oui: Some([0, 0x0f, 0xac]),
+                    cipher_type: Some(4),
+                    protection: Some(fidl_fuchsia_wlan_softmac::WlanProtection::RxTx),
+                    rsc: Some(0),
+                    ..Default::default()
+                },
+                zeroize::Zeroizing::new(vec![0x5a; 16]),
+                None,
+                reply,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn completed_power_yields_and_resumes_the_same_payload() {
+        use mt7921_core::{DMA_DESCRIPTOR_LEN, DmaDescriptor};
+        let (device, _, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+        let mut mechanics = mt7921_core::LoaderMechanics::default();
+        let mut receive = crate::receive::RxRouting::default();
+        let now = Instant::now();
+        let mut scheduler = ControlScheduler::default();
+        scheduler
+            .admit(power_control(control_context(now + Duration::from_secs(1))))
+            .unwrap();
+        scheduler.activate(now).unwrap();
+        assert_eq!(
+            scheduler.yield_after_completed_power_command(),
+            Err(zx::Status::BAD_STATE)
+        );
+        assert!(matches!(scheduler.active, Some(ControlOperation::Power(_))));
+        scheduler
+            .admit(key_control(control_context(now + Duration::from_secs(1))))
+            .unwrap();
+
+        let Some(ControlOperation::Power(power)) = scheduler.active.as_mut() else {
+            unreachable!()
+        };
+        power
+            .drive(&mut resources, &mut mechanics, &mut receive, now, now)
+            .unwrap();
+        let mut tx = [0; DMA_DESCRIPTOR_LEN];
+        resources.dma.mcu_tx_ring.read(0, &mut tx).unwrap();
+        let control = u32::from_le_bytes(tx[4..8].try_into().unwrap()) | (1 << 31);
+        tx[4..8].copy_from_slice(&control.to_le_bytes());
+        let mut response = vec![0; 44];
+        response[24..26].copy_from_slice(&20u16.to_le_bytes());
+        response[28] = 1;
+        response[29] = mechanics.sequence();
+        response[36] = 2;
+        let address = resources
+            .dma
+            .mcu_rx_buffers
+            .device_address(0)
+            .unwrap()
+            .bits();
+        model.write_dma(address, response);
+        model.write_dma(
+            resources.dma.mcu_rx_ring.device_address(0).unwrap().bits(),
+            DmaDescriptor {
+                buf0: address as u32,
+                ctrl: (1 << 31) | (1 << 30) | (44 << 16),
+                buf1: 0,
+                info: 0,
+            }
+            .to_le_bytes()
+            .to_vec(),
+        );
+        power
+            .drive(&mut resources, &mut mechanics, &mut receive, now, now)
+            .unwrap();
+        assert!(!power.complete(), "MCU reply must not retire DMA");
+        model.write_dma(
+            resources.dma.mcu_tx_ring.device_address(0).unwrap().bits(),
+            tx.to_vec(),
+        );
+        resources.bar0.write_u32(0xd441c, 1).unwrap();
+        power
+            .drive(&mut resources, &mut mechanics, &mut receive, now, now)
+            .unwrap();
+        assert!(power.complete());
+
+        scheduler.yield_after_completed_power_command().unwrap();
+        scheduler.activate(now).unwrap();
+        assert!(matches!(scheduler.active, Some(ControlOperation::Key(_))));
+        scheduler.complete().unwrap();
+        scheduler.activate(now).unwrap();
+        assert!(matches!(scheduler.active.as_ref(),
+            Some(ControlOperation::Power(power)) if power.complete()));
+    }
+
+    #[test]
+    fn queued_control_keeps_its_original_deadline() {
+        let now = Instant::now();
+        let mut scheduler = ControlScheduler::default();
+        scheduler
+            .admit(power_control(control_context(now + Duration::from_secs(1))))
+            .unwrap();
+        scheduler
+            .admit(key_control(control_context(now + Duration::from_millis(1))))
+            .unwrap();
+        scheduler.activate(now).unwrap();
+        scheduler.complete().unwrap();
+        assert_eq!(
+            scheduler.activate(now + Duration::from_millis(2)),
+            Err(zx::Status::TIMED_OUT)
+        );
+        scheduler.fail_all(zx::Status::TIMED_OUT);
+        assert!(!scheduler.pending());
+
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(1),
+        );
+        scheduler.admit(power_control(context)).unwrap();
+        scheduler.activate(now).unwrap();
+        revoke();
+        assert_eq!(scheduler.activate(now), Err(zx::Status::CANCELED));
+    }
+
+    #[test]
+    fn firmware_commands_never_pop_behind_another_active_owner() {
+        use mt7921_core::{DMA_DESCRIPTOR_LEN, PassiveMcuCommand, encode_passive_mcu_command};
+        let (device, log, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+        let command =
+            encode_passive_mcu_command(&PassiveMcuCommand::RadioLedCtrl { value: 1 }, 1).unwrap();
+        let mut first = FirmwareCommands::new([(command.clone(), RadioResponse::None)].into());
+        let mut second = FirmwareCommands::new([(command, RadioResponse::None)].into());
+        let mut mechanics = mt7921_core::LoaderMechanics::default();
+        let mut receive = crate::receive::RxRouting::default();
+        let now = Instant::now();
+        assert!(
+            first
+                .drive(&mut resources, &mut mechanics, &mut receive, now, now, None,)
+                .unwrap()
+        );
+        let operations = log.borrow().len();
+        assert!(
+            !second
+                .drive(&mut resources, &mut mechanics, &mut receive, now, now, None,)
+                .unwrap()
+        );
+        assert_eq!(second.remaining.len(), 1);
+        assert!(!second.failed);
+        assert_eq!(log.borrow().len(), operations);
+
+        let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+        resources.dma.mcu_tx_ring.read(0, &mut descriptor).unwrap();
+        let control = u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) | (1 << 31);
+        descriptor[4..8].copy_from_slice(&control.to_le_bytes());
+        model.write_dma(
+            resources.dma.mcu_tx_ring.device_address(0).unwrap().bits(),
+            descriptor.to_vec(),
+        );
+        resources.bar0.write_u32(0xd441c, 1).unwrap();
+        assert!(
+            first
+                .drive(&mut resources, &mut mechanics, &mut receive, now, now, None,)
+                .unwrap()
+        );
+        assert!(
+            second
+                .drive(&mut resources, &mut mechanics, &mut receive, now, now, None,)
+                .unwrap()
+        );
+        assert!(second.remaining.is_empty());
+    }
 
     #[test]
     fn scan_reply_waits_for_tx_reclamation_and_revocation_retains_published_dma() {
