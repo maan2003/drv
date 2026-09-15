@@ -585,6 +585,15 @@ mod tests {
         }
     }
 
+    fn thread_cpu_time() -> Option<Duration> {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+        (unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } == 0)
+            .then(|| {
+                let time = unsafe { time.assume_init() };
+                Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+            })
+    }
+
     #[test]
     fn network_filter_fixture() {
         if std::env::var_os("DRV_NETWORK_FILTER_FIXTURE").is_none() {
@@ -825,6 +834,8 @@ mod tests {
             123,
         );
         let before = service.poller_wait_counts();
+        let before_cpu = thread_cpu_time();
+        child_require(before_cpu.is_some(), 127);
         child_require(
             service
                 .serve_socks5_listener(
@@ -837,17 +848,27 @@ mod tests {
             124,
         );
         let after = service.poller_wait_counts();
+        let after_cpu = thread_cpu_time();
+        child_require(after_cpu.is_some(), 127);
         let waits = after.0 - before.0;
         let blocking = after.1 - before.1;
-        child_require(blocking != 0 && blocking == waits && waits <= 32, 125);
+        let cpu = after_cpu.unwrap().saturating_sub(before_cpu.unwrap());
+        eprintln!(
+            "resource_admission mode={} capacity={} waits={waits} blocking_waits={blocking} cpu_us={}",
+            mode.to_string_lossy(),
+            resources.admission_capacity,
+            cpu.as_micros(),
+        );
+        // Client readiness can split across an arbitrary number of epoll
+        // batches. CPU time catches an immediate-return spin without imposing
+        // a scheduling-sensitive cap on otherwise blocking-capable waits.
+        child_require(
+            blocking != 0 && blocking == waits && cpu < Duration::from_millis(30),
+            125,
+        );
         if let Some(restore_limit) = restore_limit {
             child_require(restore_limit.join().is_ok(), 126);
         }
-        eprintln!(
-            "resource_admission mode={} capacity={} waits={waits} blocking_waits={blocking}",
-            mode.to_string_lossy(),
-            resources.admission_capacity,
-        );
         drop(service);
         child_exit(0);
     }
