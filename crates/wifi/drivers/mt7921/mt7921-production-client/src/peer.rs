@@ -217,11 +217,17 @@ impl PeerJoin {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct AssociatedPeer {
+    pub aid: u16,
+    pub qos: bool,
+}
+
 /// Linux association activation: BSS/RLM, peer accounting reset, then
 /// associated STA and BSS callbacks. Completing this does not open the port.
 pub(super) struct PeerAssociation {
     pub context: wlan_softmac_class_support::OperationContext,
-    pub qos: bool,
+    pub peer: AssociatedPeer,
     bss: FirmwareCommands,
     clear: MacPreparation,
     commands: FirmwareCommands,
@@ -392,7 +398,7 @@ impl PeerAssociation {
         ]);
         Ok(Self {
             context,
-            qos,
+            peer: AssociatedPeer { aid, qos },
             bss: FirmwareCommands::new(bss_commands.into()),
             clear: MacPreparation::for_wcid(1),
             commands: FirmwareCommands::new(commands),
@@ -911,7 +917,8 @@ mod tests {
             } else {
                 assert!(association.complete());
                 assert_eq!(published, expected.len());
-                assert_eq!(association.qos, qos);
+                assert_eq!(association.peer.qos, qos);
+                assert_eq!(association.peer.aid, 42);
             }
         }
     }

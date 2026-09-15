@@ -362,7 +362,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                         }
                     }
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
-                        if self.associated_qos.is_some()
+                        if self.associated.is_some()
                             && let Ok(loss) = mt7921_core::parse_client_beacon_loss(&bytes.bytes)
                             && loss.bss_index == 0
                         {
@@ -415,7 +415,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 )?;
                 if association.complete() {
                     association.context.check(std::time::Instant::now())?;
-                    self.associated_qos = Some(association.qos);
+                    self.associated = Some(association.peer);
                     if let Some(reply) = association.reply.take() {
                         let _ = reply.send(Ok(()));
                     }
@@ -514,7 +514,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
 
     fn set_link_up(&mut self, up: bool) -> Result<(), zx::Status> {
         if up
-            && (self.associated_qos.is_none()
+            && (self.associated.is_none()
                 || self.ptk.is_none()
                 || self.gtk.is_none()
                 || self.igtk.is_none()
@@ -750,7 +750,7 @@ impl WlanSoftmac for Mt7921Driver {
         let result = (|| {
             context.check(std::time::Instant::now())?;
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted
-                || self.associated_qos.is_none()
+                || self.associated.is_none()
             {
                 return Err(zx::Status::BAD_STATE);
             }
@@ -810,7 +810,7 @@ impl WlanSoftmac for Mt7921Driver {
         let result = (|| {
             context.check(std::time::Instant::now())?;
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted
-                || self.associated_qos.is_some()
+                || self.associated.is_some()
             {
                 return Err(zx::Status::BAD_STATE);
             }
@@ -852,7 +852,7 @@ impl WlanSoftmac for Mt7921Driver {
             context.check(std::time::Instant::now())?;
             if self.session.lifecycle != SessionLifecycle::ProtocolStarted
                 || self.joined.is_none()
-                || self.associated_qos.is_none()
+                || self.associated.is_none()
                 || !self.controlled_port_open
             {
                 return Err(zx::Status::BAD_STATE);
@@ -1078,7 +1078,7 @@ impl WlanSoftmac for Mt7921Driver {
             return Err(zx::Status::BAD_STATE);
         }
         if data {
-            if self.associated_qos.is_none() {
+            if self.associated.is_none() {
                 return Err(zx::Status::BAD_STATE);
             }
             if !protected {
