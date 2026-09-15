@@ -448,6 +448,100 @@ impl PeerAssociation {
     }
 }
 
+/// Tear down the acknowledged peer, not the device or interface. Key and
+/// station commands precede WTBL accounting reset; the BSS ACK is last.
+pub(super) struct PeerRemoval {
+    pub context: wlan_softmac_class_support::OperationContext,
+    commands: FirmwareCommands,
+    clear: MacPreparation,
+    bss: FirmwareCommands,
+    pub reply: Option<futures_channel::oneshot::Sender<Result<(), zx::Status>>>,
+}
+
+impl PeerRemoval {
+    pub fn new(
+        context: wlan_softmac_class_support::OperationContext,
+        bss: &ObservedBss,
+        associated: Option<AssociatedPeer>,
+        pairwise_key: bool,
+        broadcast_keys: bool,
+        reply: futures_channel::oneshot::Sender<Result<(), zx::Status>>,
+    ) -> Result<Self, zx::Status> {
+        use mt7921_core::*;
+        let encode = |result: Result<Vec<u8>, String>| result.map_err(|_| zx::Status::INVALID_ARGS);
+        let mut commands = std::collections::VecDeque::new();
+        if associated.is_some() {
+            commands.push_back((
+                encode(encode_client_post_assoc_power_state_command(1, 0, 0))?,
+                RadioResponse::Unified(2),
+            ));
+            commands.push_back((encode(encode_client_bss_abort_command(1, 0))?, RadioResponse::None));
+            commands.push_back((
+                encode(encode_client_post_assoc_rx_filter_clear_command(1))?,
+                RadioResponse::None,
+            ));
+        }
+        for (installed, wcid, muar) in [(broadcast_keys, 19, 0x0e), (pairwise_key, 1, 0)] {
+            if installed {
+                let command = encode_disable_keys_command(1, 0, wcid, muar)
+                    .map_err(|_| zx::Status::INVALID_ARGS)?;
+                commands.push_back((command.as_bytes().to_vec(), RadioResponse::Unified(3)));
+            }
+        }
+        commands.push_back((
+            encode(encode_remove_wcid_command(
+                1, 0, 1, associated.map_or(0, |peer| peer.aid),
+                bss.bssid, associated.is_some_and(|peer| peer.qos),
+            ))?,
+            RadioResponse::Unified(3),
+        ));
+        // Preauthentication has only a station record: no associated BSS was
+        // published. Do not invent a DTIM schedule for that cleanup.
+        let bss_commands = if let Some(peer) = associated {
+            [(
+                encode(encode_client_bss_command(
+                    1, 0, bss.bssid, bss.channel.number, bss.beacon_period,
+                    bss.dtim_period.ok_or(zx::Status::BAD_STATE)?, peer.qos, false,
+                ))?,
+                RadioResponse::Unified(2),
+            )].into()
+        } else {
+            Default::default()
+        };
+        Ok(Self {
+            context, commands: FirmwareCommands::new(commands),
+            clear: MacPreparation::for_wcid(1),
+            bss: FirmwareCommands::new(bss_commands), reply: Some(reply),
+        })
+    }
+
+    pub fn complete(&self) -> bool {
+        self.commands.ready() && self.clear.complete() && self.bss.ready()
+    }
+
+    pub fn drive<B: Backend>(
+        &mut self,
+        resources: &mut crate::OwnedHardwareResources<B>,
+        mechanics: &mut mt7921_core::LoaderMechanics,
+        receive: &mut crate::receive::RxRouting,
+        transmit: &crate::transmit::ClientTx,
+        start: Instant,
+        now: Instant,
+    ) -> Result<bool, zx::Status> {
+        self.context.check(now)?;
+        if !transmit.idle() {
+            return Ok(false);
+        }
+        if !self.commands.ready() {
+            return self.commands.drive(resources, mechanics, receive, start, now, Some(&self.context));
+        }
+        if !self.clear.complete() {
+            return self.clear.drive(&resources.bar0, now);
+        }
+        self.bss.drive(resources, mechanics, receive, start, now, Some(&self.context))
+    }
+}
+
 /// Host replay state and secret material are scoped to this association.
 /// GTK bytes are also needed by the firmware's combined GTK/IGTK update.
 pub(super) struct ClientKey {
@@ -711,6 +805,147 @@ mod tests {
         frame.bytes[10] ^= 2;
         rssi.observe(&frame, local, peer);
         assert_eq!(rssi.rcpi(), 98);
+    }
+
+    #[test]
+    fn removal_drains_firmware_and_dma_before_completion() {
+        for (associated, reject_final) in [(false, false), (true, false), (true, true)] {
+            let (device, log, model) =
+                DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+            let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+            resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+            let now = Instant::now();
+            let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
+            let bss = ObservedBss::from_rx(&advertisement(), now).unwrap();
+            let (reply, mut receiver) = futures_channel::oneshot::channel();
+            let mut removal = PeerRemoval::new(
+                context.clone(), &bss, associated.then_some(AssociatedPeer { aid: 42, qos: true }),
+                associated, associated, reply,
+            ).unwrap();
+            let mut mechanics = LoaderMechanics::default();
+            let mut receive = crate::receive::RxRouting::default();
+            let idle = crate::transmit::ClientTx::default();
+            let mut busy = crate::transmit::ClientTx::default();
+            let mut auth = vec![0; 30];
+            auth[0] = 0xb0;
+            auth[4..10].copy_from_slice(&bss.bssid);
+            busy.enqueue(context.clone(), &auth, 12, bss.channel).unwrap();
+            assert!(!removal.drive(
+                &mut resources, &mut mechanics, &mut receive, &busy, now, now,
+            ).unwrap());
+            assert!(!log.borrow().iter().any(|op| matches!(
+                op, Operation::WriteU32 { offset: 0xd4418, .. }
+            )));
+            let expected: &[Option<u8>] = if associated {
+                &[Some(2), None, None, Some(3), Some(3), Some(3), Some(2)]
+            } else {
+                &[Some(3)]
+            };
+            let mut published = 0;
+            let mut rx_slot = 0usize;
+            let mut rejected = false;
+            for _ in 0..100 {
+                let result = removal.drive(
+                    &mut resources,
+                    &mut mechanics,
+                    &mut receive,
+                    &idle,
+                    now,
+                    now,
+                );
+                if reject_final && published == 7 {
+                    assert_eq!(result, Err(zx::Status::IO_DATA_INTEGRITY));
+                    rejected = true;
+                    break;
+                }
+                result.unwrap();
+                if removal.complete() {
+                    break;
+                }
+                let Some(slot) = mechanics.active_command_slot() else {
+                    continue;
+                };
+                if usize::from(slot) != published {
+                    continue;
+                }
+                let mut descriptor = [0; DMA_DESCRIPTOR_LEN];
+                resources
+                    .dma
+                    .mcu_tx_ring
+                    .read(usize::from(slot) * DMA_DESCRIPTOR_LEN, &mut descriptor)
+                    .unwrap();
+                if let Some(cid) = expected[published] {
+                    let mut response = vec![0; 44];
+                    response[24..26].copy_from_slice(&20u16.to_le_bytes());
+                    response[28] = 1;
+                    response[29] = mechanics.sequence();
+                    response[36] = if reject_final && published == 6 { cid + 1 } else { cid };
+                    let address = resources
+                        .dma
+                        .mcu_rx_buffers
+                        .device_address(rx_slot * mt7921_core::MT7921_MCU_RX_BUFFER_BYTES)
+                        .unwrap()
+                        .bits();
+                    let rx = DmaDescriptor {
+                        buf0: address as u32,
+                        ctrl: (1 << 31) | (1 << 30) | (44 << 16),
+                        buf1: 0,
+                        info: 0,
+                    };
+                    model.write_dma(address, response);
+                    model.write_dma(
+                        resources
+                            .dma
+                            .mcu_rx_ring
+                            .device_address(rx_slot * DMA_DESCRIPTOR_LEN)
+                            .unwrap()
+                            .bits(),
+                        rx.to_le_bytes().to_vec(),
+                    );
+                    rx_slot += 1;
+                    removal
+                        .drive(
+                            &mut resources,
+                            &mut mechanics,
+                            &mut receive,
+                            &idle,
+                            now,
+                            now,
+                        )
+                        .unwrap();
+                    assert_eq!(mechanics.active_command_slot(), Some(slot)); // ACK alone cannot reclaim
+                    assert!(!removal.complete());
+                }
+                let control = u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) | (1 << 31);
+                descriptor[4..8].copy_from_slice(&control.to_le_bytes());
+                model.write_dma(
+                    resources
+                        .dma
+                        .mcu_tx_ring
+                        .device_address(usize::from(slot) * DMA_DESCRIPTOR_LEN)
+                        .unwrap()
+                        .bits(),
+                    descriptor.to_vec(),
+                );
+                resources
+                    .bar0
+                    .write_u32(0xd441c, u32::from(slot) + 1)
+                    .unwrap();
+                published += 1;
+            }
+            assert_eq!(rejected, reject_final);
+            assert_eq!(removal.complete(), !reject_final);
+            assert_eq!(published, expected.len());
+            // The outer owner additionally requires a subsequent RX drain
+            // before sending this sole completion reply.
+            assert!(receiver.try_recv().unwrap().is_none());
+            revoke();
+            assert_eq!(removal.drive(
+                &mut resources, &mut mechanics, &mut receive, &idle, now, now,
+            ), Err(zx::Status::CANCELED));
+        }
     }
 
     #[test]

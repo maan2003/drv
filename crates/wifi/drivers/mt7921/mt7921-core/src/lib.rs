@@ -7705,6 +7705,15 @@ pub fn encode_client_post_assoc_rx_filter_command(sequence: u8) -> Result<Vec<u8
     encode_client_post_assoc_rx_filter_bitmap_command(sequence, 1)
 }
 
+/// Linux `mt7921_mcu_set_bss_pm(false)`: stop the firmware BSS monitor.
+/// CE SET_BSS_ABORT has no reply; the caller must drain transport completion.
+pub fn encode_client_bss_abort_command(sequence: u8, bss_index: u8) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 {
+        return Err("BSS abort escaped client interface bounds".into());
+    }
+    Ok(encode_legacy_mcu(0x17, 0, &[bss_index, 0, 0, 0], sequence))
+}
+
 /// Linux beacon-filter teardown uses `BIT_CLR` (bit operation 2) for the
 /// same `MT_WF_RFCR_DROP_OTHER_BEACON` bitmap before dismantling the BSS.
 pub fn encode_client_post_assoc_rx_filter_clear_command(sequence: u8) -> Result<Vec<u8>, String> {
@@ -15288,6 +15297,15 @@ mod tests {
         for pid in [0, 2, 127, 255] {
             assert!(encode(pid, false).is_err());
         }
+    }
+
+    #[test]
+    fn bss_abort_is_the_bounded_linux_ce_request() {
+        let command = encode_client_bss_abort_command(7, 0).unwrap();
+        assert_eq!(command, encode_legacy_mcu(0x17, 0, &[0; 4], 7));
+        assert!(encode_client_bss_abort_command(0, 0).is_err());
+        assert!(encode_client_bss_abort_command(16, 0).is_err());
+        assert!(encode_client_bss_abort_command(7, 1).is_err());
     }
 
     #[test]

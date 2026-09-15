@@ -240,6 +240,7 @@ pub(super) enum ControlOperation {
     Association(crate::peer::PeerAssociation),
     Power(crate::peer::PowerSaveChange),
     Key(crate::peer::KeyInstallation),
+    Removal(crate::peer::PeerRemoval),
 }
 
 impl ControlOperation {
@@ -251,6 +252,7 @@ impl ControlOperation {
             Self::Association(operation) => &operation.context,
             Self::Power(operation) => &operation.context,
             Self::Key(operation) => &operation.context,
+            Self::Removal(operation) => &operation.context,
         }
     }
 
@@ -277,6 +279,11 @@ impl ControlOperation {
                 }
             }
             Self::Power(operation) => {
+                if let Some(reply) = operation.reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+            }
+            Self::Removal(operation) => {
                 if let Some(reply) = operation.reply.take() {
                     let _ = reply.send(Err(status));
                 }

@@ -422,6 +422,31 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     self.control_scheduler.complete()?;
                 }
             }
+            if let Some(ControlOperation::Removal(removal)) = self.control_scheduler.active.as_mut() {
+                // Require an RX observation after the final firmware ACK,
+                // not the idle observation made before publishing that ACK.
+                let completed_before_turn = removal.complete();
+                progressed |= removal.drive(
+                    resources, &mut self.session.mcu.0, &mut self.session.receive,
+                    &self.tx, self.session.start, std::time::Instant::now(),
+                )?;
+                if completed_before_turn && receive_idle {
+                    removal.context.check(std::time::Instant::now())?;
+                    self.joined = None;
+                    self.associated = None;
+                    self.ptk = None;
+                    self.gtk = None;
+                    self.igtk = None;
+                    self.pmf = Default::default();
+                    self.association_rssi = Default::default();
+                    self.power_save_enabled = false;
+                    if let Some(reply) = removal.reply.take() {
+                        let _ = reply.send(Ok(()));
+                    }
+                    self.control_scheduler.complete()?;
+                    progressed = true;
+                }
+            }
             if let Some(ControlOperation::Power(change)) = self.control_scheduler.active.as_mut() {
                 progressed |= change.drive(
                     resources,
@@ -527,6 +552,23 @@ impl ClientRuntimeDriver for Mt7921Driver {
             return Err(zx::Status::BAD_STATE);
         }
         self.controlled_port_open = up;
+        Ok(())
+    }
+
+    fn finish_failed_connect_attempt(&mut self) -> Result<(), zx::Status> {
+        if self.session.lifecycle != SessionLifecycle::ProtocolStarted
+            || self.joined.is_some() || self.associated.is_some()
+            || self.controlled_port_open || self.ptk.is_some()
+            || self.gtk.is_some() || self.igtk.is_some()
+        {
+            return Err(zx::Status::BAD_STATE);
+        }
+        if self.control_scheduler.pending() || !self.tx.idle() {
+            return Err(zx::Status::SHOULD_WAIT);
+        }
+        // Removal publishes the empty peer only after firmware ACK, DMA
+        // reclamation and a subsequent RX drain. Host epochs fence callbacks
+        // already handed to the protocol; no device attempt work remains.
         Ok(())
     }
 
@@ -875,26 +917,40 @@ impl WlanSoftmac for Mt7921Driver {
 
     fn clear_association(
         &mut self,
-        context: wlan_softmac_class_support::OperationContext,
-        _: WlanSoftmacBaseClearAssociationRequest,
+        context: OperationContext,
+        request: WlanSoftmacBaseClearAssociationRequest,
     ) -> impl std::future::Future<Output = Result<(), zx::Status>> + 'static {
-        if let Err(status) = context.check(std::time::Instant::now()) {
-            return std::future::ready(Err(status));
-        }
-        std::future::ready({
-            // Firmware peer removal is not implemented yet. Never certify a
-            // programmed (or uncertain) peer as cleared; the owner must contain.
-            if self.joined.is_some()
-                || self
-                    .control_scheduler
-                    .iter()
-                    .any(|op| matches!(op, ControlOperation::Join(_)))
-            {
-                Err(zx::Status::NOT_SUPPORTED)
-            } else {
-                Ok(())
+        let result = (|| {
+            context.check(std::time::Instant::now())?;
+            let peer_addr = request.peer_addr.ok_or(zx::Status::INVALID_ARGS)?;
+            if self.session.lifecycle != SessionLifecycle::ProtocolStarted {
+                return Err(zx::Status::BAD_STATE);
             }
-        })
+            // Partially programmed control work cannot be certified cleared.
+            if self.control_scheduler.pending() {
+                return Err(zx::Status::SHOULD_WAIT);
+            }
+            let Some(bss) = self.joined.as_ref() else {
+                return Ok(None);
+            };
+            if peer_addr != bss.bssid {
+                return Err(zx::Status::INVALID_ARGS);
+            }
+            let (reply, receiver) = futures_channel::oneshot::channel();
+            let removal = crate::peer::PeerRemoval::new(
+                context, bss, self.associated,
+                self.ptk.is_some(), self.gtk.is_some() || self.igtk.is_some(), reply,
+            )?;
+            self.control_scheduler.admit(ControlOperation::Removal(removal))?;
+            self.controlled_port_open = false;
+            Ok(Some(receiver))
+        })();
+        async move {
+            match result? {
+                Some(receiver) => receiver.await.unwrap_or(Err(zx::Status::CANCELED)),
+                None => Ok(()),
+            }
+        }
     }
     fn start_passive_scan(
         &mut self,
@@ -1046,6 +1102,7 @@ impl WlanSoftmac for Mt7921Driver {
                     | ControlOperation::Join(_)
                     | ControlOperation::Association(_)
                     | ControlOperation::Key(_)
+                    | ControlOperation::Removal(_)
             )
         }) {
             return Err(zx::Status::SHOULD_WAIT);

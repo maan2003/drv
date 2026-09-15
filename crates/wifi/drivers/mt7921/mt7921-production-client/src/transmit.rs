@@ -260,7 +260,11 @@ impl ClientTx {
             return Err(zx::Status::BAD_STATE);
         }
         let result = (|| {
-            let mut progressed = false;
+            // Revocation discards only CPU-owned admissions. Published
+            // descriptors remain owned until their existing reclamation proof.
+            let queued = self.queue.len();
+            self.queue.retain(|frame| frame.context.check(now).is_ok());
+            let mut progressed = queued != self.queue.len();
             if self.roc.is_none()
                 && let Some(frame) = self.queue.front()
                 && !frame.data
@@ -401,9 +405,9 @@ impl ClientTx {
         grant_until: Option<Instant>,
     ) -> Result<bool, zx::Status> {
         if let Some(pending) = self.pending.as_mut() {
-            // Revocation never frees a published DMA buffer. Propagate the
-            // fault to containment while retaining this entire pending entry.
-            pending.frame.context.check(now)?;
+            // The device owner may drain an already published frame after
+            // attempt revocation. This grants no new TX authority and never
+            // substitutes for descriptor and token reclamation.
             let didx = resources
                 .bar0
                 .read_u32(0xd430c)
@@ -1019,7 +1023,7 @@ mod tests {
             DeterministicBackend::recording_mt7921_device_with_model(Default::default());
         let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
         let now = Instant::now();
-        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
             now + Duration::from_secs(10),
         );
         let mut data = vec![0; 40];
@@ -1032,6 +1036,7 @@ mod tests {
         assert_eq!(tx.pending.as_ref().unwrap().pid, mt7921_core::MT7921_PACKET_ID_NO_SKB);
         tx.tx_status(Mt7921TxStatus { wcid: 1, pid: 1, acked: true }).unwrap();
         assert!(tx.pending.as_ref().unwrap().status.is_none());
+        revoke(); // Attempt cancellation cannot release published DMA early.
         tx.tx_free(Mt7921TxFree {
             wcid: Some(1), token: 0, dropped: false, attempts: 1,
             status: 0, pair_word: None, info_word: 0,
@@ -1123,7 +1128,7 @@ mod tests {
             revocation();
             assert_eq!(
                 tx.drive_dma(&mut resources, now, Some(now + Duration::from_secs(1))),
-                Err(zx::Status::CANCELED)
+                if published { Ok(false) } else { Err(zx::Status::CANCELED) }
             );
             assert_eq!(tx.pending.is_some(), published);
             assert_eq!(tx.queue.len(), usize::from(!published));
@@ -1142,9 +1147,30 @@ mod tests {
             );
             assert_eq!(
                 tx.drive_dma(&mut resources, now, None),
-                Err(zx::Status::BAD_STATE)
+                if published { Ok(false) } else { Err(zx::Status::BAD_STATE) }
             );
         }
+    }
+
+    #[test]
+    fn canceled_unpublished_admission_is_discarded_without_a_roc_or_dma_effect() {
+        let (device, log, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
+        let mut tx = ClientTx::default();
+        tx.enqueue(context, &frame(), 12, channel()).unwrap();
+        revoke();
+        assert!(tx.drive(
+            &mut resources, &mut Default::default(), &mut Default::default(), now, now,
+        ).unwrap());
+        assert!(tx.idle());
+        assert!(!log.borrow().iter().any(|op| matches!(
+            op, Operation::WriteU32 { offset: 0xd4308 | 0xd4418, .. }
+        )));
     }
 
     #[test]
