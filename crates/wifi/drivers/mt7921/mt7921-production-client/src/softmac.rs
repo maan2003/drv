@@ -215,8 +215,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     if scan.reclaimed && scan.done.is_some() {
                         scan.context.check(std::time::Instant::now())?;
                         let done = scan.done.take().expect("checked above");
-                        let status = if usize::from(done.completed_channels) == scan.channels.len()
-                        {
+                        let status = if usize::from(done.completed_channels) == scan.channel_count {
                             zx::Status::OK
                         } else {
                             zx::Status::IO
@@ -715,14 +714,42 @@ impl WlanSoftmac for Mt7921Driver {
                         .ok_or(zx::Status::NOT_SUPPORTED)?,
                 );
             }
+            let min_channel_time_ns = request.min_channel_time.ok_or(zx::Status::INVALID_ARGS)?;
+            let max_channel_time_ns = request.max_channel_time.ok_or(zx::Status::INVALID_ARGS)?;
+            if max_channel_time_ns <= 0 {
+                return Err(zx::Status::INVALID_ARGS);
+            }
             let id = self.next_scan_id;
+            let channel_count = channels.len();
+            let command = mt7921_core::encode_passive_mcu_command(
+                &mt7921_core::PassiveMcuCommand::StartScan {
+                    scan_sequence: (id & 0x7f) as u8,
+                    channels,
+                    min_channel_time_ns,
+                    max_channel_time_ns,
+                },
+                1,
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+            // Encoding validated nonnegative, representable timing. Do not
+            // publish a scan whose minimum dwell cannot fit its original lease.
+            let minimum =
+                std::time::Duration::from_nanos(min_channel_time_ns as u64) * channel_count as u32;
+            if minimum
+                > context
+                    .deadline()
+                    .saturating_duration_since(std::time::Instant::now())
+            {
+                return Err(zx::Status::TIMED_OUT);
+            }
             self.next_scan_id = id.checked_add(1).ok_or(zx::Status::NO_RESOURCES)?;
             let (reply, receiver) = futures_channel::oneshot::channel();
             self.scan = Some(crate::radio::PassiveScan {
                 context,
                 id,
                 sequence: (id & 0x7f) as u8,
-                channels,
+                channel_count,
+                command,
                 reply: Some(reply),
                 published: false,
                 reclaimed: false,

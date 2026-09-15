@@ -3648,6 +3648,8 @@ pub enum PassiveMcuCommand {
     StartScan {
         scan_sequence: u8,
         channels: Vec<CandidateChannel>,
+        min_channel_time_ns: i64,
+        max_channel_time_ns: i64,
     },
     CancelScan {
         scan_sequence: u8,
@@ -3661,6 +3663,7 @@ pub enum PassiveMcuCommandError {
     InvalidAntennaMask,
     InvalidScanSequence,
     InvalidScanChannelCount,
+    InvalidScanDwell,
     ActiveScanMaterial,
 }
 
@@ -3910,7 +3913,9 @@ pub fn encode_client_interface_bss_command(enable: bool, sequence: u8) -> Result
 
 /// Encode only the pinned Linux commands required by the conservative passive
 /// one-channel milestone. START_HW_SCAN has no SSID, probe, IE, random-MAC, or
-/// transmit material and uses Connac2's firmware-selected dwell fields (zero).
+/// transmit material. Explicit dwell uses TU (1024us); the aggregate timeout
+/// uses milliseconds. A zero/zero range retains firmware defaults for the
+/// legacy diagnostic caller; production requests provide explicit bounds.
 pub fn encode_passive_mcu_command(
     command: &PassiveMcuCommand,
     sequence: u8,
@@ -4057,6 +4062,8 @@ pub fn encode_passive_mcu_command(
         PassiveMcuCommand::StartScan {
             scan_sequence,
             channels,
+            min_channel_time_ns,
+            max_channel_time_ns,
         } => {
             if *scan_sequence > 0x7f {
                 return Err(PassiveMcuCommandError::InvalidScanSequence);
@@ -4066,7 +4073,27 @@ pub fn encode_passive_mcu_command(
             if !(1..=64).contains(&channels.len()) {
                 return Err(PassiveMcuCommandError::InvalidScanChannelCount);
             }
+            // CMD_SCAN_REQ_V2 timing units are documented in the pinned
+            // MediaTek gen4m scan message; see SOURCE-MAP.md. Round inward:
+            // never shorten the minimum or exceed the requested maximum.
+            let min_ns = u64::try_from(*min_channel_time_ns)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let max_ns = u64::try_from(*max_channel_time_ns)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let min_tu = u16::try_from(min_ns.div_ceil(1_024_000))
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let max_tu = u16::try_from(max_ns / 1_024_000)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            if min_tu > max_tu || (max_ns != 0 && max_tu == 0) {
+                return Err(PassiveMcuCommandError::InvalidScanDwell);
+            }
+            let timeout_ms =
+                u16::try_from((u64::from(max_tu) * channels.len() as u64 * 1024).div_ceil(1000))
+                    .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
             let mut payload = vec![0; 1186];
+            payload[154..156].copy_from_slice(&max_tu.to_le_bytes());
+            payload[156..158].copy_from_slice(&timeout_ms.to_le_bytes());
+            payload[828..830].copy_from_slice(&min_tu.to_le_bytes());
             payload[0] = *scan_sequence;
             payload[3] = 1;
             payload[7] = 1;
@@ -15618,6 +15645,8 @@ mod tests {
         let scan = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel],
             },
             3,
@@ -15639,6 +15668,8 @@ mod tests {
         assert!(
             !PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel]
             }
             .expects_response()
@@ -15665,6 +15696,8 @@ mod tests {
         let scan_5ghz = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 2,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel_5ghz],
             },
             5,
@@ -15681,6 +15714,8 @@ mod tests {
             encode_passive_mcu_command(
                 &PassiveMcuCommand::StartScan {
                     scan_sequence: 1,
+                    min_channel_time_ns: 0,
+                    max_channel_time_ns: 0,
                     channels: vec![forbidden],
                 },
                 1,
@@ -15706,6 +15741,8 @@ mod tests {
             let bytes = encode_passive_mcu_command(
                 &PassiveMcuCommand::StartScan {
                     scan_sequence: 127,
+                    min_channel_time_ns: 0,
+                    max_channel_time_ns: 0,
                     channels: channels.clone(),
                 },
                 15,
@@ -15741,6 +15778,8 @@ mod tests {
                 encode_passive_mcu_command(
                     &PassiveMcuCommand::StartScan {
                         scan_sequence: 1,
+                        min_channel_time_ns: 0,
+                        max_channel_time_ns: 0,
                         channels: vec![channel; count]
                     },
                     1
@@ -17173,6 +17212,80 @@ mod tests {
             Firmware::parse(&image),
             Err(FirmwareError::PayloadOverlapsMetadata)
         );
+    }
+    #[test]
+    fn passive_scan_encodes_requested_dwell_in_tu_and_timeout_in_ms() {
+        let bytes = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channels: vec![
+                    CandidateChannel {
+                        band: PhysicalBand::Ghz2,
+                        number: 1,
+                        frequency_mhz: 2412,
+                    },
+                    CandidateChannel {
+                        band: PhysicalBand::Ghz2,
+                        number: 6,
+                        frequency_mhz: 2437,
+                    },
+                ],
+                min_channel_time_ns: 204_800_000,
+                max_channel_time_ns: 204_800_000,
+            },
+            1,
+        )
+        .unwrap();
+        let payload = &bytes[64..];
+        assert_eq!(
+            u16::from_le_bytes(payload[154..156].try_into().unwrap()),
+            200
+        );
+        assert_eq!(
+            u16::from_le_bytes(payload[828..830].try_into().unwrap()),
+            200
+        );
+        assert_eq!(
+            u16::from_le_bytes(payload[156..158].try_into().unwrap()),
+            410
+        );
+    }
+
+    #[test]
+    fn passive_scan_rejects_unrepresentable_dwell_before_encoding() {
+        let command = |min_channel_time_ns, max_channel_time_ns| PassiveMcuCommand::StartScan {
+            scan_sequence: 1,
+            channels: vec![
+                CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 1,
+                    frequency_mhz: 2412,
+                },
+                CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 6,
+                    frequency_mhz: 2437,
+                },
+            ],
+            min_channel_time_ns,
+            max_channel_time_ns,
+        };
+        for (minimum, maximum) in [
+            (-1, 1_024_000),
+            (2_048_000, 1_024_000),
+            (1, 1),
+            (0, 40_000_000_000), // aggregate timeout exceeds firmware u16 milliseconds
+            (0, i64::MAX),
+        ] {
+            assert_eq!(
+                encode_passive_mcu_command(&command(minimum, maximum), 1),
+                Err(PassiveMcuCommandError::InvalidScanDwell),
+            );
+        }
+        let bytes = encode_passive_mcu_command(&command(1_024_001, 3_071_999), 1).unwrap();
+        let payload = &bytes[64..];
+        assert_eq!(&payload[154..156], &2u16.to_le_bytes());
+        assert_eq!(&payload[828..830], &2u16.to_le_bytes());
     }
 }
 

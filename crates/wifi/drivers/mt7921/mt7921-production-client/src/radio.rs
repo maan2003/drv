@@ -638,7 +638,8 @@ pub(super) struct PassiveScan {
     pub context: wlan_softmac_class_support::OperationContext,
     pub id: u64,
     pub sequence: u8,
-    pub channels: Vec<mt7921_core::CandidateChannel>,
+    pub channel_count: usize,
+    pub command: Vec<u8>,
     pub reply: Option<
         futures_channel::oneshot::Sender<
             Result<wlan_softmac_class_support::WlanSoftmacBaseStartPassiveScanResponse, zx::Status>,
@@ -668,14 +669,6 @@ impl PassiveScan {
             return Err(status);
         }
         if !self.published {
-            let bytes = encode_passive_mcu_command(
-                &PassiveMcuCommand::StartScan {
-                    scan_sequence: self.sequence,
-                    channels: self.channels.clone(),
-                },
-                1,
-            )
-            .map_err(|_| zx::Status::INVALID_ARGS)?;
             let mut views = resources
                 .active_mcu_views(receive, start)
                 .map_err(|_| zx::Status::IO)?;
@@ -685,7 +678,7 @@ impl PassiveScan {
                 .begin_command(
                     &mut views,
                     &mut (),
-                    &bytes,
+                    &self.command,
                     LoaderCommandCompletion::NoResponse,
                 )
                 .map_err(|_| zx::Status::IO)?;
@@ -745,11 +738,21 @@ mod tests {
                 context,
                 id: 257,
                 sequence: 1,
-                channels: vec![CandidateChannel {
-                    band: PhysicalBand::Ghz2,
-                    number: 1,
-                    frequency_mhz: 2412,
-                }],
+                channel_count: 1,
+                command: encode_passive_mcu_command(
+                    &PassiveMcuCommand::StartScan {
+                        scan_sequence: 1,
+                        channels: vec![CandidateChannel {
+                            band: PhysicalBand::Ghz2,
+                            number: 1,
+                            frequency_mhz: 2412,
+                        }],
+                        min_channel_time_ns: 204_800_000,
+                        max_channel_time_ns: 204_800_000,
+                    },
+                    1,
+                )
+                .unwrap(),
                 reply: Some(reply),
                 published: false,
                 reclaimed: false,
@@ -1009,7 +1012,8 @@ mod tests {
             context,
             id: 1,
             sequence: 1,
-            channels: Vec::new(),
+            channel_count: 0,
+            command: Vec::new(),
             reply: Some(reply),
             published: false,
             reclaimed: false,

@@ -120,3 +120,25 @@ not equivalent: that bypasses the pinned host patches in the source derivation.
    3 before a healthy kernel/iwd/network restore. Full firmware loading now
    reaches N9, switches normal responses to WM2 ring 4, and parses the read-only
    NIC capability response before reset-while-pinned and healthy restoration.
+
+## Explicit passive-scan timing
+
+The production SoftMAC request's minimum and maximum channel durations are
+not firmware-default hints. Encode them into `START_HW_SCAN` rather than
+discarding them; reject an interval that has no representable TU or whose
+aggregate timeout exceeds the wire field. Legacy diagnostic zero/zero remains
+the explicitly unspecified firmware default.
+
+The pinned Linux `mt76_connac_mcu.h::mt76_connac_hw_scan_req` owns the packed
+field positions. Timing units are confirmed by MediaTek's matching
+`CMD_SCAN_REQ_V2` implementation in Motorola's gen4m release, commit
+`fa87f7db913bd36e517fe03c99f67d827a8bf64c`:
+- [`include/mgmt/scan.h`](https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-core-gen4m/blob/fa87f7db913bd36e517fe03c99f67d827a8bf64c/include/mgmt/scan.h):
+  `MSG_SCN_SCAN_REQ_V2` declares both dwell fields in TU (1024 us), timeout in ms.
+- `mgmt/scan_fsm.c::scnFsmHandleScanMsgV2` and `scnSendScanReqV2` copy those
+  fields unchanged into the firmware command.
+- `include/wsys_cmd_handler_fw.h::CMD_SCAN_REQ_V2` matches the Linux layout.
+
+Round minimum dwell upward and maximum downward to whole TU, and aggregate
+timeout upward to milliseconds. Production prepares and validates the command
+before admitting the hardware operation, retaining the original authority.
