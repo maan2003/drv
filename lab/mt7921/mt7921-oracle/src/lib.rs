@@ -1660,6 +1660,8 @@ mod tests {
                 protected,
                 qos,
                 tid,
+                7,
+                12,
             ).unwrap();
             prop_assert_eq!(rust, c_data_txwi(DataTxwiInput {
                 payload_len, payload_iova, token, pid, eapol, protected, qos, tid

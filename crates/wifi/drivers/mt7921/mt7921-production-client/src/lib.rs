@@ -213,9 +213,9 @@ pub enum HardwareResource {
     WaRxBuffers,
     DataRxRing,
     DataRxBuffers,
-    ManagementTxwi,
+    ClientTxwi,
     ManagementFrame,
-    ManagementTxRing,
+    ClientTxRing,
     Interrupt,
 }
 
@@ -512,10 +512,10 @@ impl<B: Backend> OwnedHardwareResources<B> {
                 FromDevice,
                 MT7921_DATA_RX_RING_COUNT * MT7921_MCU_RX_BUFFER_BYTES
             ),
-            management_txwi: dma!(ManagementTxwi, ToDevice, PAGE),
+            management_txwi: dma!(ClientTxwi, ToDevice, PAGE),
             management_frame: dma!(ManagementFrame, ToDevice, PAGE),
             management_tx_ring: dma!(
-                ManagementTxRing,
+                ClientTxRing,
                 Bidirectional,
                 mt7921_core::MT7921_BAND0_TX_RING_BYTES
             ),
@@ -969,7 +969,7 @@ pub struct Mt7921Driver {
     peer_association: Option<peer::PeerAssociation>,
     associated_qos: Option<bool>,
     association_rssi: peer::AssociationRssi,
-    management_tx: transmit::ManagementTx,
+    tx: transmit::ClientTx,
     next_scan_id: u64,
     upcalls: Option<Box<dyn wlan_softmac_class_support::WlanSoftmacUpcalls>>,
 }
@@ -1033,7 +1033,7 @@ impl Mt7921Driver {
                     peer_association: None,
                     associated_qos: None,
                     association_rssi: Default::default(),
-                    management_tx: transmit::ManagementTx::default(),
+                    tx: transmit::ClientTx::default(),
                     next_scan_id: 1,
                     upcalls: None,
                 })
@@ -1370,9 +1370,9 @@ mod tests {
         HardwareResource::WaRxBuffers,
         HardwareResource::DataRxRing,
         HardwareResource::DataRxBuffers,
-        HardwareResource::ManagementTxwi,
+        HardwareResource::ClientTxwi,
         HardwareResource::ManagementFrame,
-        HardwareResource::ManagementTxRing,
+        HardwareResource::ClientTxRing,
     ];
 
     fn assert_no_live_resources(probe: &DeterministicResourceProbe) {
@@ -1388,7 +1388,7 @@ mod tests {
         assert_eq!(ledger.acquired().first(), Some(&HardwareResource::Bar0));
         assert_eq!(
             ledger.acquired().last(),
-            Some(&HardwareResource::ManagementTxRing)
+            Some(&HardwareResource::ClientTxRing)
         );
         assert_eq!(ledger.acquired().len(), 16);
         assert_eq!(resources.bar0.len(), MT7921_BAR0_BYTES);

@@ -776,10 +776,11 @@ int oracle_client_data_txwi(uint16_t payload_len, uint32_t payload_iova,
 {
     uint32_t *txwi = (uint32_t *)out;
     uint8_t subtype = qos ? 8 : 0;
+    const uint8_t lmac_queue[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
     memset(out, 0, 64);
     txwi[0] = cpu_to_le32(FIELD_PREP(MT_TXD0_TX_BYTES, payload_len + 32) |
                             FIELD_PREP(MT_TXD0_PKT_FMT, MT_TX_TYPE_CT) |
-                            FIELD_PREP(MT_TXD0_Q_IDX, eapol ? 3 : 1));
+                            FIELD_PREP(MT_TXD0_Q_IDX, lmac_queue[tid]));
     txwi[1] = cpu_to_le32(MT_TXD1_LONG_FORMAT |
                             FIELD_PREP(MT_TXD1_WLAN_IDX, 7));
     txwi[3] = cpu_to_le32(FIELD_PREP(MT_TXD3_REM_TX_COUNT, 15) |
@@ -789,7 +790,7 @@ int oracle_client_data_txwi(uint16_t payload_len, uint32_t payload_iova,
     if (eapol) {
         txwi[1] |= cpu_to_le32(FIELD_PREP(MT_TXD1_HDR_FORMAT, MT_HDR_FORMAT_802_11) |
                                  FIELD_PREP(MT_TXD1_HDR_INFO, qos ? 13 : 12) |
-                                 FIELD_PREP(MT_TXD1_TID, qos ? tid : 0));
+                                 FIELD_PREP(MT_TXD1_TID, tid));
         txwi[2] |= cpu_to_le32(FIELD_PREP(MT_TXD2_FRAME_TYPE, 2) |
                                  FIELD_PREP(MT_TXD2_SUB_TYPE, subtype) |
                                  MT_TXD2_FIX_RATE);

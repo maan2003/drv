@@ -1,4 +1,4 @@
-//! Bounded management DMA ownership. A firmware grant permits publication;
+//! Bounded management and control-port DMA ownership. A firmware grant permits publication;
 //! it does not prove that either descriptor or payload ownership has returned.
 
 use crate::{
@@ -17,7 +17,8 @@ const CAPACITY: usize = 16;
 
 struct QueuedFrame {
     context: OperationContext,
-    bytes: Vec<u8>,
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    control_port: bool,
     rate: u8,
     channel: mt7921_core::CandidateChannel,
 }
@@ -55,7 +56,7 @@ struct Roc {
 
 /// One descriptor/payload pair is in flight; later frames remain CPU-owned.
 /// Only the exclusive driver may supply an unexpired, matching ROC grant.
-pub(super) struct ManagementTx {
+pub(super) struct ClientTx {
     queue: VecDeque<QueuedFrame>,
     pending: Option<PublishedFrame>,
     producer: u16,
@@ -66,7 +67,7 @@ pub(super) struct ManagementTx {
     next_roc_token: u8,
 }
 
-impl Default for ManagementTx {
+impl Default for ClientTx {
     fn default() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -81,7 +82,7 @@ impl Default for ManagementTx {
     }
 }
 
-impl ManagementTx {
+impl ClientTx {
     pub fn idle(&self) -> bool {
         self.queue.is_empty() && self.pending.is_none() && self.roc.is_none()
     }
@@ -108,15 +109,24 @@ impl ManagementTx {
         if self.queue.len() + usize::from(self.pending.is_some()) == CAPACITY {
             return Err(zx::Status::NO_RESOURCES);
         }
-        // This initial path handles only unfragmented, unprotected unicast
-        // management. Keys, multicast/BIP and data require their own contract.
         if !(26..=4095).contains(&bytes.len())
-            || !matches!(bytes[0], 0x00 | 0xb0 | 0xa0 | 0xc0)
-            || bytes[1] & !0x08 != 0
             || bytes[4] & 1 != 0
             || bytes[22] & 0xf != 0
             || !crate::peer::OFDM_RATES.contains(&rate)
         {
+            return Err(zx::Status::NOT_SUPPORTED);
+        }
+        let control_port = matches!(bytes[0], 0x08 | 0x88);
+        if control_port {
+            let header = if bytes[0] == 0x88 { 26 } else { 24 };
+            if bytes[1] & !0x08 != 1
+                || bytes.get(header..header + 8) != Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e])
+                || bytes.len() < header + 12
+                || (header == 26 && u16::from_le_bytes([bytes[24], bytes[25]]) > 7)
+            {
+                return Err(zx::Status::NOT_SUPPORTED);
+            }
+        } else if !matches!(bytes[0], 0x00 | 0xb0 | 0xa0 | 0xc0) || bytes[1] & !0x08 != 0 {
             return Err(zx::Status::NOT_SUPPORTED);
         }
         if bytes[0] == 0xb0 && bytes.len() < 30 || bytes[0] == 0 && bytes.len() < 28 {
@@ -124,7 +134,8 @@ impl ManagementTx {
         }
         self.queue.push_back(QueuedFrame {
             context,
-            bytes: bytes.to_vec(),
+            bytes: zeroize::Zeroizing::new(bytes.to_vec()),
+            control_port,
             rate,
             channel,
         });
@@ -212,6 +223,7 @@ impl ManagementTx {
             let mut progressed = false;
             if self.roc.is_none()
                 && let Some(frame) = self.queue.front()
+                && !frame.control_port
             {
                 frame.context.check(now)?;
                 let duration = if frame.bytes[0] == 0xb0 && frame.bytes[24..26] == [3, 0] {
@@ -260,6 +272,11 @@ impl ManagementTx {
                     } => {
                         roc.context.check(now)?;
                         if now >= *deadline {
+                            eprintln!(
+                                "mt7921_tx_timeout stage=roc grant_received={} command_reclaimed={}",
+                                grant.is_some(),
+                                commands.ready()
+                            );
                             return Err(zx::Status::TIMED_OUT);
                         }
                         progressed |= commands.drive(
@@ -345,6 +362,13 @@ impl ManagementTx {
             // fault to containment while retaining this entire pending entry.
             pending.frame.context.check(now)?;
             if now >= pending.deadline {
+                eprintln!(
+                    "mt7921_tx_timeout stage=dma control_port={} descriptor_done={} freed={} status={:?}",
+                    pending.frame.control_port,
+                    pending.descriptor_done,
+                    pending.freed,
+                    pending.status
+                );
                 return Err(zx::Status::TIMED_OUT);
             }
             let didx = resources
@@ -386,6 +410,12 @@ impl ManagementTx {
                 .management_txwi
                 .write(0, &[0; 64])
                 .map_err(|_| zx::Status::IO)?;
+            if pending.frame.control_port {
+                eprintln!(
+                    "mt7921_control_port_tx stage=reclaimed acked={}",
+                    pending.status.unwrap()
+                );
+            }
             self.pending = None;
             return Ok(true);
         }
@@ -393,7 +423,7 @@ impl ManagementTx {
             return Ok(false);
         };
         frame.context.check(now)?;
-        if grant_until.is_none_or(|deadline| now >= deadline) {
+        if !frame.control_port && grant_until.is_none_or(|deadline| now >= deadline) {
             return Ok(false);
         }
         let txwi_iova = resources
@@ -408,16 +438,51 @@ impl ManagementTx {
             .device_address(0)
             .map_err(|_| zx::Status::IO)?
             .bits();
-        let encoded = mt7921_core::encode_client_management_tx(
-            &frame.bytes,
-            txwi_iova,
-            frame_iova,
-            self.next_token,
-            self.next_pid,
-            1,
-            frame.rate,
-        )
-        .map_err(|_| zx::Status::INVALID_ARGS)?;
+        let encoded = if frame.control_port {
+            let qos = frame.bytes[0] == 0x88;
+            // Linux assigns control-port traffic priority7 even without a
+            // QoS header. A supplied QoS header carries its own TID.
+            let tid = if qos { frame.bytes[24] & 7 } else { 7 };
+            let txwi = mt7921_core::encode_client_data_txwi(
+                frame.bytes.len(),
+                frame_iova,
+                self.next_token,
+                self.next_pid,
+                true,
+                false,
+                qos,
+                tid,
+                1,
+                frame.rate,
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+            let descriptor = mt7921_core::mt7921_dma_tx(
+                mt7921_core::DmaSegment {
+                    iova: txwi_iova,
+                    len: 64,
+                },
+                None,
+                0,
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?;
+            mt7921_core::Mt7921MgmtTx {
+                txwi,
+                descriptor,
+                token: self.next_token,
+                pid: self.next_pid,
+            }
+        } else {
+            mt7921_core::encode_client_management_tx(
+                &frame.bytes,
+                txwi_iova,
+                frame_iova,
+                self.next_token,
+                self.next_pid,
+                1,
+                frame.rate,
+            )
+            .map_err(|_| zx::Status::INVALID_ARGS)?
+        };
         let didx = resources
             .bar0
             .read_u32(0xd430c)
@@ -471,7 +536,9 @@ impl ManagementTx {
             .map_err(|_| zx::Status::IO)?;
         // Hardware API orders the prior coherent DMA writes before MMIO.
         pending.frame.context.check(Instant::now())?;
-        if grant_until.is_none_or(|deadline| Instant::now() >= deadline) {
+        if !pending.frame.control_port
+            && grant_until.is_none_or(|deadline| Instant::now() >= deadline)
+        {
             return Err(zx::Status::TIMED_OUT);
         }
         resources
@@ -528,7 +595,7 @@ mod tests {
         let (context, _) = wlan_softmac_class_support::conformance::operation_context(
             now + Duration::from_secs(10),
         );
-        let mut tx = ManagementTx::default();
+        let mut tx = ClientTx::default();
         let mut mechanics = mt7921_core::LoaderMechanics::default();
         let mut receive = crate::receive::RxRouting::default();
         let mut data_rx = crate::receive::DataRx::default();
@@ -739,7 +806,7 @@ mod tests {
             let (context, _) = wlan_softmac_class_support::conformance::operation_context(
                 now + Duration::from_secs(10),
             );
-            let mut tx = ManagementTx::default();
+            let mut tx = ClientTx::default();
             let mut mechanics = mt7921_core::LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
             tx.enqueue(context, &frame(), 12, channel()).unwrap();
@@ -798,7 +865,7 @@ mod tests {
             let (context, _) = wlan_softmac_class_support::conformance::operation_context(
                 now + Duration::from_secs(10),
             );
-            let mut tx = ManagementTx::default();
+            let mut tx = ClientTx::default();
             tx.enqueue(context.clone(), &frame(), 12, channel())
                 .unwrap();
             tx.enqueue(context, &frame(), 24, channel()).unwrap();
@@ -851,7 +918,7 @@ mod tests {
                 assert_eq!(tx.pending.is_none(), index == 3);
                 assert_eq!(tx.queue.len(), 1);
                 if let Some(pending) = &tx.pending {
-                    assert_eq!(pending.frame.bytes, frame());
+                    assert_eq!(pending.frame.bytes.as_slice(), frame().as_slice());
                 }
             }
             assert!(!tx.drive_dma(&mut resources, now, None).unwrap());
@@ -881,7 +948,7 @@ mod tests {
             let (context, revocation) = wlan_softmac_class_support::conformance::operation_context(
                 now + Duration::from_secs(10),
             );
-            let mut tx = ManagementTx::default();
+            let mut tx = ClientTx::default();
             tx.enqueue(context, &frame(), 12, channel()).unwrap();
             assert!(!tx.drive_dma(&mut resources, now, None).unwrap());
             assert!(!tx.drive_dma(&mut resources, now, Some(now)).unwrap());
@@ -924,7 +991,7 @@ mod tests {
         let (context, _) = wlan_softmac_class_support::conformance::operation_context(
             now + Duration::from_secs(10),
         );
-        let mut tx = ManagementTx::default();
+        let mut tx = ClientTx::default();
         for (offset, bit) in [(1, 0x40), (1, 0x80), (1, 4), (4, 1), (22, 1)] {
             let mut invalid = frame();
             invalid[offset] |= bit;

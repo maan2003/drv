@@ -6794,6 +6794,23 @@ pub fn encode_mt7921_5ghz_auth_tx(
 }
 
 /// Common raw-management envelope; callers validate their frame contract.
+fn ofdm_rate_value(rate: u8) -> Option<u32> {
+    // mt76/mac80211.c::mt76_rates, expressed in 500-kbit/s units.
+    Some(
+        0x40 | match rate {
+            12 => 11,
+            18 => 15,
+            24 => 10,
+            36 => 14,
+            48 => 9,
+            72 => 13,
+            96 => 8,
+            108 => 12,
+            _ => return None,
+        },
+    )
+}
+
 fn encode_management_tx(
     frame: &[u8],
     txwi_iova: u64,
@@ -6803,18 +6820,7 @@ fn encode_management_tx(
     wcid: u16,
     rate: u8,
 ) -> Result<Mt7921MgmtTx, Mt7921MgmtTxError> {
-    // mt76/mac80211.c::mt76_rates, expressed in 500-kbit/s units.
-    let rate_index = match rate {
-        12 => 11,
-        18 => 15,
-        24 => 10,
-        36 => 14,
-        48 => 9,
-        72 => 13,
-        96 => 8,
-        108 => 12,
-        _ => return Err(Mt7921MgmtTxError::InvalidRate),
-    };
+    let rate_value = ofdm_rate_value(rate).ok_or(Mt7921MgmtTxError::InvalidRate)?;
     let subtype = u32::from((frame[0] >> 4) & 0xf);
     let fits_low32 = |iova: u64, len: usize| {
         len != 0
@@ -6850,7 +6856,7 @@ fn encode_management_tx(
     word(4, 0);
     word(5, (1 << 10) | u32::from(pid));
     // OFDM basic rate (mode 1) selected from the observed BSS intersection.
-    word(6, ((0x40u32 | rate_index) << 16) | (1 << 2));
+    word(6, (rate_value << 16) | (1 << 2));
     word(7, subtype << 16);
     drop(word);
 
@@ -8232,6 +8238,8 @@ pub fn encode_client_data_txwi(
     protected: bool,
     qos: bool,
     tid: u8,
+    wcid: u16,
+    rate: u8,
 ) -> Result<[u8; 64], String> {
     if payload_len == 0
         || payload_len > 0x0fff
@@ -8241,21 +8249,29 @@ pub fn encode_client_data_txwi(
         || token >= 8192
         || !(3..127).contains(&pid)
         || tid > 7
+        || wcid >= 20
     {
         return Err("client data TX escaped TXWI/TXP bounds".into());
     }
     let mut bytes = [0u8; 64];
+    let queue = match tid {
+        1 | 2 => 0,
+        0 | 3 => 1,
+        4 | 5 => 2,
+        _ => 3,
+    };
+
     let words = if eapol {
         let subtype = u32::from(qos) * 8;
-        let descriptor_tid = if qos { tid } else { 0 };
+        let rate_value = ofdm_rate_value(rate).ok_or("unsupported control-port basic rate")?;
         [
-            0x0600_0000 | (payload_len as u32 + 32),
-            0x8002_6007 | (u32::from(descriptor_tid) << 20) | (u32::from(qos) << 11),
+            (queue << 25) | (payload_len as u32 + 32),
+            0x8002_6000 | u32::from(wcid) | (u32::from(tid) << 20) | (u32::from(qos) << 11),
             0x8000_2020 | subtype,
             0x1000_7800 | u32::from(protected) * 2,
             0,
             0x400 | u32::from(pid),
-            0x004b_0004,
+            (rate_value << 16) | 4,
             0x0020_0000 | (subtype << 16),
         ]
     } else {
@@ -8270,8 +8286,8 @@ pub fn encode_client_data_txwi(
         // payload must therefore be the header-translated Ethernet frame from
         // `client_data_mpdu_to_ethernet`, never the 802.11 MPDU.
         [
-            0x0200_0000 | (payload_len as u32 + 32),
-            0x8000_8007 | (u32::from(tid) << 20),
+            (queue << 25) | (payload_len as u32 + 32),
+            0x8000_8000 | u32::from(wcid) | (u32::from(tid) << 20),
             0x0000_0028,
             0x0000_7802,
             0,
@@ -10604,9 +10620,19 @@ mod tests {
         assert!(super::client_data_mpdu_to_ethernet(&llc).is_err());
 
         // The 802.3 TXD carries the TID and PROTECT_FRAME, no fixed rate.
-        let txwi =
-            super::encode_client_data_txwi(ethernet.len(), 0x1234_5000, 7, 9, false, true, true, 6)
-                .unwrap();
+        let txwi = super::encode_client_data_txwi(
+            ethernet.len(),
+            0x1234_5000,
+            7,
+            9,
+            false,
+            true,
+            true,
+            6,
+            7,
+            12,
+        )
+        .unwrap();
         let dw =
             |index: usize| u32::from_le_bytes(txwi[index * 4..index * 4 + 4].try_into().unwrap());
         assert_eq!(dw(1), 0x8060_8007);

@@ -114,7 +114,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                 &mut self.session.mcu.0,
                 &mut self.session.receive,
                 &mut self.data_rx,
-                &mut self.management_tx,
+                &mut self.tx,
                 self.session.start,
                 std::time::Instant::now(),
             )?;
@@ -133,14 +133,11 @@ impl ClientRuntimeDriver for Mt7921Driver {
                             .ok_or(zx::Status::BAD_STATE)?,
                         self.joined.as_ref().map(|bss| bss.bssid),
                     ),
-                    mt7921_core::McuRxRoute::TxFree(free) => self.management_tx.tx_free(free)?,
-                    mt7921_core::McuRxRoute::TxStatus(status) => {
-                        self.management_tx.tx_status(status)?
-                    }
+                    mt7921_core::McuRxRoute::TxFree(free) => self.tx.tx_free(free)?,
+                    mt7921_core::McuRxRoute::TxStatus(status) => self.tx.tx_status(status)?,
                     mt7921_core::McuRxRoute::Firmware(bytes) => {
                         if let Ok(grant) = mt7921_core::parse_client_join_roc_grant(&bytes.bytes) {
-                            self.management_tx
-                                .roc_grant(grant, std::time::Instant::now())?;
+                            self.tx.roc_grant(grant, std::time::Instant::now())?;
                         }
                         if let Ok(done) = mt7921_core::parse_passive_scan_done(&bytes.bytes) {
                             if let Some(scan) = self.scan.as_mut() {
@@ -174,7 +171,7 @@ impl ClientRuntimeDriver for Mt7921Driver {
                     resources,
                     &mut self.session.mcu.0,
                     &mut self.session.receive,
-                    &self.management_tx,
+                    &self.tx,
                     self.session.start,
                     std::time::Instant::now(),
                 )?;
@@ -482,7 +479,7 @@ impl WlanSoftmac for Mt7921Driver {
             {
                 return Err(zx::Status::SHOULD_WAIT);
             }
-            if self.joined.is_some() || !self.management_tx.idle() {
+            if self.joined.is_some() || !self.tx.idle() {
                 return Err(zx::Status::NOT_SUPPORTED);
             }
             let requested = request.channels.ok_or(zx::Status::INVALID_ARGS)?;
@@ -590,7 +587,16 @@ impl WlanSoftmac for Mt7921Driver {
         if flags.contains(WlanTxInfoFlags::PROTECTED) {
             return Err(zx::Status::NOT_SUPPORTED);
         }
-        self.management_tx
+        if bytes.first().is_some_and(|fc| fc & 0x0c == 8) {
+            if self.associated_qos.is_none() {
+                return Err(zx::Status::BAD_STATE);
+            }
+            eprintln!(
+                "mt7921_control_port_tx stage=admission bytes={}",
+                bytes.len()
+            );
+        }
+        self.tx
             .enqueue(context, bytes, peer.management_rate(), peer.channel)
     }
 }
@@ -603,7 +609,7 @@ pub(super) fn drive_radio_io<B: drv_hardware::Backend>(
     mechanics: &mut mt7921_core::LoaderMechanics,
     receive: &mut crate::receive::RxRouting,
     data_rx: &mut crate::receive::DataRx,
-    management_tx: &mut crate::transmit::ManagementTx,
+    management_tx: &mut crate::transmit::ClientTx,
     start: std::time::Instant,
     now: std::time::Instant,
 ) -> Result<(bool, bool, Vec<mt7921_core::McuRxRoute>), zx::Status> {

@@ -409,7 +409,7 @@ impl PeerAssociation {
         resources: &mut crate::OwnedHardwareResources<B>,
         mechanics: &mut mt7921_core::LoaderMechanics,
         receive: &mut crate::receive::RxRouting,
-        management: &crate::transmit::ManagementTx,
+        management: &crate::transmit::ClientTx,
         start: Instant,
         now: Instant,
     ) -> Result<bool, zx::Status> {
@@ -575,7 +575,7 @@ mod tests {
                 PeerAssociation::new(context.clone(), &bss, 100, configuration, reply).unwrap();
             let mut mechanics = LoaderMechanics::default();
             let mut receive = crate::receive::RxRouting::default();
-            let mut busy = crate::transmit::ManagementTx::default();
+            let mut busy = crate::transmit::ClientTx::default();
             let mut auth = vec![0; 30];
             auth[0] = 0xb0;
             auth[4..10].copy_from_slice(&bss.bssid);
@@ -599,7 +599,7 @@ mod tests {
                     ..
                 }
             )));
-            let idle = crate::transmit::ManagementTx::default();
+            let idle = crate::transmit::ClientTx::default();
             let expected: &[Option<u8>] = if qos {
                 &[
                     Some(2),
