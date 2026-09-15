@@ -626,6 +626,15 @@ impl Backend for DeterministicBackend {
         })();
         if result.is_ok() {
             if self.mt7921_activation_model {
+                // MT7921 TX/RX device cursor reset strobes.
+                if matches!(offset, 0xd420c | 0xd4280) {
+                    let (base, count) = if offset == 0xd420c { (0xd430c, 18) } else { (0xd450c, 6) };
+                    for index in 0..count {
+                        if value & (1 << index) != 0 {
+                            self.registers.insert((*region, base + index * 0x10), 0);
+                        }
+                    }
+                }
                 let stored = if offset == 0xd4200 { 0 } else { value };
                 self.registers.insert((*region, offset), stored);
             }

@@ -20,7 +20,8 @@ const HOST_INT_STATUS: usize = 0x200;
 const HOST_INT_ENABLE: usize = 0x204;
 const WFDMA_GLO_CFG: usize = 0x208;
 const WFDMA_RST_DTX_PTR: usize = 0x20c;
-const WFDMA_RST_DRX_PTR: usize = 0x100;
+const WFDMA_RST: usize = 0x100;
+const WFDMA_RST_DRX_PTR: usize = 0x280;
 const WFDMA_GLO_CFG_EXT0: usize = 0x2b0;
 // Pinned Linux mt792x_regs.h defines these as live engine-status bits rather
 // than writable configuration state.
@@ -470,16 +471,16 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
             std::thread::sleep(Duration::from_millis(1));
         }
         let reset_indices = wfdma
-            .read_u32(WFDMA_RST_DRX_PTR)
+            .read_u32(WFDMA_RST)
             .map_err(|e| format!("read RX reset: {e:?}"))?;
         if reset_indices == u32::MAX {
             return Err("WFDMA reset control returned all ones".into());
         }
         wfdma
-            .write_u32(WFDMA_RST_DRX_PTR, reset_indices & !0x30)
+            .write_u32(WFDMA_RST, reset_indices & !0x30)
             .map_err(|e| format!("clear RX reset: {e:?}"))?;
         wfdma
-            .write_u32(WFDMA_RST_DRX_PTR, reset_indices | 0x30)
+            .write_u32(WFDMA_RST, reset_indices | 0x30)
             .map_err(|e| format!("set RX reset: {e:?}"))?;
         Ok(())
     }
@@ -851,6 +852,7 @@ pub(super) fn runtime_reinitialize<B: Backend>(
         if value == u32::MAX {
             return Err("WFDMA idle read returned all ones".into());
         }
+        verify_wfdma_global_readback(value, disabled, "disabled runtime WFDMA")?;
         if value & WFDMA_GLO_CFG_BUSY == 0 {
             break;
         }
@@ -858,6 +860,45 @@ pub(super) fn runtime_reinitialize<B: Backend>(
             return Err(format!("WFDMA did not quiesce: {value:#010x}"));
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // These are our runtime rings, with no outstanding TX publication and
+    // DMA verified idle above. Like mt76_dma_queue_reset(reset_idx=true),
+    // retire their old CPU/device cursors before rebuilding descriptor storage.
+    // Cold acquisition must still reject dirty rings it does not own.
+    // DMA cursors use the TX/RX reset strobes from mt792x_regs.h,
+    // not writes to per-ring read-only status registers.
+    wfdma
+        .write_u32(WFDMA_RST_DTX_PTR, mt7921_core::MT7921_RESET_ALL_TX_INDICES)
+        .map_err(|e| format!("reset runtime TX indices: {e:?}"))?;
+    wfdma
+        .write_u32(WFDMA_RST_DRX_PTR, u32::MAX)
+        .map_err(|e| format!("reset runtime RX indices: {e:?}"))?;
+    for (base, count) in [
+        (0x300, mt7921_core::MT7921_TX_RING_SLOTS),
+        (0x500, mt7921_core::MT7921_RX_RING_SLOTS),
+    ] {
+        for index in 0..count {
+            for offset in [base + index * 0x10 + 8, base + index * 0x10 + 12] {
+                let previous = wfdma
+                    .read_u32(offset)
+                    .map_err(|e| format!("read runtime ring cursor: {e:?}"))?;
+                if previous == u32::MAX {
+                    return Err("runtime ring cursor returned all ones".into());
+                }
+                if offset % 0x10 == 8 {
+                    wfdma
+                        .write_u32(offset, 0)
+                        .map_err(|e| format!("reset runtime ring cursor: {e:?}"))?;
+                }
+                readback(
+                    &wfdma,
+                    offset,
+                    0,
+                    &format!("reset runtime ring cursor {offset:#x}"),
+                )?;
+            }
+        }
     }
 
     // The warm reset must establish the same scheduler bypass as cold
@@ -1143,7 +1184,7 @@ mod tests {
 
     #[test]
     fn runtime_reinit_rebuilds_rings_and_restores_exact_wake_masks() {
-        let (device, _, _) =
+        let (device, operations, _) =
             DeterministicBackend::recording_mt7921_device_with_model(Default::default());
         let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
         let mut mechanics = mt7921_core::LoaderMechanics::new(73);
@@ -1155,7 +1196,13 @@ mod tests {
             .write_u32(0xd42b0, WFDMA_TX_DMASHDL_ENABLE)
             .unwrap();
         resources.bar0.write_u32(0xd6004, 0).unwrap();
+        // Real warm rings retain consumed TX indices and posted RX buffers.
+        resources.bar0.write_u32(0xd4308, 16).unwrap();
+        resources.bar0.write_u32(0xd430c, 16).unwrap();
+        resources.bar0.write_u32(0xd4508, 7).unwrap();
+        resources.bar0.write_u32(0xd450c, 3).unwrap();
 
+        let before = operations.borrow().len();
         runtime_reinitialize(
             &mut resources,
             &mut mechanics,
@@ -1173,6 +1220,10 @@ mod tests {
             resources.bar0.read_u32(0xd6004).unwrap() & DMASHDL_BYPASS,
             DMASHDL_BYPASS
         );
+        assert!(!operations.borrow()[before..].iter().any(|operation|
+            matches!(operation, drv_hardware_backends::Operation::WriteU32 { offset, .. }
+                if (0xd430c..=0xd441c).contains(offset) && (offset - 0xd430c) % 0x10 == 0)
+        ), "TX device cursors must use the reset strobe, not ignored register writes");
         assert_eq!(mechanics.sequence(), 73);
         assert_eq!(mechanics.command_producer(), 0);
         assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & (1 << 1), 1 << 1);
