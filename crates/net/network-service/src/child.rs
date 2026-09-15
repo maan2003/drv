@@ -1551,7 +1551,14 @@ pub(crate) fn provider_setup(
         if !resolver { close(7); }
         if !link_control { close(crate::link_control::CONTROL_FD); }
     }
-    setup(unsafe { getppid() }, if link_control { 9 } else if resolver { 7 } else { 6 })?;
+    let first_close = if link_control {
+        crate::link_control::FRAME_RESERVATION_FD as u32 + 1
+    } else if resolver {
+        8 // FD7 is the pre-bound resolver listener.
+    } else {
+        6
+    };
+    setup(unsafe { getppid() }, first_close)?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
     if epoll != EPOLL_FD {
