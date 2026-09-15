@@ -1525,6 +1525,9 @@ impl Runtime {
     }
 
     fn process_ipv6_route_events(&mut self) {
+        if self.bindings.queues.ipv6_route_events.is_empty() {
+            return;
+        }
         while let Some(event) = self.bindings.queues.ipv6_route_events.pop_front() {
             match event {
                 IpLayerEvent::AddRoute(entry) => {
@@ -1686,10 +1689,6 @@ impl Runtime {
                 SpecifiedAddr::new(Ipv6Addr::from_bytes(a)).ok_or(RuntimeError::InvalidAddress)
             })
             .transpose()?;
-        if self.dynamic_ipv6 {
-            self.set_dynamic_ipv6_link_state(false);
-            self.dynamic_ipv6 = false;
-        }
         self.revoke_ipv6();
         self.stack
             .api(&mut self.bindings)
@@ -1744,6 +1743,12 @@ impl Runtime {
 
     /// Removes the configured IPv6 address and all IPv6 routes.
     pub fn revoke_ipv6(&mut self) {
+        if self.dynamic_ipv6 {
+            self.set_dynamic_ipv6_link_state(false);
+            self.dynamic_ipv6 = false;
+        }
+        self.bindings.queues.ipv6_route_events.clear();
+        self.ipv6_discovered_routes.clear();
         let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
         let table = api.main_table_id();
         api.set_routes(&table, Vec::new());
@@ -3253,6 +3258,7 @@ mod tests {
             1500,
         )
         .unwrap();
+        runtime.enable_loopback();
         runtime.enable_dynamic_ipv6();
         let router_ip = Ipv6Addr::from_bytes([
             0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -3278,6 +3284,24 @@ mod tests {
 
         runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
         assert_eq!(runtime.ipv6_address(), None, "link loss revokes the SLAAC generation");
+        let loopback_server = runtime.udp_socket_ipv6().unwrap();
+        runtime.udp_bind_ipv6(
+            loopback_server,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            NonZeroU16::new(8053).unwrap(),
+        ).unwrap();
+        let loopback_client = runtime.udp_socket_ipv6().unwrap();
+        runtime.udp_send_to_ipv6(
+            loopback_client,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            NonZeroU16::new(8053).unwrap(),
+            b"loopback survives Ethernet loss",
+        ).unwrap();
+        runtime.dispatch_due(64);
+        assert_eq!(
+            runtime.udp_receive_ipv6(loopback_server).unwrap().as_deref(),
+            Some(&b"loopback survives Ethernet loss"[..]),
+        );
         runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
 
         runtime.receive_frame(router_advertisement(
@@ -3296,6 +3320,52 @@ mod tests {
         assert!(
             !runtime.has_ipv6_default_route(),
             "router lifetime expires the discovered default route",
+        );
+    }
+
+    #[test]
+    fn explicit_revoke_stops_dynamic_ipv6_and_does_not_restore_discovered_routes() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_dynamic_ipv6();
+        let router_ip = Ipv6Addr::from_bytes([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = Ipv6Addr::from_bytes([
+            0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let advertisement = || router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            30,
+        );
+
+        runtime.receive_frame(advertisement());
+        runtime.set_now(NativeInstant::from_nanos(2_000_000_000));
+        runtime.dispatch_due(64);
+        assert!(runtime.ipv6_address().is_some());
+        assert!(runtime.has_ipv6_default_route());
+
+        NetworkConfigurationAdmin::revoke_ipv6(&mut runtime);
+        assert_eq!(runtime.ipv6_address(), None);
+        assert!(!runtime.has_ipv6_default_route());
+
+        runtime.receive_frame(advertisement());
+        runtime.set_now(NativeInstant::from_nanos(4_000_000_000));
+        runtime.dispatch_due(64);
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+        runtime.dispatch_due(64);
+        assert_eq!(runtime.ipv6_address(), None, "revocation disables SLAAC");
+        assert!(
+            !runtime.has_ipv6_default_route(),
+            "revocation cannot restore cached or newly advertised routes",
         );
     }
 
