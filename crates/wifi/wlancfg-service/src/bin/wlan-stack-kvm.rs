@@ -8,6 +8,7 @@
 use drv_network_service::{NetworkServiceSupervisor, WifiLifecycleReceiver};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
@@ -83,7 +84,7 @@ fn completion_marker(
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("wlan_stack_kvm=REFUSED detail={error}");
+        let _ = writeln!(std::io::stderr(), "wlan_stack_kvm=REFUSED detail={error}");
         std::process::exit(1);
     }
 }
@@ -197,7 +198,9 @@ fn run() -> Result<(), String> {
                 return wait_driver_after_policy_close(driver_child, error);
             }
         };
-    println!(
+    // Diagnostic output must not unwind past live hardware-owning children.
+    let _ = writeln!(
+        std::io::stdout(),
         "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider resolver=false"
     );
 
@@ -219,7 +222,7 @@ fn run() -> Result<(), String> {
                         break Err(format!("revoke network after driver stop: {error}"));
                     }
                     network_revoked = true;
-                    println!("wlan_stack_shutdown=network_revoked");
+                    let _ = writeln!(std::io::stdout(), "wlan_stack_shutdown=network_revoked");
                     break Ok(());
                 }
                 let policy_detail = match policy_child.try_wait() {
@@ -264,7 +267,8 @@ fn run() -> Result<(), String> {
                 let _ = policy_child.wait();
                 policy_done = true;
             }
-            println!(
+            let _ = writeln!(
+                std::io::stdout(),
                 "wlan_stack_shutdown=policy_closed cause={}",
                 match cause {
                     ShutdownCause::Ordinary => "ordinary",
@@ -281,7 +285,9 @@ fn run() -> Result<(), String> {
         // an old Ethernet generation while firmware containment is pending.
         if shutdown_cause.is_none() {
             match lifecycle.receive(&mut network) {
-                Ok(Some(update)) => println!("wlan_stack_network_lifecycle={update:?}"),
+                Ok(Some(update)) => {
+                    let _ = writeln!(std::io::stdout(), "wlan_stack_network_lifecycle={update:?}");
+                }
                 Ok(None) => {}
                 Err(error) => break Err(error),
             }
@@ -308,7 +314,10 @@ fn run() -> Result<(), String> {
         result,
     );
     if let Some(marker) = completion_marker(shutdown_cause, result.is_ok(), network_revoked) {
-        println!("{marker}");
+        // All children have been reaped; failed certificate delivery is an
+        // ordinary error now, not a panic that can bypass containment.
+        writeln!(std::io::stdout(), "{marker}")
+            .map_err(|error| format!("write shutdown completion: {error}"))?;
     }
     result
 }
