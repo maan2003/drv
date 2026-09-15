@@ -1139,6 +1139,7 @@ dependencies = [
  "fuchsia-inspect",
  "fuchsia-trace",
  "futures",
+ "log",
  "netstack3-port-spike",
  "tokio",
  "wlan-common",

@@ -77,6 +77,19 @@ The pinned `wlan-sme` AP/client policy and state machines compile directly on
 the host. `wlan-sme-host.patch` excludes only the generated endpoint-serving
 module and two binding-shape compatibility sites. Host responder tokens return
 an explicit transport-unavailable error rather than emulating Fuchsia channels.
+The Linux `crates/wifi/wlan-softmac-host` serving implementation also derives
+from this pin, preserving BSD headers and upstream source paths:
+`src/serve.rs` from `drivers/wlansoftmac/rust_driver/src/lib.rs`,
+`src/mlme.rs` from `lib/mlme/rust/src/lib.rs`, and `src/sme/{mod,client}.rs`
+from `lib/sme/src/serve/{mod,client}.rs` (all below `src/connectivity/wlan`).
+Native typed channels replace FIDL/FFI transport; initialization ordering,
+MLME/SME event loops, connect transaction forwarding, and supervisor tests
+retain the upstream control flow. Hardware ownership and cancellation authority
+are Linux binding responsibilities, not copied protocol policy.
+`wlan-serving-sinks-host.patch` adds emission-time native sink callbacks,
+SME construction with supplied sinks, and a shared Minstrel constructor so
+these serving loops can use the pinned state machines without polling adapters.
+
 `wlan-sme-passive-observation-timeout-host.patch` adds one optional initial
 RSNA response timeout to `ClientConfig`. Its default preserves the pinned
 4000 ms policy; only passive validation requests 6000 ms so its 5000 ms

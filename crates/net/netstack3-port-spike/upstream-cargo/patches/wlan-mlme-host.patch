@@ -387,7 +387,7 @@ diff -ruN a/src/connectivity/wlan/lib/mlme/rust/src/lib.rs b/src/connectivity/wl
 
 --- a/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
 +++ b/src/connectivity/wlan/lib/mlme/rust/src/client/mod.rs
-@@ -443,6 +443,13 @@
+@@ -439,6 +439,13 @@
 -        let (bandwidth, secondary80_num) = bss.channel.bandwidth.to_fidl();
 +        // A non-HT station joins the primary 20 MHz channel even when the AP
 +        // advertises a wider BSS. Keep ChannelState (and association config)

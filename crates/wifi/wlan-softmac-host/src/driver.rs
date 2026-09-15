@@ -202,6 +202,7 @@ pub(crate) struct DriverActor<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRunt
     mailbox: Rc<RefCell<Mailbox>>,
     pending: Option<Pin<Box<dyn Future<Output = ()>>>>,
     stop_pending: bool,
+    reset_completed: bool,
 }
 
 impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D> {
@@ -218,6 +219,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
                 mailbox,
                 pending: None,
                 stop_pending: false,
+                reset_completed: false,
             },
             handle,
         )
@@ -292,7 +294,12 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
 
     pub(crate) fn reset(&mut self) -> Result<(), zx::Status> {
         self.close();
-        self.device.reset()
+        if !self.reset_completed {
+            self.device.reset()?;
+            self.reset_completed = true;
+            self.stop_pending = false;
+        }
+        Ok(())
     }
 
     fn close(&mut self) {
@@ -322,12 +329,13 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> DriverActor<D>
         self.device.finish_failed_connect_attempt()
     }
 
+    #[cfg(test)]
     pub(crate) async fn drive_once(&mut self) -> Result<bool, zx::Status> {
         std::future::poll_fn(|cx| Poll::Ready(self.poll(cx))).await
     }
 
-    /// Drive constructor/test protocol work with the same owner, not a nested
-    /// executor or a second mutable reference to the hardware.
+    /// Drive a device-boundary fixture without a second mutable hardware reference.
+    #[cfg(test)]
     pub(crate) async fn run_until<F: Future>(
         &mut self,
         future: F,

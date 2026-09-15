@@ -34,7 +34,7 @@ pub(crate) enum Request {
     Connect {
         context: OperationContext,
         request: fidl_sme::ConnectRequest,
-        reply: oneshot::Sender<ConnectTransaction>,
+        reply: oneshot::Sender<Option<ConnectTransaction>>,
     },
     Scan {
         context: OperationContext,
@@ -49,6 +49,8 @@ pub(crate) enum Request {
     },
 }
 
+// Preserve the upstream serving boundary with explicit native endpoints.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn serve(
     mut cfg: wlan_sme::client::ClientConfig,
     device_info: fidl_mlme::DeviceInfo,
@@ -183,12 +185,13 @@ pub(crate) fn serve(
                         reply,
                     } => {
                         if !context.is_live() {
+                            let _ = reply.send(None);
                             continue;
                         }
                         *origin.lock().unwrap() = context;
                         let transaction = station.borrow_mut().on_connect_command(request);
                         let (events, receiver) = mpsc::channel(64);
-                        let _ = reply.send(receiver);
+                        let _ = reply.send(Some(receiver));
                         transactions.push(serve_connect_txn_stream(Some(events), transaction));
                     }
                     Request::Scan {

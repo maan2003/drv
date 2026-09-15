@@ -98,6 +98,16 @@ and events to its `MlmeRequest`/`MlmeEvent` state-machine boundary. Therefore a
 host port should adapt `wlancfg` to an in-process SME command/event interface;
 it should not recreate FIDL channels or bypass SME by duplicating MLME policy.
 
+The production `wlan-softmac-host` now uses the pinned SoftMAC supervisor,
+MLME main loop, and SME request/event/transaction serving topology (source
+paths and adaptation provenance are recorded in `PROVENANCE.md`).
+The native bindings own bounded channels, emission-time request/timer authority,
+and retained operation replies. The exclusive hardware task progresses device
+completion independently of the awaiting MLME task. Public service turns
+observe results; they do not substitute a manual protocol pump.
+Upstream supervisor race tests and connect-transaction forwarding tests are
+ported alongside Linux ownership/cancellation regressions.
+
 ### WLAN authority map
 
 | State or operation | Sole owner | Host/backend boundary |

@@ -77,6 +77,8 @@ const MINSTREL_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_
 // 16 <= (MINSTREL_UPDATE_INTERVAL_HW_SIM / MINSTREL_DATA_FRAME_INTERVAL_NANOS * 1e6) < 32.
 const MINSTREL_UPDATE_INTERVAL_HW_SIM: std::time::Duration = std::time::Duration::from_millis(83);
 
+// Preserve the upstream serving boundary with explicit native endpoints.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn mlme_main_loop<T: MlmeImpl>(
     init_sender: oneshot::Sender<()>,
     config: T::Config,
@@ -164,6 +166,8 @@ where
 
 /// Runs until explicit protocol stop or a terminal serving failure.
 /// A successful return says nothing about DMA ownership.
+// Preserve the upstream serving boundary with explicit native endpoints.
+#[expect(clippy::too_many_arguments)]
 async fn main_loop_impl<T: MlmeImpl>(
     mut mlme_impl: T,
     minstrel: Option<MinstrelWrapper>,

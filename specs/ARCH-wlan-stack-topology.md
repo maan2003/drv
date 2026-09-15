@@ -177,14 +177,17 @@ request-handler futures. Control dispatch remains available while cleanup or
 hardware work is pending. Queue admission and completed effects are distinct;
 mailbox ordering alone is not cancellation or hardware-completion evidence.
 
-MLME has an owning task and the generic driver actor exclusively owns the
-device behind a bounded typed mailbox; the protocol bridge has no mutable
-device reference. Actor progression remains cooperatively driven by runtime
-turns. Inline admission cleanup and manual progress polling remain transitional.
-Explicit disconnect/cancel cleanup and its replies are retained and advanced
-in bounded service turns; driver cleanup certification can still block in
-legacy adapters.
-These are transitional implementation details, not the selected actor model.
+The pinned Fuchsia callback, MLME, and SME serving loops run under two-phase
+supervision: hardware and MLME initialize before SME admission is exposed.
+Requests, indications, and timers capture their originating authority when
+emitted, not when a later turn drains them. The independently progressing
+driver actor exclusively owns the device; the protocol bridge has no mutable
+device reference. Service turns observe retained operation results rather than
+pumping protocol or hardware work. Shutdown revokes admission first, then joins
+the protocol and returned hardware owner; only the latter can certify DMA
+cleanup. Canceled waiters retain admission replies, cleanup intent, and the
+original cleanup deadline. A replacement waiter's deadline bounds its wait,
+not the lifetime or budget of an already-owned cleanup.
 
 SoftMAC mutations return owned futures without borrowing the driver. Existing
 legacy adapters still perform synchronous work before returning ready futures;
@@ -255,7 +258,9 @@ our bugs concentrate:
 - The policy layer role from `wlancfg`; the nl80211-style control surface from
   `wlanix` is available later if standard Linux Wi-Fi tooling must drive the
   stack.
-- Dropped: the Fuchsia bridge scaffolding, FIDL transport/endpoints, Zircon
+- Reused: SoftMAC supervision and MLME/SME serving control flow, with native
+  bounded requests, callbacks, timers, and retained replies replacing transport.
+- Dropped: Fuchsia FFI/FIDL transport and endpoints, Zircon
   channels, `fuchsia.io` namespaces, and `component_manager`. Generated FIDL
   schema value types remain in the host bindings.
 

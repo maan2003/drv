@@ -16,6 +16,7 @@ use std::pin::Pin;
 
 pub(crate) async fn serve(
     mlme_init_receiver: oneshot::Receiver<()>,
+    ready: oneshot::Sender<()>,
     callbacks: impl Future<Output = Result<(), Error>> + 'static,
     mlme: Pin<Box<dyn Future<Output = Result<(), Error>>>>,
     sme: Pin<Box<impl Future<Output = Result<(), Error>>>>,
@@ -98,6 +99,7 @@ pub(crate) async fn serve(
         }
     }
 
+    let _ = ready.send(());
     info!("Starting SME and WlanSoftmacIfc servers...");
 
     // Run the SME and MLME servers.
@@ -176,6 +178,8 @@ pub(crate) async fn serve(
 /// Native binding of upstream serve_wlan_softmac_ifc_bridge. Callback records
 /// keep their originating hardware generation; stop is a retained out-of-band
 /// request and cannot be lost because an RX queue is full.
+// Preserve the upstream serving boundary with explicit native endpoints.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn serve_wlan_softmac_ifc_bridge(
     upcalls: std::sync::Arc<std::sync::Mutex<crate::runtime::UpcallQueue>>,
     io: std::sync::Arc<std::sync::Mutex<crate::runtime::HostIo>>,
@@ -296,7 +300,7 @@ mod tests {
     }
 
     fn harness() -> (
-        Pin<Box<dyn Future<Output = Result<(), zx::Status>>>>,
+        futures::future::LocalBoxFuture<'static, Result<(), zx::Status>>,
         Harness,
     ) {
         let (init, initialized) = oneshot::channel();
@@ -306,6 +310,7 @@ mod tests {
         (
             Box::pin(serve(
                 initialized,
+                oneshot::channel().0,
                 async { callback_result.await? },
                 Box::pin(async { mlme_result.await? }),
                 Box::pin(async { sme_result.await? }),
@@ -470,6 +475,7 @@ mod tests {
             };
             let future = serve(
                 initialized,
+                oneshot::channel().0,
                 callbacks,
                 Box::pin(futures::future::pending()),
                 Box::pin(futures::future::pending()),
