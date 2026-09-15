@@ -37,6 +37,16 @@ impl WlanSoftmacLifecycle for Mt7921Driver {
     }
 }
 
+fn check_power_transition_authority(
+    change: Option<&crate::peer::PowerSaveChange>,
+    now: std::time::Instant,
+) -> Result<(), zx::Status> {
+    match change {
+        Some(change) => change.context.check(now),
+        None => Ok(()),
+    }
+}
+
 impl crate::HifPowerState {
     fn retain_irq_wake(&self, pending: &mut bool) {
         if !matches!(self, Self::DriverOwned) {
@@ -216,6 +226,13 @@ impl ClientRuntimeDriver for Mt7921Driver {
             return Err(zx::Status::BAD_STATE);
         }
         let result = (|| {
+            // SET_OWN/CLR_OWN polling never renews the caller's lease. Check
+            // every transition turn, including after hardware handoff and
+            // immediately before acknowledging state 2.
+            check_power_transition_authority(
+                self.power_save_change.as_ref(),
+                std::time::Instant::now(),
+            )?;
             // A completed state-2 command is acknowledged only after SET_OWN
             // itself has been observed. This bookkeeping performs no MMIO.
             if matches!(self.hif_state, crate::HifPowerState::FirmwareOwned)
@@ -1233,5 +1250,31 @@ mod tests {
         assert!(state.complete_driver_wake(&mut pending));
         assert!(matches!(state, crate::HifPowerState::DriverOwned));
         assert!(!pending);
+    }
+    #[test]
+    fn power_transition_handoff_does_not_renew_expired_or_revoked_authority() {
+        let now = std::time::Instant::now();
+        let expired = wlan_softmac_class_support::conformance::operation_context(
+            now - std::time::Duration::from_millis(1),
+        )
+        .0;
+        let (reply, _) = futures_channel::oneshot::channel();
+        let expired = crate::peer::PowerSaveChange::new(expired, true, reply).unwrap();
+        assert_eq!(
+            check_power_transition_authority(Some(&expired), now),
+            Err(zx::Status::TIMED_OUT)
+        );
+
+        let (revoked, revocation) = wlan_softmac_class_support::conformance::operation_context(
+            now + std::time::Duration::from_secs(1),
+        );
+        let (reply, _) = futures_channel::oneshot::channel();
+        let revoked = crate::peer::PowerSaveChange::new(revoked, true, reply).unwrap();
+        revocation();
+        assert_eq!(
+            check_power_transition_authority(Some(&revoked), now),
+            Err(zx::Status::CANCELED)
+        );
+        assert_eq!(check_power_transition_authority(None, now), Ok(()));
     }
 }
