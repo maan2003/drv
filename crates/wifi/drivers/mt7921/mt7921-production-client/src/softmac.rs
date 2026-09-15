@@ -733,8 +733,9 @@ impl WlanSoftmac for Mt7921Driver {
             .map_err(|_| zx::Status::INVALID_ARGS)?;
             // Encoding validated nonnegative, representable timing. Do not
             // publish a scan whose minimum dwell cannot fit its original lease.
-            let minimum =
-                std::time::Duration::from_nanos(min_channel_time_ns as u64) * channel_count as u32;
+            let minimum = std::time::Duration::from_nanos(
+                (min_channel_time_ns as u64).div_ceil(1_024_000) * 1_024_000,
+            ) * channel_count as u32;
             if minimum
                 > context
                     .deadline()
