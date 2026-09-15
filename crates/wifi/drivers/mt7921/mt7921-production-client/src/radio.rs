@@ -236,7 +236,7 @@ pub(super) struct RadioPreparation {
 /// Shared MCU transaction progression; protocol replies stay in the operation
 /// that owns this sequence, never in this transport-only state.
 pub(super) struct FirmwareCommands {
-    remaining: VecDeque<(Vec<u8>, RadioResponse)>,
+    remaining: VecDeque<(zeroize::Zeroizing<Vec<u8>>, RadioResponse)>,
     pending: Option<(RadioResponse, Instant)>,
     failed: bool,
 }
@@ -398,7 +398,10 @@ impl RadioPreparation {
 impl FirmwareCommands {
     pub(super) fn new(remaining: VecDeque<(Vec<u8>, RadioResponse)>) -> Self {
         Self {
-            remaining,
+            remaining: remaining
+                .into_iter()
+                .map(|(bytes, response)| (zeroize::Zeroizing::new(bytes), response))
+                .collect(),
             pending: None,
             failed: false,
         }

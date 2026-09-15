@@ -523,8 +523,10 @@ impl LoaderMechanics {
         if template.len() > t.command_payload_capacity(self.command_producer) {
             return Err(LoaderMechanicsError::InvalidCommandLength);
         }
-        let mut encoded = template.to_vec();
-        encoded[39] = sequence;
+        // Command templates can contain PTK/GTK/IGTK material. Wipe the
+        // sequence-patched copy on every return path, including transport errors.
+        let mut encoded = crate::SensitiveUniCommand(template.to_vec());
+        encoded.0[39] = sequence;
         let slot = self.command_producer;
         let address = t
             .command_payload_address(slot)
@@ -533,6 +535,7 @@ impl LoaderMechanics {
             DmaSegment {
                 iova: address,
                 len: encoded
+                    .as_bytes()
                     .len()
                     .try_into()
                     .map_err(|_| LoaderMechanicsError::InvalidCommandLength)?,
@@ -541,7 +544,7 @@ impl LoaderMechanics {
             0,
         )
         .map_err(LoaderMechanicsError::Descriptor)?;
-        t.write_command_payload(slot, &encoded)
+        t.write_command_payload(slot, encoded.as_bytes())
             .map_err(LoaderMechanicsError::Transport)?;
         t.write_command_descriptor(slot, descriptor)
             .map_err(LoaderMechanicsError::Transport)?;
