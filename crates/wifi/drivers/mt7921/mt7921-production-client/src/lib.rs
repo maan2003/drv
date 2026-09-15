@@ -953,6 +953,11 @@ impl Mt7921HardwareSession {
     }
 
     fn attempt_driver_ownership_for_stop(&mut self) {
+        // Successful transport quiescence is the irreversible stale-BAR
+        // boundary: contain() may already have reset the PCI function.
+        if self.containment.transport_quiesced {
+            return;
+        }
         let Ok(conn) = self
             .resources
             .as_ref()
