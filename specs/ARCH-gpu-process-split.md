@@ -54,27 +54,50 @@ geometry, damage-since-last-frame, opaque, kind} … EndElement` markers
 GPU turns each segment into a real smithay element whose `draw` replays
 its commands clipped to the damage the compositor hands it. So there is
 one damage tracker, per-element culling, and the swapchain's buffer age is
-handled by upstream code. The reply to `Present` carries per-element
-states for presentation feedback.
+handled by upstream code. `Present` is one-way; the per-element states
+for presentation feedback come back as `GpuEvent::Presented`.
+
+Client pixels never touch the core. shm buffers go to the GPU as the pool
+fd plus layout (`ImportShm`); the GPU `pread`s damaged rows into a
+scratch buffer and uploads them, so neither process maps client memory
+and a truncated pool cannot SIGBUS anyone. dmabufs go as fds
+(`ImportDmabuf`). The GPU keeps the `Dmabuf` (and a CPU copy for
+textures up to 512x512) next to each texture: when an element's recording
+is exactly one untinted 1:1 `DrawTexture` of such a texture, the GPU
+exposes the buffer as the element's `UnderlyingStorage`, and
+`DrmCompositor` can scan it out directly or copy it to the cursor plane.
+`ElementMeta.transform` carries the buffer transform for that. Which
+planes are allowed comes from the core each frame in `PresentFlags`
+(the old `debug` config knobs).
 
 ## Protocol
 
 Unix stream socketpair, length-prefixed `postcard` frames, fds via
 `SCM_RIGHTS` on the frame that references them. Every `Request` gets
-exactly one reply `Event`. Unsolicited `Event::Notify(GpuEvent)` (vblank,
-device error) can arrive at any time; the client queues those and wakes
-the core loop through a calloop `Ping`.
+exactly one reply `Event`, except the per-frame `Execute` and `Present`,
+which are one-way so the core never blocks on the GPU; their failures
+arrive as `GpuEvent::Error`. Unsolicited `Event::Notify(GpuEvent)`
+(presented, vblank, error, device error) can arrive at any time; the
+client queues those and wakes the core loop through a calloop `Ping`.
 
-Core to GPU: `Execute{commands}`, `ImportDmabuf`, `ReadTexture`,
-`SetCustomShader`, device lifecycle (`AddDevice`, `RemoveDevice`,
-`PauseDevices`, `ResumeDevices`, `RescanDevice`, `CleanupDevice`), output
-control (`EnableOutput`, `DisableOutput`, `SetMode`, `SetVrr`,
-`SetMaxBpc`, `SetOutputGeometry`, `SetGamma`, `ClearOutputs`,
-`SetDebugTint`), `Present`, `Shutdown`.
+Core to GPU: `Execute{commands}` (incl. `ImportShm` + pool fd),
+`ImportDmabuf`, `ReadTexture`, `AllocateDmabuf`, `Sync` (used when a
+dmabuf render target is finished, so the buffer is complete before it goes
+to PipeWire or an image-copy client), `SetCustomShader`,
+device lifecycle (`AddDevice`, `RemoveDevice`, `PauseDevices`,
+`ResumeDevices`, `RescanDevice`, `CleanupDevice`), output control
+(`EnableOutput`, `DisableOutput`, `SetMode`, `SetVrr`, `SetMaxBpc`,
+`SetOutputGeometry`, `SetGamma`, `ClearOutputs`, `SetDebugTint`),
+`Present{output, frame, flags}`, `Shutdown`.
 
-GPU to core: `Ready{caps}`, `Ack`, `Image`, `DeviceAdded{caps}`,
-`Scan{connected: ConnectorInfo[], disconnected}`, `OutputState`,
-`Presented{submitted}`, `Notify(VBlank | DeviceError)`, `Error`.
+GPU to core: `Ready{caps}`, `Ack`, `Image`, `Dmabuf` (+ fds),
+`DeviceAdded{caps}`, `Scan{connected, changed, disconnected}`,
+`OutputState`, `Notify(Presented | VBlank | Error | DeviceError)`,
+`Error`.
+
+Render targets (`Command::Begin`): `Texture(id)`, `Dmabuf(id)` (the GPU
+binds the dmabuf itself, needed for screencast and image-copy buffers),
+`Output(ref)` (recorded and drawn by `Present`).
 
 `Caps` carries what the core needs to answer clients without asking again:
 shm and dmabuf formats, dmabuf render formats (screencast, image copy),
@@ -91,14 +114,26 @@ libseat and hands dups to the GPU process; it never uses them itself.
 GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
 (max bpc, HDR reset, gamma), EDID parsing for `ConnectorInfo`, page flips,
-vblank forwarding. Secondary GPUs are display-only via the primary's
+vblank forwarding, plane assignment (direct scanout, cursor plane), and
+allocating screencast / capture buffers (`AllocateDmabuf`; the core's
+`DmabufAllocator` hands PipeWire the fds and renders into them through
+`Bind<Dmabuf>`). Secondary GPUs are display-only via the primary's
 allocator with linear buffers.
+
+## Smithay fork
+
+niri builds against `../smithay` (branch `niri-gpu-process`, upstream +
+small additions): `UnderlyingStorage::Dmabuf` with matching
+`ExportBuffer` / `ScanoutBuffer` / framebuffer-cache variants, so an
+element can offer a dmabuf for scanout without a `WlBuffer`; lazy shm
+pool mapping plus `shm::with_buffer_fd`, so a compositor that only
+forwards the fd never maps client memory; `MemoryBuffer::as_mut_slice`.
 
 ## Dropped in v1
 
-DRM leasing, direct scanout and cursor plane, multi-GPU rendering,
-per-surface scanout dmabuf feedback, the winit (nested) backend, the legacy
-EGL `wl_drm` path, and the gnome-screencast default feature. None of these
+DRM leasing, multi-GPU rendering, per-surface scanout dmabuf feedback,
+the winit (nested) backend, the legacy EGL `wl_drm` path, and the
+`wait_for_frame_completion_before_queueing` debug knob. None of these
 affect the security story; they are performance or convenience features to
 revisit once the split is stable on hardware.
 
@@ -112,7 +147,8 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
 
 ## Next
 
-1. Run on real hardware: startup, hotplug, VT switch, suspend, VRR.
+1. Run on real hardware: startup, hotplug, VT switch, suspend, VRR,
+   direct scanout (check `niri msg` / feedback shows ZeroCopy for
+   fullscreen dmabuf clients), cursor plane, screencast dmabufs.
 2. Sandbox the GPU process: own UID, seccomp, only the DRM fds it is given.
-3. Screencast buffers allocated GPU-side; direct scanout via a
-   non-`WlBuffer` `UnderlyingStorage` in smithay; cursor plane.
+3. Restart the GPU process on crash instead of stopping the compositor.
