@@ -25,8 +25,9 @@ core process                              gpu process
   layout, animation, damage tracking        texture tables (ids -> GL)
   libseat, udev, libinput                   DrmDevice / GbmDevice / DrmCompositor
   output policy: modes, VRR, gamma, on/off  swapchain, page flips, vblank
-  recorded frames  ---------------------->  replay onto texture or output
-  vblank, connector scan  <---------------  events / replies
+  screencast portal, targets, pacing        PipeWire streams and buffers
+  recorded frames  ---------------------->  replay onto texture, output or cast
+  vblank, scan, cast state  <-------------  events / replies
 ```
 
 The GPU process is a dumb renderer. It has no scene graph, no layout, no
@@ -88,16 +89,23 @@ device lifecycle (`AddDevice`, `RemoveDevice`, `PauseDevices`,
 `ResumeDevices`, `RescanDevice`, `CleanupDevice`), output control
 (`EnableOutput`, `DisableOutput`, `SetMode`, `SetVrr`, `SetMaxBpc`,
 `SetOutputGeometry`, `SetGamma`, `ClearOutputs`, `SetDebugTint`),
-`Present{output, frame, flags}`, `Shutdown`.
+`Present{output, frame, flags}`, screencast streams (`CastStart` replies
+with the effective cursor mode, `CastConfigure` for size / refresh,
+one-way `CastClear` and `CastStop`), `Shutdown`.
 
 GPU to core: `Ready{caps}`, `Ack`, `Image`, `Dmabuf` (+ fds),
-`DeviceAdded{caps}`, `Scan{connected, changed, disconnected}`,
-`OutputState`, `Notify(Presented | VBlank | Error | DeviceError)`,
-`Error`.
+`CastStarted`, `DeviceAdded{caps}`, `Scan{connected, changed,
+disconnected}`, `OutputState`, `Notify(Presented | VBlank | Error |
+DeviceError | Cast(..))`, `Error`. Cast events: `NodeId` (for the
+portal), `State{active, ready_size, min_frame_time}`, `Redraw`,
+`Rendered` / `Skipped{target_time}` (frame pacing), `Stop`, `PipeWireFatal`.
 
 Render targets (`Command::Begin`): `Texture(id)`, `Dmabuf(id)` (the GPU
-binds the dmabuf itself, needed for screencast and image-copy buffers),
-`Output(ref)` (recorded and drawn by `Present`).
+binds the dmabuf itself, needed for image-copy buffers), `Output(ref)`
+(recorded and drawn by `Present`), `Cast(stream)` (rendered into the
+stream's next PipeWire buffer when the frame ends; `CastFrameInfo` before
+it carries scale, target time and cursor position) and
+`CastCursor(stream)` (the cursor bitmap for metadata cursor mode).
 
 `Caps` carries what the core needs to answer clients without asking again:
 shm and dmabuf formats, dmabuf render formats (screencast, image copy),
@@ -115,10 +123,28 @@ GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
 (max bpc, HDR reset, gamma), EDID parsing for `ConnectorInfo`, page flips,
 vblank forwarding, plane assignment (direct scanout, cursor plane), and
-allocating screencast / capture buffers (`AllocateDmabuf`; the core's
-`DmabufAllocator` hands PipeWire the fds and renders into them through
-`Bind<Dmabuf>`). Secondary GPUs are display-only via the primary's
-allocator with linear buffers.
+allocating capture buffers (`AllocateDmabuf`). Secondary GPUs are
+display-only via the primary's allocator with linear buffers.
+
+## Screencasting
+
+Core (`src/screencasting/`): the portal D-Bus session, picking output /
+window / dynamic targets, frame pacing (`min_frame_time` mirrored from
+the stream, redraw timers), and recording the target's elements into a
+`Cast` frame with a per-stream `Recorder` (`src/gpu/record.rs`, the same
+element-marker recording outputs use). It never sees PipeWire, buffer fds
+or pixel memory.
+
+GPU (`src/gpu/cast.rs`): the PipeWire connection on the GPU event loop,
+stream negotiation (dmabuf modifiers with test allocations, shm
+fallback), memfd / GBM buffer allocation, per-stream
+`OutputDamageTracker` over the replayed `SceneElement`s
+(`src/gpu/scene.rs`, shared with the DRM compositor path), rendering into
+the dequeued buffer, cursor metadata bitmaps, and queueing buffers back
+once their fences signal. A frame the core recorded is dropped when
+nothing changed or no buffer is free; every frame is reported back as
+`Rendered` or `Skipped` so the core paces on real output (a recorded frame
+counts as sent until the report arrives).
 
 ## Smithay fork
 
@@ -149,6 +175,7 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
 
 1. Run on real hardware: startup, hotplug, VT switch, suspend, VRR,
    direct scanout (check `niri msg` / feedback shows ZeroCopy for
-   fullscreen dmabuf clients), cursor plane, screencast dmabufs.
+   fullscreen dmabuf clients), cursor plane, screencasting (dmabuf and
+   shm streams, metadata cursor, window casts, dynamic casts).
 2. Sandbox the GPU process: own UID, seccomp, only the DRM fds it is given.
 3. Restart the GPU process on crash instead of stopping the compositor.
