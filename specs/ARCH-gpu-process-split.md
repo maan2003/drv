@@ -47,11 +47,15 @@ open/close shaders, blur, framebuffer capture) became commands
 (`DrawShader`, `Blur`, `CaptureFramebuffer`, `DrawCaptured`) with the GL
 code moved to `src/gpu/gl/`.
 
-Damage tracking stays in the core: one `OutputDamageTracker` per output.
-`Tty::render` records only what changed and sends `Present{output, frame,
-damage}`. The GPU side wraps the recorded list in a single `FrameElement`
-(with a short damage history) for `DrmCompositor::render_frame`, so
-smithay's swapchain damage logic still works.
+Damage tracking lives in the GPU process, where `DrmCompositor` is. The
+core records every element each frame wrapped in `BeginElement{id, src,
+geometry, damage-since-last-frame, opaque, kind} … EndElement` markers
+(framebuffer-effect captures go before a `BeginElementDraw` marker). The
+GPU turns each segment into a real smithay element whose `draw` replays
+its commands clipped to the damage the compositor hands it. So there is
+one damage tracker, per-element culling, and the swapchain's buffer age is
+handled by upstream code. The reply to `Present` carries per-element
+states for presentation feedback.
 
 ## Protocol
 
