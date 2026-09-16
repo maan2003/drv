@@ -30,9 +30,6 @@ use wlan_mlme::device::{DeviceOps, LinkStatus};
 
 const UPCALL_QUEUE_CAPACITY: usize = 256;
 const ETHERNET_QUEUE_CAPACITY: usize = 256;
-/// Bounded Ethernet generations created before production lockdown. Exhaustion
-/// terminates the runtime cleanly rather than creating a descriptor post-lock.
-pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
 
 pub(super) struct ScanOperation {
     pub(super) transaction_id: u64,
@@ -59,7 +56,7 @@ impl MlmeExecution {
 
 pub(super) struct HostIo {
     pub(super) ethernet: DriverEthernetPort,
-    pub(super) replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    pub(super) ethernet_queue_capacity: usize,
     pub(super) unpublished_ethernet_device: Option<HostEthernetDevice>,
     pub(super) pending_ethernet_devices: VecDeque<HostEthernetDevice>,
     pub(super) ethernet_mac_address: [u8; 6],
@@ -292,10 +289,12 @@ impl DeviceOps for HostMlmeDevice {
             let mut io = self.io.lock().unwrap();
             if io.ethernet.is_closed() {
                 io.pending_ethernet_devices.clear();
-                let (host, driver) = io
-                    .replacement_ethernet
-                    .pop_front()
-                    .ok_or(zx::Status::NO_RESOURCES)?;
+                // The sandbox permits anonymous packet endpoints, not ambient
+                // socket access. Bound live resources, not total reconnections.
+                let (host, mut driver) =
+                    ethernet_port(io.ethernet_mac_address, io.ethernet_queue_capacity)
+                        .map_err(|_| zx::Status::NO_RESOURCES)?;
+                driver.register_readiness().map_err(|_| zx::Status::NO_RESOURCES)?;
                 io.ethernet = driver;
                 Some(host)
             } else {
@@ -636,12 +635,12 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
 pub struct PreparedRuntimeResources {
     ethernet_device: HostEthernetDevice,
     ethernet: DriverEthernetPort,
-    replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    ethernet_queue_capacity: usize,
     mac_address: [u8; 6],
 }
 
 impl PreparedRuntimeResources {
-    /// Prepare all descriptors and reactor registrations before sandbox lockdown.
+    /// Prepare the initial endpoint and register it with the owning reactor.
     /// Requires an entered Tokio runtime with I/O enabled.
     pub fn new(mac_address: [u8; 6]) -> Result<Self, anyhow::Error> {
         Self::with_ethernet_capacity(mac_address, ETHERNET_QUEUE_CAPACITY)
@@ -651,30 +650,22 @@ impl PreparedRuntimeResources {
         mac_address: [u8; 6],
         ethernet_queue_capacity: usize,
     ) -> Result<Self, anyhow::Error> {
-        let mut generations = (0..PREPARED_ETHERNET_GENERATIONS)
-            .map(|_| ethernet_port(mac_address, ethernet_queue_capacity))
-            .collect::<Result<VecDeque<_>, _>>()
-            .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
-        for (_, driver) in &mut generations {
-            driver.register_readiness()?;
-        }
-        let (ethernet_device, ethernet) = generations.pop_front().unwrap();
+        let (ethernet_device, mut ethernet) =
+            ethernet_port(mac_address, ethernet_queue_capacity)
+                .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
+        ethernet.register_readiness()?;
         Ok(Self {
             ethernet_device,
             ethernet,
-            replacement_ethernet: generations,
+            ethernet_queue_capacity,
             mac_address,
         })
     }
 
-    /// The bounded inert Ethernet generations that sandbox setup must retain.
-    /// They remain owned by this value and are never duplicated.
+    /// Initial endpoints retained through lockdown. Subsequent anonymous
+    /// endpoints are created as needed by the same bounded runtime owner.
     pub fn fd_identities(&self) -> Vec<std::os::fd::RawFd> {
-        let mut fds = vec![self.ethernet_device.raw_fd(), self.ethernet.raw_fd()];
-        for (host, driver) in &self.replacement_ethernet {
-            fds.extend([host.raw_fd(), driver.raw_fd()]);
-        }
-        fds
+        vec![self.ethernet_device.raw_fd(), self.ethernet.raw_fd()]
     }
 }
 
@@ -756,7 +747,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let PreparedRuntimeResources {
             ethernet_device,
             ethernet,
-            replacement_ethernet,
+            ethernet_queue_capacity,
             mac_address,
         } = resources;
         let epoch = OperationEpoch::new();
@@ -770,7 +761,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
-            replacement_ethernet,
+            ethernet_queue_capacity,
             unpublished_ethernet_device: Some(ethernet_device),
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: mac_address,
@@ -1958,7 +1949,7 @@ mod tests {
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
-            replacement_ethernet: VecDeque::new(),
+            ethernet_queue_capacity: ETHERNET_QUEUE_CAPACITY,
             unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
@@ -4389,14 +4380,11 @@ mod tests {
             let mac = [2, 0, 0, 0, 0, 1];
             let capacity = 3;
             let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
-            let replacements = (0..2)
-                .map(|_| ethernet_port(mac, capacity).unwrap())
-                .collect();
             let (fake, effects) = Fake::new(0);
             let (mut actor, driver) = DriverActor::new(fake);
             let io = Arc::new(Mutex::new(HostIo {
                 ethernet,
-                replacement_ethernet: replacements,
+                ethernet_queue_capacity: capacity,
                 unpublished_ethernet_device: None,
                 pending_ethernet_devices: VecDeque::new(),
                 ethernet_mac_address: mac,
@@ -4449,18 +4437,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
-            actor
-                .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
+            // More than the old four-generation startup pool. Every old
+            // endpoint is revoked and only one replacement can be published.
+            for _ in 0..32 {
+                actor
+                    .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
+                    .await.unwrap().unwrap();
                 actor
                     .run_until(host_device.set_ethernet_status(LinkStatus::UP))
-                    .await
-                    .unwrap(),
-                Err(zx::Status::NO_RESOURCES)
-            );
+                    .await.unwrap().unwrap();
+                let mut io = io.lock().unwrap();
+                assert_eq!(io.pending_ethernet_devices.len(), 1);
+                let endpoint = io.pending_ethernet_devices.pop_front().unwrap();
+                assert_eq!(endpoint.properties().unwrap().mac_address, mac);
+            }
         });
     }
 
@@ -4474,7 +4464,7 @@ mod tests {
                 let (actor, driver) = DriverActor::new(fake);
                 let io = Arc::new(Mutex::new(HostIo {
                     ethernet,
-                    replacement_ethernet: VecDeque::new(),
+                    ethernet_queue_capacity: ETHERNET_QUEUE_CAPACITY,
                     unpublished_ethernet_device: Some(host),
                     pending_ethernet_devices: VecDeque::new(),
                     ethernet_mac_address: mac,

@@ -74,11 +74,11 @@ pub enum Wcn6750Dma {
     Broker,
 }
 
-pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket,network-lifecycle-seqpacket,vfio-platform-cdev,qrtr,16-selected-irq-eventfds,ethernet-socketpair,precreated-runtime-reactor,optional-iommufd,remoteproc-state; vfio-ioctl=DEVICE_BIND_IOMMUFD(coherent),DEVICE_ATTACH_IOMMUFD_PT(coherent),DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET,DEVICE_FEATURE(broker); iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY(coherent); qrtr=bind,connect,getsockname,getpeername,sendto,recvfrom,ppoll; ipc=bounded-policy-sendmsg-recvmsg,supervisor-sendmsg,ethernet-sendto-recvfrom; runtime=fd-bound-epoll-and-wake; memory=mmap-rw-private-anon-or-shared-vfio,noexec; denied=fd-creators,open,socket,dup,exec,clone,other-ioctl,other-fd-io,executable-memory";
+pub const ATH11K_WCN6750_AUTHORITY_INVENTORY: &str = "fds=stdio,policy-seqpacket,network-lifecycle-seqpacket,vfio-platform-cdev,qrtr,16-selected-irq-eventfds,ethernet-socketpair,precreated-runtime-reactor,optional-iommufd,remoteproc-state; vfio-ioctl=DEVICE_BIND_IOMMUFD(coherent),DEVICE_ATTACH_IOMMUFD_PT(coherent),DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET,DEVICE_FEATURE(broker); iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY(coherent); qrtr=bind,connect,getsockname,getpeername,sendto,recvfrom,ppoll; ipc=bounded-policy-sendmsg-recvmsg,supervisor-sendmsg,anonymous-seqpacket-runtime,no-address-frame-io; runtime=fd-bound-epoll-and-wake; memory=mmap-rw-private-anon-or-shared-vfio,noexec; denied=other-fd-creators,open,socket,dup,exec,clone,other-ioctl,other-fd-io,executable-memory";
 
 /// Review trace for the MT7921 profile. Request values are owned by
 /// `userspace-vfio::mt7921_seccomp`; this records the corresponding names.
-pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,ethernet-sendto-recvfrom,precreated-reactor-epoll-read-write,regulatory-database-read,readiness-fd-F_GETFD; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,prctl-GET_AUXV-max512-reserved-zero,exit,exit_group; denied=fcntl-except-owned-fd-F_GETFD,dup,fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
+pub const MT7921_VFIO_AUTHORITY_INVENTORY: &str = "fds=stdio,pci-config-rw,vfio-cdev,iommufd-rw,irq-eventfd; optional-service=fd-bound-policy-recvmsg-sendmsg,supervisor-sendmsg,anonymous-seqpacket-runtime,no-address-frame-io,precreated-reactor-epoll-read-write,regulatory-database-read,readiness-fd-F_GETFD; vfio-ioctl=DEVICE_BIND_IOMMUFD,DEVICE_ATTACH_IOMMUFD_PT,DEVICE_GET_INFO,DEVICE_GET_REGION_INFO,DEVICE_GET_IRQ_INFO,DEVICE_SET_IRQS,DEVICE_RESET; iommufd-ioctl=IOAS_ALLOC,IOAS_MAP,IOAS_UNMAP,IOMMU_DESTROY; syscalls=read-pci-or-irq,write-pci-or-stdout-stderr,close,ppoll-max-one,mmap-rw-private-anon-offset-zero-or-shared-vfio,mprotect-noexec,munmap,madvise,brk,futex,sched_yield,clock_gettime-monotonic,clock_nanosleep,nanosleep,getrandom,getpid,gettid,sigaltstack-new-only,lseek-pci-only,prctl-GET_AUXV-max512-reserved-zero,exit,exit_group; denied=fcntl-except-F_GETFD,dup,other-fd-creators,open,socket,exec,clone,clone3,signal-handler-or-mask-management,signal-send,sendmsg-without-service,recvmsg-without-service,recvmmsg,ioctl-other,mmap-other,mmap-exec,mprotect-exec";
 
 #[derive(Debug)]
 pub enum Error {
@@ -593,14 +593,43 @@ fn allow_service_messages(rules: &mut Rules, control: RawFd, supervisor: RawFd) 
         ],
     );
 }
-fn allow_frames(rules: &mut Rules, fds: &[RawFd]) {
-    for &fd in fds {
-        for (syscall, flags) in [
-            (libc::SYS_sendto, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL),
-            (libc::SYS_recvfrom, libc::MSG_DONTWAIT | libc::MSG_TRUNC),
-        ] {
-            allow(rules, syscall, vec![eq(0, fd as u64), eq(3, flags as u64)]);
-        }
+/// Anonymous runtime transport is not ambient socket authority. The role
+/// still cannot open, bind, connect, accept, or create Internet sockets.
+/// Frame operations have no address arguments and cannot transfer descriptors;
+/// SCM_RIGHTS remains restricted to the private service control channels.
+fn allow_frame_runtime(rules: &mut Rules, reactors: &[RawFd]) {
+    use SeccompCmpArgLen::Qword;
+    use SeccompCmpOp::{Ge, Le};
+    allow(
+        rules,
+        libc::SYS_socketpair,
+        vec![
+            eq(0, libc::AF_UNIX as u64),
+            eq(1, (libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64),
+            eq(2, 0),
+        ],
+    );
+    for (syscall, flags) in [
+        (libc::SYS_sendto, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL),
+        (libc::SYS_recvfrom, libc::MSG_DONTWAIT | libc::MSG_TRUNC),
+    ] {
+        allow(rules, syscall, vec![condition(0, Qword, Le, i32::MAX as u64), eq(3, flags as u64), eq(4, 0), eq(5, 0)]);
+    }
+    // Debug OwnedFd validity checks cannot create or change a capability.
+    allow(rules, libc::SYS_fcntl, vec![
+        condition(0, Qword, Le, i32::MAX as u64), eq(1, libc::F_GETFD as u64),
+    ]);
+    for &reactor in reactors {
+        allow(
+            rules,
+            libc::SYS_epoll_ctl,
+            vec![
+                eq(0, reactor as u64),
+                condition(2, Qword, Le, i32::MAX as u64),
+                condition(1, Qword, Ge, 1),
+                condition(1, Qword, Le, 3),
+            ],
+        );
     }
 }
 fn allow_runtime_wait(rules: &mut Rules, fds: &[RawFd]) {
@@ -819,31 +848,8 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
             let mut writable = vec![*pci_config_fd, 1, 2];
             if let Some(service) = service {
                 allow_service_messages(&mut rules, service.control_fd, service.supervisor_fd);
-                allow_frames(&mut rules, &service.ethernet_fds);
+                allow_frame_runtime(&mut rules, &service.runtime_fds);
                 allow_runtime_wait(&mut rules, &service.runtime_fds);
-                let mut readiness = vec![*irq_eventfd, service.control_fd, service.supervisor_fd];
-                readiness.extend(&service.ethernet_fds);
-                readiness.extend(&service.runtime_fds);
-                for &target in &readiness {
-                    // Read-only OwnedFd debug-drop validity check, not duplication.
-                    allow(
-                        &mut rules,
-                        libc::SYS_fcntl,
-                        vec![eq(0, target as u64), eq(1, libc::F_GETFD as u64)],
-                    );
-                    for &reactor in &service.runtime_fds {
-                        allow(
-                            &mut rules,
-                            libc::SYS_epoll_ctl,
-                            vec![
-                                eq(0, reactor as u64),
-                                eq(2, target as u64),
-                                condition(1, Qword, Ge, 1),
-                                condition(1, Qword, Le, 3),
-                            ],
-                        );
-                    }
-                }
                 readable.extend(service.regulatory_fd);
                 if let Some(fd) = service.regulatory_fd {
                     allow(
@@ -865,7 +871,7 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
             dma,
             qrtr_fd,
             irq_eventfds,
-            ethernet_fds,
+            ethernet_fds: _,
             runtime_fds,
             remoteproc_state_fd,
         } => {
@@ -897,7 +903,7 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
             ] {
                 allow_fds(&mut rules, syscall, &[*qrtr_fd]);
             }
-            allow_frames(&mut rules, ethernet_fds);
+            allow_frame_runtime(&mut rules, runtime_fds);
             for flags in [0, libc::MSG_DONTWAIT] {
                 allow(
                     &mut rules,
@@ -1190,6 +1196,30 @@ mod filter_tests {
                 1
             );
             let mut event: libc::epoll_event = unsafe { std::mem::zeroed() };
+            for _ in 0..32 {
+                let mut pair = [-1; 2];
+                let socket_type = if probe == "wrong-socket-type" {
+                    libc::SOCK_STREAM
+                } else { libc::SOCK_SEQPACKET };
+                assert_eq!(unsafe {
+                    libc::socketpair(libc::AF_UNIX,
+                        socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                        0, pair.as_mut_ptr())
+                }, 0);
+                event.events = libc::EPOLLIN as u32;
+                assert_eq!(unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, pair[1], &mut event) }, 0);
+                assert_eq!(unsafe { libc::send(pair[0], byte.as_ptr().cast(), 1,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) }, 1);
+                assert_eq!(unsafe { libc::epoll_wait(epoll, &mut event, 1, 0) }, 1);
+                assert_eq!(unsafe { libc::recv(pair[1], payload.as_mut_ptr().cast(), 1,
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC) }, 1);
+                assert_eq!(unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, pair[1],
+                    std::ptr::null_mut()) }, 0);
+                for fd in pair {
+                    assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+                    assert_eq!(unsafe { libc::close(fd) }, 0);
+                }
+            }
             assert_eq!(unsafe { libc::epoll_wait(epoll, &mut event, 1, 0) }, 0);
             let mut count = 0u64;
             assert_eq!(
@@ -1206,7 +1236,7 @@ mod filter_tests {
             );
             unsafe { libc::_exit(0) }
         }
-        for probe in ["positive", "wrong-fd", "bad-flags"] {
+        for probe in ["positive", "wrong-fd", "bad-flags", "wrong-socket-type"] {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST])
                 .env("DRV_MT_SERVICE_IO_PROBE", probe)
@@ -1696,7 +1726,13 @@ mod filter_tests {
             assert_eq!(unsafe { libc::fcntl(irq, libc::F_GETFD) }, libc::FD_CLOEXEC);
             match mode.as_str() {
                 "getfd-foreign" => unsafe {
-                    libc::fcntl(foreign, libc::F_GETFD);
+                    assert_eq!(libc::fcntl(foreign, libc::F_GETFD), libc::FD_CLOEXEC);
+                    libc::_exit(0);
+                },
+                "foreign-target" => unsafe {
+                    assert_eq!(libc::epoll_ctl(reactor, libc::EPOLL_CTL_ADD, foreign, &mut event), 0);
+                    assert_eq!(libc::epoll_ctl(reactor, libc::EPOLL_CTL_DEL, foreign, std::ptr::null_mut()), 0);
+                    libc::_exit(0);
                 },
                 "setfd" => unsafe {
                     libc::fcntl(irq, libc::F_SETFD, 0);
@@ -1772,7 +1808,7 @@ mod filter_tests {
                 .env("DRV_MT7921_REACTOR_PROBE", mode)
                 .status()
                 .unwrap();
-            if mode == "allowed" {
+            if matches!(mode, "allowed" | "getfd-foreign" | "foreign-target") {
                 assert!(status.success(), "{mode}: {status}");
             } else {
                 assert_eq!(status.signal(), Some(libc::SIGSYS), "{mode}: {status}");
