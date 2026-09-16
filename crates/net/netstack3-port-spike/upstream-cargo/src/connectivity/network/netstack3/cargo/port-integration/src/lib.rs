@@ -166,12 +166,18 @@ impl AtomicInstant<NativeInstant> for AtomicNativeInstant {
     }
 }
 
-/// Entropy consumed only from bytes explicitly supplied by the embedding.
-#[derive(Debug, Default)]
-pub struct InjectedEntropy(VecDeque<u8>);
+/// Entropy consumed lazily from sources explicitly supplied by the embedding.
+/// A production CSPRNG stream need not impose a finite lifetime byte budget.
+#[derive(Default)]
+pub struct InjectedEntropy(VecDeque<Box<dyn Iterator<Item = u8> + Send + Sync>>);
+impl std::fmt::Debug for InjectedEntropy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedEntropy").field("sources", &self.0.len()).finish()
+    }
+}
 impl InjectedEntropy {
-    pub fn inject(&mut self, bytes: impl IntoIterator<Item = u8>) {
-        self.0.extend(bytes)
+    pub fn inject(&mut self, bytes: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) {
+        self.0.push_back(Box::new(bytes.into_iter()));
     }
 }
 impl RngCore for InjectedEntropy {
@@ -187,10 +193,14 @@ impl RngCore for InjectedEntropy {
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
         for byte in dst {
-            *byte = self
-                .0
-                .pop_front()
-                .expect("native Netstack3 entropy exhausted")
+            loop {
+                let source = self.0.front_mut().expect("native Netstack3 entropy exhausted");
+                if let Some(value) = source.next() {
+                    *byte = value;
+                    break;
+                }
+                self.0.pop_front();
+            }
         }
     }
 }
@@ -358,14 +368,14 @@ impl Debug for NativeBindingsCtx {
 }
 
 impl NativeBindingsCtx {
-    pub fn new(queue_capacity: usize, entropy: impl IntoIterator<Item = u8>) -> Self {
+    pub fn new(queue_capacity: usize, entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) -> Self {
         Self::new_with_capacities(queue_capacity, queue_capacity, entropy)
     }
 
     fn new_with_capacities(
         socket_capacity: usize,
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
     ) -> Self {
         let mut rng = InjectedEntropy::default();
         rng.inject(entropy);
@@ -404,7 +414,7 @@ impl NativeBindingsCtx {
     pub fn advance(&mut self, by: Duration) {
         self.now = self.now.saturating_add(by);
     }
-    pub fn inject_entropy(&mut self, bytes: impl IntoIterator<Item = u8>) {
+    pub fn inject_entropy(&mut self, bytes: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) {
         self.entropy.inject(bytes);
     }
     pub fn take_tx(&mut self) -> Option<TxFrame> {
@@ -1441,7 +1451,7 @@ impl Runtime {
     /// IPv6 address is applied, preserving IPv4-only embeddings.
     pub fn new(
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
         interface_id: NonZeroU64,
         mac: [u8; 6],
         mtu: u32,
@@ -1460,7 +1470,7 @@ impl Runtime {
     pub fn new_with_capacities(
         socket_capacity: usize,
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
         interface_id: NonZeroU64,
         mac: [u8; 6],
         mtu: u32,
@@ -3112,6 +3122,24 @@ mod tests {
         )
         .unwrap();
         PacketFilterAdmin::replace_rules(&mut runtime, NativeFilterRules::default()).unwrap();
+    }
+
+    #[test]
+    fn entropy_sources_are_lazy_and_continue_beyond_the_old_provider_budget() {
+        let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = consumed.clone();
+        let mut entropy = InjectedEntropy::default();
+        entropy.inject((0..70_000).map(move |i| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            (i % 256) as u8
+        }));
+        entropy.inject([7, 8, 9, 10]);
+        assert_eq!(consumed.load(Ordering::Relaxed), 0);
+        let mut bytes = vec![0; 70_000];
+        entropy.fill_bytes(&mut bytes);
+        assert!(bytes.iter().enumerate().all(|(i, byte)| *byte == (i % 256) as u8));
+        assert_eq!(consumed.load(Ordering::Relaxed), bytes.len());
+        assert_eq!(entropy.next_u32(), u32::from_le_bytes([7, 8, 9, 10]));
     }
 
     #[test]

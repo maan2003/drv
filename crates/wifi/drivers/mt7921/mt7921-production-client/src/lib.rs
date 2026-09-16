@@ -992,6 +992,7 @@ impl Mt7921HardwareSession {
                 &mut self.activation_state,
             );
             if !errors.is_empty() {
+                eprintln!("mt7921_containment_fault stage=quiesce detail={errors:?}");
                 return Err(Mt7921ContainmentError {
                     stage: ContainmentStage::QuiesceTransport,
                     detail: format!("{errors:?}"),
@@ -1007,7 +1008,9 @@ impl Mt7921HardwareSession {
             self.pci.as_mut().expect("live PCI authority"),
             &mut self.lifecycle,
             &mut self.containment,
-        )?;
+        ).inspect_err(|error| {
+            eprintln!("mt7921_containment_fault stage=advance detail={error:?}");
+        })?;
         Ok(self.containment)
     }
 }

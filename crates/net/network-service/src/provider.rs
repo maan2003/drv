@@ -50,7 +50,7 @@ pub fn run_provider(
     let mut runtime = Runtime::new_with_capacities(
         512,
         1024,
-        (0..65536).map(|_| rand::random::<u8>()),
+        std::iter::repeat_with(rand::random::<u8>),
         NonZeroU64::new(1).unwrap(),
         mac,
         1500,

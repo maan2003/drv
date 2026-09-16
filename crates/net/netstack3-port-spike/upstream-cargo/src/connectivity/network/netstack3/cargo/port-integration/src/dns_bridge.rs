@@ -555,19 +555,25 @@ impl NativeDnsBridge {
             }
             *t = p
         }
-        while n < budget {
-            let Some(t) = self.b.tasks.lock().unwrap().pop_front() else {
-                break;
-            };
-            self.pool
-                .spawner()
-                .spawn_local(async move {
-                    let _ = t.await;
-                })
-                .unwrap();
-            n += 1;
-        }
         for _ in 0..2 {
+            if n >= budget {
+                break;
+            }
+            // A ready lookup can spawn background transport work. Admit it
+            // again after polling the pool, rather than stranding it until
+            // an unrelated packet or the request timeout wakes the embedding.
+            while n < budget {
+                let Some(t) = self.b.tasks.lock().unwrap().pop_front() else {
+                    break;
+                };
+                self.pool
+                    .spawner()
+                    .spawn_local(async move {
+                        let _ = t.await;
+                    })
+                    .unwrap();
+                n += 1;
+            }
             if n >= budget {
                 break;
             }
@@ -786,73 +792,80 @@ mod tests {
 
     #[test]
     fn pinned_resolver_transaction_trace_returns_answer() {
-        let mut client = Runtime::new(
-            16,
-            [3; 8192],
-            NonZeroU64::new(1).unwrap(),
-            [2, 0, 0, 0, 0, 1],
-            1500,
-        )
-        .unwrap();
-        let mut server = Runtime::new(
-            16,
-            [4; 8192],
-            NonZeroU64::new(2).unwrap(),
-            [2, 0, 0, 0, 0, 2],
-            1500,
-        )
-        .unwrap();
-        client.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
-        server.apply_ipv4([192, 0, 2, 53], 24, None).unwrap();
-        let server_socket = server.udp_socket().unwrap();
-        server
-            .udp_bind(
-                server_socket,
-                Some([192, 0, 2, 53]),
-                NonZeroU16::new(53).unwrap(),
+        for budget in [1, 2, DEFAULT_LIMIT] {
+            let mut client = Runtime::new(
+                16,
+                [3; 8192],
+                NonZeroU64::new(1).unwrap(),
+                [2, 0, 0, 0, 0, 1],
+                1500,
             )
             .unwrap();
+            let mut server = Runtime::new(
+                16,
+                [4; 8192],
+                NonZeroU64::new(2).unwrap(),
+                [2, 0, 0, 0, 0, 2],
+                1500,
+            )
+            .unwrap();
+            client.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
+            server.apply_ipv4([192, 0, 2, 53], 24, None).unwrap();
+            let server_socket = server.udp_socket().unwrap();
+            server
+                .udp_bind(
+                    server_socket,
+                    Some([192, 0, 2, 53]),
+                    NonZeroU16::new(53).unwrap(),
+                )
+                .unwrap();
 
-        let mut bridge = NativeDnsBridge::new();
-        bridge.configure(&[IpAddr::from([192, 0, 2, 53])]).unwrap();
-        let query = bridge.lookup_ip("native.test.").unwrap();
-        assert!(bridge.take_result(query).is_none());
-        assert!(bridge.take_result(query).is_none());
-        for _ in 0..32 {
-            bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
-            exchange(&mut client, &mut server);
-            while let Some(packet) = server.udp_receive_msg(server_socket).unwrap() {
-                let request = Message::from_vec(&packet.body).unwrap();
-                let mut response = Message::new(
-                    request.id,
-                    hickory_proto::op::MessageType::Response,
-                    hickory_proto::op::OpCode::Query,
+            let mut bridge = NativeDnsBridge::new();
+            bridge.configure(&[IpAddr::from([192, 0, 2, 53])]).unwrap();
+            let query = bridge.lookup_ip("native.test.").unwrap();
+            assert!(bridge.take_result(query).is_none());
+            assert!(bridge.take_result(query).is_none());
+            for _ in 0..32 {
+                let work = bridge.pump(&mut client, Duration::ZERO, budget);
+                assert!(
+                    work != 0 || bridge.b.tasks.lock().unwrap().is_empty(),
+                    "queued DNS tasks must keep the embedding runnable"
                 );
-                response.add_query(request.queries[0].clone());
-                if request.queries[0].query_type() == hickory_proto::rr::RecordType::A {
-                    response.add_answer(Record::from_rdata(
-                        Name::from_ascii("native.test.").unwrap(),
-                        60,
-                        RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
-                            192, 0, 2, 99,
-                        ))),
-                    ));
+                exchange(&mut client, &mut server);
+                while let Some(packet) = server.udp_receive_msg(server_socket).unwrap() {
+                    let request = Message::from_vec(&packet.body).unwrap();
+                    let mut response = Message::new(
+                        request.id,
+                        hickory_proto::op::MessageType::Response,
+                        hickory_proto::op::OpCode::Query,
+                    );
+                    response.add_query(request.queries[0].clone());
+                    if request.queries[0].query_type() == hickory_proto::rr::RecordType::A {
+                        response.add_answer(Record::from_rdata(
+                            Name::from_ascii("native.test.").unwrap(),
+                            60,
+                            RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
+                                192, 0, 2, 99,
+                            ))),
+                        ));
+                    }
+                    server
+                        .udp_send_to(
+                            server_socket,
+                            [192, 0, 2, 2],
+                            NonZeroU16::new(packet.source.port).unwrap(),
+                            &response.to_vec().unwrap(),
+                        )
+                        .unwrap();
                 }
-                server
-                    .udp_send_to(
-                        server_socket,
-                        [192, 0, 2, 2],
-                        NonZeroU16::new(packet.source.port).unwrap(),
-                        &response.to_vec().unwrap(),
-                    )
-                    .unwrap();
+                exchange(&mut client, &mut server);
             }
-            exchange(&mut client, &mut server);
+            assert_eq!(
+                bridge.take_result(query).unwrap().unwrap(),
+                [IpAddr::from([192, 0, 2, 99])]
+            );
+
         }
-        assert_eq!(
-            bridge.take_result(query).unwrap().unwrap(),
-            [IpAddr::from([192, 0, 2, 99])]
-        );
     }
 
     #[test]

@@ -75,8 +75,10 @@ policy, Netstack3 networking, and netcfg device introduction/observation. The
 launcher retains process and hardware-stop ownership; netcfg receives only
 interface administration, lifecycle, and read-only status capabilities. See
 [the network binding contract](ARCH-network-service.md#device-introduction-and-observation-binding).
-The new netcfg process graph is host/native-build tested; physical KVM acceptance
-is still pending. Separate DNS is a later refinement. Persistent
+The netcfg process graph has host/native-build tests and bounded physical
+MT7921 KVM coverage, including repeated link replacement, application traffic
+and certified shutdown. This is not sustained host-deployment acceptance.
+Separate DNS is a later refinement. Persistent
 credential storage stays out of the Wi-Fi process, and device/DMA authority
 stays out of Internet parsers. The Wi-Fi process necessarily receives active
 connection authentication material and session keys; it is not secret-free.

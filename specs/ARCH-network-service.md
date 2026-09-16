@@ -176,9 +176,11 @@ device, flushing its neighbors while leaving the separate loopback device
 available. DHCP run effects, waits and DNS resolver work are cancelled on
 revocation; unchanged DNS configuration preserves pending queries and cache.
 
-These bindings have host/core tests. Full acceptance of the new process graph
-still requires the physical KVM run; this section does not claim that run or
-complete Linux socket-option compatibility.
+These bindings have host/core tests and bounded physical MT7921 KVM coverage:
+offline sockets, NSS resolution and IPv4/IPv6 applications, repeated link
+replacement, power transitions, saved-state restart and certified hardware
+stop. This does not establish continuously deployed host operation or complete
+Linux socket-option compatibility.
 
 ## Implementation direction and open choices
 

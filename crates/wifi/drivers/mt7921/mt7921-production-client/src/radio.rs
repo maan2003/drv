@@ -323,7 +323,18 @@ impl ControlScheduler {
             self.active = self.queued.pop_front();
         }
         if let Some(active) = self.active.as_ref() {
-            active.context().check(now)?;
+            active.context().check(now).inspect_err(|status| {
+                let operation = match active {
+                    ControlOperation::Channel(_) => "channel",
+                    ControlOperation::Join(_) => "join",
+                    ControlOperation::Scan(_) => "scan",
+                    ControlOperation::Association(_) => "association",
+                    ControlOperation::Power(_) => "power",
+                    ControlOperation::Key(_) => "key",
+                    ControlOperation::Removal(_) => "removal",
+                };
+                eprintln!("mt7921_control_fault operation={operation} status={status:?}");
+            })?;
         }
         Ok(())
     }
@@ -541,6 +552,14 @@ impl FirmwareCommands {
 
     pub(super) fn ready(&self) -> bool {
         !self.failed && self.remaining.is_empty() && self.pending.is_none()
+    }
+
+    /// Discard only commands still owned by the CPU. An active descriptor
+    /// remains in `pending` and must be reclaimed by the existing owner.
+    pub(super) fn discard_queued(&mut self) -> usize {
+        let count = self.remaining.len();
+        self.remaining.clear();
+        count
     }
 
     #[cfg(test)]
