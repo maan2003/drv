@@ -1,3 +1,16 @@
+Object-authority sandbox acceptance
+===================================
+Seccomp no longer compares descriptor arguments. Startup capability inventories
+remain checked; readonly inputs use actual readonly opens and object operations
+reject inappropriate commands. Provider/netcfg frame reservations are removed.
+Host: network-service 64; shared sandbox 14 + 3 subprocess; DNS 8;
+wlancfg library 25, launcher 5, provisioner 3, CLI 3: PASS.
+Linux 7.3 no-INET KVM (debug and optimized provider): shared sandbox 14,
+3 privileged setup subprocesses (no skips), netcfg lifecycle plus maintained production
+endpoint/TCP/UDP/NSS/Netlink/DHCP/link-loss/replacement guest harness: PASS.
+Physical one-shot deployment is tracked separately; no claim here of a
+complete hostile-provider security proof.
+
 NETLINK_ROUTE bridge acceptance (Linux 7.3.0-rc2, same np build tree, -j16)
 ==========================================================================
 No-INET KVM, no virtual/physical network device passthrough, kernel build #28:

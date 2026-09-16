@@ -205,10 +205,6 @@ pub fn run_provider(
         }
     }
     let mut pending_frame = None;
-    // Without a replacement-link capability, retain the revoked frame owner
-    // so CLAIM cannot reuse FD4, which the sandbox permanently treats as frame
-    // authority rather than an application endpoint.
-    let mut _offline_frame = None;
     let mut last_network_snapshot = None;
     let mut active_link_generation = None;
     let mut last_link_generation = 0u64;
@@ -294,18 +290,8 @@ pub fn run_provider(
                         // The trusted supervisor validates connected AF_UNIX
                         // SOCK_SEQPACKET direction and nonblocking mode before
                         // this capability enters the private channel.
-                        if unsafe { libc::dup3(frame.as_raw_fd(), 4, libc::O_CLOEXEC) } < 0 {
-                            return Err(format!(
-                                "install Ethernet capability: {}",
-                                io::Error::last_os_error()
-                            ));
-                        }
-                        drop(frame);
                         let mut installed = unsafe {
-                            crate::ServiceEthernetDevice::from_frame_fd(
-                                OwnedFd::from_raw_fd(4),
-                                mac,
-                            )
+                            crate::ServiceEthernetDevice::from_frame_fd(frame, mac)
                         };
                         let mut event = libc::epoll_event {
                             events: frame_events,
@@ -323,19 +309,6 @@ pub fn run_provider(
                         last_link_generation = generation;
                     }
                     crate::link_control::Request::Detach { .. } => {
-                        if unsafe {
-                            libc::dup3(
-                                crate::link_control::FRAME_RESERVATION_FD,
-                                4,
-                                libc::O_CLOEXEC,
-                            )
-                        } < 0
-                        {
-                            return Err(format!(
-                                "reserve offline Ethernet slot: {}",
-                                io::Error::last_os_error()
-                            ));
-                        }
                         active_link_generation = None;
                     }
                 }
@@ -413,23 +386,7 @@ pub fn run_provider(
                 progress = true;
             }
         }
-        if close_frame {
-            if link_control.is_some() { ethernet = None; }
-            else { _offline_frame = ethernet.take(); }
-            if link_control.is_some() && unsafe {
-                libc::dup3(
-                    crate::link_control::FRAME_RESERVATION_FD,
-                    4,
-                    libc::O_CLOEXEC,
-                )
-            } < 0
-            {
-                return Err(format!(
-                    "reserve offline Ethernet slot: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        if close_frame { ethernet = None; }
         progress |= network.poll_at(start.elapsed(), 64) != 0;
         if let Some(frame) = &mut ethernet {
             for _ in 0..64 {

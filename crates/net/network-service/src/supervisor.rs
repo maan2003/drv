@@ -448,12 +448,6 @@ impl NetworkServiceSupervisor {
                 .map_err(|e| format!("open netlink registration: {e}"))?;
             Some(duplicate_capability(fd.as_raw_fd())?)
         } else { None };
-        let placeholder = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .map_err(|error| format!("reserve provider frame slot: {error}"))?;
-        let placeholder = duplicate_capability(placeholder.as_raw_fd())?;
         let (control_parent, control_child) = seqpacket_pair()?;
         let control_pass = duplicate_capability(control_child.as_raw_fd())?;
         let (mut bootstrap_parent, bootstrap_child) = std::os::unix::net::UnixStream::pair()
@@ -466,10 +460,8 @@ impl NetworkServiceSupervisor {
             .map(|listener| duplicate_capability(listener.as_raw_fd())).transpose()?;
         let mut inherited = vec![
             (registration.as_raw_fd(), FRAME_FD),
-            (placeholder.as_raw_fd(), LISTENER_FD),
             (bootstrap_pass.as_raw_fd(), BOOTSTRAP_FD),
             (control_pass.as_raw_fd(), LINK_CONTROL_FD),
-            (placeholder.as_raw_fd(), crate::link_control::FRAME_RESERVATION_FD),
         ];
         if let Some(registration) = &netlink_registration {
             inherited.push((registration.as_raw_fd(), crate::rtnetlink::REGISTRATION_FD));
@@ -531,7 +523,7 @@ impl NetworkServiceSupervisor {
         }
         let child = command.spawn()
             .map_err(|error| format!("spawn network provider: {error}"))?;
-        drop((registration, placeholder, bootstrap_pass, bootstrap_child, control_child, control_pass));
+        drop((registration, bootstrap_pass, bootstrap_child, control_child, control_pass));
         self.kernel_process = Some(KernelProcess {
             generation,
             child,
@@ -957,7 +949,12 @@ mod tests {
         }
         const F_GETFD: i32 = 1;
         const FD_CLOEXEC: i32 = 1;
+        let linked = std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_LINK_CONTROL").is_some();
         for fd in [FRAME_FD, LISTENER_FD, BOOTSTRAP_FD] {
+            if linked && fd == LISTENER_FD {
+                assert!(unsafe { fcntl(fd, F_GETFD) } < 0, "offline frame slot must be free");
+                continue;
+            }
             let flags = unsafe { fcntl(fd, F_GETFD) };
             assert!(flags >= 0, "missing inherited fd {fd}");
             assert_eq!(flags & FD_CLOEXEC, 0, "inherited fd {fd} is CLOEXEC");
@@ -995,12 +992,6 @@ mod tests {
             return;
         }
         if std::env::var_os("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_LINK_CONTROL").is_some() {
-            for fd in [4, crate::link_control::FRAME_RESERVATION_FD] {
-                assert_eq!(
-                    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap(),
-                    PathBuf::from("/dev/null")
-                );
-            }
             crate::lifecycle::validate_seqpacket(LINK_CONTROL_FD).unwrap();
             let control = unsafe { std::os::fd::BorrowedFd::borrow_raw(LINK_CONTROL_FD) };
             let mut active: Option<(u64, OwnedFd)> = None;

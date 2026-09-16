@@ -83,9 +83,11 @@ offline `backtrace` dev dependency; it is not counted as passing.
 
 `netstack3-provider --ethernet-mac XX:XX:XX:XX:XX:XX` additionally accepts a
 trusted launcher's nonblocking AF_UNIX SOCK_SEQPACKET frame capability on FD4.
-FD3 still owns the application namespace. FD4 cannot be used for endpoint
-ioctls or raw reads/writes; the sandbox permits only the frame transport's
-nonblocking datagram operations. No device/DMA authority crosses this boundary.
+FD3 still owns the application namespace. These numbers are startup conventions:
+seccomp checks syscall/command/flag constraints, not descriptor slots. Native
+file operations reject endpoint ioctls on a frame socket; its socket capability
+authorizes frame I/O. Replacement frames retain their received descriptors, with
+no reserved offline slot. No device/DMA authority crosses this boundary.
 
 The same runtime now runs the existing Fuchsia `DhcpService`, not a second
 stack or DHCP implementation. It reports address/DNS acquisition. Link loss

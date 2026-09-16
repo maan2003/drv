@@ -28,7 +28,7 @@ fn main() {
                 }
                 Some(mac)
             }
-            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver | --resolver-fd] [--link-control] [--netlink] (registration FD3, reserved frame FD4, bootstrap FD5, resolver FD7, link control FD8, netlink registration FD10)".into()),
+            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver | --resolver-fd] [--link-control] [--netlink] (registration FD3, initial frame FD4, bootstrap FD5, resolver FD7, link control FD8, netlink registration FD10)".into()),
         };
         drv_network_service::run_provider(mac, bootstrap, resolver, link_control, netlink)
     })();

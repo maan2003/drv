@@ -88,7 +88,6 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
     const CLIENTS: usize = 32;
     let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 256).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -112,7 +111,7 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
         .collect();
     let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
     if filtered {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
 
@@ -148,7 +147,6 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
 fn idle_epoll_waits_for_deadline_without_busy_polling() {
     let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -156,7 +154,7 @@ fn idle_epoll_waits_for_deadline_without_busy_polling() {
     let listen = listener.local_addr().unwrap();
     let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
     if filtered {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
     let before_waits = service.poller_wait_counts();
@@ -519,7 +517,6 @@ fn drive(
 fn socks_connect_relays_application_bytes_over_ethernet() {
     let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
@@ -614,7 +611,7 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
         .unwrap();
     client.set_nonblocking(true).unwrap();
     if std::env::var_os("DRV_NETWORK_RELAY_FILTER_FIXTURE").is_some() {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
     let mut response = Vec::new();

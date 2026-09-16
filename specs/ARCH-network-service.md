@@ -99,6 +99,13 @@ provider absence never silently exposes native kernel state. The current
 adapter supports read-only link/address discovery; route queries and mutations
 remain unsupported. Other Netlink protocols retain their native owners.
 
+Seccomp restricts syscall kinds, commands, flags and other non-descriptor
+arguments, never descriptor numbers. Capability identity, access mode and
+generation are enforced by the underlying objects; duplication or slot reuse
+does not change authority. Launchers retain only the intended capabilities,
+open immutable inputs read-only, and isolate filesystem/network namespaces.
+Fixed inherited FD numbers are startup conventions only, not security labels.
+
 The kernel mediates provider authority and resource limits. A compromised
 provider cannot select arbitrary namespaces, access unrelated sockets or
 application memory, or manufacture kernel pointers. Applications retain
@@ -181,8 +188,8 @@ view. This all-multicast receive contract does not imply multicast forwarding.
 Watcher pressure cannot block packet processing: acknowledgements are retained,
 control intake pauses behind a blocked acknowledgement, and observations
 coalesce until writable readiness. Netcfg's accepted status clients are bounded
-and time-limited. Its frame monitor occupies a fixed descriptor slot excluded
-from application-status I/O. Link-down disables both IP families on the Ethernet
+and time-limited. Its frame monitor owns the received capability directly and drops it on
+revocation; there is no reserved descriptor slot. Link-down disables both IP families on the Ethernet
 device, flushing its neighbors while leaving the separate loopback device
 available. DHCP run effects, waits and DNS resolver work are cancelled on
 revocation; unchanged DNS configuration preserves pending queries and cache.

@@ -24,7 +24,7 @@ struct ProviderInterfaces {
     mac: [u8; 6],
     provider_generation: u64,
     active_link: Option<u64>,
-    monitor: OwnedFd,
+    monitor: Option<OwnedFd>,
     last_link: Option<u64>,
     snapshot: Option<netstack3_port_integration::interfaces::InterfaceSnapshot>,
 }
@@ -71,13 +71,8 @@ impl ProviderInterfaces {
 impl InterfaceInstaller for ProviderInterfaces {
     fn mac_address(&self) -> [u8; 6] { self.mac }
     fn install(&mut self, generation: u64, frame: OwnedFd) -> Result<u64, String> {
-        // Keep frame authority out of the dynamically accepted client range.
-        // The fixed monitor slot permits only HUP observation and transfer.
-        if unsafe { libc::dup3(frame.as_raw_fd(), self.monitor.as_raw_fd(), libc::O_CLOEXEC) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        drop(frame);
-        link_control::send_attach(self.control.as_fd(), generation, self.monitor.as_fd())?;
+        link_control::send_attach(self.control.as_fd(), generation, frame.as_fd())?;
+        self.monitor = Some(frame);
         self.completed(generation)?;
         self.active_link = Some(generation);
         self.last_link = Some(generation);
@@ -92,16 +87,14 @@ impl InterfaceInstaller for ProviderInterfaces {
         }
         link_control::send_detach(self.control.as_fd(), generation)?;
         self.completed(generation)?;
-        if unsafe { libc::dup3(5, self.monitor.as_raw_fd(), libc::O_CLOEXEC) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+        self.monitor = None;
         self.active_link = None;
         Ok(())
     }
 }
 
 /// Inherited private capabilities: Wi-Fi device events FD3, Netstack admin FD4,
-/// readiness FD5, read-only status listener FD6, reserved frame monitor FD7.
+/// readiness FD5 and read-only status listener FD6.
 /// No hardware descriptors, credential storage or filesystem.
 pub fn run(mac: [u8; 6], provider_generation: u64) -> Result<(), String> {
     if mac == [0; 6] || mac[0] & 1 != 0 || provider_generation == 0 {
@@ -115,9 +108,9 @@ pub fn run(mac: [u8; 6], provider_generation: u64) -> Result<(), String> {
         }
     }
     let sandbox = linux_self_sandbox::Sandbox::new()
-        .setup(&[3, 4, 5, 6, 7], None).map_err(|e| format!("netcfg setup: {e:?}"))?
+        .setup(&[3, 4, 5, 6], None).map_err(|e| format!("netcfg setup: {e:?}"))?
         .lockdown(linux_self_sandbox::Profile::Netcfg {
-            device_fd: 3, provider_fd: 4, readiness_fd: 5, status_listener_fd: 6, monitor_fd: 7,
+            device_fd: 3, provider_fd: 4, readiness_fd: 5, status_listener_fd: 6,
         }).map_err(|e| format!("netcfg lockdown: {e:?}"))?;
     sandbox.run(|| serve(mac, provider_generation))
 }
@@ -129,15 +122,15 @@ fn serve(mac: [u8; 6], provider_generation: u64) -> Result<(), String> {
     let mut provider = ProviderInterfaces {
         control: unsafe { OwnedFd::from_raw_fd(4) }, mac, provider_generation,
         active_link: None, last_link: None, snapshot: None,
-        monitor: unsafe { OwnedFd::from_raw_fd(7) },
+        monitor: None,
     };
     link_control::watch(provider.control.as_fd(), provider_generation)?;
     provider.completed(provider_generation)?;
-    // Keep this slot occupied for the entire sandbox lifetime.
-    let _readiness = unsafe { OwnedFd::from_raw_fd(5) };
+    let readiness = unsafe { OwnedFd::from_raw_fd(5) };
     if unsafe { libc::write(5, b"READY".as_ptr().cast(), 5) } != 5 {
         return Err("netcfg readiness delivery failed".into());
     }
+    drop(readiness);
     let _listener = unsafe { OwnedFd::from_raw_fd(6) };
     let mut clients: Vec<(OwnedFd, Instant)> = Vec::new();
     let mut device_present = false;
@@ -183,7 +176,7 @@ fn serve(mac: [u8; 6], provider_generation: u64) -> Result<(), String> {
                     libc::pollfd { fd: 3, events: libc::POLLIN, revents: 0 },
                     libc::pollfd { fd: 4, events: libc::POLLIN, revents: 0 },
                     libc::pollfd {
-                        fd: provider.active_link.map_or(-1, |_| provider.monitor.as_raw_fd()),
+                        fd: provider.monitor.as_ref().map_or(-1, AsRawFd::as_raw_fd),
                         events: 0, revents: 0,
                     },
                 ];
@@ -240,7 +233,7 @@ mod tests {
         let mac = [2, 0, 0, 0, 0, 1];
         if std::env::var_os("DRV_NETCFG_FIXTURE").is_some() {
             linux_self_sandbox::install_runtime_filter_for_integration_test(
-                linux_self_sandbox::Profile::Netcfg { device_fd: 3, provider_fd: 4, readiness_fd: 5, status_listener_fd: 6, monitor_fd: 7 }
+                linux_self_sandbox::Profile::Netcfg { device_fd: 3, provider_fd: 4, readiness_fd: 5, status_listener_fd: 6 }
             ).unwrap();
             let result = serve(mac, 1);
             if let Err(error) = &result { eprintln!("netcfg fixture: {error}"); }
@@ -258,7 +251,7 @@ mod tests {
         rustix::net::bind(&listener, &address).unwrap();
         rustix::net::listen(&listener, 8).unwrap();
         // Sources above all targets prevent pre_exec remapping collisions.
-        let sources = [cfg_wifi.as_raw_fd(), cfg_stack.as_raw_fd(), cfg_ready.as_raw_fd(), listener.as_raw_fd(), cfg_ready.as_raw_fd()]
+        let sources = [cfg_wifi.as_raw_fd(), cfg_stack.as_raw_fd(), cfg_ready.as_raw_fd(), listener.as_raw_fd()]
             .map(|fd| unsafe { OwnedFd::from_raw_fd(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10)) });
         let inherited = sources.iter().enumerate().map(|(i, fd)| (fd.as_raw_fd(), 3+i as i32))
             .collect::<Vec<_>>();

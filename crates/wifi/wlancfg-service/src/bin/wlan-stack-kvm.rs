@@ -667,7 +667,7 @@ fn spawn_netcfg(
     let ready_pass = duplicate(child_ready.as_raw_fd())?;
     let status_pass = duplicate(listener.as_raw_fd())?;
     let inherited = [(device.as_raw_fd(), 3), (admin.as_raw_fd(), 4),
-        (ready_pass.as_raw_fd(), 5), (status_pass.as_raw_fd(), 6), (ready_pass.as_raw_fd(), 7)];
+        (ready_pass.as_raw_fd(), 5), (status_pass.as_raw_fd(), 6)];
     let mut command = Command::new(binary);
     command.env_clear()
         .arg(mac.map(|v| format!("{v:02x}")).join(":"))

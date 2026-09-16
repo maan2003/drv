@@ -4,7 +4,7 @@ use crate::{Socks5Service, NetworkPoller, ServiceEthernetDevice};
 use std::env;
 use std::ffi::{c_char, c_void};
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -107,11 +107,8 @@ fn append_kill(filter: &mut Vec<SockFilter>, syscall: i64) {
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
 }
 
-fn append_fd_and_flags(filter: &mut Vec<SockFilter>, syscall: i64, fd: RawFd, flags: i32) {
-    filter.push(jump(syscall as u32, 0, 20));
-    filter.push(arg(0));
-    filter.push(jump(fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+fn append_datagram_flags(filter: &mut Vec<SockFilter>, syscall: i64, flags: i32) {
+    filter.push(jump(syscall as u32, 0, 17));
     filter.push(arg(3));
     filter.push(jump(flags as u32, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
@@ -133,19 +130,8 @@ fn append_fd_and_flags(filter: &mut Vec<SockFilter>, syscall: i64, fd: RawFd, fl
 }
 
 
-fn append_three_arg_fd_and_flags(
-    filter: &mut Vec<SockFilter>,
-    syscall: i64,
-    fd: RawFd,
-    flags: i32,
-) {
-    filter.push(jump(syscall as u32, 0, 11));
-    filter.push(arg(0));
-    filter.push(jump(fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg_high(0));
-    filter.push(jump(0, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+fn append_message_flags(filter: &mut Vec<SockFilter>, syscall: i64, flags: i32) {
+    filter.push(jump(syscall as u32, 0, 5));
     filter.push(arg(2));
     filter.push(jump(flags as u32, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
@@ -153,26 +139,10 @@ fn append_three_arg_fd_and_flags(
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
-fn append_link_dup3(filter: &mut Vec<SockFilter>) {
-    filter.push(jump(libc::SYS_dup3 as u32, 0, 11));
-    filter.push(arg(1));
-    filter.push(jump(4, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg_high(1));
-    filter.push(jump(0, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg(2));
-    filter.push(jump(libc::O_CLOEXEC as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
-}
 
-fn append_accept4(filter: &mut Vec<SockFilter>, listener_fd: RawFd) {
-    filter.push(jump(libc::SYS_accept4 as u32, 0, 7));
-    filter.push(arg(0));
-    filter.push(jump(listener_fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+
+fn append_accept4(filter: &mut Vec<SockFilter>) {
+    filter.push(jump(libc::SYS_accept4 as u32, 0, 4));
     filter.push(arg(3));
     filter.push(jump(
         (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32,
@@ -184,20 +154,7 @@ fn append_accept4(filter: &mut Vec<SockFilter>, listener_fd: RawFd) {
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
-fn append_io_except_capabilities(
-    filter: &mut Vec<SockFilter>,
-    syscall: i64,
-    frame_fd: RawFd,
-    listener_fd: RawFd,
-) {
-    filter.push(jump(syscall as u32, 0, 6));
-    filter.push(arg(0));
-    filter.push(jump(frame_fd as u32, 2, 0));
-    filter.push(jump(listener_fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
-}
+
 
 fn append_fcntl_commands(filter: &mut Vec<SockFilter>) {
     filter.push(jump(libc::SYS_fcntl as u32, 0, 5));
@@ -209,14 +166,8 @@ fn append_fcntl_commands(filter: &mut Vec<SockFilter>) {
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
-fn append_epoll_ctl(filter: &mut Vec<SockFilter>, epoll_fd: RawFd) {
-    filter.push(jump(libc::SYS_epoll_ctl as u32, 0, 21));
-    filter.push(arg(0));
-    filter.push(jump(epoll_fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg_high(0));
-    filter.push(jump(0, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+fn append_epoll_ctl(filter: &mut Vec<SockFilter>) {
+    filter.push(jump(libc::SYS_epoll_ctl as u32, 0, 9));
     filter.push(arg(1));
     filter.push(jump(libc::EPOLL_CTL_ADD as u32, 3, 0));
     filter.push(jump(libc::EPOLL_CTL_MOD as u32, 2, 0));
@@ -225,24 +176,12 @@ fn append_epoll_ctl(filter: &mut Vec<SockFilter>, epoll_fd: RawFd) {
     filter.push(arg_high(1));
     filter.push(jump(0, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg(2));
-    filter.push(jump(epoll_fd as u32, 0, 1));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg_high(2));
-    filter.push(jump(0, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
 }
 
-fn append_epoll_pwait(filter: &mut Vec<SockFilter>, epoll_fd: RawFd) {
-    filter.push(jump(libc::SYS_epoll_pwait as u32, 0, 25));
-    filter.push(arg(0));
-    filter.push(jump(epoll_fd as u32, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(arg_high(0));
-    filter.push(jump(0, 1, 0));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+fn append_epoll_pwait(filter: &mut Vec<SockFilter>) {
+    filter.push(jump(libc::SYS_epoll_pwait as u32, 0, 19));
     filter.push(arg(2));
     filter.push(jump(EPOLL_EVENT_BATCH, 1, 0));
     filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
@@ -381,7 +320,7 @@ fn setup(expected_parent: i32, first_close: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn network_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Vec<SockFilter> {
+fn network_filter() -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
@@ -393,30 +332,24 @@ fn network_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Vec<S
     for denied in [SYS_IOCTL, SYS_SOCKET, SYS_OPENAT] {
         append_kill(&mut filter, denied);
     }
-    // Netstack3's only kernel packet transport is inherited frame fd 3.
-    append_fd_and_flags(
+    // Packet transport requires a possessed connected socket, not a particular FD.
+    append_datagram_flags(
         &mut filter,
         libc::SYS_sendto,
-        frame_fd,
         libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
     );
-    append_fd_and_flags(
+    append_datagram_flags(
         &mut filter,
         libc::SYS_recvfrom,
-        frame_fd,
         libc::MSG_DONTWAIT | libc::MSG_TRUNC,
     );
-    // Owned applications enter only through the inherited loopback listener.
-    append_accept4(&mut filter, listener_fd);
-    // Bootstrap, logs, and dynamic accepted clients use byte-stream I/O. The
-    // frame and listener capabilities cannot bypass their role-specific calls.
-    append_io_except_capabilities(&mut filter, libc::SYS_read, frame_fd, listener_fd);
-    append_io_except_capabilities(&mut filter, libc::SYS_write, frame_fd, listener_fd);
+    // A possessed listening socket authorizes accepting application connections.
+    append_accept4(&mut filter);
     // Accepted streams are made nonblocking; no descriptor duplication,
     // ownership, or advisory-lock fcntl commands are needed at runtime.
     append_fcntl_commands(&mut filter);
-    append_epoll_ctl(&mut filter, epoll_fd);
-    append_epoll_pwait(&mut filter, epoll_fd);
+    append_epoll_ctl(&mut filter);
+    append_epoll_pwait(&mut filter);
     // Heap growth/reclamation is allowed, but executable memory is not.
     append_no_exec_memory(&mut filter, libc::SYS_mmap);
     append_no_exec_memory(&mut filter, libc::SYS_mprotect);
@@ -424,6 +357,7 @@ fn network_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Vec<S
     // Runtime and teardown operations, grouped by the role that requires them.
     // read/write/close cover bootstrap fd 5, logs, and dynamic accepted clients.
     let allowed = [
+        libc::SYS_read, libc::SYS_write,
         libc::SYS_close,
         // Rust allocation and deallocation after executable mappings are denied.
         libc::SYS_munmap,
@@ -461,11 +395,11 @@ fn network_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Vec<S
 }
 
 fn lockdown() -> Result<(), String> {
-    install_filter(FRAME_FD, LISTENER_FD, EPOLL_FD)
+    install_filter()
 }
 
-fn install_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Result<(), String> {
-    let filter = network_filter(frame_fd, listener_fd, epoll_fd);
+fn install_filter() -> Result<(), String> {
+    let filter = network_filter();
     let program = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
@@ -485,16 +419,12 @@ fn install_filter(frame_fd: RawFd, listener_fd: RawFd, epoll_fd: RawFd) -> Resul
 }
 
 #[cfg(test)]
-pub(crate) fn install_test_filter(
-    frame_fd: RawFd,
-    listener_fd: RawFd,
-    epoll_fd: RawFd,
-) -> Result<(), String> {
+pub(crate) fn install_test_filter() -> Result<(), String> {
     syscall_ok(
         unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1usize, 0usize, 0usize, 0usize) },
         "test no-new-privileges",
     )?;
-    install_filter(frame_fd, listener_fd, epoll_fd)
+    install_filter()
 }
 
 fn write_all_fd(fd: i32, mut bytes: &[u8], operation: &'static str) -> Result<(), String> {
@@ -598,7 +528,7 @@ mod tests {
     use crate::Socks5ResourceBudget;
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsRawFd as _, RawFd};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
@@ -641,7 +571,7 @@ mod tests {
             10,
         );
         child_require(
-            install_filter(FRAME_FD, LISTENER_FD, poller.raw_fd()).is_ok(),
+            install_filter().is_ok(),
             11,
         );
 
@@ -789,7 +719,7 @@ mod tests {
             45,
         );
         child_require(
-            install_filter(FRAME_FD, LISTENER_FD, poller.raw_fd()).is_ok(),
+            install_filter().is_ok(),
             46,
         );
         let mut dns = netstack3_port_integration::dns_bridge::NativeDnsBridge::new();
@@ -866,7 +796,7 @@ mod tests {
             122,
         );
         child_require(
-            install_filter(FRAME_FD, LISTENER_FD, service.poller_fd()).is_ok(),
+            install_filter().is_ok(),
             123,
         );
         let before = service.poller_wait_counts();
@@ -933,7 +863,7 @@ mod tests {
             "ethernet-recv-wrong-flags" => [libc::SYS_recvfrom, 4, 0, 0],
             "link-control-read" => [libc::SYS_read, crate::link_control::CONTROL_FD as i64, 0, 0],
             "link-control-write" => [libc::SYS_write, crate::link_control::CONTROL_FD as i64, 0, 0],
-            "frame-reservation-read" => [libc::SYS_read, crate::link_control::FRAME_RESERVATION_FD as i64, 0, 0],
+
             _ => panic!("unknown denial"),
         };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
@@ -997,7 +927,6 @@ mod tests {
         let Ok(Some(crate::link_control::Request::Attach { generation: 9, frame })) = request else {
             child_exit(59);
         };
-        child_require(unsafe { libc::dup3(frame.as_raw_fd(), 4, libc::O_CLOEXEC) } == 4, 60);
         child_require(
             crate::link_control::send_ack(
                 unsafe { std::os::fd::BorrowedFd::borrow_raw(crate::link_control::CONTROL_FD) },
@@ -1009,7 +938,7 @@ mod tests {
         child_require(
             unsafe {
                 libc::sendto(
-                    4,
+                    frame.as_raw_fd(),
                     b"frame".as_ptr().cast(),
                     5,
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
@@ -1023,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_filter_allows_scoped_link_control_descriptor_replacement() {
+    fn provider_filter_allows_owned_link_control_descriptor() {
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1040,13 +969,46 @@ mod tests {
     }
 
     #[test]
+    fn provider_descriptor_identity_fixture() {
+        if std::env::var_os("DRV_PROVIDER_DESCRIPTOR_IDENTITY").is_none() { return; }
+        let mut pair = [-1; 2];
+        child_require(unsafe { libc::socketpair(libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK, 0, pair.as_mut_ptr()) } == 0, 70);
+        let source = duplicate(pair[0]);
+        let peer = duplicate(pair[1]);
+        // Identical object at a formerly protected slot and an arbitrary high slot.
+        child_require(unsafe { libc::dup2(source.as_raw_fd(), 4) } == 4, 71);
+        child_require(unsafe { libc::dup2(source.as_raw_fd(), 73) } == 73, 72);
+        let filter = provider_filter(true, true, true);
+        let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+        child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 73);
+        child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 74);
+        for fd in [4, 73] {
+            child_require(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) } == 1, 75);
+            let mut byte = 0u8;
+            child_require(unsafe { libc::read(peer.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) } == 1 && byte == b'x', 76);
+            // An allowed command does not make a Unix socket a registration.
+            child_require(unsafe { libc::ioctl(fd, 0x8008B401u64, std::ptr::null_mut::<u64>()) } == -1, 77);
+            child_require(std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTTY), 78);
+        }
+        child_exit(0);
+    }
+
+    #[test]
+    fn provider_authority_follows_objects_not_descriptor_numbers() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child::tests::provider_descriptor_identity_fixture", "--nocapture"])
+            .env("DRV_PROVIDER_DESCRIPTOR_IDENTITY", "1")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
+            .status().unwrap();
+        assert!(status.success(), "descriptor independence failed: {status}");
+    }
+
+    #[test]
     fn provider_filter_forbidden_operations_are_fatal() {
         use std::os::unix::process::ExitStatusExt as _;
-        for operation in ["socket", "read-registration", "write-registration", "read-epoll",
-            "claim-wrong-fd", "netlink-claim-wrong-fd", "control-registration", "control-epoll", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
-            "ethernet-read", "ethernet-write", "ethernet-publish", "ethernet-control",
-            "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags",
-            "link-control-read", "link-control-write", "frame-reservation-read"] {
+        for operation in ["socket", "unknown-ioctl", "dup",
+            "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags"] {
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "child::tests::provider_filter_denial_fixture", "--nocapture"])
                 .env("DRV_PROVIDER_FILTER_DENIAL", operation)
@@ -1242,20 +1204,13 @@ mod tests {
             "socket",
             "openat",
             "ioctl",
-            "wrong-send-fd",
             "send-flags",
             "recv-flags",
             "frame-address",
-            "read-frame",
-            "write-listener",
-            "wrong-accept-fd",
             "accept-flags",
             "fcntl-dup",
             "fcntl-getfl",
-            "epoll-ctl-fd",
             "epoll-ctl-operation",
-            "epoll-ctl-self",
-            "epoll-wait-fd",
             "epoll-wait-batch",
             "epoll-wait-signal-mask",
             "executable-memory",
@@ -1548,15 +1503,16 @@ pub(crate) fn provider_setup(
     netlink: bool,
 ) -> Result<(), String> {
     unsafe {
-        if !ethernet && !link_control { close(4); }
+        if !ethernet { close(4); }
         if !bootstrap { close(5); }
         if !resolver { close(7); }
-        if !link_control { close(crate::link_control::CONTROL_FD); close(crate::link_control::FRAME_RESERVATION_FD); }
+        if !link_control { close(crate::link_control::CONTROL_FD); }
+        close(9);
     }
     let first_close = if netlink {
         crate::rtnetlink::REGISTRATION_FD as u32 + 1
     } else if link_control {
-        crate::link_control::FRAME_RESERVATION_FD as u32 + 1
+        crate::link_control::CONTROL_FD as u32 + 1
     } else if resolver {
         8 // FD7 is the pre-bound resolver listener.
     } else {
@@ -1573,7 +1529,7 @@ pub(crate) fn provider_setup(
     if resolver {
         // Add the only new syscall authority: accept from the pre-bound resolver listener.
         let mut accept = Vec::new();
-        append_accept4(&mut accept, 7);
+        append_accept4(&mut accept);
         filter.splice(4..4, accept);
     }
     let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
@@ -1587,93 +1543,31 @@ fn provider_filter(ethernet: bool, link_control: bool, netlink: bool) -> Vec<Soc
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
-    if netlink {
-        filter.extend([
-            jump(libc::SYS_ioctl as u32, 0, 6),
-            arg(1), jump(0x8008B401, 0, 4),
-            arg(0), jump(crate::rtnetlink::REGISTRATION_FD as u32, 0, 1),
-            stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-            stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-            stmt(BPF_LD | BPF_W | BPF_ABS, 0),
-        ]);
-    }
+    // Object operations validate capability type; no descriptor slot carries authority.
     if ethernet {
-        append_fd_and_flags(&mut filter, libc::SYS_recvfrom, 4, libc::MSG_DONTWAIT | libc::MSG_TRUNC);
-        append_fd_and_flags(&mut filter, libc::SYS_sendto, 4, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
-        // Frame authority is only usable through bounded datagram operations,
-        // never endpoint ioctl or unframed read/write.
-        for syscall in [libc::SYS_ioctl, libc::SYS_read, libc::SYS_write] {
-            filter.push(jump(syscall as u32, 0, 3));
-            filter.push(arg(0));
-            filter.push(jump(4, 0, 1));
-            filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-            filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
-        }
+        append_datagram_flags(&mut filter, libc::SYS_recvfrom, libc::MSG_DONTWAIT | libc::MSG_TRUNC);
+        append_datagram_flags(&mut filter, libc::SYS_sendto, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
     }
     if link_control {
-        // The inherited private control channel is the sole descriptor ingress.
-        // recvmsg/sendmsg are restricted to it and dup3 may only replace frame FD4.
-        append_three_arg_fd_and_flags(
-            &mut filter,
-            libc::SYS_recvmsg,
-            crate::link_control::CONTROL_FD,
-            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
-        );
-        append_three_arg_fd_and_flags(
-            &mut filter,
-            libc::SYS_sendmsg,
-            crate::link_control::CONTROL_FD,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-        );
-        append_link_dup3(&mut filter);
-        // Neither the typed control channel nor its inert frame-slot reservation
-        // may be used as unframed application byte streams.
-        for protected_fd in [
-            crate::link_control::CONTROL_FD,
-            crate::link_control::FRAME_RESERVATION_FD,
-        ] {
-            for syscall in [libc::SYS_read, libc::SYS_write] {
-                filter.push(jump(syscall as u32, 0, 3));
-                filter.push(arg(0));
-                filter.push(jump(protected_fd as u32, 0, 1));
-                filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-                filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
-            }
-        }
+        append_message_flags(&mut filter, libc::SYS_recvmsg, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC);
+        append_message_flags(&mut filter, libc::SYS_sendmsg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
     }
-    filter.push(jump(libc::SYS_ioctl as u32, 0, 12));
+    let mut requests = vec![0x8008B301, 0xC038B302, 0x8080B303];
+    if netlink { requests.push(0x8008B401); }
+    filter.push(jump(libc::SYS_ioctl as u32, 0, (requests.len() + 3) as u8));
     filter.push(arg(1));
-    filter.push(jump(0x8008B301, 0, 3));
-    filter.push(arg(0));
-    filter.push(jump(3, 6, 7));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(jump(0xC038B302, 1, 0));
-    filter.push(jump(0x8080B303, 0, 4));
-    filter.push(arg(0));
-    filter.push(jump(6, 2, 0));
-    filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 0, jf: 1, k: 4 });
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
-    for syscall in [libc::SYS_read, libc::SYS_write] {
-        filter.push(jump(syscall as u32, 0, 7));
-        filter.push(arg(0));
-        filter.push(jump(6, 4, 0));
-        // Apart from reserved frame FD4 (guarded above), FD4+ comes from
-        // CLAIM/PUBLISH_ACCEPT: open/socket/dup are forbidden.
-        filter.push(SockFilter { code: BPF_JMP | 0x30 | BPF_K, jt: 2, jf: 0, k: 4 });
-        filter.push(jump(if syscall == libc::SYS_write { 1 } else { u32::MAX }, 1, 0));
-        filter.push(jump(if syscall == libc::SYS_write { 2 } else { u32::MAX }, 0, 1));
-        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
+    for (i, request) in requests.iter().enumerate() {
+        filter.push(jump(*request, (requests.len() - i) as u8, 0));
     }
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 0));
     append_fcntl_commands(&mut filter);
-    append_epoll_ctl(&mut filter, EPOLL_FD);
-    append_epoll_pwait(&mut filter, EPOLL_FD);
+    append_epoll_ctl(&mut filter);
+    append_epoll_pwait(&mut filter);
     append_no_exec_memory(&mut filter, libc::SYS_mmap);
     append_no_exec_memory(&mut filter, libc::SYS_mprotect);
-    for syscall in [libc::SYS_close, libc::SYS_munmap, libc::SYS_brk,
+    for syscall in [libc::SYS_read, libc::SYS_write, libc::SYS_close, libc::SYS_munmap, libc::SYS_brk,
         libc::SYS_mremap, libc::SYS_madvise, libc::SYS_futex, libc::SYS_getrandom,
         libc::SYS_clock_gettime, libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask,
         libc::SYS_rt_sigreturn, libc::SYS_sigaltstack, libc::SYS_restart_syscall,

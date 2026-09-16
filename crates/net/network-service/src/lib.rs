@@ -395,10 +395,7 @@ impl Socks5Client {
 }
 
 impl Socks5Service {
-    #[cfg(test)]
-    fn poller_fd(&self) -> RawFd {
-        self.poller.raw_fd()
-    }
+
 
     #[cfg(test)]
     fn poller_wait_counts(&self) -> (usize, usize) {

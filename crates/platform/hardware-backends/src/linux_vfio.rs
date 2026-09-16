@@ -438,7 +438,7 @@ impl LinuxVfioPlatformCapabilities {
         ))
     }
 
-    /// Exact descriptor identities for the caller's fd-bound sandbox policy.
+    /// Descriptor inventory for startup capability retention and validation.
     pub fn fd_identities(&self) -> LinuxVfioPlatformFdIdentities {
         LinuxVfioPlatformFdIdentities {
             vfio: self.device.as_raw_fd(),

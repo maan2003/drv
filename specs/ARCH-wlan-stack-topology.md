@@ -303,6 +303,12 @@ before `lockdown()` completes** — no `accept()`, no wire read, no untrusted
 config parse. This is the crosvm model; it makes the running allowlist far
 smaller than a launch-time jail because setup-only syscalls never appear in it.
 
+Seccomp constrains syscall kinds and non-descriptor arguments, not FD numbers.
+The startup inventory still limits which capabilities survive. File access modes,
+socket types and device/endpoint implementations enforce operations on those
+objects; descriptor aliases or reuse do not change their authority. Capability
+transfer and namespace/filesystem isolation remain separate boundaries.
+
 `lockdown()` is the per-kernel portability seam (Linux `unshare`+`seccomp`+cap
 drop; FreeBSD `cap_enter`+`cap_rights_limit`; a capability microkernel needs
 little). No ambient authority: a service starts from an empty namespace and holds

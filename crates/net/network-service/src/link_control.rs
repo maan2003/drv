@@ -16,7 +16,6 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 
 pub(crate) const CONTROL_FD: RawFd = 8;
-pub(crate) const FRAME_RESERVATION_FD: RawFd = 9;
 const MAGIC: [u8; 4] = *b"DLNK";
 const VERSION: u8 = 1;
 const MESSAGE_LEN: usize = 16;
