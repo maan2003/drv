@@ -50,7 +50,8 @@ cat /run/death.log
 kill -KILL "$provider"
 wait "$provider" || true
 /bin/loopback-test absent
-LD_LIBRARY_PATH=/lib DRV_KERNEL_PROVIDER_ETHERNET_GUEST=1 /bin/network-service-tests --exact \
+/bin/netlink-test
+LD_LIBRARY_PATH=/lib DRV_KERNEL_PROVIDER_ETHERNET_GUEST=1 DRV_KERNEL_PROVIDER_NETLINK_GUEST=1 /bin/network-service-tests --exact \
     integration_test::kernel_provider_ethernet_guest_fixture --nocapture
 /bin/loopback-test absent
 echo PASS_KVM_PRODUCTION_LOOPBACK

@@ -18,6 +18,39 @@ Current [ABI6 acceptance](rust-abi5/evidence.txt) records native tests, lock-deb
 no-INET KVM and private-overlay OpenSSH. The captures below are historical
 baselines, not ABI6 acceptance evidence.
 
+## Delegated route metadata
+
+Linux retains native AF_NETLINK socket transport, port binding, subscriptions,
+credentials, receive limits and unrelated protocols. A separate
+`/dev/netstack3-netlink` registration delegates subsequently created
+NETLINK_ROUTE sockets in the launcher's namespace. Claimed FDs identify single
+sockets; publication is restricted to that generation's current subscribers.
+Provider loss fails closed, including after replacement. The wire contract and
+limits are in [netlink-protocol.h](netlink-protocol.h).
+
+The supervisor passes registration FD10 with `--netlink` into the existing
+sandbox. The userspace adapter renders read-only link/address dumps and change
+notifications from actual Netstack3 observations, including loopback, DHCP,
+IPv6 address state and link loss. It does not synthesize configured IP addresses.
+Route queries and mutations return explicit unsupported errors. Per-application
+metadata privacy remains deferred; this is a namespace-wide compatibility view.
+
+The standard guest fixture now also needs these clients, built from this
+directory (no Go module or external Go dependency is required):
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -pthread netlink-test.c -o "$ROOT/bin/netlink-test"
+gcc -O2 -Wall -Wextra -Werror netlink-client-test.c -o "$ROOT/bin/netlink-client-test"
+CGO_ENABLED=0 go build -p 16 -o "$ROOT/bin/netlink-go-test" netlink-go-test.go
+```
+
+The boundary fixture checks endpoint isolation, subscriptions, bounded queues,
+overrun reporting, sender credentials, namespace isolation, native Generic
+Netlink, revocation and replacement. The real Ethernet fixture checks glibc
+`getifaddrs`/`AI_ADDRCONFIG`, pure-Go interface discovery and address-removal
+notifications before/after link loss, alongside existing TCP/UDP and NSS tests.
+These are no-INET KVM checks, not physical deployment or full rtnetlink coverage.
+
 ## Original C baseline proof
 
 Linux 6.18.40 in KVM on np registers our implementation for AF_INET/AF_INET6,

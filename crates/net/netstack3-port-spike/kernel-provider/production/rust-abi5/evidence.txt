@@ -1,3 +1,17 @@
+NETLINK_ROUTE bridge acceptance (Linux 7.3.0-rc2, same np build tree, -j16)
+==========================================================================
+No-INET KVM, no virtual/physical network device passthrough, kernel build #28:
+- netlink-test: endpoint/subscription isolation, TX bounds and readiness,
+  multicast overrun isolation, per-send credentials, namespace isolation,
+  native Generic Netlink, provider death and non-resurrection: PASS.
+- Real Netstack3 DHCP fixture: glibc getifaddrs/AI_ADDRCONFIG and CGO=0 Go
+  interfaces before/after link loss; RTM_DELADDR notification: PASS.
+- Maintained production guest-init: full endpoint, TCP/UDP v4/v6, 64MiB
+  integrity, idle/parallel, generation replacement, DHCP/DNS/NSS: PASS.
+- Network-service host suite: 62 passed serially, including scoped sandbox
+  netlink-claim rejection. No kernel build warnings introduced.
+This is VM acceptance, not physical deployment, full rtnetlink or security proof.
+
 Focused connection-lifecycle follow-up, 2026-09-13
 Fresh advisor adv-8ecy inspected current connection lifecycle (not migration diff).
 Two confirmed issues corrected: failed asynchronous connect readiness survives

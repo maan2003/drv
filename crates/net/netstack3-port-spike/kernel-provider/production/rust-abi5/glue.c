@@ -151,6 +151,14 @@ static int __net_init net_init(struct net *net) {
 }
 static void __net_exit net_exit(struct net *net) { ns3_net_drop(rn(net)->state); }
 static struct pernet_operations pernet = { .init = net_init, .exit = net_exit, .id = &net_id, .size = sizeof(struct rust_net) };
+extern const struct file_operations *ns3_netlink_registration_ops(void);
+extern int ns3_nl_socket_new(void *, void *, void **);
+int ns3_nl_open(struct sock *sk, void **out);
+int ns3_nl_open(struct sock *sk, void **out) {
+    return ns3_nl_socket_new(rn(sock_net(sk))->state, sk, out);
+}
+static struct miscdevice netlink_device = { .minor = MISC_DYNAMIC_MINOR,
+    .name = "netstack3-netlink", .mode = 0600 };
 static struct miscdevice device = { .minor = MISC_DYNAMIC_MINOR, .name = "netstack3", .mode = 0600 };
 static int __init init(void) {
 	int ret = proto_register(&proto, 1);
@@ -159,7 +167,13 @@ static int __init init(void) {
 	ret = sock_register(&family4); if (ret) goto pernet;
 	ret = sock_register(&family6); if (ret) goto family4;
 	device.fops = ns3_registration_ops();
-	ret = misc_register(&device); if (!ret) return 0;
+	ret = misc_register(&device);
+    if (!ret) {
+        netlink_device.fops = ns3_netlink_registration_ops();
+        ret = misc_register(&netlink_device);
+        if (!ret) return 0;
+        misc_deregister(&device);
+    }
 	sock_unregister(AF_INET6);
 family4: sock_unregister(AF_INET);
 pernet: unregister_pernet_subsys(&pernet);

@@ -812,19 +812,32 @@ fn kernel_provider_ethernet_guest_fixture() {
     bootstrap.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let bootstrap_pass = unsafe { libc::fcntl(bootstrap_child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     assert!(bootstrap_pass >= 10);
+    let test_netlink = std::env::var_os("DRV_KERNEL_PROVIDER_NETLINK_GUEST").is_some();
+    let netlink_registration = test_netlink.then(|| std::fs::OpenOptions::new()
+        .read(true).write(true).open("/dev/netstack3-netlink").unwrap());
+    let netlink_pass = netlink_registration.as_ref().map(|fd| unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 11)
+    });
+    if let Some(fd) = netlink_pass { assert!(fd >= 11); }
     let mut command = std::process::Command::new("/bin/netstack3-provider");
     command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap", "--resolver"]);
+    if test_netlink { command.arg("--netlink"); }
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0
                 || libc::dup2(bootstrap_pass, 5) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if let Some(fd) = netlink_pass
+                && libc::dup2(fd, 10) < 0
+            { return Err(std::io::Error::last_os_error()); }
             Ok(())
         });
     }
     let mut child = command.spawn().unwrap();
     unsafe { libc::close(frame_pass); libc::close(registration_pass); libc::close(bootstrap_pass); }
+    if let Some(fd) = netlink_pass { unsafe { libc::close(fd); } }
+    drop(netlink_registration);
     drop((registration, frame, bootstrap_child));
     let mut ready = [0; 5];
     bootstrap.read_exact(&mut ready).unwrap();
@@ -910,6 +923,19 @@ fn kernel_provider_ethernet_guest_fixture() {
     assert!(std::process::Command::new("/bin/nss-test").status().unwrap().success());
     // A configured external address must not steal localhost's source route.
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
+    let mut watcher = if test_netlink {
+        assert!(std::process::Command::new("/bin/netlink-client-test")
+            .arg("online").status().unwrap().success());
+        assert!(std::process::Command::new("/bin/netlink-go-test")
+            .arg("online").status().unwrap().success());
+        let mut watcher = std::process::Command::new("/bin/netlink-client-test")
+            .arg("watch").stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(watcher.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line, "WATCH_READY\n");
+        Some(watcher)
+    } else { None };
     println!("PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST");
     finished.store(true, std::sync::atomic::Ordering::Release);
     ap_thread.join().unwrap();
@@ -917,6 +943,14 @@ fn kernel_provider_ethernet_guest_fixture() {
     // localhost rather than turning link loss into a process/generation reset.
     std::thread::sleep(Duration::from_millis(50));
     assert!(child.try_wait().unwrap().is_none());
+    if let Some(watcher) = watcher.as_mut() {
+        assert!(watcher.wait().unwrap().success());
+        println!("PASS_NETLINK_ADDRESS_REMOVAL_EVENT");
+        assert!(std::process::Command::new("/bin/netlink-client-test")
+            .arg("offline").status().unwrap().success());
+        assert!(std::process::Command::new("/bin/netlink-go-test")
+            .arg("offline").status().unwrap().success());
+    }
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
     assert!(std::process::Command::new("/bin/nss-test").arg("absent").status().unwrap().success());
     child.kill().unwrap();

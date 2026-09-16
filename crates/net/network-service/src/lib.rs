@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 mod child;
 mod provider;
+mod rtnetlink;
 mod socket_worker;
 mod resolver;
 pub use provider::{run_provider, ResolverEndpoint};

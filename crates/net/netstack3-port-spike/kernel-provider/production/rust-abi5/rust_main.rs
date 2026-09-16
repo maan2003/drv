@@ -4,6 +4,7 @@ mod connection;
 mod endpoint_file;
 mod frontend;
 mod linux;
+mod netlink;
 use core::{ffi::c_void, ptr};
 use frontend::{Namespace, Session, Socket};
 use kernel::{
@@ -166,4 +167,58 @@ const REGISTRATION: bindings::file_operations = bindings::file_operations {
 #[no_mangle]
 extern "C" fn ns3_registration_ops() -> *const bindings::file_operations {
     &REGISTRATION
+}
+
+
+// NETLINK_ROUTE transport hooks. Every borrowed pointer is socket-owned;
+// final application release consumes exactly that foreign Arc.
+#[no_mangle]
+unsafe extern "C" fn ns3_nl_socket_new(ns: *mut c_void, sk: *mut c_void, out: *mut *mut c_void) -> i32 {
+    let namespace = unsafe { Arc::<Namespace>::borrow(ns) };
+    let native = unsafe { linux::NativeSock::acquire(sk) };
+    match netlink::Namespace::socket(namespace.netlink.clone(), native) {
+        Ok(Some(channel)) => { unsafe { out.write(channel.into_foreign()) }; 0 }
+        Ok(None) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_nl_close(p: *mut c_void) {
+    let channel = unsafe { Arc::<netlink::Channel>::from_foreign(p) };
+    channel.close_app();
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_nl_drained(p: *mut c_void) {
+    unsafe { Arc::<netlink::Channel>::borrow(p) }.rx_drained();
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_nl_send(p: *mut c_void, data: *const u8, len: usize,
+    context: *const u8, nonblock: bool) -> i32
+{
+    let channel = unsafe { Arc::<netlink::Channel>::borrow(p) };
+    let data = unsafe { core::slice::from_raw_parts(data, len) };
+    let context = unsafe { &*context.cast::<[u8; 24]>() };
+    channel.send(data, context, nonblock).map(|n| n as i32).unwrap_or_else(|e| e.to_errno())
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_nl_poll(p: *mut c_void, f: *mut bindings::file,
+    t: *mut bindings::poll_table) -> u32
+{
+    unsafe { Arc::<netlink::Channel>::borrow(p) }.app_poll(&unsafe { endpoint_file::Poll::new(f, t) })
+}
+unsafe extern "C" fn netlink_provider_open(_inode: *mut bindings::inode, file: *mut bindings::file) -> i32 {
+    (|| -> Result {
+        let net = linux::NetRef::current()?;
+        let namespace = unsafe { Arc::<Namespace>::borrow(net.state()) };
+        let session = netlink::Session::new(namespace.netlink.clone(), net)?;
+        unsafe { (*file).private_data = session.into_foreign() };
+        Ok(())
+    })().map(|()| 0).unwrap_or_else(|e| e.to_errno())
+}
+const NETLINK_REGISTRATION: bindings::file_operations = bindings::file_operations {
+    open: Some(netlink_provider_open), ..endpoint_file::operations::<netlink::Session>()
+};
+#[no_mangle]
+extern "C" fn ns3_netlink_registration_ops() -> *const bindings::file_operations {
+    &NETLINK_REGISTRATION
 }

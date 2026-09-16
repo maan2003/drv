@@ -90,6 +90,15 @@ Linux TCP. Netstack3 owns transport connections, retransmission, congestion
 control, and packet processing. Localhost and wildcard listeners belong to
 the same Netstack3 instance; there is no special native-loopback backend.
 
+Route metadata is another binding of the same service. Linux retains native
+AF_NETLINK transport and subscriptions; a separate namespace registration
+delegates NETLINK_ROUTE endpoints to the sandbox. The adapter publishes real
+link/address observations and lifecycle events, not a second interface-state
+database. Old endpoints cannot join a replacement provider generation, and
+provider absence never silently exposes native kernel state. The current
+adapter supports read-only link/address discovery; route queries and mutations
+remain unsupported. Other Netlink protocols retain their native owners.
+
 The kernel mediates provider authority and resource limits. A compromised
 provider cannot select arbitrary namespaces, access unrelated sockets or
 application memory, or manufacture kernel pointers. Applications retain

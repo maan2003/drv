@@ -1725,6 +1725,16 @@ impl Runtime {
     /// changes and is suitable for configuration/watch consumers.
     pub fn interface_revision(&self) -> u64 { self.bindings.interfaces.revision }
 
+    pub fn interface_snapshots(&self) -> Vec<interfaces::InterfaceSnapshot> {
+        let mut snapshots = vec![self.interface_snapshot()];
+        if let Some(loopback) = &self.loopback
+            && let Some(snapshot) = self.bindings.interfaces.snapshot(loopback.bindings_id().0.get())
+        {
+            snapshots.push(snapshot);
+        }
+        snapshots
+    }
+
     pub fn interface_snapshot(&self) -> interfaces::InterfaceSnapshot {
         self.bindings.interfaces.snapshot(self.device.bindings_id().0.get())
             .expect("Ethernet IP configuration emits the initial interface state")

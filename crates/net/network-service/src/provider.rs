@@ -35,6 +35,7 @@ pub fn run_provider(
     bootstrap: bool,
     resolver: Option<ResolverEndpoint>,
     link_control: bool,
+    netlink: bool,
 ) -> Result<(), String> {
     if bootstrap && ethernet_mac.is_none() {
         return Err("bootstrap requires an Ethernet identity".into());
@@ -53,7 +54,7 @@ pub fn run_provider(
         std::iter::repeat_with(rand::random::<u8>),
         NonZeroU64::new(1).unwrap(),
         mac,
-        1500,
+        u32::from(crate::SOFTMAC_ETHERNET_MTU),
     )
     .map_err(|e| format!("{e:?}"))?;
     if ethernet_mac.is_some() {
@@ -137,7 +138,7 @@ pub fn run_provider(
         None => None,
     };
     crate::child::provider_setup(
-        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control,
+        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control, netlink,
     )?;
     // SAFETY: setup retains this inherited descriptor exclusively for this
     // provider. Keep its ownership explicit for every ancillary operation.
@@ -146,6 +147,12 @@ pub fn run_provider(
     });
     // SAFETY: provider_setup created FD6; it lives for this entire service loop.
     let poller = unsafe { std::os::fd::BorrowedFd::borrow_raw(6) };
+    let mut route_adapter = if netlink {
+        // SAFETY: the launcher reserves FD10; setup retains this sole owner.
+        let registration = unsafe { OwnedFd::from_raw_fd(crate::rtnetlink::REGISTRATION_FD) };
+        Some(crate::rtnetlink::Adapter::new(registration, poller).map_err(|e| e.to_string())?)
+    } else { None };
+    let mut route_revision = None;
     let mut resolver_server = resolver_listener
         .map(|listener| crate::resolver::ResolverServer::new(listener, poller))
         .transpose()
@@ -198,6 +205,10 @@ pub fn run_provider(
         }
     }
     let mut pending_frame = None;
+    // Without a replacement-link capability, retain the revoked frame owner
+    // so CLAIM cannot reuse FD4, which the sandbox permanently treats as frame
+    // authority rather than an application endpoint.
+    let mut _offline_frame = None;
     let mut last_network_snapshot = None;
     let mut active_link_generation = None;
     let mut last_link_generation = 0u64;
@@ -223,6 +234,7 @@ pub fn run_provider(
             } else if event.u64 != 0
                 && event.u64 != crate::resolver::TOKEN
                 && event.u64 != LINK_CONTROL_TOKEN
+                && !crate::rtnetlink::Adapter::owns_token(event.u64)
             {
                 ready.push(event.u64);
             }
@@ -402,7 +414,8 @@ pub fn run_provider(
             }
         }
         if close_frame {
-            ethernet = None;
+            if link_control.is_some() { ethernet = None; }
+            else { _offline_frame = ethernet.take(); }
             if link_control.is_some() && unsafe {
                 libc::dup3(
                     crate::link_control::FRAME_RESERVATION_FD,
@@ -572,6 +585,19 @@ pub fn run_provider(
                 }
                 control_events = desired;
             }
+        }
+        if let Some(adapter) = &mut route_adapter {
+            let update = {
+                let runtime = network.runtime();
+                let revision = (runtime.interface_revision(), ethernet.is_some());
+                if route_revision != Some(revision) {
+                    route_revision = Some(revision);
+                    Some(crate::rtnetlink::View::new(
+                        runtime.interface_snapshots(), revision.1, mac))
+                } else { None }
+            };
+            progress |= adapter.advance(poller, &events[..event_count], update)
+                .map_err(|e| format!("netlink registration: {e}"))?;
         }
         let now = start.elapsed();
         // Poll even while runnable: level-triggered IPC readiness provides fair

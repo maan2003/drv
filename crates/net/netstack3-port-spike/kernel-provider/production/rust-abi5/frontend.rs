@@ -37,18 +37,18 @@ const READ_CONTROL: u32 = 0x8080B303;
 
 /// An absolute monotonic budget. Mutex reacquisition and processing count,
 /// unlike carrying schedule_timeout's sleep-only remainder between waits.
-struct Deadline {
+pub(crate) struct Deadline {
     start: kernel::time::Instant<kernel::time::Monotonic>,
     ticks: usize,
 }
 impl Deadline {
-    fn new(ticks: usize) -> Self {
+    pub(crate) fn new(ticks: usize) -> Self {
         Self {
             start: kernel::time::Instant::now(),
             ticks,
         }
     }
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         if self.ticks == kernel::task::MAX_SCHEDULE_TIMEOUT as usize {
             return self.ticks;
         }
@@ -85,6 +85,7 @@ struct Registry {
 }
 #[pin_data]
 pub(crate) struct Namespace {
+    pub(crate) netlink: Arc<crate::netlink::Namespace>,
     #[pin]
     registry: Mutex<Registry>,
     #[pin]
@@ -96,6 +97,7 @@ impl Namespace {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
+                netlink: crate::netlink::Namespace::new()?,
                 registry <- kernel::new_mutex!(Registry {next_id:0,next_generation:0,sockets:KVec::new()}),
                 changed <- kernel::new_poll_condvar!(), live:AtomicU64::new(0),count:AtomicUsize::new(0),
             }),

@@ -918,6 +918,7 @@ mod tests {
             "write-registration" => [libc::SYS_write, 3, 0, 0],
             "read-epoll" => [libc::SYS_read, 6, 0, 0],
             "claim-wrong-fd" => [libc::SYS_ioctl, 4, 0x8008B301, 0],
+            "netlink-claim-wrong-fd" => [libc::SYS_ioctl, 3, 0x8008B401, 0],
             "control-registration" => [libc::SYS_ioctl, 3, 0x8080B303, 0],
             "control-epoll" => [libc::SYS_ioctl, 6, 0x8080B303, 0],
             "publish-registration" => [libc::SYS_ioctl, 3, 0xC038B302, 0],
@@ -936,7 +937,7 @@ mod tests {
             _ => panic!("unknown denial"),
         };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
-        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"), true);
+        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"), true, true);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 51);
         unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3], 0usize, 0usize, 0usize); }
@@ -984,7 +985,7 @@ mod tests {
             56,
         );
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 57);
-        let filter = provider_filter(true, true);
+        let filter = provider_filter(true, true, false);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(
             unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0,
@@ -1042,7 +1043,7 @@ mod tests {
     fn provider_filter_forbidden_operations_are_fatal() {
         use std::os::unix::process::ExitStatusExt as _;
         for operation in ["socket", "read-registration", "write-registration", "read-epoll",
-            "claim-wrong-fd", "control-registration", "control-epoll", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
+            "claim-wrong-fd", "netlink-claim-wrong-fd", "control-registration", "control-epoll", "publish-registration", "publish-epoll", "unknown-ioctl", "dup",
             "ethernet-read", "ethernet-write", "ethernet-publish", "ethernet-control",
             "ethernet-send-wrong-flags", "ethernet-recv-wrong-flags",
             "link-control-read", "link-control-write", "frame-reservation-read"] {
@@ -1069,7 +1070,7 @@ mod tests {
         // for ordinary application endpoints.
         child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 8) } == 8, 68);
         child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 9) } == 9, 69);
-        let filter = provider_filter(true, false);
+        let filter = provider_filter(true, false, false);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 63);
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 64);
@@ -1544,14 +1545,17 @@ pub(crate) fn provider_setup(
     bootstrap: bool,
     resolver: bool,
     link_control: bool,
+    netlink: bool,
 ) -> Result<(), String> {
     unsafe {
         if !ethernet && !link_control { close(4); }
         if !bootstrap { close(5); }
         if !resolver { close(7); }
-        if !link_control { close(crate::link_control::CONTROL_FD); }
+        if !link_control { close(crate::link_control::CONTROL_FD); close(crate::link_control::FRAME_RESERVATION_FD); }
     }
-    let first_close = if link_control {
+    let first_close = if netlink {
+        crate::rtnetlink::REGISTRATION_FD as u32 + 1
+    } else if link_control {
         crate::link_control::FRAME_RESERVATION_FD as u32 + 1
     } else if resolver {
         8 // FD7 is the pre-bound resolver listener.
@@ -1565,7 +1569,7 @@ pub(crate) fn provider_setup(
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
-    let mut filter = provider_filter(ethernet || link_control, link_control);
+    let mut filter = provider_filter(ethernet || link_control, link_control, netlink);
     if resolver {
         // Add the only new syscall authority: accept from the pre-bound resolver listener.
         let mut accept = Vec::new();
@@ -1576,13 +1580,23 @@ pub(crate) fn provider_setup(
     syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
 }
 
-fn provider_filter(ethernet: bool, link_control: bool) -> Vec<SockFilter> {
+fn provider_filter(ethernet: bool, link_control: bool, netlink: bool) -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
+    if netlink {
+        filter.extend([
+            jump(libc::SYS_ioctl as u32, 0, 6),
+            arg(1), jump(0x8008B401, 0, 4),
+            arg(0), jump(crate::rtnetlink::REGISTRATION_FD as u32, 0, 1),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+            stmt(BPF_LD | BPF_W | BPF_ABS, 0),
+        ]);
+    }
     if ethernet {
         append_fd_and_flags(&mut filter, libc::SYS_recvfrom, 4, libc::MSG_DONTWAIT | libc::MSG_TRUNC);
         append_fd_and_flags(&mut filter, libc::SYS_sendto, 4, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
