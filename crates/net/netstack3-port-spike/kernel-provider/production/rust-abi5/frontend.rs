@@ -1077,7 +1077,9 @@ impl Endpoint for SocketEndpoint {
         if !socket.alive(&s) {
             return b::POLLERR | b::POLLHUP;
         }
-        (if s.rx.len() < 32 && s.rx_bytes < LIMIT {
+        // RX records are atomic. OUT must admit even a maximum-sized record,
+        // otherwise a blocked publisher can spin on writable/EAGAIN.
+        (if s.rx.len() < 32 && s.rx_bytes <= LIMIT - PAYLOAD {
             b::POLLOUT
         } else {
             0

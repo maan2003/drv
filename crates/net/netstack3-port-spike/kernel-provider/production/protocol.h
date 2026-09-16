@@ -17,6 +17,7 @@
  * dequeue is binding ownership, core write is core ownership; none means peer
  * delivery. UDP destination is fixed at kernel admission, not pump time.
  * Kernel queues bound bytes AND records, including zero-length datagrams.
+ * Endpoint POLLOUT guarantees capacity for one maximum-sized RX record.
  * No mirrored RX credits. A blocked RX binding retains one bounded record.
  *
  * OPEN(kind:u32,family:u32) -> local address (unbound).

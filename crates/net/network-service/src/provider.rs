@@ -513,13 +513,15 @@ pub fn run_provider(
             match worker.poll_data() {
                 Ok(Work::Idle) => {}
                 Ok(Work::Progress) => progress = true,
-                Ok(Work::Closed) => { remove.push(id); progress = true; }
+                Ok(Work::Closed) => { remove.push(id); progress = true; continue; }
                 Err(fault) => {
                     eprintln!("endpoint {id} retired: {fault}");
                     remove.push(id);
                     progress = true;
+                    continue;
                 }
             }
+            worker.update_poll(poller).map_err(|e| format!("endpoint readiness: {e}"))?;
         }
         for id in remove {
             workers.remove(&id);

@@ -9,7 +9,8 @@ use netstack3_port_integration::{
 };
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
+use rustix::event::epoll;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 const VERSION: u32 = 6;
@@ -542,6 +543,7 @@ pub(super) struct SocketWorker {
     pub(super) id: u64,
     pub(super) fd: Rc<OwnedFd>,
     data: Option<Endpoint>,
+    events: epoll::EventFlags,
 }
 
 impl SocketWorker {
@@ -551,7 +553,22 @@ impl SocketWorker {
             id,
             fd,
             data: None,
+            events: epoll::EventFlags::IN,
         }
+    }
+
+    /// A retained RX record needs endpoint write readiness, not more core traffic.
+    /// Arm it only while blocked: permanent level-triggered OUT would spin.
+    pub(super) fn update_poll(&mut self, poller: BorrowedFd<'_>) -> Result<(), rustix::io::Errno> {
+        let events = epoll::EventFlags::IN
+            | if self.data.as_ref().is_some_and(|e| e.receive.pending.is_some()) {
+                epoll::EventFlags::OUT
+            } else { epoll::EventFlags::empty() };
+        if events != self.events {
+            epoll::modify(poller, &*self.fd, epoll::EventData::new_u64(self.id), events)?;
+            self.events = events;
+        }
+        Ok(())
     }
 
     pub(super) fn wants_accept(&self) -> bool {
@@ -616,6 +633,7 @@ impl SocketWorker {
             sockets: self.sockets.clone(),
             id,
             fd,
+            events: epoll::EventFlags::IN,
             data: Some(Endpoint::new(Socket::Tcp(child))),
         }
     }

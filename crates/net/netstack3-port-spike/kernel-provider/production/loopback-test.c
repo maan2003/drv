@@ -132,6 +132,43 @@ static void tcp(int family, unsigned short port) {
 	printf("BENCH TCP family=%d seconds=%.6f MBps=%.2f\n", family, seconds, length * 2.0 / seconds / 1e6);
 	printf("PASS TCP family=%d bytes=%zu bidirectional integrity epoll nonblock halfclose dup fork\n", family, length); fflush(stdout);
 }
+/* Fill kernel RX, let all unrelated activity settle, then resume the reader.
+ * Pending provider RX must wake on restored write capacity, not a TCP timer. */
+static void rx_pressure(int family, unsigned short port) {
+    const size_t length = 384 * 1024;
+    struct sockaddr_storage a = addr(family, port);
+    int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    check(listener >= 0 && bind(listener, (void *)&a, alen(family)) == 0 &&
+          listen(listener, 1) == 0, "RX pressure listener");
+    pid_t child = fork();
+    check(child >= 0, "RX pressure fork");
+    if (!child) {
+        close(listener);
+        int fd = socket(family, SOCK_STREAM, 0);
+        check(fd >= 0 && connect(fd, (void *)&a, alen(family)) == 0, "RX pressure connect");
+        unsigned char *data = malloc(length);
+        check(data != NULL, "RX pressure allocation");
+        memset(data, 0x5a, length);
+        transfer(fd, data, length, 1);
+        close(fd);
+        free(data);
+        _exit(0);
+    }
+    int fd = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    check(fd >= 0, "RX pressure accept");
+    sleep(1);
+    unsigned char *data = malloc(length);
+    check(data != NULL, "RX pressure allocation");
+    transfer(fd, data, length, 0);
+    for (size_t i = 0; i < length; i++) check(data[i] == 0x5a, "RX pressure integrity");
+    wait_event(fd, EPOLLIN);
+    check(recv(fd, data, 1, 0) == 0, "RX pressure EOF");
+    close(fd); close(listener); free(data);
+    int status;
+    check(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 0, "RX pressure sender");
+    printf("PASS_RX_BACKPRESSURE_WAKE family=%d\n", family);
+}
 static void udp(int family) {
 	struct sockaddr_storage a = addr(family, 23457), source;
 	int server = socket(family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -553,6 +590,12 @@ int main(int argc, char **argv) {
         puts("PASS IDLE_SOCKET_TCP");
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "rx-pressure")) {
+        rx_pressure(AF_INET, 20401);
+        rx_pressure(AF_INET6, 20402);
+        return 0;
+    }
+
 	if (argc == 2 && (!strcmp(argv[1], "bench") || !strcmp(argv[1], "bench-long"))) {
         payload_length = (!strcmp(argv[1], "bench-long") ? 64 : 8) * 1024 * 1024;
         tcp(AF_INET, 23456); tcp(AF_INET6, 23456); return 0;

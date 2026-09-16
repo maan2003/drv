@@ -349,6 +349,12 @@ full-duplex throughput. Optimization alone did not fix the old configuration.
 [Raw before/after results](evidence/throughput.txt),
 [final maintained KVM suite](evidence/throughput-serial.log), and
 [37 service tests](evidence/throughput-tests.log) retain delivery evidence.
+`rx-pressure` pauses an application reader until kernel RX fills, then resumes
+without unrelated traffic. Provider endpoints arm write readiness only while an
+RX record is pending; the kernel advertises enough capacity for a maximum atomic
+record. This prevents both missed wakeups and writable/EAGAIN spinning. The
+[red→green regression](evidence/rx-backpressure.log) covers IPv4 and IPv6.
+
 The maintained suite includes `bench-long` (64 MiB per direction) to exhaust
 quick ACKs and catch timer-paced regressions within its existing 50-second
 whole-VM timeout. The old 64 KiB optimized configuration times out (exit 124);
