@@ -640,10 +640,13 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # Keep this aligned with scripts/fetch-fuchsia-reference.
-          sapphirePigweedArchive = pkgs.fetchurl {
+          # Keep the commit aligned with scripts/fetch-fuchsia-reference.
+          # googlesource +archive tarballs are regenerated on every download with a
+          # different byte stream, so hash the unpacked tree, not the tarball.
+          sapphirePigweedSource = pkgs.fetchzip {
             url = "https://pigweed.googlesource.com/pigweed/pigweed/+archive/c14c119c51a82f6e044f81b7dad0a322091d4121.tar.gz";
-            hash = "sha256-VhMYiubataca+o9sZP3SkLxSdNPisZPP8dG+4jnVscQ=";
+            hash = "sha256-befDOkr5h4zGA7CJuhou7UHtYrwTYqMZTHRDrrxV1Ds=";
+            stripRoot = false;
           };
         in
         {
@@ -686,7 +689,7 @@
             ];
 
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.linuxHeaders}/include";
-            SAPPHIRE_PIGWEED_ARCHIVE = sapphirePigweedArchive;
+            SAPPHIRE_PIGWEED_SOURCE = sapphirePigweedSource;
           };
         }
       );

@@ -9,7 +9,7 @@ output_root="$work/bazel-output"
 target=${SAPPHIRE_BAZEL_TARGET:-//pw_bluetooth_sapphire/host/gap:gap_test}
 gtest_arg=${SAPPHIRE_GTEST_ARG-}
 
-: "${SAPPHIRE_PIGWEED_ARCHIVE:?run inside nix develop}"
+: "${SAPPHIRE_PIGWEED_SOURCE:?run inside nix develop}"
 rm -rf "$source" "$tool_repo"
 mkdir -p \
   "$source" \
@@ -21,7 +21,7 @@ touch \
   "$tool_repo/include/c++/v1/placeholder" \
   "$tool_repo/include/x86_64-unknown-linux-gnu/c++/v1/placeholder" \
   "$tool_repo/lib/clang/21/include/placeholder"
-tar -xzf "$SAPPHIRE_PIGWEED_ARCHIVE" -C "$source"
+cp -r --no-preserve=mode "$SAPPHIRE_PIGWEED_SOURCE"/. "$source"
 
 cxx=$(command -v wasm32-unknown-wasip1-clang++)
 cc=$(command -v wasm32-unknown-wasip1-clang)
