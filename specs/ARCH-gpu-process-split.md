@@ -91,12 +91,16 @@ device lifecycle (`AddDevice`, `RemoveDevice`, `PauseDevices`,
 `SetOutputGeometry`, `SetGamma`, `ClearOutputs`, `SetDebugTint`),
 `Present{output, frame, flags}`, screencast streams (`CastStart` replies
 with the effective cursor mode, `CastConfigure` for size / refresh,
-one-way `CastClear` and `CastStop`), `Shutdown`.
+one-way `CastClear` and `CastStop`), `LoadCursor{theme, names, size,
+fallback, first_id}` (Xcursor lookup and upload; replies `Cursor` with
+per-frame size, hotspot and delay, the textures being `first_id..`),
+one-way `EncodePng{token, id, region}` (result as `Notify(Png{token,
+data})`), `Shutdown`.
 
 GPU to core: `Ready{caps}`, `Ack`, `Image`, `Dmabuf` (+ fds),
-`CastStarted`, `DeviceAdded{caps}`, `Scan{connected, changed,
+`CastStarted`, `Cursor`, `DeviceAdded{caps}`, `Scan{connected, changed,
 disconnected}`, `OutputState`, `Notify(Presented | VBlank | Error |
-DeviceError | Cast(..))`, `Error`. Cast events: `NodeId` (for the
+DeviceError | Cast(..) | Png)`, `Error`. Cast events: `NodeId` (for the
 portal), `State{active, ready_size, min_frame_time}`, `Redraw`,
 `Rendered` / `Skipped{target_time}` (frame pacing), `Stop`, `PipeWireFatal`.
 
@@ -146,6 +150,24 @@ nothing changed or no buffer is free; every frame is reported back as
 `Rendered` or `Skipped` so the core paces on real output (a recorded frame
 counts as sent until the report arrives).
 
+## Cursors and screenshots
+
+Xcursor theme files are parsed in the GPU process (`src/gpu/cursor.rs`,
+the `xcursor` crate) and uploaded straight into textures; the core's
+`CursorManager` (`src/cursor.rs`) asks for an icon by name through
+`GpuHandle::load_cursor` and keeps only frame geometry plus a
+`RemoteTexture` per frame. Named cursors therefore exist only once the
+GPU renderer is up (before that the pointer is hidden), and the cache is
+dropped when the primary device goes away. Up to 512x512 cursor frames
+keep a CPU copy on the GPU side so `DrmCompositor` can still put them on
+the cursor plane.
+
+Screenshots stay on the GPU: the core renders into a texture and sends
+`EncodePng`; a GPU-process thread reads the pixels back, encodes them with
+the `png` crate and returns the bytes. The core only writes the file, sets
+the clipboard selection and emits the IPC event. The `png` and `xcursor`
+crates are thereby out of the process that holds client connections.
+
 ## Smithay fork
 
 niri builds against `../smithay` (branch `niri-gpu-process`, upstream +
@@ -176,6 +198,7 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
 1. Run on real hardware: startup, hotplug, VT switch, suspend, VRR,
    direct scanout (check `niri msg` / feedback shows ZeroCopy for
    fullscreen dmabuf clients), cursor plane, screencasting (dmabuf and
-   shm streams, metadata cursor, window casts, dynamic casts).
+   shm streams, metadata cursor, window casts, dynamic casts), named
+   cursors from the theme, screenshots (file, clipboard, portal).
 2. Sandbox the GPU process: own UID, seccomp, only the DRM fds it is given.
 3. Restart the GPU process on crash instead of stopping the compositor.
