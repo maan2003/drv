@@ -29,6 +29,7 @@ let
   patchFiles = map (name:
     ../crates/net/netstack3-port-spike/upstream-cargo/patches/${name}
   ) [
+    "tcp-passive-storage-admission-host.patch"
     "dhcp-client-core-host.patch"
     "trust-dns-workspace.patch"
     "wlan-common-host.patch"

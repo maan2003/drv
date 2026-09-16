@@ -349,6 +349,14 @@ full-duplex throughput. Optimization alone did not fix the old configuration.
 [Raw before/after results](evidence/throughput.txt),
 [final maintained KVM suite](evidence/throughput-serial.log), and
 [37 service tests](evidence/throughput-tests.log) retain delivery evidence.
+Accepted sockets inherit kernel-owned buffer sizes and wait timeouts from
+their listener. Passive core storage is charged per admitted SYN, not per
+idle listener backlog; the lease follows the buffers through accept and final
+destruction. Exhaustion leaves the SYN unadmitted, allowing retransmission
+after capacity returns. [Candidate acceptance](evidence/socket-storage.log)
+runs all 67 service tests on the no-INET kernel, including the previously
+failing listener and buffer-inheritance cases.
+
 `rx-pressure` pauses an application reader until kernel RX fills, then resumes
 without unrelated traffic. Provider endpoints arm write readiness only while an
 RX record is pending; the kernel advertises enough capacity for a maximum atomic

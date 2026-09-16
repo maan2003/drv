@@ -346,6 +346,7 @@ pub struct NativeBindingsCtx {
     entropy: InjectedEntropy,
     socket_capacity: usize,
     queue_capacity: usize,
+    storage_budget: Arc<StorageBudget>,
     queues: Queues,
     interfaces: interfaces::Interfaces,
     loopback_rx_ready: bool,
@@ -393,6 +394,10 @@ impl NativeBindingsCtx {
             entropy: rng,
             socket_capacity,
             queue_capacity,
+            storage_budget: Arc::new(StorageBudget {
+                limit: socket_capacity.checked_mul(2).expect("storage capacity overflow"),
+                used: AtomicUsize::new(0),
+            }),
             queues: Queues::default(),
             interfaces: interfaces::Interfaces::default(),
             loopback_rx_ready: false,
@@ -880,6 +885,15 @@ impl TcpBindingsTypes for NativeBindingsCtx {
     ) -> (NativeReceiveBuffer, NativeSendBuffer, NativeTcpBuffers) {
         let b = NativeTcpBuffers::new(s);
         (b.receive.clone(), b.send.clone(), b)
+    }
+    fn try_new_passive_open_buffers(
+        &mut self,
+        sizes: BufferSizes,
+    ) -> Option<(NativeReceiveBuffer, NativeSendBuffer, NativeTcpBuffers)> {
+        let lease = self.storage_budget.reserve(1).ok()?;
+        let b = NativeTcpBuffers::new(sizes);
+        b.attach_lease(lease);
+        Some((b.receive.clone(), b.send.clone(), b))
     }
 }
 
@@ -1411,13 +1425,11 @@ struct RuntimeTcpSocket {
     id: NativeTcpV4,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
-    listener_storage: Vec<Arc<StorageLease>>,
 }
 struct RuntimeTcpSocketV6 {
     id: NativeTcpV6,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
-    listener_storage: Vec<Arc<StorageLease>>,
 }
 
 /// Single-owner facade over one Netstack3 core and one Ethernet interface.
@@ -1439,7 +1451,6 @@ pub struct Runtime {
     ipv6_discovered_routes: Vec<AddableEntry<Ipv6Addr, WeakDeviceId<NativeBindingsCtx>>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
-    storage_budget: Arc<StorageBudget>,
     stack: StackState<NativeBindingsCtx>,
     bindings: NativeBindingsCtx,
 }
@@ -1476,7 +1487,7 @@ impl Runtime {
         mtu: u32,
     ) -> Result<Self, RuntimeError> {
         let mac = UnicastAddr::new(Mac::new(mac)).ok_or(RuntimeError::InvalidMac)?;
-        if socket_capacity == 0 || queue_capacity == 0 {
+        if socket_capacity == 0 || queue_capacity == 0 || socket_capacity.checked_mul(2).is_none() {
             return Err(RuntimeError::InvalidCapacity);
         }
         if mtu > 1500 {
@@ -1545,7 +1556,7 @@ impl Runtime {
         queue_capacity: usize,
         entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
     ) -> Result<Self, RuntimeError> {
-        if socket_capacity == 0 || queue_capacity == 0 {
+        if socket_capacity == 0 || queue_capacity == 0 || socket_capacity.checked_mul(2).is_none() {
             return Err(RuntimeError::InvalidCapacity);
         }
         let mut bindings =
@@ -1565,12 +1576,6 @@ impl Runtime {
             ipv6_discovered_routes: Vec::new(),
             dns_servers: [None, None],
             next_socket: 0,
-            // Separate active and passive populations each have a capacity-sized
-            // allowance. Retained post-close storage competes for the same pool.
-            storage_budget: Arc::new(StorageBudget {
-                limit: socket_capacity.checked_mul(2).ok_or(RuntimeError::InvalidCapacity)?,
-                used: AtomicUsize::new(0),
-            }),
             stack,
             bindings,
         })
@@ -2493,7 +2498,7 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let lease = self.storage_budget.reserve(1)?;
+        let lease = self.bindings.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
@@ -2519,7 +2524,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier,
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2569,12 +2573,8 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         let socket = self.tcp.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
-        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
-        let extra = backlog.get().saturating_sub(reserved);
-        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
         self.stack.api(&mut self.bindings).tcp::<Ipv4>()
             .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
-        if let Some(lease) = lease { socket.listener_storage.push(lease); }
         Ok(())
     }
 
@@ -2610,7 +2610,6 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         if self.tcp_pending_connections(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
-        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp
             .get(&listener)
@@ -2622,7 +2621,6 @@ impl Runtime {
             .tcp::<Ipv4>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
-        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -2645,7 +2643,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier: NativeTcpSocketData::default(),
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2852,7 +2849,7 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let lease = self.storage_budget.reserve(1)?;
+        let lease = self.bindings.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
@@ -2878,7 +2875,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier,
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2938,12 +2934,8 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         let socket = self.tcp_v6.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
-        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
-        let extra = backlog.get().saturating_sub(reserved);
-        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
         self.stack.api(&mut self.bindings).tcp::<Ipv6>()
             .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
-        if let Some(lease) = lease { socket.listener_storage.push(lease); }
         Ok(())
     }
 
@@ -2983,7 +2975,6 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         if self.tcp_pending_connections_ipv6(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
-        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp_v6
             .get(&listener)
@@ -2995,7 +2986,6 @@ impl Runtime {
             .tcp::<Ipv6>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
-        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -3018,7 +3008,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier: NativeTcpSocketData::default(),
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -3703,6 +3692,100 @@ mod tests {
     }
 
     #[test]
+    fn many_idle_listeners_share_capacity_without_backlog_reservations() {
+        let mut rt = Runtime::new_isolated(32, 128, (0u8..=255).cycle().take(65536)).unwrap();
+        rt.enable_loopback();
+        for i in 0..32 {
+            let port = NonZeroU16::new(20000 + i).unwrap();
+            if i % 2 == 0 {
+                let h = rt.tcp_socket().unwrap();
+                rt.tcp_bind(h, Some([127,0,0,1]), port).unwrap();
+                rt.tcp_listen(h, NonZeroUsize::new(32).unwrap()).unwrap();
+            } else {
+                let h = rt.tcp_socket_ipv6().unwrap();
+                rt.tcp_bind_ipv6(h, Some(std::net::Ipv6Addr::LOCALHOST.octets()), port).unwrap();
+                rt.tcp_listen_ipv6(h, NonZeroUsize::new(32).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 32);
+    }
+
+    #[test]
+    fn passive_ipv4_and_ipv6_share_budget_and_retry_after_capacity_returns() {
+        let mut rt = Runtime::new_isolated(4, 128, (0u8..=255).cycle().take(65536)).unwrap();
+        rt.enable_loopback();
+        let port = NonZeroU16::new(20000).unwrap();
+        let l4 = rt.tcp_socket().unwrap();
+        let l6 = rt.tcp_socket_ipv6().unwrap();
+        rt.tcp_bind(l4, Some([127,0,0,1]), port).unwrap();
+        rt.tcp_bind_ipv6(l6, Some(std::net::Ipv6Addr::LOCALHOST.octets()), port).unwrap();
+        rt.tcp_listen(l4, NonZeroUsize::new(4).unwrap()).unwrap();
+        rt.tcp_listen_ipv6(l6, NonZeroUsize::new(4).unwrap()).unwrap();
+        let c4 = rt.tcp_socket().unwrap();
+        let c6 = rt.tcp_socket_ipv6().unwrap();
+        rt.tcp_connect(c4, [127,0,0,1], port).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.tcp_pending_connections(l4).unwrap(), 1);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 5);
+        let held = rt.bindings.storage_budget.reserve(3).unwrap();
+        rt.tcp_connect_ipv6(c6, std::net::Ipv6Addr::LOCALHOST.octets(), port).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.tcp_pending_connections_ipv6(l6).unwrap(), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 8);
+        drop(held);
+        for second in 1..=8 { rt.poll_at(Duration::from_secs(second), 128); }
+        assert_eq!(rt.tcp_pending_connections_ipv6(l6).unwrap(), 1);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn half_open_storage_is_charged_once_and_released_on_close_reset_or_timeout() {
+      for action in ["close", "reset", "timeout"] {
+        let mut client = runtime(11, [2,0,0,0,0,1], [192,0,2,11]);
+        let mut server = runtime(12, [2,0,0,0,0,2], [192,0,2,12]);
+        let port = NonZeroU16::new(20000).unwrap();
+        let listener = server.tcp_socket().unwrap();
+        server.tcp_bind(listener, None, port).unwrap();
+        server.tcp_listen(listener, NonZeroUsize::new(2).unwrap()).unwrap();
+        let conn = client.tcp_socket().unwrap();
+        client.tcp_connect(conn, [192,0,2,12], port).unwrap();
+        server.receive_frame(client.take_tx().unwrap()); // ARP request.
+        client.receive_frame(server.take_tx().unwrap()); // ARP reply.
+        let syn = client.take_tx().unwrap();
+        let duplicate = EthernetFrame::try_from(syn.as_bytes().to_vec()).unwrap();
+        server.receive_frame(syn);
+        let syn_ack = server.take_tx().unwrap(); // Withhold final ACK.
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        server.receive_frame(duplicate);
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        assert_eq!(server.tcp_pending_connections(listener).unwrap(), 0);
+        while server.take_tx().is_some() {}
+        if action == "reset" {
+            client.tcp_close(conn).unwrap();
+            client.receive_frame(syn_ack); // Closed client responds with RST, not ACK.
+            server.receive_frame(client.take_tx().unwrap());
+        }
+        if action == "timeout" {
+            for power in 0..16 {
+                server.poll_at(Duration::from_secs(1 << power), 128);
+                while server.take_tx().is_some() {} // No final ACK ever arrives.
+            }
+        }
+        if action != "close" {
+            assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
+            // A different client SYN must fit the recovered backlog and budget.
+            let next = client.tcp_socket().unwrap();
+            client.tcp_connect(next, [192,0,2,12], port).unwrap();
+            server.receive_frame(client.take_tx().unwrap());
+            assert!(server.take_tx().is_some());
+            assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        }
+        server.tcp_close(listener).unwrap();
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
+      }
+    }
+
+    #[test]
     fn two_native_runtimes_resolve_arp_and_exchange_udp() {
         let mut client = runtime(1, [0x02, 0, 0, 0, 0, 1], [192, 0, 2, 1]);
         let mut server = runtime(2, [0x02, 0, 0, 0, 0, 2], [192, 0, 2, 2]);
@@ -3810,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_pressure_preserves_queued_child_until_storage_release() {
+    fn accept_transfers_precharged_storage_even_when_budget_is_full() {
         let mut rt = Runtime::new_with_capacities(4, 16, (0u8..=255).cycle().take(65536),
             NonZeroU64::new(1).unwrap(), [2,0,0,0,0,1], 1500).unwrap();
         rt.enable_loopback();
@@ -3826,23 +3909,32 @@ mod tests {
             retained.push(rt.tcp.get(&h).unwrap().buffers.clone());
             rt.tcp_close(h).unwrap();
         }
-        assert_eq!(rt.tcp_accept(listener), Err(RuntimeError::SocketLimit));
-        assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 1);
-        retained.pop();
+        let used = rt.bindings.storage_budget.used.load(Ordering::Relaxed);
+        assert_eq!(used, rt.bindings.storage_budget.limit);
         let child = rt.tcp_accept(listener).unwrap();
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), used);
         assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 0);
         assert_eq!(rt.tcp_write(client, b"still alive").unwrap(), 11);
         for _ in 0..32 { rt.dispatch_due(128); }
         let mut bytes = [0;16];
         assert_eq!(rt.tcp_read(child, &mut bytes).unwrap(), 11);
         assert_eq!(&bytes[..11], b"still alive");
+        let child_buffers = rt.tcp.get(&child).unwrap().buffers.clone();
+        drop(retained);
+        rt.tcp_close(listener).unwrap();
+        rt.tcp_close(child).unwrap();
+        rt.tcp_close(client).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
+        drop(child_buffers);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn storage_budget_follows_buffers_after_runtime_handle_removal() {
         let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
         let mut held = Vec::new();
-        for _ in 0..rt.storage_budget.limit {
+        for _ in 0..rt.bindings.storage_budget.limit {
             let h = rt.tcp_socket().unwrap();
             held.push(rt.tcp.get(&h).unwrap().buffers.clone());
             rt.tcp_close(h).unwrap();
@@ -3853,20 +3945,20 @@ mod tests {
         let h = rt.tcp_socket().unwrap();
         rt.tcp_close(h).unwrap();
         drop(held);
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn listener_backlog_reservation_survives_failed_reconfiguration_and_releases_after_close() {
+    fn idle_listener_does_not_precharge_backlog_storage() {
         let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
         let h = rt.tcp_socket().unwrap();
         rt.tcp_bind(h, None, None).unwrap();
         rt.tcp_listen(h, NonZeroUsize::new(2).unwrap()).unwrap();
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
         assert_eq!(rt.tcp_listen(h, NonZeroUsize::new(1).unwrap()), Err(RuntimeError::NotSupported));
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
         rt.tcp_close(h).unwrap();
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
