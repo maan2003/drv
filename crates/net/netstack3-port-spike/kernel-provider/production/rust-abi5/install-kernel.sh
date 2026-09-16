@@ -13,8 +13,11 @@ fi
 if ! grep -q 'ns3_nl_owner' "$tree/net/netlink/af_netlink.c"; then
     patch -d "$tree" -p1 < "$here/netlink-provider.patch"
 fi
+if ! grep -q 'bool ns3_delegated' "$tree/net/netlink/af_netlink.c"; then
+    patch -d "$tree" -p1 < "$here/namespace-lifetime.patch"
+fi
 mkdir -p "$tree/net/netstack3_rust"
-cp "$here"/{Kconfig,Makefile,glue.c,rust_main.rs,linux.rs,frontend.rs,connection.rs,netlink.rs} "$tree/net/netstack3_rust/"
+cp "$here"/{Kconfig,Makefile,glue.c,rust_main.rs,linux.rs,frontend.rs,connection.rs,netlink.rs,namespace.rs} "$tree/net/netstack3_rust/"
 cp "$here/../rust-lifecycle/endpoint_file.rs" "$tree/net/netstack3_rust/"
 grep -qF 'source "net/netstack3_rust/Kconfig"' "$tree/net/Kconfig" ||
  printf '\nsource "net/netstack3_rust/Kconfig"\n' >>"$tree/net/Kconfig"

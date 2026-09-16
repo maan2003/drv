@@ -6,6 +6,10 @@
 #include <linux/poll.h>
 #include <linux/anon_inodes.h>
 #include <linux/nsproxy.h>
+#include <linux/netdevice.h>
+#include <linux/rtnetlink.h>
+#include <linux/sockios.h>
+#include <linux/user_namespace.h>
 #include <net/sock.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
@@ -16,8 +20,18 @@ static unsigned int net_id;
 static const struct proto_ops ops4, ops6;
 static struct proto proto = { .name = "NETSTACK3_RUST", .owner = THIS_MODULE,
 	.obj_size = sizeof(struct rust_sock) };
-extern void *ns3_net_new(void);
+extern void *ns3_net_new(void *);
 extern void ns3_net_drop(void *);
+extern void ns3_loopback_flags(void *, u32);
+extern int ns3_wait_loopback(void *);
+extern bool ns3_loopback_managed(void *);
+extern int ns3_broker_init(void);
+extern const struct file_operations *ns3_broker_ops(void);
+void ns3_hold_passive(void *p);
+void ns3_put_passive(void *p);
+u64 ns3_net_cookie(void *p);
+int ns3_set_loopback(void *p, bool up);
+bool ns3_provisioner_allowed(void);
 extern int ns3_socket_new(void *, void *, int, int, bool, void **);
 extern void ns3_socket_release(void *);
 extern int ns3_bind(void *, const void *, int);
@@ -38,6 +52,7 @@ static struct rust_sock *rs(struct socket *s) { return container_of(s->sk, struc
  * runs from sk_destruct. Rust's application owner is consumed by final release. */
 void ns3_hold(void *p);
 void ns3_put(void *p);
+void ns3_detach_net(struct sock *sk);
 int ns3_error(void *p, bool consume);
 void ns3_set_error(void *p, int error);
 unsigned long ns3_timeout(void *p, bool send, bool nonblock);
@@ -53,6 +68,20 @@ void ns3_sigpipe(void);
 struct file *nsrl_anon_file(const struct file_operations *, void *);
 void ns3_hold(void *p) { sock_hold(p); }
 void ns3_put(void *p) { sock_put(p); }
+/* Final application close: provider-held references retain socket memory, not
+ * an operational namespace. The caller still owns the native socket reference
+ * and has finished all namespace operations before this downgrade. */
+void ns3_detach_net(struct sock *sk) {
+    struct net *net = sock_net(sk);
+    if (!sk->sk_net_refcnt)
+        return;
+    net_passive_inc(net);
+    __netns_tracker_free(net, &sk->ns_tracker, true);
+    sk->sk_net_refcnt = 0;
+    sock_inuse_add(net, -1);
+    __netns_tracker_alloc(net, &sk->ns_tracker, false, GFP_KERNEL);
+    put_net(net);
+}
 int ns3_error(void *p, bool consume) {
 	struct sock *sk = p; return consume ? sock_error(sk) : -READ_ONCE(sk->sk_err);
 }
@@ -81,11 +110,80 @@ void *ns3_net_state(void *p) { return rn(p)->state; }
 struct file *nsrl_anon_file(const struct file_operations *ops, void *data) {
 	return anon_inode_getfile("netstack3-endpoint", ops, data, O_RDWR | O_NONBLOCK);
 }
+
+void ns3_hold_passive(void *p) { net_passive_inc(p); }
+void ns3_put_passive(void *p) { net_passive_dec(p); }
+u64 ns3_net_cookie(void *p) { return ((struct net *)p)->net_cookie; }
+bool ns3_provisioner_allowed(void) {
+    return ns_capable(&init_user_ns, CAP_SYS_ADMIN);
+}
+/* A capability retains memory only. Never resurrect a torn-down namespace. */
+int ns3_set_loopback(void *p, bool up) {
+    struct net *net = maybe_get_net(p);
+    int ret;
+    if (!net)
+        return -ENETDOWN;
+    rtnl_net_lock(net);
+    if (!net->loopback_dev) {
+        ret = -ENODEV;
+    } else {
+        unsigned int flags = netif_get_flags(net->loopback_dev);
+        ret = dev_change_flags(net->loopback_dev,
+            up ? flags | IFF_UP : flags & ~IFF_UP, NULL);
+    }
+    rtnl_net_unlock(net);
+    put_net(net);
+    return ret;
+}
+static int loopback_event(struct notifier_block *block, unsigned long event, void *info) {
+    struct net_device *dev = netdev_notifier_info_to_dev(info);
+    void *state;
+    if (!(dev->flags & IFF_LOOPBACK) ||
+        (event != NETDEV_UP && event != NETDEV_DOWN && event != NETDEV_REGISTER))
+        return NOTIFY_DONE;
+    state = rn(dev_net(dev))->state;
+    if (state)
+        ns3_loopback_flags(state, netif_get_flags(dev));
+    return NOTIFY_DONE;
+}
+static struct notifier_block loopback_notifier = { .notifier_call = loopback_event };
+
+/* Preserve the generic Linux ioctl path and its namespace-relative capability
+ * checks. Only the synchronous completion fence belongs to this binding. */
+static int socket_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg) {
+    struct net *net = sock_net(sock->sk);
+    struct ifreq ifr;
+    void __user *data;
+    bool copyout;
+    int ret;
+    if (!ns3_loopback_managed(rn(net)->state))
+        return -EOPNOTSUPP;
+    switch (cmd) {
+    case SIOCGIFFLAGS: case SIOCGIFMTU: case SIOCGIFINDEX:
+    case SIOCGIFNAME: case SIOCGIFHWADDR: case SIOCGIFTXQLEN:
+        return -ENOIOCTLCMD; /* native, read-only device attributes */
+    case SIOCSIFFLAGS:
+        break;
+    default:
+        return -EOPNOTSUPP;
+    }
+    if (get_user_ifreq(&ifr, &data, (void __user *)arg))
+        return -EFAULT;
+    if (strncmp(ifr.ifr_name, "lo", IFNAMSIZ) ||
+        (ifr.ifr_flags & ~(IFF_UP | IFF_VOLATILE)))
+        return -EOPNOTSUPP;
+    ret = dev_ioctl(net, cmd, &ifr, data, &copyout);
+    if (!ret && !strncmp(ifr.ifr_name, "lo", IFNAMSIZ))
+        ret = ns3_wait_loopback(rn(net)->state);
+    return ret;
+}
+
 static int release(struct socket *sock) {
 	struct rust_sock *s;
 	if (!sock->sk) return 0;
 	s = rs(sock); ns3_socket_release(s->state); s->state = NULL;
-	sock_orphan(&s->sk); sock->sk = NULL; sock_put(&s->sk); return 0;
+	sock_orphan(&s->sk); sock->sk = NULL;
+    ns3_detach_net(&s->sk); sock_put(&s->sk); return 0;
 }
 static int create(struct net *net, struct socket *sock, int protocol, int kern, int family) {
 	struct sock *sk; int ret;
@@ -142,12 +240,12 @@ static int setsockopt(struct socket *s, int l, int o, sockptr_t p, unsigned int 
 #define OPS(f) { .family = f, .owner = THIS_MODULE, .release = release, .bind = bind, \
 	.connect = connect, .listen = listen, .accept = accept, .sendmsg = sendmsg, .recvmsg = recvmsg, \
 	.getname = socket_getname, .shutdown = shutdown, .poll = poll, .setsockopt = setsockopt, \
-	.socketpair = sock_no_socketpair, .ioctl = sock_no_ioctl, .mmap = sock_no_mmap }
+	.socketpair = sock_no_socketpair, .ioctl = socket_ioctl, .mmap = sock_no_mmap }
 static const struct proto_ops ops4 = OPS(AF_INET), ops6 = OPS(AF_INET6);
 static const struct net_proto_family family4 = { .family = AF_INET, .create = create4, .owner = THIS_MODULE };
 static const struct net_proto_family family6 = { .family = AF_INET6, .create = create6, .owner = THIS_MODULE };
 static int __net_init net_init(struct net *net) {
-	rn(net)->state = ns3_net_new(); return rn(net)->state ? 0 : -ENOMEM;
+	rn(net)->state = ns3_net_new(net); return rn(net)->state ? 0 : -ENOMEM;
 }
 static void __net_exit net_exit(struct net *net) { ns3_net_drop(rn(net)->state); }
 static struct pernet_operations pernet = { .init = net_init, .exit = net_exit, .id = &net_id, .size = sizeof(struct rust_net) };
@@ -159,9 +257,13 @@ int ns3_nl_open(struct sock *sk, void **out) {
 }
 static struct miscdevice netlink_device = { .minor = MISC_DYNAMIC_MINOR,
     .name = "netstack3-netlink", .mode = 0600 };
+static struct miscdevice broker_device = { .minor = MISC_DYNAMIC_MINOR,
+    .name = "netstack3-namespaces", .mode = 0600 };
 static struct miscdevice device = { .minor = MISC_DYNAMIC_MINOR, .name = "netstack3", .mode = 0600 };
 static int __init init(void) {
-	int ret = proto_register(&proto, 1);
+	int ret = ns3_broker_init();
+    if (ret) return ret;
+    ret = proto_register(&proto, 1);
 	if (ret) return ret;
 	ret = register_pernet_subsys(&pernet); if (ret) goto proto;
 	ret = sock_register(&family4); if (ret) goto pernet;
@@ -171,7 +273,16 @@ static int __init init(void) {
     if (!ret) {
         netlink_device.fops = ns3_netlink_registration_ops();
         ret = misc_register(&netlink_device);
-        if (!ret) return 0;
+        if (!ret) {
+            broker_device.fops = ns3_broker_ops();
+            ret = misc_register(&broker_device);
+            if (!ret) {
+                ret = register_netdevice_notifier(&loopback_notifier);
+                if (!ret) return 0;
+                misc_deregister(&broker_device);
+            }
+            misc_deregister(&netlink_device);
+        }
         misc_deregister(&device);
     }
 	sock_unregister(AF_INET6);

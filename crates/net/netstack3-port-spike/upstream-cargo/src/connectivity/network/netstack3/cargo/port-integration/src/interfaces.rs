@@ -121,9 +121,14 @@ fn preferred(value: PreferredLifetime<NativeInstant>) -> PreferredUntil {
 }
 
 impl Interfaces {
-    fn device(&mut self, id: u64, limit: usize) -> Option<&mut InterfaceSnapshot> {
+    /// Called only after core has accepted a device; address/configuration
+    /// observations continue to arrive through typed core events.
+    pub(crate) fn introduce(&mut self, id: u64) {
+        self.device(id).expect("device admission exceeds interface observer capacity");
+    }
+    fn device(&mut self, id: u64) -> Option<&mut InterfaceSnapshot> {
         self.revision = self.revision.wrapping_add(1);
-        if !self.snapshots.contains_key(&id) && self.snapshots.len() >= limit {
+        if !self.snapshots.contains_key(&id) && self.snapshots.len() >= 64 {
             return None;
         }
         Some(
@@ -155,7 +160,7 @@ impl Interfaces {
                 valid_until,
                 preferred_lifetime,
             } => {
-                let Some(view) = self.device(device.bindings_id().0.get(), limit) else {
+                let Some(view) = self.device(device.bindings_id().0.get()) else {
                     return;
                 };
                 let address = ip::<I>(addr.addr().get());
@@ -173,7 +178,7 @@ impl Interfaces {
                 });
             }
             IpDeviceEvent::AddressRemoved { device, addr, .. } => {
-                if let Some(view) = self.device(device.bindings_id().0.get(), limit) {
+                if let Some(view) = self.device(device.bindings_id().0.get()) {
                     view.addresses
                         .retain(|entry| entry.address != ip::<I>(addr.get()));
                 }
@@ -183,7 +188,7 @@ impl Interfaces {
                 addr,
                 state: assignment,
             } => {
-                if let Some(view) = self.device(device.bindings_id().0.get(), limit) {
+                if let Some(view) = self.device(device.bindings_id().0.get()) {
                     if let Some(entry) = view
                         .addresses
                         .iter_mut()
@@ -199,7 +204,7 @@ impl Interfaces {
                 valid_until,
                 preferred_lifetime,
             } => {
-                if let Some(view) = self.device(device.bindings_id().0.get(), limit) {
+                if let Some(view) = self.device(device.bindings_id().0.get()) {
                     if let Some(entry) = view
                         .addresses
                         .iter_mut()
@@ -211,7 +216,7 @@ impl Interfaces {
                 }
             }
             IpDeviceEvent::EnabledChanged { device, ip_enabled } => {
-                if let Some(view) = self.device(device.bindings_id().0.get(), limit) {
+                if let Some(view) = self.device(device.bindings_id().0.get()) {
                     match I::VERSION {
                         net_types::ip::IpVersion::V4 => view.ipv4_enabled = ip_enabled,
                         net_types::ip::IpVersion::V6 => view.ipv6_enabled = ip_enabled,
@@ -227,7 +232,7 @@ impl Interfaces {
         limit: usize,
     ) {
         let limit = limit.min(64);
-        let Some(view) = self.device(event.device.bindings_id().0.get(), limit) else {
+        let Some(view) = self.device(event.device.bindings_id().0.get()) else {
             return;
         };
         let address = ip::<I>(event.addr.get());
@@ -264,10 +269,8 @@ impl Interfaces {
         &mut self,
         event: RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>,
         now: NativeInstant,
-        limit: usize,
     ) {
-        let limit = limit.min(64);
-        let Some(view) = self.device(event.device.bindings_id().0.get(), limit) else {
+        let Some(view) = self.device(event.device.bindings_id().0.get()) else {
             return;
         };
         // As in Fuchsia's bounded NDP watcher, overload loses observations,
@@ -291,7 +294,7 @@ impl Interfaces {
         let limit = limit.min(64);
         match event {
             EthernetDeviceEvent::MulticastJoin { device, addr } => {
-                let Some(view) = self.device(device.bindings_id().0.get(), limit) else {
+                let Some(view) = self.device(device.bindings_id().0.get()) else {
                     return;
                 };
                 let addr = addr.get().bytes();
@@ -304,7 +307,7 @@ impl Interfaces {
                 }
             }
             EthernetDeviceEvent::MulticastLeave { device, addr } => {
-                if let Some(view) = self.device(device.bindings_id().0.get(), limit) {
+                if let Some(view) = self.device(device.bindings_id().0.get()) {
                     view.multicast.retain(|entry| *entry != addr.get().bytes());
                 }
             }

@@ -136,6 +136,29 @@ complete requests from its predecessor. Applications reconnect normally.
 This avoids pretending that ephemeral transport state survived a crash and
 keeps recovery simpler than transparent connection resurrection.
 
+## Network namespace ownership
+
+Unowned Linux network namespaces acquire independent, loopback-only Netstack3
+instances lazily on first socket use. Namespace creation itself does not spawn
+a service. The generic supervisor receives global provisioning authority, passes
+a namespace-bound serving capability to a sandboxed worker, and retains only
+separate lifecycle/revocation authority. It neither enters served namespaces nor
+gives these workers Ethernet, Wi-Fi, DMA or netcfg authority. Explicitly supervised
+namespaces remain reserved for their existing supervisor across provider failure;
+lazy provisioning must not replace the machine's network policy.
+
+Application sockets and namespace handles retain native namespace lifetime.
+Service capabilities retain only safe backing memory: namespace teardown revokes
+them and causes workers to be reaped. Authority follows the socket or serving
+object across descriptor transfer and `setns`, not the caller's current namespace.
+Failure and replacement are generation boundaries, including for metadata; old
+capabilities cannot mutate or revive a replacement.
+
+Loopback administration changes actual core device state before completion is
+acknowledged. Newly isolated namespaces start with loopback down and no assigned
+addresses; address/link views reflect core observations, not invented Ethernet
+or configured-address fixtures. Unsupported management operations fail explicitly.
+
 ## Validation without a production escape hatch
 
 KVM on np isolates kernel and service development from the host's management

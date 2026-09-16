@@ -4,7 +4,7 @@
 use crate::{
     endpoint_file::{self, Endpoint, Poll},
     frontend::Deadline,
-    linux::{NativeSock, NetRef},
+    linux::NativeSock,
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel::{
@@ -40,6 +40,12 @@ impl Namespace {
             changed <- kernel::new_poll_condvar!(),
             live: AtomicU64::new(0), count: AtomicUsize::new(0),
         }), GFP_KERNEL)
+    }
+    pub(crate) fn abort_generation(&self) {
+        let registry = self.registry.lock();
+        self.live.store(0, Ordering::Release);
+        for channel in &registry.sockets { channel.abort(&mut channel.state.lock()); }
+        self.changed.notify_all();
     }
     pub(crate) fn socket(ns: Arc<Self>, native: NativeSock) -> Result<Option<Arc<Channel>>> {
         let mut registry = ns.registry.lock();
@@ -139,12 +145,11 @@ impl Channel {
 pub(crate) struct Session {
     ns: Arc<Namespace>,
     generation: u64,
-    _net: NetRef,
 }
 impl Session {
-    pub(crate) fn new(ns: Arc<Namespace>, net: NetRef) -> Result<Arc<Self>> {
+    pub(crate) fn new(ns: Arc<Namespace>) -> Result<Arc<Self>> {
         let mut session = kernel::sync::UniqueArc::new(
-            Self { ns: ns.clone(), generation: 0, _net: net }, GFP_KERNEL)?;
+            Self { ns: ns.clone(), generation: 0 }, GFP_KERNEL)?;
         let mut registry = ns.registry.lock();
         if ns.live.load(Ordering::Acquire) != 0 { return Err(EBUSY); }
         let generation = registry.next_generation.checked_add(1).ok_or(EOVERFLOW)?;

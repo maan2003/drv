@@ -517,3 +517,34 @@ Limitations: no KASAN, exhaustive fault injection, physical Wi-Fi, production
 network metadata or release-performance claim. Prior service/runtime unit
 suites were unchanged; real guest service integration reran in every full KVM.
 Private fixture daemons are explicitly stopped after acceptance.
+
+
+Namespace lifecycle and lazy provisioning acceptance
+---------------------------------------------------
+Linux 7.3.0-rc2-drv-trial, CONFIG_INET=n, CONFIG_NETSTACK3_RUST=y.
+Final KVM kernel #37: CONFIG_PROVE_LOCKING=y, CONFIG_DEBUG_MUTEXES=y,
+CONFIG_DEBUG_ATOMIC_SLEEP=y, CONFIG_DEBUG_LIST=y; 2 vCPUs, 1536 MiB,
+no guest NIC and no host device assignment. Complete normalized serial:
+../evidence/namespaces.log. PASS_KVM_PRODUCTION_LOOPBACK; no BUG, WARNING,
+Oops, panic, lockdep diagnostic or guest failure marker.
+
+Native Cargo: 66 network-service library tests and 45 port-integration
+library tests passed. KVM additionally passed 14 process-sandbox tests and
+the real Ethernet/DHCP/DNS/NSS fixture.
+
+Namespace checks: passive service lifetime; faulted CLAIM cleanup; old
+generation SET_UP/revocation rejection; privileged administration checks;
+independent identical UDP ports; SCM_RIGHTS/setns socket authority; worker
+and supervisor death/replacement; old socket terminal failure; lazy startup
+and worker reaping. Ordinary unshare -n and unshare -Urn exercised the full
+IPv4/IPv6 localhost TCP/UDP suite. Both ioctl and Netlink loopback mutations
+were exercised. Explicit root registration remains reserved while offline.
+
+Kernel review found two generation races, fixed by fencing Session registration
+and native SET_UP against broker failure/replacement. A subsequent narrow
+authority/lifetime review reported no concrete blockers. Native/core tests
+and VM verification were run by the primary agent, not the reviewer.
+
+This establishes generic loopback-only namespaces, not arbitrary virtual-link
+or routing support, Lix-specific acceptance, physical deployment, exhaustive
+failure-schedule coverage, or a security proof.

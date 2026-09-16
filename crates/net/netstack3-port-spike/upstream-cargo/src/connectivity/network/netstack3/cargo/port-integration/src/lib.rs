@@ -72,7 +72,7 @@ use netstack3_icmp_echo::{
     IcmpEchoBindingsContext, IcmpEchoBindingsTypes, IcmpEchoSettings, IcmpSocketId,
     ReceiveIcmpEchoError,
 };
-use netstack3_ip::device::{IidGenerationConfiguration, IidSecret, StableSlaacAddressConfiguration};
+use netstack3_ip::device::{AddIpAddrSubnetError, IidGenerationConfiguration, IidSecret, StableSlaacAddressConfiguration};
 use netstack3_ip::nud::{LinkResolutionContext, LinkResolutionNotifier};
 use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
@@ -1107,7 +1107,7 @@ impl<I: Ip>
 
 impl EventContext<RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>> for NativeBindingsCtx {
     fn on_event(&mut self, event: RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>) {
-        self.interfaces.ra_event(event, self.now, self.queue_capacity);
+        self.interfaces.ra_event(event, self.now);
     }
 }
 
@@ -1430,8 +1430,8 @@ pub struct Runtime {
     udp_v6: HashMap<UdpSocketHandle, NativeUdpV6>,
     tcp: HashMap<TcpSocketHandle, RuntimeTcpSocket>,
     tcp_v6: HashMap<TcpSocketHandle, RuntimeTcpSocketV6>,
-    dhcp_socket: SocketId<NativeBindingsCtx>,
-    device: EthernetDeviceId<NativeBindingsCtx>,
+    dhcp_socket: Option<SocketId<NativeBindingsCtx>>,
+    device: Option<EthernetDeviceId<NativeBindingsCtx>>,
     loopback: Option<LoopbackDeviceId<NativeBindingsCtx>>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
@@ -1484,11 +1484,9 @@ impl Runtime {
         }
         let max_frame_size =
             MaxEthernetFrameSize::from_mtu(Mtu::new(mtu)).ok_or(RuntimeError::InvalidMtu)?;
-        let mut bindings =
-            NativeBindingsCtx::new_with_capacities(socket_capacity, queue_capacity, entropy);
-        let stack = bindings.build_stack();
-        let device = stack
-            .api(&mut bindings)
+        let mut runtime = Self::new_isolated(socket_capacity, queue_capacity, entropy)?;
+        let device = runtime.stack
+            .api(&mut runtime.bindings)
             .device::<EthernetLinkDevice>()
             .add_device(
                 NativeDeviceIdentifier(interface_id),
@@ -1502,8 +1500,8 @@ impl Runtime {
                 netstack3_device::queue::BufVecU8Allocator::default(),
             );
         let device_id = device.clone().into();
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .device_ip::<Ipv4>()
             .update_configuration(
                 &device_id,
@@ -1516,32 +1514,50 @@ impl Runtime {
                 },
             )
             .expect("new Ethernet device accepts IPv4 enablement");
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .transmit_queue::<EthernetLinkDevice>()
             .set_configuration(&device, TransmitQueueConfiguration::Fifo);
-        let dhcp_socket = stack
-            .api(&mut bindings)
+        let dhcp_socket = runtime.stack
+            .api(&mut runtime.bindings)
             .device_socket()
             .create(Mutex::new(VecDeque::<(
                 WeakDeviceId<NativeBindingsCtx>,
                 Vec<u8>,
             )>::new()));
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .device_socket()
             .set_device_and_protocol(
                 &dhcp_socket,
                 TargetDevice::SpecificDevice(&device_id),
                 Protocol::Specific(NonZeroU16::new(0x0800).unwrap()),
             );
+        runtime.dhcp_socket = Some(dhcp_socket);
+        runtime.device = Some(device);
+        Ok(runtime)
+    }
+
+    /// Independent protocol/bindings state, with no Ethernet or DHCP socket.
+    /// The caller introduces loopback and its administrative state explicitly.
+    pub fn new_isolated(
+        socket_capacity: usize,
+        queue_capacity: usize,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
+    ) -> Result<Self, RuntimeError> {
+        if socket_capacity == 0 || queue_capacity == 0 {
+            return Err(RuntimeError::InvalidCapacity);
+        }
+        let mut bindings =
+            NativeBindingsCtx::new_with_capacities(socket_capacity, queue_capacity, entropy);
+        let stack = bindings.build_stack();
         Ok(Self {
             udp: HashMap::new(),
             udp_v6: HashMap::new(),
             tcp: HashMap::new(),
             tcp_v6: HashMap::new(),
-            dhcp_socket,
-            device,
+            dhcp_socket: None,
+            device: None,
             loopback: None,
             ipv4_address: None,
             ipv6_address: None,
@@ -1559,6 +1575,8 @@ impl Runtime {
             bindings,
         })
     }
+
+    pub fn has_ethernet(&self) -> bool { self.device.is_some() }
 
     fn dynamic_ipv6_configuration(enabled: bool) -> Ipv6DeviceConfigurationUpdate {
         Ipv6DeviceConfigurationUpdate {
@@ -1599,8 +1617,9 @@ impl Runtime {
     }
 
     fn set_link_state(&mut self, up: bool) {
+        let Some(device) = self.device.clone() else { return; };
         self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
-            &self.device.clone().into(), Ipv4DeviceConfigurationUpdate {
+            &device.clone().into(), Ipv4DeviceConfigurationUpdate {
                 ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                 ..Default::default()
             }).expect("valid Ethernet IPv4 link state");
@@ -1608,7 +1627,7 @@ impl Runtime {
             self.set_dynamic_ipv6_link_state(up);
         } else {
             self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
-                &self.device.clone().into(), Ipv6DeviceConfigurationUpdate {
+                &device.clone().into(), Ipv6DeviceConfigurationUpdate {
                     ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                     ..Default::default()
                 }).expect("valid Ethernet IPv6 link state");
@@ -1616,9 +1635,10 @@ impl Runtime {
     }
 
     fn set_dynamic_ipv6_link_state(&mut self, up: bool) {
+        let Some(device) = self.device.clone() else { return; };
         if !self.dynamic_ipv6 { return; }
         self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
-            &self.device.clone().into(), Self::dynamic_ipv6_configuration(up),
+            &device.clone().into(), Self::dynamic_ipv6_configuration(up),
         ).expect("Ethernet device accepts IPv6 link-state configuration");
         self.process_ipv6_route_events();
         if !up { self.ipv6_address = None; }
@@ -1672,9 +1692,10 @@ impl Runtime {
     }
 
     fn refresh_dynamic_ipv6_address(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
         if !self.dynamic_ipv6 { return; }
         self.ipv6_address = self.stack.api(&mut self.bindings).device_ip::<Ipv6>()
-            .get_assigned_ip_addr_subnets(&self.device.clone().into())
+            .get_assigned_ip_addr_subnets(&device.clone().into())
             .into_iter()
             .find(|address| {
                 let bytes = address.addr().ipv6_bytes();
@@ -1695,29 +1716,41 @@ impl Runtime {
     }
 
     /// Enables Netstack3's actual loopback device, independent of carrier/DHCP.
-    pub fn enable_loopback(&mut self) {
-        if self.loopback.is_some() { return; }
-        let device = self.stack.api(&mut self.bindings).device::<LoopbackDevice>()
-            .add_device(NativeDeviceIdentifier(NonZeroU64::new(u64::MAX).unwrap()),
-                LoopbackCreationProperties { mtu: Mtu::new(65536) },
-                RawMetric(0), NativeDeviceState,
-                netstack3_device::queue::BufVecU8Allocator::default());
+    pub fn enable_loopback(&mut self) { self.set_loopback_up(true); }
+
+    /// Introduces a real loopback device, initially without addresses when down.
+    /// Administrative changes act on core; metadata comes from the resulting events.
+    pub fn set_loopback_up(&mut self, up: bool) {
+        if self.loopback.is_none() {
+            let device = self.stack.api(&mut self.bindings).device::<LoopbackDevice>()
+                .add_device(NativeDeviceIdentifier(NonZeroU64::new(u64::MAX).unwrap()),
+                    LoopbackCreationProperties { mtu: Mtu::new(65536) },
+                    RawMetric(0), NativeDeviceState,
+                    netstack3_device::queue::BufVecU8Allocator::default());
+            self.bindings.interfaces.introduce(device.bindings_id().0.get());
+            self.loopback = Some(device);
+        }
+        let device = self.loopback.as_ref().unwrap();
         let id = device.clone().into();
         self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
             &id, Ipv4DeviceConfigurationUpdate {
-                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                 ..Default::default()
             }).unwrap();
         self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
             &id, Ipv6DeviceConfigurationUpdate {
-                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                 ..Default::default()
             }).unwrap();
-        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().add_ip_addr_subnet(
-            &id, AddrSubnet::new(Ipv4Addr::new([127,0,0,1]), 8).unwrap()).unwrap();
-        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
-            &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap()).unwrap();
-        self.loopback = Some(device);
+        if !up { return; }
+        // Core, not the bounded observation cache, decides whether an address
+        // already exists. Observation overflow must never duplicate protocol state.
+        let v4 = self.stack.api(&mut self.bindings).device_ip::<Ipv4>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv4Addr::new([127,0,0,1]), 8).unwrap());
+        assert!(matches!(v4, Ok(()) | Err(AddIpAddrSubnetError::Exists)));
+        let v6 = self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap());
+        assert!(matches!(v6, Ok(()) | Err(AddIpAddrSubnetError::Exists)));
     }
 
     /// Current observations for this Ethernet interface. Unlike diagnostic
@@ -1726,7 +1759,8 @@ impl Runtime {
     pub fn interface_revision(&self) -> u64 { self.bindings.interfaces.revision }
 
     pub fn interface_snapshots(&self) -> Vec<interfaces::InterfaceSnapshot> {
-        let mut snapshots = vec![self.interface_snapshot()];
+        let mut snapshots = Vec::new();
+        if self.has_ethernet() { snapshots.push(self.interface_snapshot()); }
         if let Some(loopback) = &self.loopback
             && let Some(snapshot) = self.bindings.interfaces.snapshot(loopback.bindings_id().0.get())
         {
@@ -1736,7 +1770,7 @@ impl Runtime {
     }
 
     pub fn interface_snapshot(&self) -> interfaces::InterfaceSnapshot {
-        self.bindings.interfaces.snapshot(self.device.bindings_id().0.get())
+        self.bindings.interfaces.snapshot(self.device.as_ref().expect("Ethernet snapshot requires an Ethernet runtime").bindings_id().0.get())
             .expect("Ethernet IP configuration emits the initial interface state")
     }
 
@@ -1755,6 +1789,7 @@ impl Runtime {
         prefix: u8,
         default_gateway: Option<[u8; 4]>,
     ) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
         let address = AddrSubnet::new(Ipv4Addr::new(address), prefix)
             .map_err(|_| RuntimeError::InvalidAddress)?;
         let gateway = default_gateway
@@ -1764,13 +1799,13 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .device_ip::<Ipv4>()
-            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .add_ip_addr_subnet(&device.clone().into(), address)
             .map_err(|_| RuntimeError::AddressInUse)?;
 
         let metric = AddableMetric::ExplicitMetric(RawMetric(0));
         let mut generation = Generation::initial();
         let mut routes = vec![
-            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+            AddableEntry::without_gateway(address.subnet(), device.clone().into(), metric)
                 .resolve_metric(RawMetric(0))
                 .with_generation(generation),
         ];
@@ -1779,7 +1814,7 @@ impl Runtime {
             routes.push(
                 AddableEntry::with_gateway(
                     Subnet::new(Ipv4Addr::new([0, 0, 0, 0]), 0).unwrap(),
-                    self.device.clone().into(),
+                    device.clone().into(),
                     gateway,
                     metric,
                 )
@@ -1796,6 +1831,7 @@ impl Runtime {
 
     /// Removes the configured IPv4 address and all IPv4 routes.
     pub fn revoke_ipv4(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
         let mut api = self.stack.api(&mut self.bindings).routes::<Ipv4>();
         let table = api.main_table_id();
         api.set_routes(&table, Vec::new());
@@ -1804,7 +1840,7 @@ impl Runtime {
                 .stack
                 .api(&mut self.bindings)
                 .device_ip::<Ipv4>()
-                .del_ip_addr(&self.device.clone().into(), address.addr());
+                .del_ip_addr(&device.clone().into(), address.addr());
         }
         self.dns_servers = [None, None];
     }
@@ -1816,6 +1852,7 @@ impl Runtime {
         prefix: u8,
         default_gateway: Option<[u8; 16]>,
     ) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
         let address = AddrSubnet::new(Ipv6Addr::from_bytes(address), prefix)
             .map_err(|_| RuntimeError::InvalidAddress)?;
         let gateway = default_gateway
@@ -1828,7 +1865,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_ip::<Ipv6>()
             .update_configuration(
-                &self.device.clone().into(),
+                &device.clone().into(),
                 Ipv6DeviceConfigurationUpdate {
                     max_router_solicitations: Some(None),
                     route_discovery_config: RouteDiscoveryConfigurationUpdate {
@@ -1845,13 +1882,13 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .device_ip::<Ipv6>()
-            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .add_ip_addr_subnet(&device.clone().into(), address)
             .map_err(|_| RuntimeError::AddressInUse)?;
 
         let metric = AddableMetric::ExplicitMetric(RawMetric(0));
         let mut generation = Generation::initial();
         let mut routes = vec![
-            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+            AddableEntry::without_gateway(address.subnet(), device.clone().into(), metric)
                 .resolve_metric(RawMetric(0))
                 .with_generation(generation),
         ];
@@ -1860,7 +1897,7 @@ impl Runtime {
             routes.push(
                 AddableEntry::with_gateway(
                     Subnet::new(Ipv6Addr::from_bytes([0; 16]), 0).unwrap(),
-                    self.device.clone().into(),
+                    device.clone().into(),
                     gateway,
                     metric,
                 )
@@ -1877,6 +1914,7 @@ impl Runtime {
 
     /// Removes the configured IPv6 address and all IPv6 routes.
     pub fn revoke_ipv6(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
         if self.dynamic_ipv6 {
             self.set_dynamic_ipv6_link_state(false);
             self.dynamic_ipv6 = false;
@@ -1891,7 +1929,7 @@ impl Runtime {
                 .stack
                 .api(&mut self.bindings)
                 .device_ip::<Ipv6>()
-                .del_ip_addr(&self.device.clone().into(), address.addr());
+                .del_ip_addr(&device.clone().into(), address.addr());
         }
     }
 
@@ -1905,6 +1943,8 @@ impl Runtime {
 
     /// Sends an upstream DHCP core AF_PACKET payload through the private device socket.
     pub fn dhcp_packet_send(&mut self, packet: &[u8]) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
+        let dhcp_socket = self.dhcp_socket.as_ref().ok_or(RuntimeError::NetworkUnreachable)?;
         if packet.len() > 1500 {
             return Err(RuntimeError::PayloadTooLarge);
         }
@@ -1912,9 +1952,9 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_socket()
             .send_frame::<_, EthernetLinkDevice>(
-                &self.dhcp_socket,
+                dhcp_socket,
                 DeviceSocketMetadata {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     metadata: Some(EthernetHeaderParams {
                         dest_addr: Mac::BROADCAST,
                         protocol: EtherType::Ipv4,
@@ -1927,7 +1967,8 @@ impl Runtime {
 
     /// Takes one full IPv4 packet for the upstream DHCP core AF_PACKET adapter.
     pub fn dhcp_packet_receive(&mut self) -> Option<Vec<u8>> {
-        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+        let dhcp_socket = self.dhcp_socket.as_ref()?;
+        while let Some((_, frame)) = dhcp_socket.socket_state().lock().unwrap().pop_front() {
             let Some(packet) = frame.get(14..) else {
                 continue;
             };
@@ -1940,6 +1981,8 @@ impl Runtime {
 
     /// Sends a pre-lease DHCP datagram through core's private device socket.
     pub fn dhcp_send(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
+        let dhcp_socket = self.dhcp_socket.as_ref().ok_or(RuntimeError::NetworkUnreachable)?;
         if payload.len() > MAX_DHCP_DATAGRAM_LEN {
             return Err(RuntimeError::PayloadTooLarge);
         }
@@ -1962,9 +2005,9 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_socket()
             .send_frame::<_, EthernetLinkDevice>(
-                &self.dhcp_socket,
+                dhcp_socket,
                 DeviceSocketMetadata {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     metadata: Some(EthernetHeaderParams {
                         dest_addr: Mac::new([0xff; 6]),
                         protocol: EtherType::Ipv4,
@@ -1977,7 +2020,8 @@ impl Runtime {
 
     /// Takes one DHCP server datagram received by the private device socket.
     pub fn dhcp_receive(&mut self) -> Option<Vec<u8>> {
-        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+        let dhcp_socket = self.dhcp_socket.as_ref()?;
+        while let Some((_, frame)) = dhcp_socket.socket_state().lock().unwrap().pop_front() {
             let Some(ip) = frame.get(14..) else {
                 continue;
             };
@@ -2012,12 +2056,13 @@ impl Runtime {
 
     /// Delivers one owned Ethernet frame into core.
     pub fn receive_frame(&mut self, frame: EthernetFrame) {
+        let Some(device) = self.device.clone() else { return; };
         self.stack
             .api(&mut self.bindings)
             .device::<EthernetLinkDevice>()
             .receive_frame(
                 RecvEthernetFrameMeta {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     parsing_context: netstack3_base::NetworkParsingContext::default(),
                 },
                 Buf::new(frame.into_vec(), ..),
@@ -2027,6 +2072,7 @@ impl Runtime {
     }
 
     fn service_tx(&mut self, budget: usize) {
+        let Some(device) = self.device.clone() else { return; };
         if budget == 0 || self.bindings.queues.tx.len() >= self.bindings.queue_capacity {
             return;
         }
@@ -2035,7 +2081,7 @@ impl Runtime {
             .stack
             .api(&mut self.bindings)
             .transmit_queue::<EthernetLinkDevice>()
-            .transmit_queued_frames(&self.device, BatchSize::new_saturating(available), &mut ());
+            .transmit_queued_frames(&device, BatchSize::new_saturating(available), &mut ());
     }
 
     /// Takes one outbound frame, servicing core's TX queue as capacity opens.
@@ -3421,7 +3467,7 @@ mod tests {
         )
         .unwrap();
         runtime.enable_dynamic_ipv6();
-        let device: DeviceId<_> = runtime.device.clone().into();
+        let device: DeviceId<_> = runtime.device.clone().unwrap().into();
         let entry = default_v6_route(device.clone());
 
         EventContext::on_event(
@@ -3454,7 +3500,7 @@ mod tests {
             64,
             Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfe]),
         );
-        let device: DeviceId<_> = runtime.device.clone().into();
+        let device: DeviceId<_> = runtime.device.clone().unwrap().into();
         EventContext::on_event(
             &mut runtime.bindings,
             IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device.clone())),
@@ -3734,6 +3780,35 @@ mod tests {
             "removal updates the observer even when diagnostic queues are full");
 
     }
+    #[test]
+    fn isolated_runtime_has_only_real_loopback_and_no_ethernet_authority() {
+        let mut rt = Runtime::new_isolated(16, 32, (0u8..=255).cycle().take(65536)).unwrap();
+        assert!(!rt.has_ethernet());
+        assert!(rt.interface_snapshots().is_empty());
+        assert_eq!(rt.dhcp_packet_send(&[0; 20]), Err(RuntimeError::NetworkUnreachable));
+        rt.set_loopback_up(false);
+        let down = rt.interface_snapshots();
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0].id, u64::MAX);
+        assert!(!down[0].ipv4_enabled && !down[0].ipv6_enabled);
+        assert!(down[0].addresses.is_empty());
+        rt.set_loopback_up(true);
+        rt.set_loopback_up(true); // repeated native observations are idempotent
+        let up = rt.interface_snapshots();
+        assert!(up[0].ipv4_enabled && up[0].ipv6_enabled);
+        assert_eq!(up[0].addresses.len(), 2);
+        rt.set_loopback_up(false);
+        let down = rt.interface_snapshots();
+        assert!(!down[0].ipv4_enabled && !down[0].ipv6_enabled);
+        rt.set_loopback_up(true);
+        assert_eq!(rt.interface_snapshots()[0].addresses.len(), 2);
+        assert!(rt.take_tx().is_none());
+        let mut tiny = Runtime::new_isolated(4, 1, (0u8..=255).cycle().take(65536)).unwrap();
+        tiny.set_loopback_up(true);
+        tiny.set_loopback_up(true);
+        assert!(tiny.interface_snapshots()[0].incomplete);
+    }
+
     #[test]
     fn accept_pressure_preserves_queued_child_until_storage_release() {
         let mut rt = Runtime::new_with_capacities(4, 16, (0u8..=255).cycle().take(65536),

@@ -4,9 +4,9 @@
 use crate::{
     connection::{ConnectAttempt, Names},
     endpoint_file::{self, Endpoint},
-    linux::{AcceptTarget, Accepted, Address, Message, NativeSock, NetRef},
+    linux::{AcceptTarget, Accepted, Address, Message, NativeSock},
 };
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kernel::{
     bindings as b,
     fs::file::FileDescriptorReservation,
@@ -85,24 +85,45 @@ struct Registry {
 }
 #[pin_data]
 pub(crate) struct Namespace {
+    pub(crate) id: u64,
+    pub(crate) native: crate::linux::NativeNamespace,
+    #[pin] pub(crate) lifecycle: crate::namespace::Lifecycle,
     pub(crate) netlink: Arc<crate::netlink::Namespace>,
     #[pin]
     registry: Mutex<Registry>,
     #[pin]
     changed: PollCondVar,
     live: AtomicU64,
+    dead: AtomicBool,
     count: AtomicUsize,
 }
 impl Namespace {
-    pub(crate) fn new() -> Result<Arc<Self>> {
+    pub(crate) fn new(native: crate::linux::NativeNamespace) -> Result<Arc<Self>> {
+        let id = native.id();
         Arc::pin_init(
             try_pin_init!(Self {
+                id, native, lifecycle <- crate::namespace::Lifecycle::new(),
                 netlink: crate::netlink::Namespace::new()?,
                 registry <- kernel::new_mutex!(Registry {next_id:0,next_generation:0,sockets:KVec::new()}),
-                changed <- kernel::new_poll_condvar!(), live:AtomicU64::new(0),count:AtomicUsize::new(0),
+                changed <- kernel::new_poll_condvar!(), live:AtomicU64::new(0),dead:AtomicBool::new(false),count:AtomicUsize::new(0),
             }),
             GFP_KERNEL,
         )
+    }
+    /// Service capabilities may outlive the native namespace, never keep it alive.
+    pub(crate) fn revoke(&self) {
+        self.lifecycle.dying();
+        self.dead.store(true, Ordering::Release);
+        self.abort_generation();
+        crate::broker().remove(self.id);
+    }
+    pub(crate) fn abort_generation(&self) {
+        let registry = self.registry.lock();
+        self.live.store(0, Ordering::Release);
+        for socket in &registry.sockets { socket.abort(); }
+        self.changed.notify_all();
+        drop(registry);
+        self.netlink.abort_generation();
     }
     pub(crate) fn socket(
         ns: Arc<Self>,
@@ -111,6 +132,7 @@ impl Namespace {
         kind: i32,
         claimed: bool,
     ) -> Result<Arc<Socket>> {
+        crate::broker().ensure(&ns)?;
         let mut registry = ns.registry.lock();
         let generation = ns.live.load(Ordering::Acquire);
         if generation == 0 {
@@ -719,19 +741,18 @@ impl Socket {
 pub(crate) struct Session {
     namespace: Arc<Namespace>,
     generation: u64,
-    _net: NetRef,
 }
 impl Session {
-    pub(crate) fn new(namespace: Arc<Namespace>, net: NetRef) -> Result<Arc<Self>> {
+    pub(crate) fn new(namespace: Arc<Namespace>) -> Result<Arc<Self>> {
         let mut session = kernel::sync::UniqueArc::new(
             Self {
                 namespace: namespace.clone(),
                 generation: 0,
-                _net: net,
             },
             GFP_KERNEL,
         )?;
         let mut registry = namespace.registry.lock();
+        if namespace.dead.load(Ordering::Acquire) { return Err(ENETDOWN); }
         if namespace.live.load(Ordering::Acquire) != 0 {
             return Err(EBUSY);
         }

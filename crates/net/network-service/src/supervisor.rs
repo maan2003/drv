@@ -50,7 +50,7 @@ fn capability_revoked(frame: &OwnedFd) -> Result<bool, String> {
 
 fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
     const F_DUPFD_CLOEXEC: i32 = 1030;
-    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, crate::rtnetlink::REGISTRATION_FD + 1) };
+    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, crate::namespace::CONTROL_FD + 1) };
     if duplicate < 0 {
         return Err(format!(
             "duplicate network-service capability: {}",
@@ -511,18 +511,7 @@ impl NetworkServiceSupervisor {
                 command.arg("--resolver-fd");
             }
         }
-        unsafe {
-            command.pre_exec(move || {
-                for &(source, target) in &inherited {
-                    if dup2(source, target) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn()
-            .map_err(|error| format!("spawn network provider: {error}"))?;
+        let child = spawn_provider(&mut command, inherited)?;
         drop((registration, bootstrap_pass, bootstrap_child, control_child, control_pass));
         self.kernel_process = Some(KernelProcess {
             generation,
@@ -1884,5 +1873,108 @@ mod tests {
         });
         bootstrap(&mut parent, true).unwrap();
         peer.join().unwrap();
+    }
+}
+
+
+/// All provider launch paths use the same explicit capability adoption boundary.
+fn spawn_provider(command: &mut Command, inherited: Vec<(RawFd, RawFd)>) -> Result<Child, String> {
+    // SAFETY: sources are owned by the caller through spawn and are duplicated
+    // above every destination slot. Only async-signal-safe dup2 runs after fork.
+    unsafe {
+        command.pre_exec(move || {
+            for &(source, target) in &inherited {
+                if dup2(source, target) < 0 { return Err(std::io::Error::last_os_error()); }
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map_err(|error| format!("spawn network provider: {error}"))
+}
+
+struct NamespaceProcess {
+    child: Child,
+    monitor: OwnedFd,
+    exit: OwnedFd,
+}
+impl Drop for NamespaceProcess {
+    fn drop(&mut self) {
+        // Revocation does not depend on whether the worker is responsive.
+        unsafe { libc::ioctl(self.monitor.as_raw_fd(), crate::namespace::REVOKE) };
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Generic namespace spawner. It never enters served namespaces, receives
+/// device/DMA authority or configures their network policy.
+pub fn run_namespace_supervisor(binary: impl AsRef<Path>) -> Result<(), String> {
+    let broker = OpenOptions::new().read(true).write(true)
+        .open("/dev/netstack3-namespaces").map_err(|e| format!("namespace provisioner: {e}"))?;
+    let mut children: Vec<NamespaceProcess> = Vec::new();
+    loop {
+        let mut descriptors = vec![PollFd { fd: broker.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        for child in &children {
+            descriptors.push(PollFd { fd: child.monitor.as_raw_fd(), events: 0, revents: 0 });
+            descriptors.push(PollFd { fd: child.exit.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
+        let result = unsafe { poll(descriptors.as_mut_ptr(), descriptors.len(), -1) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(format!("namespace supervisor poll: {error}"));
+        }
+        for index in (0..children.len()).rev() {
+            if descriptors[1 + 2 * index].revents != 0 || descriptors[2 + 2 * index].revents != 0 {
+                // Drop revokes, kills if needed and reaps; no detached workers.
+                children.swap_remove(index);
+            }
+        }
+        if descriptors[0].revents & libc::POLLIN == 0 { continue; }
+        loop {
+            let mut fds = [-1i32; 2];
+            // SAFETY: CLAIM writes exactly two newly installed descriptor numbers.
+            if unsafe { libc::ioctl(broker.as_raw_fd(), crate::namespace::CLAIM, fds.as_mut_ptr()) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock { break; }
+                // Native teardown can win after selection but before registration.
+                // Losing one request must not revoke unrelated active namespaces.
+                if error.raw_os_error() == Some(libc::ENETDOWN) { continue; }
+                return Err(format!("claim namespace: {error}"));
+            }
+            let serving = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            let monitor = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            let inherited = duplicate_capability(serving.as_raw_fd())?;
+            let mut command = Command::new(binary.as_ref());
+            command.env_clear()
+                .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
+                .args(["--namespace", "--netlink"])
+                .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            let mut child = match spawn_provider(&mut command, vec![
+                (inherited.as_raw_fd(), FRAME_FD),
+                (inherited.as_raw_fd(), crate::rtnetlink::REGISTRATION_FD),
+                (inherited.as_raw_fd(), crate::namespace::CONTROL_FD),
+            ]) {
+                Ok(child) => child,
+                Err(error) => {
+                    unsafe { libc::ioctl(monitor.as_raw_fd(), crate::namespace::REVOKE) };
+                    eprintln!("{error}");
+                    continue;
+                }
+            };
+            // The supervisor retains only lifecycle authority, never a serving copy.
+            drop((serving, inherited));
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0u32) };
+            if pidfd < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::ioctl(monitor.as_raw_fd(), crate::namespace::REVOKE) };
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("namespace worker pidfd: {error}"));
+            }
+            children.push(NamespaceProcess {
+                child, monitor, exit: unsafe { OwnedFd::from_raw_fd(pidfd as i32) },
+            });
+        }
     }
 }

@@ -32,7 +32,8 @@ The supervisor passes registration FD10 with `--netlink` into the existing
 sandbox. The userspace adapter renders read-only link/address dumps and change
 notifications from actual Netstack3 observations, including loopback, DHCP,
 IPv6 address state and link loss. It does not synthesize configured IP addresses.
-Route queries and mutations return explicit unsupported errors. Per-application
+Route queries and unsupported mutations return explicit unsupported errors;
+lazy namespace workers also support authorized loopback up/down. Per-application
 metadata privacy remains deferred; this is a namespace-wide compatibility view.
 
 The standard guest fixture now also needs these clients, built from this
@@ -50,6 +51,39 @@ Netlink, revocation and replacement. The real Ethernet fixture checks glibc
 `getifaddrs`/`AI_ADDRCONFIG`, pure-Go interface discovery and address-removal
 notifications before/after link loss, alongside existing TCP/UDP and NSS tests.
 These are no-INET KVM checks, not physical deployment or full rtnetlink coverage.
+
+## Generic network namespaces
+
+`netstack3-supervisor /absolute/path/to/netstack3-provider` owns
+`/dev/netstack3-namespaces` (initial-user-namespace `CAP_SYS_ADMIN`, exclusive
+registration). First socket use in an unowned namespace requests a worker;
+creation alone does not. Each worker receives one namespace-bound serving
+object through inherited FD3/FD10/FD11, enters the existing empty-root,
+unprivileged process sandbox, and owns independent Netstack3 state with **no
+Ethernet device or DHCP socket**. The supervisor closes every serving copy and
+retains only a separate monitor/revoke capability plus a process handle.
+
+Ordinary `unshare -n` starts with loopback down and no addresses. Both
+`SIOCSIFFLAGS` and authenticated `RTM_NEWLINK` can enable/disable loopback;
+completion waits for actual core configuration. `ip link set lo up` enables
+IPv4/IPv6 localhost TCP/UDP. Other link mutations and route operations remain
+unsupported. Explicit legacy registrations retain their original supervisor,
+including across restart, and do not gain these administration operations.
+Register the machine's explicit network service before starting lazy provisioning.
+
+At most 64 lazy namespaces are admitted; startup has a 10-second interruptible
+budget. Native namespace teardown, worker death, monitor revocation and
+supervisor loss terminate the affected generation. New sockets can request a
+replacement; existing sockets never attach to it. Serving and monitoring FDs
+retain namespace memory safely but do not prevent teardown. Namespace handles
+and application sockets do retain it, including across `setns` and `SCM_RIGHTS`.
+
+The standard KVM suite includes `namespace-test` lifetime, faulted handoff,
+old-generation rejection, independent identical-port namespaces, descriptor
+transfer, administration permissions, worker/supervisor restart and worker
+reaping, plus an ordinary `unshare -n` shell running the full localhost suite.
+These checks do not establish arbitrary virtual-link/routing support or host
+deployment.
 
 ## Original C baseline proof
 
@@ -318,16 +352,18 @@ make -C "$LINUX" olddefconfig
 make -C "$LINUX" -j4 bzImage
 cc -O2 -Wall -Wextra -Werror loopback-test.c -o "$ROOT/bin/loopback-test"
 cc -O2 -Wall -Wextra -Werror endpoint-test.c -o "$ROOT/bin/endpoint-test"
+cc -O2 -Wall -Wextra -Werror namespace-test.c -o "$ROOT/bin/namespace-test"
 ```
 
-Build `netstack3-provider` from `crates/net/network-service` with the repository's
+Build `netstack3-provider` and `netstack3-supervisor` from `crates/net/network-service` with the repository's
 materialized upstream Cargo overlay and vendor setup. The changed
-`port-integration/src/{lib.rs,socket_provider.rs}` overlay files must be copied
+`port-integration/src` overlay files must be copied
 into that reference tree, as for other service builds. Use `cargo build --release`
 for throughput measurements. No Nix build is required.
 
 Stage a static Busybox as `$ROOT/bin/busybox`, the provider as
-`$ROOT/bin/netstack3-provider`, and both test clients above. Build service tests
+`$ROOT/bin/netstack3-provider`, the namespace supervisor as
+`$ROOT/bin/netstack3-supervisor`, and the test clients above. Build service tests
 with `cargo test --no-run --lib` and stage the reported library test executable
 as `$ROOT/bin/network-service-tests` (strip debug symbols to keep the initrd small).
 For dynamically linked

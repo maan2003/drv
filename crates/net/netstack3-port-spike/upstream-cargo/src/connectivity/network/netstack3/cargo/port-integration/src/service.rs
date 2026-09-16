@@ -228,6 +228,7 @@ impl<R: Rng> RngProvider for NativeRng<R> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DhcpStatus {
+    Offline,
     Acquiring,
     Bound,
     Failed,
@@ -269,6 +270,7 @@ impl DhcpService {
         mac: [u8; 6],
         dns_capacity: NonZeroUsize,
     ) -> Self {
+        let ethernet = runtime.has_ethernet();
         let rt = Rc::new(RefCell::new(runtime));
         let now = Rc::new(Cell::new(NativeInstant::ZERO));
         let wakes = Rc::new(RefCell::new(Wakes::default()));
@@ -303,6 +305,7 @@ impl DhcpService {
         let pool = LocalPool::new();
         let (stop, mut stop_receiver) = mpsc::unbounded();
         let (resume, mut resume_receiver) = mpsc::unbounded();
+        if ethernet {
         pool.spawner()
             .spawn_local(async move {
                 let counters = Counters::default();
@@ -348,6 +351,7 @@ impl DhcpService {
                 }
             })
             .expect("spawn DHCP core");
+        }
         let owned_sockets = crate::sockets::Sockets::new(rt.clone());
         Self {
             owned_sockets,
@@ -360,11 +364,13 @@ impl DhcpService {
             address,
             stop,
             resume,
-            dhcp_enabled: true,
-            link_up: true,
-            status: DhcpStatus::Acquiring,
+            dhcp_enabled: ethernet,
+            link_up: ethernet,
+            status: if ethernet { DhcpStatus::Acquiring } else { DhcpStatus::Offline },
         }
     }
+
+    pub fn set_loopback_up(&mut self, up: bool) { self.rt.borrow_mut().set_loopback_up(up); }
 
     pub fn status(&self) -> DhcpStatus {
         self.status

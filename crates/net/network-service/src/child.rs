@@ -1501,6 +1501,7 @@ pub(crate) fn provider_setup(
     resolver: bool,
     link_control: bool,
     netlink: bool,
+    namespace: bool,
 ) -> Result<(), String> {
     unsafe {
         if !ethernet { close(4); }
@@ -1509,7 +1510,9 @@ pub(crate) fn provider_setup(
         if !link_control { close(crate::link_control::CONTROL_FD); }
         close(9);
     }
-    let first_close = if netlink {
+    let first_close = if namespace {
+        crate::namespace::CONTROL_FD as u32 + 1
+    } else if netlink {
         crate::rtnetlink::REGISTRATION_FD as u32 + 1
     } else if link_control {
         crate::link_control::CONTROL_FD as u32 + 1
@@ -1553,7 +1556,8 @@ fn provider_filter(ethernet: bool, link_control: bool, netlink: bool) -> Vec<Soc
         append_message_flags(&mut filter, libc::SYS_sendmsg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
     }
     let mut requests = vec![0x8008B301, 0xC038B302, 0x8080B303];
-    if netlink { requests.push(0x8008B401); }
+    if netlink { requests.extend([0x8008B401, crate::namespace::STATE as u32,
+        crate::namespace::ACK as u32, crate::namespace::SET_UP as u32]); }
     filter.push(jump(libc::SYS_ioctl as u32, 0, (requests.len() + 3) as u8));
     filter.push(arg(1));
     for (i, request) in requests.iter().enumerate() {

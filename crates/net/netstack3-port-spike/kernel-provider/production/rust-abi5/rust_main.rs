@@ -5,6 +5,8 @@ mod endpoint_file;
 mod frontend;
 mod linux;
 mod netlink;
+mod namespace;
+use core::pin::Pin;
 use core::{ffi::c_void, ptr};
 use frontend::{Namespace, Session, Socket};
 use kernel::{
@@ -18,15 +20,18 @@ use kernel::{
 // escape the callback; only explicit Arc clones may outlive it. C release
 // consumes the exact foreign owner created for its object.
 #[no_mangle]
-extern "C" fn ns3_net_new() -> *mut c_void {
-    Namespace::new()
+unsafe extern "C" fn ns3_net_new(net: *mut c_void) -> *mut c_void {
+    // SAFETY: pernet init owns this native namespace through construction.
+    Namespace::new(unsafe { linux::NativeNamespace::acquire(net) })
         .map(ForeignOwnable::into_foreign)
         .unwrap_or(ptr::null_mut())
 }
 #[no_mangle]
 unsafe extern "C" fn ns3_net_drop(p: *mut c_void) {
     // SAFETY: pernet exit consumes its unique foreign namespace owner.
-    drop(unsafe { Arc::<Namespace>::from_foreign(p) });
+    let namespace = unsafe { Arc::<Namespace>::from_foreign(p) };
+    namespace.revoke();
+    drop(namespace);
 }
 #[no_mangle]
 unsafe extern "C" fn ns3_socket_new(
@@ -152,8 +157,8 @@ unsafe extern "C" fn provider_open(_inode: *mut bindings::inode, file: *mut bind
     let result = (|| -> Result {
         let net = linux::NetRef::current()?;
         // SAFETY: NetRef retains the namespace and its pernet Arc during borrow.
-        let namespace = unsafe { Arc::<Namespace>::borrow(net.state()) }.into();
-        let session = Session::new(namespace, net)?;
+        let namespace: Arc<Namespace> = unsafe { Arc::<Namespace>::borrow(net.state()) }.into();
+        let session = namespace.lifecycle.register_manual(|| Session::new(namespace.clone()))?;
         // SAFETY: open exclusively initializes this file's private data.
         unsafe { (*file).private_data = session.into_foreign() };
         Ok(())
@@ -175,6 +180,10 @@ extern "C" fn ns3_registration_ops() -> *const bindings::file_operations {
 #[no_mangle]
 unsafe extern "C" fn ns3_nl_socket_new(ns: *mut c_void, sk: *mut c_void, out: *mut *mut c_void) -> i32 {
     let namespace = unsafe { Arc::<Namespace>::borrow(ns) };
+    let namespace: Arc<Namespace> = namespace.into();
+    if namespace.lifecycle.managed() || broker().connected() {
+        if let Err(error) = broker().ensure(&namespace) { return error.to_errno(); }
+    }
     let native = unsafe { linux::NativeSock::acquire(sk) };
     match netlink::Namespace::socket(namespace.netlink.clone(), native) {
         Ok(Some(channel)) => { unsafe { out.write(channel.into_foreign()) }; 0 }
@@ -210,7 +219,7 @@ unsafe extern "C" fn netlink_provider_open(_inode: *mut bindings::inode, file: *
     (|| -> Result {
         let net = linux::NetRef::current()?;
         let namespace = unsafe { Arc::<Namespace>::borrow(net.state()) };
-        let session = netlink::Session::new(namespace.netlink.clone(), net)?;
+        let session = namespace.lifecycle.register_manual(|| netlink::Session::new(namespace.netlink.clone()))?;
         unsafe { (*file).private_data = session.into_foreign() };
         Ok(())
     })().map(|()| 0).unwrap_or_else(|e| e.to_errno())
@@ -221,4 +230,49 @@ const NETLINK_REGISTRATION: bindings::file_operations = bindings::file_operation
 #[no_mangle]
 extern "C" fn ns3_netlink_registration_ops() -> *const bindings::file_operations {
     &NETLINK_REGISTRATION
+}
+
+kernel::sync::global_lock! {
+    // SAFETY: initialized once from the C initcall before pernet registration.
+    unsafe(uninit) static NAMESPACE_BROKER: Mutex<Option<Arc<namespace::Broker>>> = None;
+}
+pub(crate) fn broker() -> Arc<namespace::Broker> {
+    NAMESPACE_BROKER.lock().as_ref().expect("initialized before pernet").clone()
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_broker_init() -> i32 {
+    unsafe { NAMESPACE_BROKER.init() };
+    match namespace::Broker::new() {
+        Ok(broker) => { *NAMESPACE_BROKER.lock() = Some(broker); 0 }
+        Err(error) => error.to_errno(),
+    }
+}
+unsafe extern "C" {
+    fn ns3_provisioner_allowed() -> bool;
+}
+unsafe extern "C" fn broker_open(_inode: *mut bindings::inode, file: *mut bindings::file) -> i32 {
+    if !unsafe { ns3_provisioner_allowed() } { return EPERM.to_errno(); }
+    match broker().open() {
+        Ok(owner) => { unsafe { (*file).private_data = owner.into_foreign() }; 0 }
+        Err(error) => error.to_errno(),
+    }
+}
+const BROKER_REGISTRATION: bindings::file_operations = bindings::file_operations {
+    open: Some(broker_open), ..endpoint_file::operations::<namespace::Provisioner>()
+};
+#[no_mangle]
+extern "C" fn ns3_broker_ops() -> *const bindings::file_operations { &BROKER_REGISTRATION }
+#[no_mangle]
+unsafe extern "C" fn ns3_loopback_flags(ns: *mut c_void, flags: u32) {
+    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.flags_changed(flags);
+}
+#[no_mangle]
+unsafe extern "C" fn ns3_wait_loopback(ns: *mut c_void) -> i32 {
+    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.wait_applied()
+        .map(|()| 0).unwrap_or_else(|error| error.to_errno())
+}
+
+#[no_mangle]
+unsafe extern "C" fn ns3_loopback_managed(ns: *mut c_void) -> bool {
+    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.managed()
 }

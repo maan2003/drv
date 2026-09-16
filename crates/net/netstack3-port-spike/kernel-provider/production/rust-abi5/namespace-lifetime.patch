@@ -1,0 +1,21 @@
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -751,4 +751,7 @@
+ static int netlink_release(struct socket *sock)
+ {
+ 	struct sock *sk = sock->sk;
++#ifdef CONFIG_NETSTACK3_RUST
++    bool ns3_delegated = sk && ns3_nl_owner(sk);
++#endif
+ 	struct netlink_sock *nlk;
+@@ -839,3 +842,10 @@
++#ifdef CONFIG_NETSTACK3_RUST
++    if (ns3_delegated) {
++        extern void ns3_detach_net(struct sock *);
++        /* All netlink namespace operations above are finished. */
++        ns3_detach_net(sk);
++    }
++#endif
+ 	call_rcu(&nlk->rcu, deferred_put_nlk_sk);
+ 	return 0;
+ }

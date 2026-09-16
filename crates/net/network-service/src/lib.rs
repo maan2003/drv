@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 mod child;
 mod provider;
+mod namespace;
 mod rtnetlink;
 mod socket_worker;
 mod resolver;
@@ -36,7 +37,7 @@ mod supervisor;
 pub use child::run;
 use ethernet_device::ServiceEthernetDevice;
 pub use lifecycle::{InterfaceInstaller, WifiLifecycleReceiver, WifiLifecycleUpdate};
-pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor};
+pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor, run_namespace_supervisor};
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;
 

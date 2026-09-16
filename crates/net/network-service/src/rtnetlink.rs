@@ -63,7 +63,7 @@ impl View {
         let mut b = vec![0, 0];
         b.extend_from_slice(&(if loopback { 772u16 } else { 1u16 }).to_ne_bytes());
         b.extend_from_slice(&Self::index(i)?.to_ne_bytes());
-        let iflags = if loopback { 0x49u32 } else { 0x1002 | if self.online { 0x10041 } else { 0 } };
+        let iflags = if loopback { 0x8u32 | if i.ipv4_enabled || i.ipv6_enabled { 0x10041 } else { 0 } } else { 0x1002 | if self.online { 0x10041 } else { 0 } };
         b.extend_from_slice(&iflags.to_ne_bytes());
         b.extend_from_slice(&0u32.to_ne_bytes());
         let name = if loopback { "lo".to_string() } else { format!("netstack{}", i.id - 1) };
@@ -71,7 +71,7 @@ impl View {
         let mtu = if loopback { 65536u32 } else { u32::from(crate::SOFTMAC_ETHERNET_MTU) };
         attribute(&mut b, 4, &mtu.to_ne_bytes());
         attribute(&mut b, 1, &if loopback { [0; 6] } else { self.mac });
-        attribute(&mut b, 16, &[if loopback || self.online { 6 } else { 2 }]); // operstate
+        attribute(&mut b, 16, &[if loopback { 0 } else if self.online { 6 } else { 2 }]); // operstate
         Ok(message(LINK, flags, seq, pid, &b))
     }
     fn address(i: &InterfaceSnapshot, a: &Address, kind: u16, seq: u32, pid: u32, flags: u16) -> Result<Vec<u8>, i32> {
@@ -129,7 +129,8 @@ impl View {
         let mut records = Vec::new();
         for i in &self.interfaces {
             let before = old.interfaces.iter().find(|b| b.id == i.id);
-            if before.is_none() || self.online != old.online || self.mac != old.mac {
+            if before.is_none_or(|before| before.ipv4_enabled != i.ipv4_enabled || before.ipv6_enabled != i.ipv6_enabled)
+                || self.online != old.online || self.mac != old.mac {
                 records.push((1, self.link(i, 0, 0, 0)?));
             }
             if let Some(before) = before {
@@ -158,6 +159,34 @@ impl View {
         Ok(records)
     }
 }
+/// The supported mutation is administrative loopback state, not arbitrary
+/// link creation. Credentials come from the kernel record, never nlmsg_pid.
+fn loopback_change(request: &[u8], capable: bool) -> Result<bool, i32> {
+    if !capable { return Err(libc::EPERM); }
+    if request.len() < 32 { return Err(libc::EINVAL); }
+    if u16_at(request, 6) & 1 == 0 || request[16] != 0 || request[17] != 0 {
+        return Err(libc::EINVAL);
+    }
+    if u16_at(request, 6) & !5 != 0 || u32_at(request, 28) != libc::IFF_UP as u32 {
+        return Err(libc::EOPNOTSUPP);
+    }
+    let index = u32_at(request, 20);
+    if index > 1 { return Err(libc::ENODEV); }
+    let mut named = false;
+    let mut attrs = &request[32..];
+    while !attrs.is_empty() {
+        if attrs.len() < 4 { return Err(libc::EINVAL); }
+        let len = u16_at(attrs, 0) as usize;
+        if len < 4 || len > attrs.len() { return Err(libc::EINVAL); }
+        if u16_at(attrs, 2) != 3 { return Err(libc::EOPNOTSUPP); }
+        if &attrs[4..len] != b"lo\0" { return Err(libc::ENODEV); }
+        if named { return Err(libc::EINVAL); }
+        named = true;
+        attrs = &attrs[align(len).min(attrs.len())..];
+    }
+    if index == 0 && !named { return Err(libc::ENODEV); }
+    Ok(u32_at(request, 24) & libc::IFF_UP as u32 != 0)
+}
 struct Client {
     fd: OwnedFd,
     output: VecDeque<Vec<u8>>,
@@ -175,7 +204,7 @@ impl Client {
         self.output.push_back(record);
         Ok(())
     }
-    fn read(&mut self, view: &View) -> Result<bool, Errno> {
+    fn read(&mut self, view: &mut View, set_up: &mut impl FnMut(bool) -> Result<View, Errno>) -> Result<bool, Errno> {
         let mut buf = [0u8; MAX_MESSAGE + 40];
         let n = match rustix::io::read(&self.fd, &mut buf) {
             Ok(n) => n,
@@ -195,10 +224,20 @@ impl Client {
                     count += 1;
                     if count > 32 { return Err(Errno::NOBUFS); }
                     let request = &payload[..len];
-                    match view.request(request, pid) {
+                    if u16_at(request, 4) == LINK {
+                        let result = loopback_change(request, u32_at(&buf, 32) != 0)
+                            .and_then(|up| set_up(up).map_err(|error| error.raw_os_error()));
+                        match result {
+                            Ok(updated) => {
+                                *view = updated;
+                                if u16_at(request, 6) & 4 != 0 { self.queue(0, error(request, pid, 0))?; }
+                            }
+                            Err(errno) => self.queue(0, error(request, pid, errno))?,
+                        }
+                    } else { match view.request(request, pid) {
                         Ok(records) => for record in records { self.queue(0, record)?; },
                         Err(errno) => self.queue(0, error(request, pid, errno))?,
-                    }
+                    } }
                     payload = &payload[align(len).min(payload.len())..];
                 }
             }
@@ -234,7 +273,7 @@ impl Adapter {
         epoll::add(poll, &registration, epoll::EventData::new_u64(TOKEN), epoll::EventFlags::IN)?;
         Ok(Self { registration, clients: HashMap::new(), view: None })
     }
-    pub(crate) fn advance(&mut self, poll: BorrowedFd<'_>, events: &[libc::epoll_event], update: Option<View>) -> Result<bool, Errno> {
+    pub(crate) fn advance(&mut self, poll: BorrowedFd<'_>, events: &[libc::epoll_event], update: Option<View>, set_up: &mut impl FnMut(bool) -> Result<View, Errno>) -> Result<bool, Errno> {
         let mut progress = false;
         let mut ready: Vec<i32> = events.iter().filter_map(|e| {
             let token = e.u64;
@@ -257,7 +296,28 @@ impl Adapter {
                 progress = true;
             }
         }
-        if let (Some(old), Some(view)) = (&self.view, &update)
+        let old_view = self.view.clone();
+        if let Some(view) = update { self.view = Some(view); }
+        ready.sort_unstable(); ready.dedup();
+        for fd in ready {
+            let Some(client) = self.clients.get_mut(&fd) else { continue };
+            let result = (|| {
+                // Don't accumulate queries behind a blocked dump.
+                progress |= client.flush()?;
+                if client.output.is_empty() {
+                    for _ in 0..32 {
+                        if !client.read(self.view.as_mut().unwrap(), set_up)? { break; }
+                        progress = true;
+                        progress |= client.flush()?;
+                        if !client.output.is_empty() { break; }
+                    }
+                }
+                epoll::modify(poll, &client.fd, epoll::EventData::new_u64(TAG | fd as u64),
+                    if client.output.is_empty() { epoll::EventFlags::IN } else { epoll::EventFlags::OUT })
+            })();
+            if result.is_err() { self.clients.remove(&fd); progress = true; }
+        }
+        if let (Some(old), Some(view)) = (&old_view, &self.view)
             && old != view
         {
             if old.interfaces.iter().any(|i| i.incomplete) || view.interfaces.iter().any(|i| i.incomplete) {
@@ -274,26 +334,6 @@ impl Adapter {
                     progress = true;
                 }
             }
-        }
-        if let Some(view) = update { self.view = Some(view); }
-        ready.sort_unstable(); ready.dedup();
-        for fd in ready {
-            let Some(client) = self.clients.get_mut(&fd) else { continue };
-            let result = (|| {
-                // Don't accumulate queries behind a blocked dump.
-                progress |= client.flush()?;
-                if client.output.is_empty() {
-                    for _ in 0..32 {
-                        if !client.read(self.view.as_ref().unwrap())? { break; }
-                        progress = true;
-                        progress |= client.flush()?;
-                        if !client.output.is_empty() { break; }
-                    }
-                }
-                epoll::modify(poll, &client.fd, epoll::EventData::new_u64(TAG | fd as u64),
-                    if client.output.is_empty() { epoll::EventFlags::IN } else { epoll::EventFlags::OUT })
-            })();
-            if result.is_err() { self.clients.remove(&fd); progress = true; }
         }
         Ok(progress)
     }
@@ -334,4 +374,36 @@ mod tests {
     fn unsupported_mutations_are_not_successful_empty_dumps() {
         assert_eq!(view().request(&message(20,0x301,1,1,&[0]),1), Err(libc::EOPNOTSUPP));
     }
+    #[test]
+    fn loopback_mutation_requires_authenticated_authority_and_exact_scope() {
+        let mut body = [0u8; 16];
+        body[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        body[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        body[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        let mut request = message(LINK, 5, 1, 0, &body);
+        assert_eq!(loopback_change(&request, false), Err(libc::EPERM));
+        assert_eq!(loopback_change(&request, true), Ok(true));
+        request[24..28].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(loopback_change(&request, true), Ok(false));
+        request[20..24].copy_from_slice(&2u32.to_ne_bytes());
+        assert_eq!(loopback_change(&request, true), Err(libc::ENODEV));
+        request[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        request[28..32].copy_from_slice(&9u32.to_ne_bytes());
+        assert_eq!(loopback_change(&request, true), Err(libc::EOPNOTSUPP));
+        assert_eq!(loopback_change(&request[..31], true), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn loopback_link_events_follow_core_enablement_not_ethernet() {
+        let old = View::new(vec![InterfaceSnapshot { id: u64::MAX, ..Default::default() }],
+            false, [0; 6]);
+        let mut new = old.clone();
+        new.interfaces[0].ipv4_enabled = true;
+        let changes = new.changes(&old).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(u32_at(&old.link(&old.interfaces[0], 0, 0, 0).unwrap(), 24) & 1, 0);
+        assert_eq!(u32_at(&changes[0].1, 24) & 1, 1);
+        assert_eq!(changes[0].0, 1);
+    }
+
 }
