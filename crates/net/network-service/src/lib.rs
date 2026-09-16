@@ -2,6 +2,9 @@
 
 //! Sandboxed native Netstack3 service and application networking.
 
+// Optimized cross-crate Netstack3 lock-order proofs exceed rustc's default depth.
+#![recursion_limit = "256"]
+
 use netstack3_port_integration::{
     Runtime, RuntimeError, NativeSocketAddress, NativeIpAddress,
     sockets::{TcpSocket, IpVersion, Connection},
