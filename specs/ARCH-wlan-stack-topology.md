@@ -78,7 +78,8 @@ interface administration, lifecycle, and read-only status capabilities. See
 The netcfg process graph has host/native-build tests and bounded physical
 MT7921 KVM coverage, including repeated link replacement, application traffic
 and certified shutdown. This is not sustained host-deployment acceptance.
-Separate DNS is a later refinement. Persistent
+The host deployment runs separate DNS for NSS and loopback UDP/TCP;
+legacy network fixtures retain an integrated resolver. Persistent
 credential storage stays out of the Wi-Fi process, and device/DMA authority
 stays out of Internet parsers. The Wi-Fi process necessarily receives active
 connection authentication material and session keys; it is not secret-free.
@@ -87,7 +88,7 @@ connection authentication material and session keys; it is not secret-free.
 |---|---|---|---|---|---|---|
 | driver + MLME + SME + RSN | VFIO/DMA, 802.11 control, SAE, 4-way handshake, keys | no | active connection only | yes | no | ephemeral |
 | netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | provider generation; survives link replacement |
-| dns (later separate process) | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
+| dns | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
 | policy (wlancfg) | saved networks, config, credentials, connection policy | yes | yes | no | no | stateful |
 
 The netstack remains one service and is not split by DNS domain, remote address,

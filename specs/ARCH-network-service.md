@@ -71,15 +71,17 @@ One sandboxed portable network service owns Ethernet, ARP/NDP, IP,
 fragmentation, ICMP, UDP, TCP, and routing. It is not split by DNS domain,
 remote address, connection, or application frontend. SOCKS and the Linux
 socket frontend are bindings to this service, not separate network stacks.
-Wi-Fi selection and credentials belong to wlancfg. DNS currently shares
-the network process and uses Hickory 0.26.3 with native Netstack3 transport;
-the NSS endpoint carries lookup requests, not DNS parsing or a second
-network stack. The kernel-provider launcher owns and locks its Unix listener,
-passing only the listener capability into the sandbox. The endpoint survives
-link and provider replacement; a new launcher may reclaim a stale endpoint
-only after excluding a live owner. Its C ABI pointer adapter is isolated from safe Rust lookup,
-layout and I/O code; the separate DNS service described in
-[ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) remains a later boundary.
+Wi-Fi selection and credentials belong to wlancfg. The host deployment uses
+the separately sandboxed DNS service described in
+[ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md): one encrypted upstream
+engine serves NSS and IPv4/IPv6 loopback UDP/TCP clients through Netstack3.
+The service manager owns the NSS listener path and passes the listening
+capability to DNS; it never competes with a provider-owned NSS listener.
+Legacy standalone network fixtures retain the integrated Hickory 0.26.3
+resolver and its launcher-owned, locked Unix endpoint. Host deployments
+disable that endpoint rather than running two independent resolver policies.
+The NSS C ABI pointer adapter remains isolated from safe Rust lookup,
+layout and I/O code.
 
 The production Linux frontend owns the existing `AF_INET` and `AF_INET6`
 socket families. It uses native socket objects, local bounded queues,

@@ -62,8 +62,31 @@ pub fn lockdown() -> io::Result<Capabilities> {
     }
     input(3, 8192)?;
     input(4, 2097152)?;
+    let inherited_nss = std::env::var_os("DRV_DNS_INHERIT_NSS").is_some();
+    let nss = if inherited_nss {
+        // FD 5 is a pre-bound listener from the trusted service manager.
+        for (option, expected) in [
+            (libc::SO_DOMAIN, libc::AF_UNIX),
+            (libc::SO_TYPE, libc::SOCK_STREAM),
+            (libc::SO_ACCEPTCONN, 1),
+        ] {
+            let mut value = 0i32;
+            let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+            unsafe {
+                check(libc::getsockopt(5, libc::SOL_SOCKET, option,
+                    (&mut value as *mut i32).cast(), &mut len) as _)?;
+            }
+            if value != expected {
+                return Err(io::Error::other("invalid inherited NSS listener"));
+            }
+        }
+        Some(unsafe { UnixListener::from_raw_fd(5) })
+    } else {
+        None
+    };
     unsafe {
-        check(libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0))?;
+        check(libc::syscall(libc::SYS_close_range,
+            if inherited_nss { 6u32 } else { 5u32 }, u32::MAX, 0))?;
     }
     unsafe {
         let mut pipe = [-1; 2];
@@ -83,10 +106,16 @@ pub fn lockdown() -> io::Result<Capabilities> {
         tcp.push(t);
     }
     // The trusted launcher owns stale-path removal after the previous process exits.
-    let nss = UnixListener::bind(drv_dns_wire::PATH)?;
+    let nss = match nss {
+        Some(listener) => listener,
+        None => {
+            let listener = UnixListener::bind(drv_dns_wire::PATH)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))?;
+            listener
+        }
+    };
     nss.set_nonblocking(true)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))?;
     unsafe {
         check(libc::unshare(libc::CLONE_NEWNS) as _)?;
         check(libc::mount(

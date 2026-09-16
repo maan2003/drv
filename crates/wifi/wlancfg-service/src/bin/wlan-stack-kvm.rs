@@ -145,11 +145,20 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("create saved-network directory: {error}"))?;
     let (_application_lock, application) =
         bind_listener(Path::new("/run/drv/wlancfg.sock"), ListenerKind::Policy)?;
-    let (_resolver_lock, resolver) =
-        bind_listener(Path::new(drv_dns_wire::PATH), ListenerKind::Resolver)?;
+    // Standalone DNS owns NSS and wire DNS in the host deployment. Keep the
+    // integrated endpoint for fixtures that do not launch the DNS service.
+    let resolver = if std::env::var_os("DRV_EXTERNAL_DNS").is_some() {
+        None
+    } else {
+        Some(bind_listener(Path::new(drv_dns_wire::PATH), ListenerKind::Resolver)?)
+    };
+    let (_resolver_lock, resolver) = match resolver {
+        Some((lock, listener)) => (Some(lock), Some(std::os::unix::net::UnixListener::from(listener))),
+        None => (None, None),
+    };
+    let integrated_resolver = resolver.is_some();
     let (_netcfg_lock, netcfg_listener) =
         bind_listener(Path::new(drv_network_service::netcfg::STATUS_PATH), ListenerKind::NetworkStatus)?;
-    let resolver = std::os::unix::net::UnixListener::from(resolver);
     let state = File::open(&state_directory)
         .map_err(|error| format!("open saved-network directory: {error}"))?;
     if unsafe { libc::fchown(state.as_raw_fd(), 65534, 65534) } != 0 {
@@ -192,7 +201,7 @@ fn run() -> Result<(), String> {
 
     let mut network =
         match NetworkServiceSupervisor::new_kernel(
-            network_binary, "/dev/netstack3", mac, Some(resolver),
+            network_binary, "/dev/netstack3", mac, resolver,
         ) {
             Ok(network) => network,
             Err(error) => {
@@ -220,7 +229,7 @@ fn run() -> Result<(), String> {
     // Diagnostic output must not unwind past live hardware-owning children.
     let _ = writeln!(
         std::io::stdout(),
-        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider netcfg=netcfg-service resolver=true"
+        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider netcfg=netcfg-service resolver={integrated_resolver}"
     );
 
     let mut shutdown_cause = None;
