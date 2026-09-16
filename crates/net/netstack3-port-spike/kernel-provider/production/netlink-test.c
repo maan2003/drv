@@ -18,12 +18,14 @@
 #include <stdint.h>
 #include <endian.h>
 #include "netlink-protocol.h"
+#include "namespace-protocol.h"
 static void check(int ok, const char *what) {
     if (!ok) { fprintf(stderr,"FAIL %s errno=%d\n",what,errno); exit(1); }
 }
 static int registration(void) {
-    int fd=open("/dev/netstack3-netlink",O_RDWR|O_CLOEXEC);
-    check(fd>=0,"registration"); return fd;
+    int fd=open("/dev/netstack3",O_RDWR|O_CLOEXEC);
+    check(fd>=0,"registration");
+    check(ioctl(fd,NS3_NAMESPACE_READY)==0,"ready"); return fd;
 }
 static int client(unsigned groups) {
     int fd=socket(AF_NETLINK,SOCK_RAW|SOCK_NONBLOCK,NETLINK_ROUTE);
@@ -77,7 +79,7 @@ static void *blocked_receive(void *ptr) {
 int main(void) {
     alarm(15);
     int reg=registration();
-    check(open("/dev/netstack3-netlink",O_RDWR)==-1 && errno==EBUSY,"exclusive registration");
+    check(open("/dev/netstack3",O_RDWR)==-1 && errno==EBUSY,"exclusive registration");
     int a=client(0),b=client(RTMGRP_LINK);
     int ea=claim(reg),eb=claim(reg);
     check(ioctl(ea,NS3_NL_CLAIM,&(uint64_t){0})==-1 && errno==ENOTTY,"typed endpoint");
@@ -122,7 +124,7 @@ int main(void) {
     pid_t pid=fork(); check(pid>=0,"credential fork");
     if(!pid) {
         check(!setgid(65534) && !setuid(65534),"drop credentials");
-        check(open("/dev/netstack3-netlink",O_RDWR)<0,"unprivileged registration denied");
+        check(open("/dev/netstack3",O_RDWR)<0,"unprivileged registration denied");
         send_request(unpriv); _exit(0);
     }
     int status; check(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status),"credential child");

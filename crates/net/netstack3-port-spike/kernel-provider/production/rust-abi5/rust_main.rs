@@ -8,7 +8,7 @@ mod netlink;
 mod namespace;
 use core::pin::Pin;
 use core::{ffi::c_void, ptr};
-use frontend::{Namespace, Session, Socket};
+use frontend::{Namespace, Socket};
 use kernel::{
     bindings,
     prelude::*,
@@ -20,9 +20,8 @@ use kernel::{
 // escape the callback; only explicit Arc clones may outlive it. C release
 // consumes the exact foreign owner created for its object.
 #[no_mangle]
-unsafe extern "C" fn ns3_net_new(net: *mut c_void) -> *mut c_void {
-    // SAFETY: pernet init owns this native namespace through construction.
-    Namespace::new(unsafe { linux::NativeNamespace::acquire(net) })
+extern "C" fn ns3_net_new() -> *mut c_void {
+    Namespace::new()
         .map(ForeignOwnable::into_foreign)
         .unwrap_or(ptr::null_mut())
 }
@@ -39,14 +38,14 @@ unsafe extern "C" fn ns3_socket_new(
     sk: *mut c_void,
     family: i32,
     kind: i32,
-    claimed: bool,
+    generation: u64,
     out: *mut *mut c_void,
 ) -> i32 {
     // SAFETY: C supplies a live pernet owner and initialized native sock;
     // acquire retains a native reference independent of the application file.
     let namespace = unsafe { Arc::<Namespace>::borrow(ns) }.into();
     let native = unsafe { linux::NativeSock::acquire(sk) };
-    match Namespace::socket(namespace, native, family, kind, claimed) {
+    match Namespace::socket(namespace, native, family, kind, generation) {
         Ok(socket) => {
             unsafe { out.write(socket.into_foreign()) };
             0
@@ -158,7 +157,7 @@ unsafe extern "C" fn provider_open(_inode: *mut bindings::inode, file: *mut bind
         let net = linux::NetRef::current()?;
         // SAFETY: NetRef retains the namespace and its pernet Arc during borrow.
         let namespace: Arc<Namespace> = unsafe { Arc::<Namespace>::borrow(net.state()) }.into();
-        let session = namespace.lifecycle.register_manual(|| Session::new(namespace.clone()))?;
+        let session = broker().register(namespace)?;
         // SAFETY: open exclusively initializes this file's private data.
         unsafe { (*file).private_data = session.into_foreign() };
         Ok(())
@@ -167,7 +166,7 @@ unsafe extern "C" fn provider_open(_inode: *mut bindings::inode, file: *mut bind
 }
 const REGISTRATION: bindings::file_operations = bindings::file_operations {
     open: Some(provider_open),
-    ..endpoint_file::operations::<Session>()
+    ..endpoint_file::operations::<namespace::Provider>()
 };
 #[no_mangle]
 extern "C" fn ns3_registration_ops() -> *const bindings::file_operations {
@@ -181,14 +180,14 @@ extern "C" fn ns3_registration_ops() -> *const bindings::file_operations {
 unsafe extern "C" fn ns3_nl_socket_new(ns: *mut c_void, sk: *mut c_void, out: *mut *mut c_void) -> i32 {
     let namespace = unsafe { Arc::<Namespace>::borrow(ns) };
     let namespace: Arc<Namespace> = namespace.into();
-    if namespace.lifecycle.managed() || broker().connected() {
-        if let Err(error) = broker().ensure(&namespace) { return error.to_errno(); }
-    }
+    let generation = match broker().ensure(&namespace) {
+        Ok(generation) => generation,
+        Err(error) => return error.to_errno(),
+    };
     let native = unsafe { linux::NativeSock::acquire(sk) };
-    match netlink::Namespace::socket(namespace.netlink.clone(), native) {
-        Ok(Some(channel)) => { unsafe { out.write(channel.into_foreign()) }; 0 }
-        Ok(None) => 0,
-        Err(error) => error.to_errno(),
+    match netlink::Namespace::socket(namespace.netlink.clone(), native, generation) {
+        Ok(channel) => { unsafe { out.write(channel.into_foreign()) }; 0 }
+        Err(e) => e.to_errno(),
     }
 }
 #[no_mangle]
@@ -215,23 +214,6 @@ unsafe extern "C" fn ns3_nl_poll(p: *mut c_void, f: *mut bindings::file,
 {
     unsafe { Arc::<netlink::Channel>::borrow(p) }.app_poll(&unsafe { endpoint_file::Poll::new(f, t) })
 }
-unsafe extern "C" fn netlink_provider_open(_inode: *mut bindings::inode, file: *mut bindings::file) -> i32 {
-    (|| -> Result {
-        let net = linux::NetRef::current()?;
-        let namespace = unsafe { Arc::<Namespace>::borrow(net.state()) };
-        let session = namespace.lifecycle.register_manual(|| netlink::Session::new(namespace.netlink.clone()))?;
-        unsafe { (*file).private_data = session.into_foreign() };
-        Ok(())
-    })().map(|()| 0).unwrap_or_else(|e| e.to_errno())
-}
-const NETLINK_REGISTRATION: bindings::file_operations = bindings::file_operations {
-    open: Some(netlink_provider_open), ..endpoint_file::operations::<netlink::Session>()
-};
-#[no_mangle]
-extern "C" fn ns3_netlink_registration_ops() -> *const bindings::file_operations {
-    &NETLINK_REGISTRATION
-}
-
 kernel::sync::global_lock! {
     // SAFETY: initialized once from the C initcall before pernet registration.
     unsafe(uninit) static NAMESPACE_BROKER: Mutex<Option<Arc<namespace::Broker>>> = None;
@@ -262,17 +244,20 @@ const BROKER_REGISTRATION: bindings::file_operations = bindings::file_operations
 };
 #[no_mangle]
 extern "C" fn ns3_broker_ops() -> *const bindings::file_operations { &BROKER_REGISTRATION }
+/// Native caller holds a socket/net reference throughout this synchronous call.
+/// Only fixed, pointer-free bytes cross the worker boundary.
 #[no_mangle]
-unsafe extern "C" fn ns3_loopback_flags(ns: *mut c_void, flags: u32) {
-    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.flags_changed(flags);
-}
-#[no_mangle]
-unsafe extern "C" fn ns3_wait_loopback(ns: *mut c_void) -> i32 {
-    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.wait_applied()
-        .map(|()| 0).unwrap_or_else(|error| error.to_errno())
-}
-
-#[no_mangle]
-unsafe extern "C" fn ns3_loopback_managed(ns: *mut c_void) -> bool {
-    unsafe { Arc::<Namespace>::borrow(ns) }.lifecycle.managed()
+unsafe extern "C" fn ns3_interface_request(ns: *mut c_void, input: *const u8,
+    output: *mut u8, capacity: usize) -> i32
+{
+    let namespace: Arc<Namespace> = unsafe { Arc::<Namespace>::borrow(ns) }.into();
+    let request = unsafe { *input.cast::<[u8; 48]>() };
+    let result = (|| -> Result<i32> {
+        let generation = broker().ensure(&namespace)?;
+        let reply = namespace.lifecycle.control(generation, request)?;
+        if reply.len() > capacity { return Err(EMSGSIZE); }
+        unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), output, reply.len()) };
+        Ok(reply.len() as i32)
+    })();
+    result.unwrap_or_else(|error| error.to_errno())
 }

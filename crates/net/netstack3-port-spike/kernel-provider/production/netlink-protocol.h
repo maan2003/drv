@@ -3,9 +3,9 @@
 #define NS3_NETLINK_PROTOCOL_H
 #include <linux/types.h>
 /*
- * /dev/netstack3-netlink registers NETLINK_ROUTE in the opener's namespace.
+ * /dev/netstack3 serves INET and NETLINK_ROUTE in one namespace generation.
  * Privileged launcher passes this FD into the sandbox. Registration applies
- * to subsequently created user route sockets. Existing sockets retain their
+ * to user route sockets after READY. Existing sockets retain their
  * original owner. Once delegated, absence never falls back to kernel state.
  * CLAIM returns a nonblocking, CLOEXEC FD permanently bound to one socket.
  *

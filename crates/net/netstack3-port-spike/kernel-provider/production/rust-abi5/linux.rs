@@ -17,7 +17,7 @@ unsafe extern "C" {
     fn ns3_current_net() -> *mut c_void;
     fn ns3_put_net(p: *mut c_void);
     fn ns3_net_state(p: *mut c_void) -> *mut c_void;
-    fn ns3_new_accepted(p: *mut c_void, family: i32) -> *mut c_void;
+    fn ns3_new_accepted(p: *mut c_void, family: i32, generation: u64) -> *mut c_void;
     fn ns3_accepted_state(p: *mut c_void) -> *mut c_void;
     fn ns3_accept_transfer(p: *mut c_void, new: *mut c_void);
     fn ns3_accept_drop(p: *mut c_void);
@@ -57,8 +57,8 @@ impl NativeSock {
     pub(crate) fn netlink_writable(&self) -> u32 {
         if unsafe { ns3_nl_writable(self.0.as_ptr()) } { bindings::POLLOUT } else { 0 }
     }
-    pub(crate) fn accepted(&self, family: i32) -> Result<Accepted> {
-        let p = from_err_ptr(unsafe { ns3_new_accepted(self.0.as_ptr(), family) })?;
+    pub(crate) fn accepted(&self, family: i32, generation: u64) -> Result<Accepted> {
+        let p = from_err_ptr(unsafe { ns3_new_accepted(self.0.as_ptr(), family, generation) })?;
         Ok(Accepted(unsafe { NonNull::new_unchecked(p) }))
     }
 }
@@ -66,34 +66,6 @@ impl Drop for NativeSock {
     fn drop(&mut self) {
         unsafe { ns3_put(self.0.as_ptr()) }
     }
-}
-unsafe extern "C" {
-    fn ns3_hold_passive(net: *mut c_void);
-    fn ns3_put_passive(net: *mut c_void);
-    fn ns3_net_cookie(net: *mut c_void) -> u64;
-    fn ns3_set_loopback(net: *mut c_void, up: bool) -> i32;
-}
-/// Memory-only namespace lease. Native operations acquire a live reference and
-/// fail after native teardown; this lease never prevents that teardown.
-pub(crate) struct NativeNamespace(NonNull<c_void>);
-// SAFETY: passive native references are atomic; operations acquire their own
-// live net reference and serialize device state with RTNL.
-unsafe impl Send for NativeNamespace {}
-unsafe impl Sync for NativeNamespace {}
-impl NativeNamespace {
-    /// Caller owns a live native namespace during acquisition.
-    pub(crate) unsafe fn acquire(p: *mut c_void) -> Self {
-        unsafe { ns3_hold_passive(p) };
-        Self(unsafe { NonNull::new_unchecked(p) })
-    }
-    pub(crate) fn id(&self) -> u64 { unsafe { ns3_net_cookie(self.0.as_ptr()) } }
-    pub(crate) fn set_loopback(&self, up: bool) -> Result {
-        let result = unsafe { ns3_set_loopback(self.0.as_ptr(), up) };
-        if result < 0 { Err(Error::from_errno(result)) } else { Ok(()) }
-    }
-}
-impl Drop for NativeNamespace {
-    fn drop(&mut self) { unsafe { ns3_put_passive(self.0.as_ptr()) } }
 }
 pub(crate) struct NetRef(NonNull<c_void>);
 // SAFETY: get_net/put_net references may cross threads; namespace data is locked.

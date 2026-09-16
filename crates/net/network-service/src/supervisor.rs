@@ -50,7 +50,7 @@ fn capability_revoked(frame: &OwnedFd) -> Result<bool, String> {
 
 fn duplicate_capability(fd: RawFd) -> Result<OwnedFd, String> {
     const F_DUPFD_CLOEXEC: i32 = 1030;
-    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, crate::namespace::CONTROL_FD + 1) };
+    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, crate::rtnetlink::REGISTRATION_FD + 1) };
     if duplicate < 0 {
         return Err(format!(
             "duplicate network-service capability: {}",
@@ -439,15 +439,6 @@ impl NetworkServiceSupervisor {
             .open(registration_path)
             .map_err(|error| format!("open fresh kernel registration: {error}"))?;
         let registration = duplicate_capability(registration.as_raw_fd())?;
-        let use_netlink = true;
-        #[cfg(test)]
-        let use_netlink = use_netlink && !self.fixture;
-        let netlink_registration = if use_netlink {
-            let fd = OpenOptions::new().read(true).write(true)
-                .open("/dev/netstack3-netlink")
-                .map_err(|e| format!("open netlink registration: {e}"))?;
-            Some(duplicate_capability(fd.as_raw_fd())?)
-        } else { None };
         let (control_parent, control_child) = seqpacket_pair()?;
         let control_pass = duplicate_capability(control_child.as_raw_fd())?;
         let (mut bootstrap_parent, bootstrap_child) = std::os::unix::net::UnixStream::pair()
@@ -463,9 +454,6 @@ impl NetworkServiceSupervisor {
             (bootstrap_pass.as_raw_fd(), BOOTSTRAP_FD),
             (control_pass.as_raw_fd(), LINK_CONTROL_FD),
         ];
-        if let Some(registration) = &netlink_registration {
-            inherited.push((registration.as_raw_fd(), crate::rtnetlink::REGISTRATION_FD));
-        }
         if let Some(listener) = &resolver_pass {
             inherited.push((listener.as_raw_fd(), 7));
         }
@@ -498,7 +486,6 @@ impl NetworkServiceSupervisor {
                 command.env("DRV_NETWORK_SERVICE_SUPERVISOR_FIXTURE_ECHO", "1");
             }
         }
-        if netlink_registration.is_some() { command.arg("--netlink"); }
         if resolver_pass.is_some() {
             #[cfg(not(test))]
             command.arg("--resolver-fd");
@@ -1948,12 +1935,10 @@ pub fn run_namespace_supervisor(binary: impl AsRef<Path>) -> Result<(), String> 
             let mut command = Command::new(binary.as_ref());
             command.env_clear()
                 .env("DRV_NETSTACK_PARENT_PID", std::process::id().to_string())
-                .args(["--namespace", "--netlink"])
+                .arg("--namespace")
                 .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
             let mut child = match spawn_provider(&mut command, vec![
                 (inherited.as_raw_fd(), FRAME_FD),
-                (inherited.as_raw_fd(), crate::rtnetlink::REGISTRATION_FD),
-                (inherited.as_raw_fd(), crate::namespace::CONTROL_FD),
             ]) {
                 Ok(child) => child,
                 Err(error) => {

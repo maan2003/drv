@@ -867,7 +867,7 @@ mod tests {
             _ => panic!("unknown denial"),
         };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 50);
-        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"), true, true);
+        let filter = provider_filter(operation.to_str().unwrap().starts_with("ethernet-"), true);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 51);
         unsafe { libc::syscall(syscall_args[0], syscall_args[1], syscall_args[2], syscall_args[3], 0usize, 0usize, 0usize); }
@@ -915,7 +915,7 @@ mod tests {
             56,
         );
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 57);
-        let filter = provider_filter(true, true, false);
+        let filter = provider_filter(true, true);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(
             unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0,
@@ -979,7 +979,7 @@ mod tests {
         // Identical object at a formerly protected slot and an arbitrary high slot.
         child_require(unsafe { libc::dup2(source.as_raw_fd(), 4) } == 4, 71);
         child_require(unsafe { libc::dup2(source.as_raw_fd(), 73) } == 73, 72);
-        let filter = provider_filter(true, true, true);
+        let filter = provider_filter(true, true);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 73);
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 74);
@@ -1032,7 +1032,7 @@ mod tests {
         // for ordinary application endpoints.
         child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 8) } == 8, 68);
         child_require(unsafe { libc::dup2(_peer.as_raw_fd(), 9) } == 9, 69);
-        let filter = provider_filter(true, false, false);
+        let filter = provider_filter(true, false);
         let program = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
         child_require(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0, 63);
         child_require(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) } == 0, 64);
@@ -1500,8 +1500,6 @@ pub(crate) fn provider_setup(
     bootstrap: bool,
     resolver: bool,
     link_control: bool,
-    netlink: bool,
-    namespace: bool,
 ) -> Result<(), String> {
     unsafe {
         if !ethernet { close(4); }
@@ -1510,17 +1508,7 @@ pub(crate) fn provider_setup(
         if !link_control { close(crate::link_control::CONTROL_FD); }
         close(9);
     }
-    let first_close = if namespace {
-        crate::namespace::CONTROL_FD as u32 + 1
-    } else if netlink {
-        crate::rtnetlink::REGISTRATION_FD as u32 + 1
-    } else if link_control {
-        crate::link_control::CONTROL_FD as u32 + 1
-    } else if resolver {
-        8 // FD7 is the pre-bound resolver listener.
-    } else {
-        6
-    };
+    let first_close = crate::rtnetlink::REGISTRATION_FD as u32 + 1;
     setup(unsafe { getppid() }, first_close)?;
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 { return Err(std::io::Error::last_os_error().to_string()); }
@@ -1528,7 +1516,7 @@ pub(crate) fn provider_setup(
         if unsafe { libc::dup3(epoll, EPOLL_FD, libc::O_CLOEXEC) } < 0 { return Err(std::io::Error::last_os_error().to_string()); }
         unsafe { close(epoll); }
     }
-    let mut filter = provider_filter(ethernet || link_control, link_control, netlink);
+    let mut filter = provider_filter(ethernet || link_control, link_control);
     if resolver {
         // Add the only new syscall authority: accept from the pre-bound resolver listener.
         let mut accept = Vec::new();
@@ -1539,7 +1527,7 @@ pub(crate) fn provider_setup(
     syscall_ok(unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0usize, 0usize) }, "provider seccomp")
 }
 
-fn provider_filter(ethernet: bool, link_control: bool, netlink: bool) -> Vec<SockFilter> {
+fn provider_filter(ethernet: bool, link_control: bool) -> Vec<SockFilter> {
     let mut filter = vec![
         stmt(BPF_LD | BPF_W | BPF_ABS, 4),
         jump(AUDIT_ARCH, 1, 0),
@@ -1555,9 +1543,8 @@ fn provider_filter(ethernet: bool, link_control: bool, netlink: bool) -> Vec<Soc
         append_message_flags(&mut filter, libc::SYS_recvmsg, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC);
         append_message_flags(&mut filter, libc::SYS_sendmsg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL);
     }
-    let mut requests = vec![0x8008B301, 0xC038B302, 0x8080B303];
-    if netlink { requests.extend([0x8008B401, crate::namespace::STATE as u32,
-        crate::namespace::ACK as u32, crate::namespace::SET_UP as u32]); }
+    let requests = [0x8008B301, 0xC038B302, 0x8080B303, 0x8008B401,
+        crate::namespace::READY as u32, crate::namespace::CLAIM_CONTROL as u32];
     filter.push(jump(libc::SYS_ioctl as u32, 0, (requests.len() + 3) as u8));
     filter.push(arg(1));
     for (i, request) in requests.iter().enumerate() {

@@ -810,31 +810,19 @@ fn kernel_provider_ethernet_guest_fixture() {
     let bootstrap_pass = unsafe { libc::fcntl(bootstrap_child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     assert!(bootstrap_pass >= 10);
     let test_netlink = std::env::var_os("DRV_KERNEL_PROVIDER_NETLINK_GUEST").is_some();
-    let netlink_registration = test_netlink.then(|| std::fs::OpenOptions::new()
-        .read(true).write(true).open("/dev/netstack3-netlink").unwrap());
-    let netlink_pass = netlink_registration.as_ref().map(|fd| unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 11)
-    });
-    if let Some(fd) = netlink_pass { assert!(fd >= 11); }
     let mut command = std::process::Command::new("/bin/netstack3-provider");
     command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap", "--resolver"]);
-    if test_netlink { command.arg("--netlink"); }
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(registration_pass, 3) < 0 || libc::dup2(frame_pass, 4) < 0
                 || libc::dup2(bootstrap_pass, 5) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if let Some(fd) = netlink_pass
-                && libc::dup2(fd, 10) < 0
-            { return Err(std::io::Error::last_os_error()); }
             Ok(())
         });
     }
     let mut child = command.spawn().unwrap();
     unsafe { libc::close(frame_pass); libc::close(registration_pass); libc::close(bootstrap_pass); }
-    if let Some(fd) = netlink_pass { unsafe { libc::close(fd); } }
-    drop(netlink_registration);
     drop((registration, frame, bootstrap_child));
     let mut ready = [0; 5];
     bootstrap.read_exact(&mut ready).unwrap();

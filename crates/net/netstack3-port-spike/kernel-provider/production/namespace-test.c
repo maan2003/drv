@@ -7,9 +7,12 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include "namespace-protocol.h"
 #include <linux/netlink.h>
+#include <linux/bpf.h>
+#include <sys/syscall.h>
 #include <linux/rtnetlink.h>
 #include <poll.h>
 #include <sched.h>
@@ -30,7 +33,8 @@ static void lifetime(void)
         CHECK(unshare(CLONE_NEWNET) == 0);
         int ns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
         int inet = open("/dev/netstack3", O_RDWR | O_CLOEXEC);
-        int route = open("/dev/netstack3-netlink", O_RDWR | O_CLOEXEC);
+        int route = dup(inet);
+        CHECK(ioctl(inet, NS3_NAMESPACE_READY) == 0);
         CHECK(ns >= 0 && inet >= 0 && route >= 0);
         int client = family ? socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)
                             : socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -119,6 +123,39 @@ static void loopback(int fd, int up)
     req.ifr_flags = up ? IFF_UP : 0;
     CHECK(ioctl(fd, SIOCSIFFLAGS, &req) == 0);
 }
+static void interface_controls(void)
+{
+    CHECK(access("/sys/class/net/lo", F_OK) == -1 && errno == ENOENT);
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(fd >= 0);
+    struct ifreq req = {};
+    strcpy(req.ifr_name, "lo");
+    CHECK(ioctl(fd, SIOCGIFINDEX, &req) == 0 && req.ifr_ifindex == 1);
+    CHECK(ioctl(fd, SIOCGIFMTU, &req) == 0 && req.ifr_mtu == 65536);
+    CHECK(ioctl(fd, SIOCGIFFLAGS, &req) == 0 && (req.ifr_flags & IFF_UP));
+    struct ifconf conf = {};
+    CHECK(ioctl(fd, SIOCGIFCONF, &conf) == 0 && conf.ifc_len == sizeof(req));
+    struct ifreq address = {};
+    conf.ifc_buf = (void *)&address;
+    CHECK(ioctl(fd, SIOCGIFCONF, &conf) == 0 && conf.ifc_len == sizeof(address));
+    CHECK(!strcmp(address.ifr_name, "lo"));
+    CHECK(((struct sockaddr_in *)&address.ifr_addr)->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    conf.ifc_len = 1;
+    CHECK(ioctl(fd, SIOCGIFCONF, &conf) == 0 && conf.ifc_len == 0);
+    struct ifreq *readonly = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(readonly != MAP_FAILED);
+    strcpy(readonly->ifr_name, "lo");
+    readonly->ifr_flags = 0;
+    CHECK(mprotect(readonly, 4096, PROT_READ) == 0);
+    CHECK(ioctl(fd, SIOCSIFFLAGS, readonly) == 0);
+    CHECK(ioctl(fd, SIOCGIFFLAGS, &req) == 0 && !(req.ifr_flags & IFF_UP));
+    CHECK(munmap(readonly, 4096) == 0);
+    loopback(fd, 1);
+    CHECK(close(fd) == 0);
+    puts("PASS_USERSPACE_INTERFACE_IOCTL_NO_NATIVE_LOOPBACK");
+}
+
 static void send_to(int fd, unsigned short port, char value)
 {
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port),
@@ -203,9 +240,7 @@ static struct ns3_namespace_claim claim(int broker)
     CHECK(poll(&ready, 1, 3000) == 1);
     struct ns3_namespace_claim result;
     CHECK(ioctl(broker, NS3_NAMESPACE_CLAIM, &result) == 0);
-    struct ns3_namespace_state state;
-    CHECK(ioctl(result.provider_fd, NS3_NAMESPACE_STATE, &state) == 0);
-    CHECK(ioctl(result.provider_fd, NS3_NAMESPACE_ACK, &state.revision) == 0);
+    CHECK(ioctl(result.provider_fd, NS3_NAMESPACE_READY) == 0);
     return result;
 }
 static void broker_failures(void)
@@ -243,14 +278,11 @@ static void broker_failures(void)
     byte(request[1], 1);
     struct ns3_namespace_claim next = claim(broker);
     byte(response[0], 0);
-    struct ns3_namespace_state before, after;
-    CHECK(ioctl(next.provider_fd, NS3_NAMESPACE_STATE, &before) == 0);
-    unsigned up = 1;
-    CHECK(ioctl(old.provider_fd, NS3_NAMESPACE_SET_UP, &up) == -1 && errno == ENETDOWN);
+    CHECK(ioctl(old.provider_fd, NS3_NAMESPACE_READY) == -1 && errno == ENETDOWN);
+    CHECK(ioctl(old.provider_fd, NS3_NAMESPACE_CONTROL) == -1 && errno == ENETDOWN);
     CHECK(ioctl(old.monitor_fd, NS3_NAMESPACE_REVOKE) == 0);
     CHECK(close(old.provider_fd) == 0 && close(old.monitor_fd) == 0);
-    CHECK(ioctl(next.provider_fd, NS3_NAMESPACE_STATE, &after) == 0);
-    CHECK(after.flags == before.flags && after.revision == before.revision);
+    CHECK(ioctl(next.provider_fd, NS3_NAMESPACE_READY) == 0);
     CHECK(close(broker) == 0);
     revoked(next.provider_fd); revoked(next.monitor_fd);
     byte(request[1], 1);
@@ -276,6 +308,7 @@ static void managed(void)
     CHECK(children(manager, pids) == 1);
     pid_t worker_a = pids[0];
     loopback(control_a, 1);
+    interface_controls();
     int server_a = udp(32001), client_a = udp(32002);
     CHECK(setns(original, CLONE_NEWNET) == 0);
     CHECK(unshare(CLONE_NEWNET) == 0);
@@ -319,6 +352,10 @@ static void managed(void)
     revoked(server_a);
     send_to(client_b, 32001, 'B'); receive(server_b, 'B');
     CHECK(setns(a, CLONE_NEWNET) == 0);
+    int replacement_control = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(replacement_control >= 0);
+    loopback(replacement_control, 1);
+    CHECK(close(replacement_control) == 0);
     int replacement = udp(32001), replacement_client = udp(32002);
     send_to(replacement_client, 32001, 'R'); receive(replacement, 'R');
     CHECK(sendto(passed, "x", 1, 0, (void *)&addr, sizeof(addr)) == -1);
@@ -334,6 +371,10 @@ static void managed(void)
     CHECK(setns(original, CLONE_NEWNET) == 0);
     manager = start_manager();
     CHECK(setns(b, CLONE_NEWNET) == 0);
+    int next_control = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(next_control >= 0);
+    loopback(next_control, 1);
+    CHECK(close(next_control) == 0);
     int next = udp(32001), next_client = udp(32002);
     send_to(next_client, 32001, 'M'); receive(next, 'M');
     puts("PASS_NAMESPACE_MANAGER_RESTART");
@@ -346,10 +387,48 @@ static void managed(void)
     CHECK(waitpid(manager, NULL, 0) == manager);
     puts("PASS_NAMESPACE_LAZY_PROVISION_AND_REAP");
 }
+static void native_boundaries(void)
+{
+    CHECK(access("/sys/class/net/lo", F_OK) == -1 && errno == ENOENT);
+    int fd = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    CHECK(fd >= 0 && close(fd) == 0);
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+    CHECK(fd >= 0 && close(fd) == 0);
+    const unsigned types[] = {BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_XDP};
+    for (unsigned i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
+        struct bpf_insn code[] = {
+            {.code = BPF_ALU64 | BPF_MOV | BPF_K, .dst_reg = BPF_REG_0,
+             .imm = types[i] == BPF_PROG_TYPE_XDP ? 2 : 0},
+            {.code = BPF_JMP | BPF_EXIT},
+        };
+        char license[] = "GPL", log[4096] = {};
+        union bpf_attr load = {};
+        load.prog_type = types[i];
+        load.insn_cnt = 2;
+        load.insns = (unsigned long)code;
+        load.license = (unsigned long)license;
+        load.log_buf = (unsigned long)log;
+        load.log_size = sizeof(log);
+        load.log_level = 1;
+        fd = syscall(SYS_bpf, BPF_PROG_LOAD, &load, sizeof(load));
+        if (fd < 0) fprintf(stderr, "BPF verifier: %s\n", log);
+        CHECK(fd >= 0);
+        char packet[64] = {};
+        union bpf_attr run = {};
+        run.test.prog_fd = fd;
+        run.test.data_in = (unsigned long)packet;
+        run.test.data_size_in = sizeof(packet);
+        run.test.repeat = 1;
+        CHECK(syscall(SYS_bpf, BPF_PROG_TEST_RUN, &run, sizeof(run)) == -1 && errno == EOPNOTSUPP);
+        CHECK(close(fd) == 0);
+    }
+    puts("PASS_NATIVE_PACKET_GENERIC_AND_BPF_BOUNDARIES");
+}
 int main(int argc, char **argv)
 {
     alarm(30);
     if (argc == 1) lifetime();
+    else if (argc == 2 && !strcmp(argv[1], "native")) native_boundaries();
     else if (argc == 2 && !strcmp(argv[1], "managed")) managed();
     else if (argc == 2 && !strcmp(argv[1], "broker")) broker_failures();
     else CHECK(!"unknown namespace test mode");

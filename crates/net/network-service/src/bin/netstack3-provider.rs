@@ -13,8 +13,6 @@ fn main() {
         args.retain(|arg| arg != "--resolver" && arg != "--resolver-fd");
         let namespace = args.iter().any(|arg| arg == "--namespace");
         args.retain(|arg| arg != "--namespace");
-        let netlink = args.iter().any(|arg| arg == "--netlink");
-        args.retain(|arg| arg != "--netlink");
         let bootstrap = args.iter().any(|arg| arg == "--bootstrap");
         let link_control = args.iter().any(|arg| arg == "--link-control");
         args.retain(|arg| arg != "--bootstrap" && arg != "--link-control");
@@ -30,9 +28,9 @@ fn main() {
                 }
                 Some(mac)
             }
-            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver | --resolver-fd] [--link-control] [--netlink] [--namespace] (registration FD3, initial frame FD4, bootstrap FD5, resolver FD7, link control FD8, netlink registration FD10, namespace control FD11)".into()),
+            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver | --resolver-fd] [--link-control] [--namespace] (registration FD3, initial frame FD4, bootstrap FD5, resolver FD7, link control FD8)".into()),
         };
-        drv_network_service::run_provider(mac, bootstrap, resolver, link_control, netlink, namespace)
+        drv_network_service::run_provider(mac, bootstrap, resolver, link_control, namespace)
     })();
     if let Err(error) = result {
         eprintln!("netstack3-provider: {error}");

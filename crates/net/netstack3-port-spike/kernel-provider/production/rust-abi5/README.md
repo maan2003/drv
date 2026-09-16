@@ -1,8 +1,18 @@
 # Rust kernel frontend: owned socket binding, ABI6
 
-Registers AF_INET/AF_INET6 with native INET excluded. The historical directory
+Registers AF_INET/AF_INET6 with native INET and native loopback excluded. The historical directory
 name is retained; ABI5 peers are not supported. The current private transport is
 [`../protocol.h`](../protocol.h). Linux application syscalls remain unchanged.
+
+## One namespace generation
+
+`namespace.rs` owns the sole lifecycle for INET, route metadata and interface
+control. Both explicit registration and lazy provisioning create the same
+serving object. Protocol modules own queues, not independent provider sessions.
+Accepted children inherit the listener's generation without triggering provisioning.
+The userspace wrapper owns interface interpretation and core configuration;
+Linux only marshals authenticated, bounded requests. See the
+[namespace/control contract](../README.md#generic-network-namespaces).
 
 ## Ownership follows actual storage
 

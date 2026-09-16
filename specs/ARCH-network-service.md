@@ -9,7 +9,7 @@ Linux socket-provider spike exercises a deterministic Ethernet peer, but is
 not the production frontend described below: it retains native loopback and
 uses synchronous RPC where native socket buffering and readiness are needed.
 The production-shaped frontend now owns both Internet families in a KVM
-kernel with native INET excluded. A namespace registration capability yields
+kernel with native INET and the native loopback device excluded. A namespace registration capability yields
 per-socket provider FDs with independent bounded queues and local accept queues;
 control interruption revokes only the affected socket. Its sandboxed Netstack3 binding has passed
 IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
@@ -139,7 +139,8 @@ keeps recovery simpler than transparent connection resurrection.
 ## Network namespace ownership
 
 Unowned Linux network namespaces acquire independent, loopback-only Netstack3
-instances lazily on first socket use. Namespace creation itself does not spawn
+instances lazily on first Internet/route-metadata socket or interface-control
+request. Namespace creation itself does not spawn
 a service. The generic supervisor receives global provisioning authority, passes
 a namespace-bound serving capability to a sandboxed worker, and retains only
 separate lifecycle/revocation authority. It neither enters served namespaces nor
@@ -151,13 +152,21 @@ Application sockets and namespace handles retain native namespace lifetime.
 Service capabilities retain only safe backing memory: namespace teardown revokes
 them and causes workers to be reaped. Authority follows the socket or serving
 object across descriptor transfer and `setns`, not the caller's current namespace.
-Failure and replacement are generation boundaries, including for metadata; old
-capabilities cannot mutate or revive a replacement.
+A single namespace generation owns Internet sockets, route metadata and interface
+control; explicit and lazy launchers use the same serving object. Failure and
+replacement invalidate all three together. Old capabilities cannot mutate,
+provision or revive a replacement.
 
 Loopback administration changes actual core device state before completion is
 acknowledged. Newly isolated namespaces start with loopback down and no assigned
 addresses; address/link views reflect core observations, not invented Ethernet
-or configured-address fixtures. Unsupported management operations fail explicitly.
+or configured-address fixtures. Interface ioctl and rtnetlink interpretation,
+authorization policy and configuration belong to the userspace wrapper, backed by
+the same core state. Linux only authenticates namespace-relative credentials,
+marshals user memory and transports bounded, revocable requests. There is no native
+loopback device or flags mirror. A replacement isolated worker starts down again;
+configuration does not survive its owning generation. Unsupported management
+operations fail explicitly.
 
 ## Validation without a production escape hatch
 

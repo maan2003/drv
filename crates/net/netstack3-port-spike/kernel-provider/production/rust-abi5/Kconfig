@@ -4,3 +4,5 @@ config NETSTACK3_RUST
 	help
 	  AF_INET and AF_INET6 delegated to Netstack3 over ABI5. All frontend
 	  state and protocol handling is Rust; Linux registration uses C glue.
+	  Native loopback and MPLS routing are excluded. Userspace owns interface
+	  configuration; Linux retains socket, namespace and IPC mechanics.

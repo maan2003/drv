@@ -6,7 +6,7 @@ use crate::{
     endpoint_file::{self, Endpoint},
     linux::{AcceptTarget, Accepted, Address, Message, NativeSock},
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel::{
     bindings as b,
     fs::file::FileDescriptorReservation,
@@ -31,7 +31,6 @@ const RX: u32 = 9;
 const STATE: u32 = 10;
 const CONNECTION: u32 = 14;
 const ACTIVATE: u32 = 13;
-const CLAIM: u32 = 0x8008B301;
 const PUBLISH: u32 = 0xC038B302;
 const READ_CONTROL: u32 = 0x8080B303;
 
@@ -80,46 +79,37 @@ fn frame(op: u32, request: u64, len: usize) -> [u8; 24] {
 }
 struct Registry {
     next_id: u64,
-    next_generation: u64,
     sockets: KVec<Arc<Socket>>,
 }
 #[pin_data]
 pub(crate) struct Namespace {
-    pub(crate) id: u64,
-    pub(crate) native: crate::linux::NativeNamespace,
-    #[pin] pub(crate) lifecycle: crate::namespace::Lifecycle,
+    pub(crate) lifecycle: Arc<crate::namespace::Lifecycle>,
     pub(crate) netlink: Arc<crate::netlink::Namespace>,
     #[pin]
     registry: Mutex<Registry>,
     #[pin]
     changed: PollCondVar,
-    live: AtomicU64,
-    dead: AtomicBool,
     count: AtomicUsize,
 }
 impl Namespace {
-    pub(crate) fn new(native: crate::linux::NativeNamespace) -> Result<Arc<Self>> {
-        let id = native.id();
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        let lifecycle = crate::namespace::Lifecycle::new()?;
         Arc::pin_init(
             try_pin_init!(Self {
-                id, native, lifecycle <- crate::namespace::Lifecycle::new(),
-                netlink: crate::netlink::Namespace::new()?,
-                registry <- kernel::new_mutex!(Registry {next_id:0,next_generation:0,sockets:KVec::new()}),
-                changed <- kernel::new_poll_condvar!(), live:AtomicU64::new(0),dead:AtomicBool::new(false),count:AtomicUsize::new(0),
+                netlink: crate::netlink::Namespace::new(lifecycle.clone())?,
+                lifecycle,
+                registry <- kernel::new_mutex!(Registry {next_id:0,sockets:KVec::new()}),
+                changed <- kernel::new_poll_condvar!(), count:AtomicUsize::new(0),
             }),
             GFP_KERNEL,
         )
     }
     /// Service capabilities may outlive the native namespace, never keep it alive.
     pub(crate) fn revoke(&self) {
-        self.lifecycle.dying();
-        self.dead.store(true, Ordering::Release);
-        self.abort_generation();
-        crate::broker().remove(self.id);
+        crate::broker().revoke(self);
     }
     pub(crate) fn abort_generation(&self) {
         let registry = self.registry.lock();
-        self.live.store(0, Ordering::Release);
         for socket in &registry.sockets { socket.abort(); }
         self.changed.notify_all();
         drop(registry);
@@ -130,12 +120,12 @@ impl Namespace {
         native: NativeSock,
         family: i32,
         kind: i32,
-        claimed: bool,
+        generation: u64,
     ) -> Result<Arc<Socket>> {
-        crate::broker().ensure(&ns)?;
+        let claimed = generation != 0;
+        let generation = if claimed { generation } else { crate::broker().ensure(&ns)? };
         let mut registry = ns.registry.lock();
-        let generation = ns.live.load(Ordering::Acquire);
-        if generation == 0 {
+        if ns.lifecycle.live() != generation {
             return Err(ENETDOWN);
         }
         if ns.count.load(Ordering::Relaxed) >= SOCKETS {
@@ -230,7 +220,7 @@ pub(crate) struct Socket {
 }
 impl Socket {
     fn alive(&self, s: &SocketState) -> bool {
-        !s.dead && self.lease.0.live.load(Ordering::Acquire) == self.generation
+        !s.dead && self.lease.0.lifecycle.live() == self.generation
     }
     fn wake(&self) {
         self.changed.notify_all();
@@ -738,51 +728,11 @@ impl Socket {
     }
 }
 
-pub(crate) struct Session {
-    namespace: Arc<Namespace>,
-    generation: u64,
-}
-impl Session {
-    pub(crate) fn new(namespace: Arc<Namespace>) -> Result<Arc<Self>> {
-        let mut session = kernel::sync::UniqueArc::new(
-            Self {
-                namespace: namespace.clone(),
-                generation: 0,
-            },
-            GFP_KERNEL,
-        )?;
-        let mut registry = namespace.registry.lock();
-        if namespace.dead.load(Ordering::Acquire) { return Err(ENETDOWN); }
-        if namespace.live.load(Ordering::Acquire) != 0 {
-            return Err(EBUSY);
-        }
-        let generation = registry.next_generation.checked_add(1).ok_or(EOVERFLOW)?;
-        session.generation = generation;
-        registry.next_generation = generation;
-        namespace.live.store(generation, Ordering::Release);
-        Ok(session.into())
-    }
-}
-impl Drop for Session {
-    fn drop(&mut self) {
-        if self.generation == 0 {
-            return;
-        }
-        let registry = self.namespace.registry.lock();
-        if self.namespace.live.load(Ordering::Acquire) == self.generation {
-            self.namespace.live.store(0, Ordering::Release);
-            for socket in registry.sockets.iter() {
-                socket.abort();
-            }
-            self.namespace.changed.notify_all();
-        }
-    }
-}
-impl Endpoint for Session {
-    fn poll(&self, poll: &endpoint_file::Poll<'_>) -> u32 {
-        poll.register(&self.namespace.changed);
-        let registry = self.namespace.registry.lock();
-        if self.namespace.live.load(Ordering::Acquire) != self.generation {
+impl Namespace {
+    pub(crate) fn poll(&self, generation: u64, poll: &endpoint_file::Poll<'_>) -> u32 {
+        poll.register(&self.changed);
+        let registry = self.registry.lock();
+        if self.lifecycle.live() != generation {
             return b::POLLERR | b::POLLHUP;
         }
         for socket in registry.sockets.iter() {
@@ -793,13 +743,10 @@ impl Endpoint for Session {
         }
         0
     }
-    fn ioctl(&self, cmd: u32, arg: usize) -> Result<isize> {
-        if cmd != CLAIM {
-            return Err(ENOTTY);
-        }
+    pub(crate) fn claim(&self, generation: u64, arg: usize) -> Result<isize> {
         let reserved = FileDescriptorReservation::get_unused_fd_flags(b::O_CLOEXEC)?;
-        let registry = self.namespace.registry.lock();
-        if self.namespace.live.load(Ordering::Acquire) != self.generation {
+        let registry = self.registry.lock();
+        if self.lifecycle.live() != generation {
             return Err(ENETDOWN);
         }
         for socket in registry.sockets.iter() {
@@ -1176,7 +1123,7 @@ impl Endpoint for SocketEndpoint {
             }
         }
         let reserved = FileDescriptorReservation::get_unused_fd_flags(b::O_CLOEXEC)?;
-        let child = listener.native.accepted(listener.family)?;
+        let child = listener.native.accepted(listener.family, listener.generation)?;
         let socket = crate::accepted_socket(&child);
         {
             let mut s = socket.state.lock();

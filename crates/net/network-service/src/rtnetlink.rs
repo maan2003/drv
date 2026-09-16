@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Read-only rtnetlink adapter over real interface observations, not Linux IP.
+//! Linux interface control and metadata over real core observations, not Linux IP.
 //! The private endpoint supplies authenticated identity; nlmsg_pid is not authority.
 use netstack3_port_integration::interfaces::{Address, AddressState, InterfaceSnapshot, PreferredUntil};
 use std::collections::{HashMap, VecDeque};
@@ -63,16 +63,94 @@ impl View {
         let mut b = vec![0, 0];
         b.extend_from_slice(&(if loopback { 772u16 } else { 1u16 }).to_ne_bytes());
         b.extend_from_slice(&Self::index(i)?.to_ne_bytes());
-        let iflags = if loopback { 0x8u32 | if i.ipv4_enabled || i.ipv6_enabled { 0x10041 } else { 0 } } else { 0x1002 | if self.online { 0x10041 } else { 0 } };
-        b.extend_from_slice(&iflags.to_ne_bytes());
+        b.extend_from_slice(&self.flags(i).to_ne_bytes());
         b.extend_from_slice(&0u32.to_ne_bytes());
-        let name = if loopback { "lo".to_string() } else { format!("netstack{}", i.id - 1) };
-        attribute(&mut b, 3, &[name.as_bytes(), &[0]].concat());
-        let mtu = if loopback { 65536u32 } else { u32::from(crate::SOFTMAC_ETHERNET_MTU) };
-        attribute(&mut b, 4, &mtu.to_ne_bytes());
+        attribute(&mut b, 3, &[Self::name(i).as_bytes(), &[0]].concat());
+        attribute(&mut b, 4, &Self::mtu(i).to_ne_bytes());
         attribute(&mut b, 1, &if loopback { [0; 6] } else { self.mac });
         attribute(&mut b, 16, &[if loopback { 0 } else if self.online { 6 } else { 2 }]); // operstate
         Ok(message(LINK, flags, seq, pid, &b))
+    }
+    /// The same core observation backs rtnetlink and legacy interface ioctls.
+    pub(crate) fn ioctl(&mut self, request: &[u8; 48],
+        set_up: &mut impl FnMut(bool) -> Result<View, Errno>) -> Result<Vec<u8>, Errno>
+    {
+        let command = u32::from_le_bytes(request[..4].try_into().unwrap()) as libc::c_ulong;
+        let capable = u32::from_le_bytes(request[4..8].try_into().unwrap()) & 1 != 0;
+        let mut output = request[8..].to_vec();
+        if command == libc::SIOCGIFCONF {
+            if self.interfaces.iter().any(|i| i.incomplete) { return Err(Errno::NOBUFS); }
+            let mut entries = Vec::new();
+            for interface in &self.interfaces {
+                for address in &interface.addresses {
+                    let IpAddr::V4(ip) = address.address else { continue };
+                    let mut entry = vec![0u8; 40];
+                    let name = Self::name(interface);
+                    entry[..name.len()].copy_from_slice(name.as_bytes());
+                    entry[16..18].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+                    entry[20..24].copy_from_slice(&ip.octets());
+                    entries.extend(entry);
+                }
+            }
+            return if entries.len() <= 4096 { Ok(entries) } else { Err(Errno::NOBUFS) };
+        }
+        if command == libc::SIOCSIFFLAGS && !capable { return Err(Errno::PERM); }
+        let interface = self.interfaces.iter().find(|interface| {
+            if command == libc::SIOCGIFNAME {
+                Self::index(interface).ok() == Some(u32_at(&output, 16))
+            } else {
+                let end = output[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
+                Self::name(interface).as_bytes() == &output[..end]
+            }
+        }).ok_or(Errno::NODEV)?;
+        match command {
+            libc::SIOCGIFNAME => {
+                let name = Self::name(interface);
+                output[..16].fill(0);
+                output[..name.len()].copy_from_slice(name.as_bytes());
+            }
+            libc::SIOCGIFINDEX => output[16..20].copy_from_slice(
+                &Self::index(interface).map_err(Errno::from_raw_os_error)?.to_ne_bytes()),
+            libc::SIOCGIFFLAGS => output[16..18].copy_from_slice(
+                &(self.flags(interface) as u16).to_ne_bytes()),
+            libc::SIOCGIFMTU => output[16..20].copy_from_slice(&Self::mtu(interface).to_ne_bytes()),
+            libc::SIOCGIFHWADDR => {
+                output[16..32].fill(0);
+                output[16..18].copy_from_slice(
+                    &(if interface.id == u64::MAX { 772u16 } else { 1u16 }).to_ne_bytes());
+                if !(interface.id == u64::MAX) { output[18..24].copy_from_slice(&self.mac); }
+            }
+            libc::SIOCGIFADDR | libc::SIOCGIFNETMASK => {
+                let address = interface.addresses.iter().find(|a| a.address.is_ipv4())
+                    .ok_or(Errno::ADDRNOTAVAIL)?;
+                let IpAddr::V4(ip) = address.address else { unreachable!() };
+                let value = if command == libc::SIOCGIFADDR { ip.octets() }
+                    else { (u32::MAX.checked_shl(32 - u32::from(address.prefix)).unwrap_or(0)).to_be_bytes() };
+                output[16..32].fill(0);
+                output[16..18].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+                output[20..24].copy_from_slice(&value);
+            }
+            libc::SIOCSIFFLAGS => {
+                let flags = u16_at(&output, 16) as i32;
+                if !(interface.id == u64::MAX) || flags & !(libc::IFF_UP | libc::IFF_LOOPBACK | libc::IFF_RUNNING) != 0 {
+                    return Err(Errno::OPNOTSUPP);
+                }
+                *self = set_up(flags & libc::IFF_UP != 0)?;
+            }
+            _ => return Err(Errno::OPNOTSUPP),
+        }
+        Ok(output)
+    }
+    fn name(i: &InterfaceSnapshot) -> String {
+        if i.id == u64::MAX { "lo".into() } else { format!("netstack{}", i.id - 1) }
+    }
+    fn mtu(i: &InterfaceSnapshot) -> u32 {
+        if i.id == u64::MAX { 65536 } else { u32::from(crate::SOFTMAC_ETHERNET_MTU) }
+    }
+    fn flags(&self, i: &InterfaceSnapshot) -> u32 {
+        if i.id == u64::MAX {
+            0x8 | if i.ipv4_enabled || i.ipv6_enabled { 0x10041 } else { 0 }
+        } else { 0x1002 | if self.online { 0x10041 } else { 0 } }
     }
     fn address(i: &InterfaceSnapshot, a: &Address, kind: u16, seq: u32, pid: u32, flags: u16) -> Result<Vec<u8>, i32> {
         let addr_flags = match a.state {
@@ -349,6 +427,30 @@ mod tests {
                 preferred_until: PreferredUntil::Preferred(None),
             }], ..Default::default()
         }], true, [2,0,0,0,0,1])
+    }
+    #[test]
+    fn interface_ioctl_uses_observations_and_authenticated_mutation() {
+        let mut v = view();
+        v.interfaces[0].id = u64::MAX;
+        let mut request = [0u8; 48];
+        request[..4].copy_from_slice(&(libc::SIOCGIFADDR as u32).to_le_bytes());
+        request[8..10].copy_from_slice(b"lo");
+        let mut reject = |_| panic!("query or unauthorized request must not mutate");
+        let reply = v.ioctl(&request, &mut reject).unwrap();
+        assert_eq!(&reply[20..24], &[192,0,2,7]);
+        request[..4].copy_from_slice(&(libc::SIOCSIFFLAGS as u32).to_le_bytes());
+        request[24..26].copy_from_slice(&(libc::IFF_UP as u16).to_ne_bytes());
+        assert_eq!(v.ioctl(&request, &mut reject), Err(Errno::PERM));
+        request[4] = 1;
+        let updated = v.clone();
+        let mut called = false;
+        v.ioctl(&request, &mut |up| { assert!(up); called = true; Ok(updated.clone()) }).unwrap();
+        assert!(called);
+        request[24..26].copy_from_slice(&(libc::IFF_PROMISC as u16).to_ne_bytes());
+        assert_eq!(v.ioctl(&request, &mut reject), Err(Errno::OPNOTSUPP));
+        v.interfaces[0].incomplete = true;
+        request[..4].copy_from_slice(&(libc::SIOCGIFCONF as u32).to_le_bytes());
+        assert_eq!(v.ioctl(&request, &mut reject), Err(Errno::NOBUFS));
     }
     #[test]
     fn dumps_use_real_addresses_and_authenticated_port_id() {

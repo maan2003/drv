@@ -21,19 +21,21 @@ baselines, not ABI6 acceptance evidence.
 ## Delegated route metadata
 
 Linux retains native AF_NETLINK socket transport, port binding, subscriptions,
-credentials, receive limits and unrelated protocols. A separate
-`/dev/netstack3-netlink` registration delegates subsequently created
-NETLINK_ROUTE sockets in the launcher's namespace. Claimed FDs identify single
+credentials, receive limits and unrelated protocols. The same `/dev/netstack3`
+serving object owns INET, NETLINK_ROUTE and interface-control requests in the
+launcher's namespace. There is one generation and one revocation boundary;
+the separate Netlink registration device has been removed. Claimed FDs identify single
 sockets; publication is restricted to that generation's current subscribers.
 Provider loss fails closed, including after replacement. The wire contract and
 limits are in [netlink-protocol.h](netlink-protocol.h).
 
-The supervisor passes registration FD10 with `--netlink` into the existing
-sandbox. The userspace adapter renders read-only link/address dumps and change
+Every worker serves metadata on its inherited serving object (internally
+duplicated for the adapter's poll registration). The userspace adapter renders
+link/address dumps and change
 notifications from actual Netstack3 observations, including loopback, DHCP,
 IPv6 address state and link loss. It does not synthesize configured IP addresses.
 Route queries and unsupported mutations return explicit unsupported errors;
-lazy namespace workers also support authorized loopback up/down. Per-application
+all workers also support authorized loopback up/down. Per-application
 metadata privacy remains deferred; this is a namespace-wide compatibility view.
 
 The standard guest fixture now also needs these clients, built from this
@@ -56,9 +58,10 @@ These are no-INET KVM checks, not physical deployment or full rtnetlink coverage
 
 `netstack3-supervisor /absolute/path/to/netstack3-provider` owns
 `/dev/netstack3-namespaces` (initial-user-namespace `CAP_SYS_ADMIN`, exclusive
-registration). First socket use in an unowned namespace requests a worker;
+registration). First Internet/route-metadata socket or interface-control request
+in an unowned namespace requests a worker;
 creation alone does not. Each worker receives one namespace-bound serving
-object through inherited FD3/FD10/FD11, enters the existing empty-root,
+object through inherited FD3, enters the existing empty-root,
 unprivileged process sandbox, and owns independent Netstack3 state with **no
 Ethernet device or DHCP socket**. The supervisor closes every serving copy and
 retains only a separate monitor/revoke capability plus a process handle.
@@ -67,21 +70,64 @@ Ordinary `unshare -n` starts with loopback down and no addresses. Both
 `SIOCSIFFLAGS` and authenticated `RTM_NEWLINK` can enable/disable loopback;
 completion waits for actual core configuration. `ip link set lo up` enables
 IPv4/IPv6 localhost TCP/UDP. Other link mutations and route operations remain
-unsupported. Explicit legacy registrations retain their original supervisor,
-including across restart, and do not gain these administration operations.
+unsupported. Explicit registrations retain their original supervisor,
+including across restart, and use the same administration implementation.
 Register the machine's explicit network service before starting lazy provisioning.
+
+Interface ioctls on INET, Unix and Netlink sockets are marshalled into the same
+worker's bounded control lane. It interprets authenticated credentials and reads
+the same core observations as rtnetlink. Configuration is not mirrored in Linux:
+isolated replacement workers start down and must be configured again.
+The serving `READY` operation acknowledges initialized userspace state.
+`CLAIM_CONTROL` returns a one-request FD: read 48 bytes (LE command, LE
+namespace-relative CAP_NET_ADMIN bit, native 40-byte ifreq), then write LE signed
+errno plus up to 4096 reply bytes. Internal kernel statuses (512–4095) complete
+with EPROTO, never native fallback or syscall restart. At most 32 requests wait per scope, with
+interruptible 10-second waits. Cancellation/death retires each transaction.
+
+`CONFIG_NETSTACK3_RUST` omits native loopback registration and its private
+implementation, retaining shared statistics and blackhole helpers. Page-pool
+unregister uses the existing wipe/deferred-release path rather than orphaning
+onto native `lo`; BPF skb/XDP/netfilter test runs report unsupported; native MPLS
+routing is excluded. Other configurations retain the native implementation.
+The optional `page-pool-test.c` guest module exercises device removal while a
+pool page is outstanding; `namespace-test native` checks AF_PACKET,
+NETLINK_GENERIC and skb/XDP BPF test-run boundaries (netfilter program loading
+is unavailable without INET). Enable `CONFIG_PACKET=y` for that guest check. Never install that test
+module as part of the production service.
+
+Build the optional fixture against the same configured guest kernel:
+```sh
+mkdir -p "$WORK/page-pool-test"
+cp page-pool-test.c "$WORK/page-pool-test/"
+printf 'obj-m += page-pool-test.o\\n' > "$WORK/page-pool-test/Makefile"
+make -C "$KERNEL" M="$WORK/page-pool-test" modules
+# In the no-INET guest, before starting providers:
+namespace-test native
+insmod page-pool-test.ko
+rmmod page_pool_test
+```
 
 At most 64 lazy namespaces are admitted; startup has a 10-second interruptible
 budget. Native namespace teardown, worker death, monitor revocation and
 supervisor loss terminate the affected generation. New sockets can request a
 replacement; existing sockets never attach to it. Serving and monitoring FDs
-retain namespace memory safely but do not prevent teardown. Namespace handles
+retain pure Rust scope state, not an active Linux namespace reference.
+Namespace handles
 and application sockets do retain it, including across `setns` and `SCM_RIGHTS`.
 
 The standard KVM suite includes `namespace-test` lifetime, faulted handoff,
 old-generation rejection, independent identical-port namespaces, descriptor
 transfer, administration permissions, worker/supervisor restart and worker
 reaping, plus an ordinary `unshare -n` shell running the full localhost suite.
+The [recorded run](evidence/namespaces.log) uses kernel #43 with native INET/lo
+absent, built-in AF_PACKET, and lockdep/mutex/list/atomic-sleep diagnostics.
+It includes page-pool deferred release, BPF failure boundaries, Unix-socket
+interface ioctls and read-only setter input. The native-control build (#40,
+same patches with the provider disabled) retains native loopback and passes
+IPv4/IPv6 bulk TCP. The 67 host service tests also pass. Unsupported ioctls
+such as TX queue-length queries remain explicit errors, not synthetic values.
+
 These checks do not establish arbitrary virtual-link/routing support or host
 deployment.
 

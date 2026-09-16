@@ -1,49 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Operations on the inherited, namespace-bound provider capability.
-use std::os::fd::{AsRawFd, OwnedFd};
-use netstack3_port_integration::service::DhcpService;
+//! Namespace control transactions on the same capability as data and metadata.
+use std::os::fd::{FromRawFd, OwnedFd};
 use rustix::io::Errno;
-
-pub(crate) const CONTROL_FD: i32 = 11;
 pub(crate) const CLAIM: libc::c_ulong = 0x8008B501;
-pub(crate) const STATE: libc::c_ulong = 0x8010B502;
-pub(crate) const ACK: libc::c_ulong = 0x4008B503;
-pub(crate) const SET_UP: libc::c_ulong = 0x4004B504;
+pub(crate) const READY: libc::c_ulong = 0xB502;
+pub(crate) const CLAIM_CONTROL: libc::c_ulong = 0xB503;
 pub(crate) const REVOKE: libc::c_ulong = 0xB505;
 
-pub(crate) struct Control { fd: OwnedFd, applied: Option<u64> }
-impl Control {
-    pub(crate) fn new(fd: OwnedFd) -> Self { Self { fd, applied: None } }
-    pub(crate) fn fd(&self) -> &OwnedFd { &self.fd }
-    /// Returns false if a concurrent interface change requires another pass.
-    pub(crate) fn synchronize(&mut self, network: &mut DhcpService) -> Result<bool, Errno> {
-        let mut state = [0u64; 2];
-        // SAFETY: STATE writes its fixed 16-byte record into initialized storage.
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), STATE, state.as_mut_ptr()) } < 0 {
-            return Err(Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap()));
-        }
-        let revision = state[0];
-        if self.applied == Some(revision) { return Ok(true); }
-        let flags = state[1] as u32;
-        network.set_loopback_up(flags & libc::IFF_UP as u32 != 0);
-        // ACK commits readiness only after the actual core operation above.
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), ACK, &revision) } < 0 {
+pub(crate) fn serve(
+    view: &mut crate::rtnetlink::View,
+    set_up: &mut impl FnMut(bool) -> Result<crate::rtnetlink::View, Errno>,
+) -> Result<bool, Errno> {
+    let mut progress = false;
+    for _ in 0..32 {
+        // The inherited serving capability owns this namespace, irrespective of
+        // the worker's current namespace. Each returned FD owns one transaction.
+        let fd = unsafe { libc::ioctl(3, CLAIM_CONTROL) };
+        if fd < 0 {
             let error = Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap());
-            if error == Errno::AGAIN { return Ok(false); }
+            if error == Errno::AGAIN { return Ok(progress); }
             return Err(error);
         }
-        self.applied = Some(revision);
-        Ok(true)
-    }
-    pub(crate) fn set_up(&mut self, network: &mut DhcpService, up: bool) -> Result<(), Errno> {
-        let value = u32::from(up);
-        // SAFETY: SET_UP reads exactly one u32; authority comes from this object.
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), SET_UP, &value) } < 0 {
-            return Err(Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap()));
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut request = [0u8; 48];
+        match rustix::io::read(&fd, &mut request) {
+            Ok(48) => {}
+            Err(Errno::NOENT) => continue, // Caller canceled while being claimed.
+            Err(error) => return Err(error),
+            _ => return Err(Errno::PROTO),
         }
-        for _ in 0..32 {
-            if self.synchronize(network)? { return Ok(()); }
+        let reply = match view.ioctl(&request, set_up) {
+            Ok(data) => { let mut reply = 0i32.to_le_bytes().to_vec(); reply.extend(data); reply }
+            Err(error) => (-error.raw_os_error()).to_le_bytes().to_vec(),
+        };
+        match rustix::io::write(&fd, &reply) {
+            Ok(count) if count == reply.len() => {}
+            Err(Errno::NOENT) => {} // A completed operation need not outlive its caller.
+            Err(error) => return Err(error),
+            _ => return Err(Errno::PROTO),
         }
-        Err(Errno::AGAIN)
+        progress = true;
     }
+    Ok(progress)
 }

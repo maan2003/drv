@@ -35,10 +35,9 @@ pub fn run_provider(
     bootstrap: bool,
     resolver: Option<ResolverEndpoint>,
     link_control: bool,
-    netlink: bool,
     namespace: bool,
 ) -> Result<(), String> {
-    if namespace && (ethernet_mac.is_some() || bootstrap || resolver.is_some() || link_control || !netlink) {
+    if namespace && (ethernet_mac.is_some() || bootstrap || resolver.is_some() || link_control) {
         return Err("namespace providers require only their serving capability".into());
     }
     if bootstrap && ethernet_mac.is_none() {
@@ -46,6 +45,10 @@ pub fn run_provider(
     }
     if link_control && ethernet_mac.is_none() {
         return Err("link control requires an Ethernet identity".into());
+    }
+    // Two views of one serving object; neither protocol can own a separate generation.
+    if unsafe { libc::dup3(3, crate::rtnetlink::REGISTRATION_FD, libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error().to_string());
     }
     // FD3 owns the socket namespace; optional FD4 owns only Ethernet frames.
     if unsafe { libc::fcntl(3, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
@@ -140,7 +143,7 @@ pub fn run_provider(
         None => None,
     };
     crate::child::provider_setup(
-        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control, netlink, namespace,
+        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control,
     )?;
     // SAFETY: setup retains this inherited descriptor exclusively for this
     // provider. Keep its ownership explicit for every ancillary operation.
@@ -149,23 +152,10 @@ pub fn run_provider(
     });
     // SAFETY: provider_setup created FD6; it lives for this entire service loop.
     let poller = unsafe { std::os::fd::BorrowedFd::borrow_raw(6) };
-    let mut route_adapter = if netlink {
-        // SAFETY: the launcher reserves FD10; setup retains this sole owner.
-        let registration = unsafe { OwnedFd::from_raw_fd(crate::rtnetlink::REGISTRATION_FD) };
-        Some(crate::rtnetlink::Adapter::new(registration, poller).map_err(|e| e.to_string())?)
-    } else { None };
+    let registration = unsafe { OwnedFd::from_raw_fd(crate::rtnetlink::REGISTRATION_FD) };
+    let mut route_adapter = crate::rtnetlink::Adapter::new(registration, poller)
+        .map_err(|e| e.to_string())?;
     let mut route_revision = None;
-    let mut namespace_control = namespace.then(|| {
-        // SAFETY: the supervisor transfers this serving-object reference exclusively.
-        crate::namespace::Control::new(unsafe { OwnedFd::from_raw_fd(crate::namespace::CONTROL_FD) })
-    });
-    const NAMESPACE_TOKEN: u64 = u64::MAX - 2;
-    if let Some(control) = &namespace_control {
-        let mut event = libc::epoll_event { events: libc::EPOLLPRI as u32, u64: NAMESPACE_TOKEN };
-        if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, control.fd().as_raw_fd(), &mut event) } < 0 {
-            return Err(io::Error::last_os_error().to_string());
-        }
-    }
 
     let mut resolver_server = resolver_listener
         .map(|listener| crate::resolver::ResolverServer::new(listener, poller))
@@ -174,6 +164,11 @@ pub fn run_provider(
 
     if bootstrap {
         crate::child::provider_bootstrap_ready()?;
+    }
+    if unsafe { libc::ioctl(3, crate::namespace::READY) } < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if bootstrap {
         // Readiness certifies the initialized core, loopback, registration
         // namespace and sandbox. Physical address acquisition is deliberately
         // not part of provider availability.
@@ -183,7 +178,7 @@ pub fn run_provider(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
     );
     let mut event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
+        events: (libc::EPOLLIN | libc::EPOLLPRI) as u32,
         u64: 0, // Socket IDs start at one; zero names registration.
     };
     if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, 3, &mut event) } < 0 {
@@ -234,14 +229,15 @@ pub fn run_provider(
     events[0].u64 = 0;
     let mut event_count = 1;
     loop {
-        if let Some(control) = &mut namespace_control {
-            match control.synchronize(&mut network) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::NETDOWN) => return Ok(()),
-                Err(error) => return Err(format!("namespace lifecycle: {error}")),
-            }
-        }
         let mut progress = false;
+        if events[..event_count].iter().any(|event| event.u64 == 0 && event.events & libc::EPOLLPRI as u32 != 0) {
+            let online = ethernet.is_some();
+            let mut view = crate::rtnetlink::View::new(network.runtime().interface_snapshots(), online, mac);
+            progress |= crate::namespace::serve(&mut view, &mut |up| {
+                network.set_loopback_up(up);
+                Ok(crate::rtnetlink::View::new(network.runtime().interface_snapshots(), online, mac))
+            }).map_err(|e| format!("interface control: {e}"))?;
+        }
         let mut ready = Vec::with_capacity(64);
         for event in &events[..event_count] {
             if event.u64 == ETHERNET_TOKEN {
@@ -564,7 +560,7 @@ pub fn run_provider(
                 control_events = desired;
             }
         }
-        if let Some(adapter) = &mut route_adapter {
+        {
             let update = {
                 let runtime = network.runtime();
                 let revision = (runtime.interface_revision(), ethernet.is_some());
@@ -574,10 +570,9 @@ pub fn run_provider(
                         runtime.interface_snapshots(), revision.1, mac))
                 } else { None }
             };
-            progress |= adapter.advance(poller, &events[..event_count], update, &mut |up| {
-                let control = namespace_control.as_mut().ok_or(rustix::io::Errno::OPNOTSUPP)?;
-                control.set_up(&mut network, up)?;
-                Ok(crate::rtnetlink::View::new(network.runtime().interface_snapshots(), false, mac))
+            progress |= route_adapter.advance(poller, &events[..event_count], update, &mut |up| {
+                network.set_loopback_up(up);
+                Ok(crate::rtnetlink::View::new(network.runtime().interface_snapshots(), ethernet.is_some(), mac))
             })
                 .map_err(|e| format!("netlink registration: {e}"))?;
         }
