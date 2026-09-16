@@ -87,8 +87,10 @@ dmabuf render target is finished, so the buffer is complete before it goes
 to PipeWire or an image-copy client), `SetCustomShader`,
 device lifecycle (`AddDevice`, `RemoveDevice`, `PauseDevices`,
 `ResumeDevices`, `RescanDevice`, `CleanupDevice`), output control
-(`EnableOutput`, `DisableOutput`, `SetMode`, `SetVrr`, `SetMaxBpc`,
-`SetOutputGeometry`, `SetGamma`, `ClearOutputs`, `SetDebugTint`),
+(`EnableOutput{.., color, prefer_10bit}`, `DisableOutput`, `SetMode`,
+`SetVrr`, `SetColorState` (HDR signalling + max bpc, staged for the next
+commit), `SetCtm`, `SetOutputGeometry`, `SetGamma`, `ClearOutputs`,
+`SetDebugTint`),
 `Present{output, frame, flags}`, screencast streams (`CastStart` replies
 with the effective cursor mode, `CastConfigure` for size / refresh,
 one-way `CastClear` and `CastStop`), `LoadCursor{theme, names, size,
@@ -168,6 +170,54 @@ the `png` crate and returns the bytes. The core only writes the file, sets
 the clipboard selection and emits the IPC event. The `png` and `xcursor`
 crates are thereby out of the process that holds client connections.
 
+## HDR and wide gamut
+
+Merged from the `ma/turtle-pig-penguin` branch (protocol v10). The core
+keeps all policy: the color-management protocol, per-output image
+descriptions, `hdr { mode="auto"|"on"; reference-luminance }`,
+`wide-gamut-p3` and the IPC `Ctm` action live in `niri.rs` / the handlers
+unchanged. What moved into the GPU process is everything that touched the
+renderer or KMS:
+
+- Connector capabilities: `ConnectorInfo` carries `hdr: HdrCaps`
+  (driver exposes `Colorspace` with BT2020_RGB and `HDR_OUTPUT_METADATA`,
+  EDID advertises PQ; EDID luminances via libdisplay-info) and the
+  `max bpc` range. The core stores them as `OutputHdrCaps` in the output
+  user data.
+- Signalling: `Tty::render` reconciles a `ColorState{hdr: Option<
+  HdrMetadataDesc>, max_bpc}` per frame and sends `SetColorState` only
+  when it changes; the GPU stages it with smithay's `use_color_state` so
+  it rides the compositor's atomic commit (standalone connector-property
+  commits hang some drivers). A rejected state is remembered core-side
+  (`failed_color_state`) until the config changes or the session resumes.
+  Max bpc no longer has its own request; the initial state goes with
+  `EnableOutput`.
+- Framebuffer formats: SDR outputs are 8-bit. With `prefer_10bit` (HDR
+  allowed or `wide-gamut-p3`) the GPU probes each 10-bit format with a
+  throwaway compositor + `render_frame` and puts the working ones first.
+- Blend space: `Command::Begin{blend: Option<BlendParams>}` (`HdrPq{
+  ref_lum_scale}` or `DisplayP3`) tells the GPU to install the
+  `TextureHdr` program as the frame-wide default texture override and to
+  encode solid colors on the CPU (`src/gpu/gl/blend.rs`). All GPU-side
+  shaders end in `niri_blend(color)` (`hdr.frag`); the core appends the
+  `niri_blend_mode` / `niri_ref_lum_scale` uniforms to its own shader and
+  tex-program draws from `RemoteRenderer::frame_blend`. Overrides form a
+  stack in `run_frame`, so an element override or
+  `SuspendTexProgramOverride` / `RestoreTexProgramOverride` (used by
+  `BlendSurfaceRenderElement` for content already in the blend space)
+  restores the frame-wide one. Only the output frame is recorded with a
+  blend; casts and screenshots stay SDR. A blend change resets the
+  compositor's buffers (full redraw).
+- Planes: while blending, the core clears the cursor and overlay plane
+  flags in `Present` and allows primary scanout only for fullscreen
+  content already encoded in the blend space.
+- CTM: `SetCtm{matrix}` writes the CRTC `CTM` blob (S31.32) from the GPU
+  process, deferred to resume while the device is inactive.
+
+The GPU smoke test renders a PQ frame with llvmpipe and checks the CPU and
+shader encodes agree and that a suspended override passes pixels raw.
+Nothing here has run on real HDR hardware yet.
+
 ## Smithay fork
 
 niri builds against `../smithay` (branch `niri-gpu-process`, upstream +
@@ -176,6 +226,12 @@ small additions): `UnderlyingStorage::Dmabuf` with matching
 element can offer a dmabuf for scanout without a `WlBuffer`; lazy shm
 pool mapping plus `shm::with_buffer_fd`, so a compositor that only
 forwards the fd never maps client memory; `MemoryBuffer::as_mut_slice`.
+For HDR it also carries dividebysandwich's three commits: connector color
+state in atomic commits (`ConnectorColorState`, `HdrOutputMetadata`,
+`use_color_state`), the color-management / color-representation
+protocols, and the renderer-level tex program override plus solid color
+transform in `GlesRenderer`. niri pins the fork by git rev in
+`Cargo.toml` (`rho/niri-gpu-process` on maan2003/smithay).
 
 ## Dropped in v1
 
