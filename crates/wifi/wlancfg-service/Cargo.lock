@@ -525,6 +525,7 @@ version = "0.1.0"
 dependencies = [
  "drv-dns-wire",
  "libc",
+ "linux-self-sandbox",
  "netstack3-port-integration",
  "netstack3-port-spike",
  "rand 0.9.4",

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use crate::NetworkServiceSupervisor;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
 use wifi_supervisor_wire::{LifecycleKind, LifecycleMessage, MESSAGE_LEN};
@@ -80,6 +79,25 @@ struct ActiveGeneration {
     ethernet: u64,
 }
 
+/// Device installation authority; deliberately excludes process and hardware
+/// control. The legacy launcher and the private provider protocol implement
+/// the same interface so configuration policy does not own either mechanism.
+pub trait InterfaceInstaller {
+    fn mac_address(&self) -> [u8; 6];
+    fn install(&mut self, generation: u64, frame: OwnedFd) -> Result<u64, String>;
+    fn revoke(&mut self, generation: u64) -> Result<(), String>;
+}
+
+impl InterfaceInstaller for crate::NetworkServiceSupervisor {
+    fn mac_address(&self) -> [u8; 6] { self.mac_address() }
+    fn install(&mut self, generation: u64, frame: OwnedFd) -> Result<u64, String> {
+        self.attach_generation(generation, frame)
+    }
+    fn revoke(&mut self, generation: u64) -> Result<(), String> {
+        self.revoke_generation(generation)
+    }
+}
+
 /// Receiver for the dedicated, fd-bearing Wi-Fi lifecycle channel.
 ///
 /// Policy IPC must never be passed here. Each seqpacket datagram is decoded by
@@ -106,7 +124,7 @@ impl WifiLifecycleReceiver {
 
     pub fn receive(
         &mut self,
-        supervisor: &mut NetworkServiceSupervisor,
+        supervisor: &mut impl InterfaceInstaller,
     ) -> Result<Option<WifiLifecycleUpdate>, String> {
         if self.closed {
             return Ok(None);
@@ -189,7 +207,7 @@ impl WifiLifecycleReceiver {
                 return Err(wifi_supervisor_wire::WireError::InvalidLength.to_string());
             }
             if let Some(active) = self.active.take() {
-                supervisor.revoke_generation(active.ethernet)?;
+                supervisor.revoke(active.ethernet)?;
             }
             self.closed = true;
             return Ok(Some(WifiLifecycleUpdate::ChannelClosed));
@@ -226,7 +244,7 @@ impl WifiLifecycleReceiver {
                 // The persistent provider acknowledges revocation of any old
                 // link and installation of this descriptor before ownership is
                 // reported to Wi-Fi.
-                let provider_generation = supervisor.attach_generation(
+                let provider_generation = supervisor.install(
                     message.ethernet_generation,
                     frame,
                 )?;
@@ -252,7 +270,7 @@ impl WifiLifecycleReceiver {
                 {
                     return Err("Wi-Fi lifecycle Revoke does not match active generation".into());
                 }
-                supervisor.revoke_generation(message.ethernet_generation)?;
+                supervisor.revoke(message.ethernet_generation)?;
                 self.active = None;
                 Ok(Some(WifiLifecycleUpdate::Revoked {
                     wifi_generation: message.wifi_generation,
@@ -266,6 +284,7 @@ impl WifiLifecycleReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NetworkServiceSupervisor;
 
     #[test]
     fn receiver_rejects_unconnected_seqpacket_capability() {

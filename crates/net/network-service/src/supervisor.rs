@@ -535,6 +535,16 @@ impl NetworkServiceSupervisor {
         Ok(generation)
     }
 
+    /// Introduce the provider's private interface-admin capability to netcfg.
+    /// The parent retains its copy solely to prevent netcfg failure from
+    /// tearing down networking before hardware has completed orderly stop.
+    /// The production launcher does not issue interface requests itself.
+    pub fn configuration_capability(&self) -> Result<(OwnedFd, u64), String> {
+        let process = self.kernel_process.as_ref()
+            .ok_or("network provider must be started before netcfg")?;
+        Ok((duplicate_capability(process.control.as_raw_fd())?, process.generation))
+    }
+
     pub fn attach_generation(&mut self, generation: u64, frame: OwnedFd) -> Result<u64, String> {
         if generation == 0 {
             return Err("Ethernet generation must be nonzero".into());

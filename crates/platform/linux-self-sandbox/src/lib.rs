@@ -29,6 +29,9 @@ pub enum Profile {
         /// filter tests; the production service always supplies it.
         application_listener_fd: Option<RawFd>,
     },
+    /// Device introduction and network configuration, without device,
+    /// credential, filesystem or process-management authority.
+    Netcfg { device_fd: RawFd, provider_fd: RawFd, readiness_fd: RawFd },
     /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
     /// One MT7921 PCI function, its precreated IRQ eventfd, and optionally
@@ -301,6 +304,13 @@ impl Sandbox<SetupComplete> {
             expected.extend(application_listener_fd);
             expected.sort_unstable();
             if expected != self.inherited {
+                return Err(Error::ProfileAuthorityMismatch);
+            }
+        }
+        if let Profile::Netcfg { device_fd, provider_fd, readiness_fd } = &profile {
+            let mut expected = vec![*device_fd, *provider_fd, *readiness_fd];
+            expected.sort_unstable();
+            if self.persistence_dir_fd.is_some() || expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
             }
         }
@@ -701,6 +711,31 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
     );
 
     match profile {
+        Profile::Netcfg { device_fd, provider_fd, readiness_fd } => {
+            // Received descriptors are validated as connected, nonblocking
+            // Unix packet endpoints, then transferred; never read as files.
+            for option in [libc::SO_DOMAIN, libc::SO_TYPE] {
+                allow(&mut rules, libc::SYS_getsockopt, vec![
+                    eq(1, libc::SOL_SOCKET as u64), eq(2, option as u64),
+                ]);
+            }
+            allow(&mut rules, libc::SYS_getpeername, vec![condition(0, Qword, Le, i32::MAX as u64)]);
+            for cmd in [libc::F_GETFD, libc::F_GETFL] {
+                allow(&mut rules, libc::SYS_fcntl, vec![eq(1, cmd as u64)]);
+            }
+            for fd in [device_fd, provider_fd] {
+                for flags in [libc::MSG_DONTWAIT, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC] {
+                    allow(&mut rules, libc::SYS_recvmsg,
+                        vec![eq(0, *fd as u64), eq(2, flags as u64)]);
+                }
+            }
+            allow(&mut rules, libc::SYS_sendmsg, vec![
+                eq(0, *provider_fd as u64),
+                eq(2, (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64),
+            ]);
+            allow(&mut rules, libc::SYS_poll, vec![condition(1, Qword, Le, 2)]);
+            allow_fds(&mut rules, libc::SYS_write, &[1, 2, *readiness_fd]);
+        }
         Profile::Wlancfg {
             control_fd,
             persistence_dir_fd,
@@ -1019,6 +1054,7 @@ fn allowed(profile: &Profile) -> Vec<libc::c_long> {
             // and durably syncs the file and inherited state directory.
             libc::SYS_fsync,
         ]),
+        Profile::Netcfg { .. } => calls.push(libc::SYS_rt_sigreturn),
         Profile::WifiSimulated => calls.extend([
             libc::SYS_read,
             libc::SYS_write,
@@ -1043,10 +1079,11 @@ mod filter_tests {
 
     #[test]
     fn compiled_profiles_retain_instruction_headroom() {
-        // Current maximum: four Ethernet generations and the three Tokio
-        // reactor descriptors observed on Linux. Dynamic inventories remain
-        // exact sets; oversized future profiles must fail compilation closed.
+        // Include the three Tokio reactor descriptors observed on Linux.
+        // Initial inventories remain exact; runtime frame allocation does
+        // not add filter rules per connection.
         let profiles = [
+            Profile::Netcfg { device_fd: 3, provider_fd: 4, readiness_fd: 5 },
             Profile::WifiSimulated,
             Profile::Wlancfg {
                 control_fd: 3,
@@ -1443,6 +1480,11 @@ mod filter_tests {
             kill_body(&probe);
         }
         for probe in [
+            "netcfg:open",
+            "netcfg:dup",
+            "netcfg:clone3",
+            "netcfg:wrong-ioctl-fd",
+            "netcfg:tgkill",
             "wifi:open",
             "wifi:eventfd",
             "wifi:clone3",
@@ -2303,6 +2345,9 @@ mod filter_tests {
 
     fn profile(role: &str, fds: [RawFd; 4]) -> Profile {
         match role {
+            "netcfg" => Profile::Netcfg {
+                device_fd: fds[0], provider_fd: fds[1], readiness_fd: fds[2],
+            },
             "wifi" => Profile::WifiSimulated,
             "wlancfg" => Profile::Wlancfg {
                 control_fd: fds[0],

@@ -5,7 +5,7 @@
 //! This process creates capabilities and starts independently sandboxed
 //! services. It owns no association policy and never reads a credential.
 
-use drv_network_service::{NetworkServiceSupervisor, WifiLifecycleReceiver};
+use drv_network_service::NetworkServiceSupervisor;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -56,10 +56,10 @@ enum ShutdownCause {
     SuspendPreparation,
 }
 
-fn requested_shutdown(now: Instant, deadline: Instant) -> Option<ShutdownCause> {
+fn requested_shutdown(now: Instant, deadline: Option<Instant>) -> Option<ShutdownCause> {
     if SUSPEND_REQUESTED.load(Ordering::Acquire) {
         Some(ShutdownCause::SuspendPreparation)
-    } else if STOP_REQUESTED.load(Ordering::Acquire) || now >= deadline {
+    } else if STOP_REQUESTED.load(Ordering::Acquire) || deadline.is_some_and(|deadline| now >= deadline) {
         Some(ShutdownCause::Ordinary)
     } else {
         None
@@ -95,11 +95,12 @@ fn run() -> Result<(), String> {
     let driver = PathBuf::from(args.next().ok_or_else(usage)?);
     let wlancfg_binary = PathBuf::from(args.next().ok_or_else(usage)?);
     let network_binary = PathBuf::from(args.next().ok_or_else(usage)?);
+    let netcfg_binary = PathBuf::from(args.next().ok_or_else(usage)?);
     let state_directory = PathBuf::from(args.next().ok_or_else(usage)?);
     if args.next().is_some() {
         return Err(usage());
     }
-    for binary in [&driver, &wlancfg_binary, &network_binary] {
+    for binary in [&driver, &wlancfg_binary, &network_binary, &netcfg_binary] {
         if !binary.is_file() {
             return Err(format!(
                 "service binary does not exist: {}",
@@ -131,12 +132,14 @@ fn run() -> Result<(), String> {
         &std::env::var("DRV_SAE_CLIENT_MAC")
             .map_err(|_| "DRV_SAE_CLIENT_MAC is required".to_string())?,
     )?;
-    let max_seconds = std::env::var("DRV_STACK_MAX_SECONDS")
-        .map_or(Ok(60), |value| value.parse::<u64>())
-        .map_err(|_| "DRV_STACK_MAX_SECONDS is invalid")?;
-    if !(30..=300).contains(&max_seconds) {
-        return Err("DRV_STACK_MAX_SECONDS must be 30..=300".into());
-    }
+    // Continuous service by default; an explicit deadline is useful for KVM
+    // qualification but is not a production lifetime/resource limit.
+    let deadline = std::env::var("DRV_STACK_MAX_SECONDS").ok().map(|value| {
+        let seconds = value.parse::<std::num::NonZeroU64>()
+            .map_err(|_| "DRV_STACK_MAX_SECONDS must be positive")?;
+        Instant::now().checked_add(Duration::from_secs(seconds.get()))
+            .ok_or("DRV_STACK_MAX_SECONDS exceeds clock range")
+    }).transpose()?;
     std::fs::create_dir_all("/run/drv").map_err(|error| format!("create /run/drv: {error}"))?;
     std::fs::create_dir_all(&state_directory)
         .map_err(|error| format!("create saved-network directory: {error}"))?;
@@ -185,14 +188,6 @@ fn run() -> Result<(), String> {
     };
     drop((driver_policy, policy, driver_supervisor, application, state));
 
-    let mut lifecycle = match WifiLifecycleReceiver::new(supervisor) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => {
-            let _ = policy_child.kill();
-            let _ = policy_child.wait();
-            return wait_driver_after_policy_close(driver_child, error);
-        }
-    };
     let mut network =
         match NetworkServiceSupervisor::new_kernel(
             network_binary, "/dev/netstack3", mac, Some(resolver),
@@ -211,13 +206,21 @@ fn run() -> Result<(), String> {
         let _ = policy_child.wait();
         return wait_driver_after_policy_close(driver_child, error);
     }
+    let mut netcfg_child = match spawn_netcfg(&netcfg_binary, &supervisor, &network, mac) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = policy_child.kill();
+            let _ = policy_child.wait();
+            // Keep Netstack and both lifecycle peers alive during hardware stop.
+            return wait_driver_after_policy_close(driver_child, error);
+        }
+    };
     // Diagnostic output must not unwind past live hardware-owning children.
     let _ = writeln!(
         std::io::stdout(),
-        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider resolver=true"
+        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider netcfg=netcfg-service resolver=true"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(max_seconds);
     let mut shutdown_cause = None;
     let mut shutdown_deadline = None;
     let mut policy_done = false;
@@ -272,6 +275,9 @@ fn run() -> Result<(), String> {
             && let Some(cause) = requested_shutdown(Instant::now(), deadline)
         {
             shutdown_cause = Some(cause);
+            if let Err(error) = stop_netcfg(&mut netcfg_child) {
+                break Err(error);
+            }
             shutdown_deadline = Some(Instant::now() + Duration::from_secs(10));
             if !policy_done {
                 if let Err(error) = policy_child.kill() {
@@ -294,15 +300,11 @@ fn run() -> Result<(), String> {
             // The network child is still terminated before certification.
         }
 
-        // Once revocation starts, never consume a queued Install and recreate
-        // an old Ethernet generation while firmware containment is pending.
         if shutdown_cause.is_none() {
-            match lifecycle.receive(&mut network) {
-                Ok(Some(update)) => {
-                    let _ = writeln!(std::io::stdout(), "wlan_stack_network_lifecycle={update:?}");
-                }
+            match netcfg_child.try_wait() {
+                Ok(Some(status)) => break Err(format!("netcfg exited unexpectedly: {status}")),
                 Ok(None) => {}
-                Err(error) => break Err(error),
+                Err(error) => break Err(format!("poll netcfg: {error}")),
             }
         }
         match network.poll_exit() {
@@ -318,6 +320,13 @@ fn run() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(1));
     };
 
+    let result = match stop_netcfg(&mut netcfg_child) {
+        Ok(()) => result,
+        Err(error) => Err(match result {
+            Ok(()) => error,
+            Err(original) => format!("{original}; {error}"),
+        }),
+    };
     let result = finish_children(
         &mut policy_child,
         policy_done,
@@ -336,7 +345,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: wlan-stack-kvm MT7921_DRIVER WLANCFG_SERVICE NETSTACK3_PROVIDER STATE_DIRECTORY".into()
+    "usage: wlan-stack-kvm MT7921_DRIVER WLANCFG_SERVICE NETSTACK3_PROVIDER NETCFG_SERVICE STATE_DIRECTORY".into()
 }
 
 fn wait_driver_after_policy_close(mut driver: Child, original: String) -> Result<(), String> {
@@ -629,6 +638,75 @@ fn spawn_driver(
         .map_err(|error| format!("spawn MT7921 service: {error}"))
 }
 
+fn spawn_netcfg(
+    binary: &Path,
+    device: &OwnedFd,
+    network: &NetworkServiceSupervisor,
+    mac: [u8; 6],
+) -> Result<Child, String> {
+    use std::io::Read as _;
+    let device = duplicate(device.as_raw_fd())?;
+    let (admin, generation) = network.configuration_capability()?;
+    let (mut ready, child_ready) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| format!("netcfg readiness channel: {e}"))?;
+    ready.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let ready_pass = duplicate(child_ready.as_raw_fd())?;
+    let inherited = [(device.as_raw_fd(), 3), (admin.as_raw_fd(), 4), (ready_pass.as_raw_fd(), 5)];
+    let mut command = Command::new(binary);
+    command.env_clear()
+        .arg(mac.map(|v| format!("{v:02x}")).join(":"))
+        .arg(generation.to_string())
+        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in inherited {
+                if libc::dup2(source, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| format!("spawn netcfg: {e}"))?;
+    drop((ready_pass, child_ready));
+    let mut reply = [0; 5];
+    if let Err(error) = ready.read_exact(&mut reply).and_then(|()| {
+        if &reply == b"READY" { Ok(()) }
+        else { Err(std::io::Error::other("invalid netcfg readiness")) }
+    }) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("netcfg startup: {error}"));
+    }
+    Ok(child)
+}
+
+fn stop_netcfg(child: &mut Child) -> Result<(), String> {
+    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        return if status.success() { Ok(()) }
+            else { Err(format!("netcfg failed: {status}")) };
+    }
+    // Unlike a hardware owner, netcfg can be killed safely if its bounded
+    // control operation fails to drain. Its peer capabilities remain held by
+    // the launcher until Wi-Fi has stopped, preserving shutdown ordering.
+    if unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } != 0 {
+        return Err(format!("stop netcfg: {}", std::io::Error::last_os_error()));
+    }
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return if status.success() { Ok(()) }
+                else { Err(format!("netcfg stop failed: {status}")) };
+        }
+        if Instant::now() >= deadline {
+            child.kill().map_err(|e| e.to_string())?;
+            child.wait().map_err(|e| e.to_string())?;
+            return Err("netcfg stop timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn spawn_policy(
     binary: &Path,
     generation: &str,
@@ -729,16 +807,17 @@ mod tests {
         let now = Instant::now();
         STOP_REQUESTED.store(false, Ordering::Release);
         SUSPEND_REQUESTED.store(false, Ordering::Release);
-        assert_eq!(requested_shutdown(now, now + Duration::from_secs(1)), None);
-        assert_eq!(requested_shutdown(now, now), Some(ShutdownCause::Ordinary));
+        assert_eq!(requested_shutdown(now, Some(now + Duration::from_secs(1))), None);
+        assert_eq!(requested_shutdown(now, None), None);
+        assert_eq!(requested_shutdown(now, Some(now)), Some(ShutdownCause::Ordinary));
         STOP_REQUESTED.store(true, Ordering::Release);
         assert_eq!(
-            requested_shutdown(now, now + Duration::from_secs(1)),
+            requested_shutdown(now, Some(now + Duration::from_secs(1))),
             Some(ShutdownCause::Ordinary)
         );
         SUSPEND_REQUESTED.store(true, Ordering::Release);
         assert_eq!(
-            requested_shutdown(now, now + Duration::from_secs(1)),
+            requested_shutdown(now, Some(now + Duration::from_secs(1))),
             Some(ShutdownCause::SuspendPreparation)
         );
         STOP_REQUESTED.store(false, Ordering::Release);

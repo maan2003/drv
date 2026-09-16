@@ -519,6 +519,7 @@ dependencies = [
  "dhcp-protocol",
  "drv-dns-wire",
  "libc",
+ "linux-self-sandbox",
  "net_types",
  "netstack3-port-integration",
  "netstack3-port-spike",
@@ -1195,6 +1196,15 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "linux-self-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seccompiler",
+ "userspace-vfio",
+]
 
 [[package]]
 name = "litemap"
@@ -2070,6 +2080,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2400,6 +2419,13 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "userspace-vfio"
+version = "0.1.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

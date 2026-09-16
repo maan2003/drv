@@ -28,12 +28,13 @@ mod resolver;
 pub use provider::{run_provider, ResolverEndpoint};
 mod ethernet_device;
 mod lifecycle;
+pub mod netcfg;
 mod link_control;
 mod supervisor;
 
 pub use child::run;
 use ethernet_device::ServiceEthernetDevice;
-pub use lifecycle::{WifiLifecycleReceiver, WifiLifecycleUpdate};
+pub use lifecycle::{InterfaceInstaller, WifiLifecycleReceiver, WifiLifecycleUpdate};
 pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor};
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;

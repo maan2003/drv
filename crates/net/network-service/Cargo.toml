@@ -9,6 +9,7 @@ version = "0.1.0"
 resolver = "3"
 
 [dependencies]
+linux-self-sandbox = { path = "../../platform/linux-self-sandbox" }
 drv-dns-wire = { path = "../dns-wire" }
 libc = "0.2"
 rustix = { version = "=1.1.4", features = ["net", "event", "fs"] }
@@ -18,6 +19,7 @@ rand = "=0.9.4"
 wifi-supervisor-wire = { path = "../../wifi/wifi-supervisor-wire" }
 
 [dev-dependencies]
+linux-self-sandbox = { path = "../../platform/linux-self-sandbox", features = ["filter-integration-test"] }
 netstack3_tcp = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/netstack3/core/tcp" }
 dhcp-protocol = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/network/dhcpv4/protocol" }
 net_types = { path = "../../../reference/fuchsia-1e1219e3fac944c9a906aea9646939746b6062b3/src/connectivity/lib/net-types" }
