@@ -1085,12 +1085,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
         }
         let result = self.connect_attempt.as_ref().unwrap().result.unwrap();
-        if result.code != fidl_ieee80211::StatusCode::Success {
-            self.begin_cleanup(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)?;
-            self.cleanup.as_mut().unwrap().failed_connect = Some(ConnectError::Failed(result));
+        // MLME can report failure before its awaited peer removal completes.
+        // Keep that operation's authority live until the protocol is quiescent;
+        // begin_cleanup revokes the old epoch.
+        if !self.protocol_idle() {
             return Ok(None);
         }
-        if !self.protocol_idle() {
+        if result.code != fidl_ieee80211::StatusCode::Success {
+            eprintln!("client_connection_failed result={result:?}");
+            self.begin_cleanup(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)?;
+            self.cleanup.as_mut().unwrap().failed_connect = Some(ConnectError::Failed(result));
             return Ok(None);
         }
         if !self.sme.borrow().status().is_connected()
@@ -4509,6 +4513,51 @@ mod tests {
             assert!(while_pending_io.unpublished_ethernet_device.is_none());
             assert!(while_pending_io.pending_ethernet_devices.is_empty());
             assert!(while_pending_io.ethernet.is_closed());
+        });
+    }
+
+    #[test]
+    fn failed_connect_preserves_pending_peer_removal_authority() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (completion, receiver) = oneshot::channel();
+            {
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.reject_next_auth = true;
+                state.retry_cleanup = true;
+                state.clear_completion = Some(receiver);
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime.begin_connect(
+                connect_request(), Instant::now() + Duration::from_secs(3),
+            ).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    assert!(runtime.drive_connect_once().await.unwrap().is_none());
+                    if effects.lock().unwrap().calls.contains(&"clear")
+                        && (runtime.connect_attempt.as_ref().unwrap().result.is_some()
+                            || runtime.cleanup.is_some())
+                    {
+                        break;
+                    }
+                }
+            }).await.unwrap();
+            let context = effects.lock().unwrap().association_contexts.last().unwrap().clone();
+            assert!(context.check(Instant::now()).is_ok(),
+                "failure reporting revoked an in-flight peer removal");
+            completion.send(Ok(())).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match runtime.drive_connect_once().await {
+                        Ok(None) => {}
+                        other => break other,
+                    }
+                }
+            }).await.unwrap();
+            assert!(matches!(result, Err(ConnectError::Failed(_))));
+            assert!(!runtime.revoked);
+            runtime.shutdown().await.unwrap();
         });
     }
 
