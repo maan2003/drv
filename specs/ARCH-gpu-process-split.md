@@ -2,118 +2,113 @@
 
 ## Status
 
-Design and first implementation slice. Nothing user-visible yet. Implements
-the "GPU process" component of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
-Work happens on the `gpu-process` branch of the niri fork at `/src/niri`, with
-smithay at `/src/smithay` for the storage change described below.
+Implemented on the `gpu-process` branch of the niri fork at `/src/niri`
+(smithay fork at `/src/smithay`). Builds, passes the test suite under
+llvmpipe, not yet run on real hardware. Implements the "GPU process"
+component of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
 
 ## Goal
 
-The compositor core never opens `/dev/dri` and never maps client memory.
-Everything that touches Mesa, GBM, EGL, or KMS runs in a separate process
-with its own UID. A Mesa bug yields a process that can draw pixels and read
-client buffers, not one that routes input, holds policy, or owns the lock
-lease.
+The compositor core never opens `/dev/dri` for rendering and never runs
+Mesa. Everything that touches Mesa, GBM, EGL, or KMS runs in a separate
+process. A Mesa bug yields a process that can draw pixels and read client
+buffers, not one that routes input, holds policy, or talks to clients.
 
 The protocol stays in the core. Whoever owns a client connection can send
 `wl_keyboard.key` to that client, so the GPU process must never hold one.
 
-## What niri looks like today
-
-- `Backend` enum (`src/backend/mod.rs`) with tty, winit, headless variants.
-  The rest of niri reaches the renderer only through
-  `Backend::with_primary_renderer` (~35 call sites) and `Backend::render`.
-- `tty.rs` owns libseat, udev, libinput, GBM, EGL, `DrmCompositor`,
-  vblank handling. It is the GPU process in embryo.
-- Render elements are generic over `R: NiriRenderer`, which is bound to
-  `GlesRenderer` (`render_helpers/renderer.rs`). Effect elements (border,
-  shadow, blur, resize, custom shaders) hold GL programs and textures.
-  `OffscreenBuffer::render` renders sub-trees into textures while elements
-  are being built, so the scene is a tree, not a list.
-- smithay caches textures per renderer inside each `wl_surface`'s user
-  data (`RendererSurfaceState`) and imports lazily during render.
-- smithay's direct scanout path (`DrmCompositor`, `UnderlyingStorage`)
-  only understands `WlBuffer`-backed storage.
-
-## Target shape
+## Shape
 
 ```text
-core process                         gpu process
-  wayland clients (SO_PEERCRED)        render node + DRM master
-  policy, focus, input, layout         GlesRenderer, shaders, textures
-  buffer fds: validate, seal, forward  buffer registry: BufferId -> texture
-  scene tree per frame  ------------>  DrmCompositor, plane assignment
-  frame callbacks, feedback <--------  presented / released events
+core process                              gpu process
+  wayland clients, focus, input             GlesRenderer, shaders, blur
+  layout, animation, damage tracking        texture tables (ids -> GL)
+  libseat, udev, libinput                   DrmDevice / GbmDevice / DrmCompositor
+  output policy: modes, VRR, gamma, on/off  swapchain, page flips, vblank
+  recorded frames  ---------------------->  replay onto texture or output
+  vblank, connector scan  <---------------  events / replies
 ```
 
-One binary. The GPU process is `niri --gpu-process` with the socket on an
-inherited fd, the way Chromium does `--type=gpu-process`. This lets it reuse
-`render_helpers` shaders without splitting the crate.
+The GPU process is a dumb renderer. It has no scene graph, no layout, no
+timing policy. It replays what the core recorded.
+
+One binary. The core spawns `niri gpu-process --socket-fd 3 --mode drm`
+(`--mode headless` for tests) via `std::env::current_exe`; setting
+`NIRI_GPU_THREAD` runs the server as a thread instead, for debugging.
+
+## Recording renderer
+
+`src/gpu/remote.rs` implements smithay's `Renderer`, `Frame`, `Texture`,
+`Bind`, `Offscreen`, `ImportMem`, `ImportDma`, `ExportMem` by recording
+`Command`s (`src/gpu/protocol.rs`) instead of issuing GL. Render elements
+in `render_helpers/` are unchanged in structure; `GlesRenderer` became
+`RemoteRenderer`. Effects that used raw GL (border, shadow, resize,
+open/close shaders, blur, framebuffer capture) became commands
+(`DrawShader`, `Blur`, `CaptureFramebuffer`, `DrawCaptured`) with the GL
+code moved to `src/gpu/gl/`.
+
+Damage tracking stays in the core: one `OutputDamageTracker` per output.
+`Tty::render` records only what changed and sends `Present{output, frame,
+damage}`. The GPU side wraps the recorded list in a single `FrameElement`
+(with a short damage history) for `DrmCompositor::render_frame`, so
+smithay's swapchain damage logic still works.
 
 ## Protocol
 
-Unix stream socketpair, length-prefixed `postcard` frames, fds attached via
-`SCM_RIGHTS` to the frame that references them and consumed in order. All
-ids are `u64` chosen by the core; the GPU process maps them to smithay
-`Id`s and textures.
+Unix stream socketpair, length-prefixed `postcard` frames, fds via
+`SCM_RIGHTS` on the frame that references them. Every `Request` gets
+exactly one reply `Event`. Unsolicited `Event::Notify(GpuEvent)` (vblank,
+device error) can arrive at any time; the client queues those and wakes
+the core loop through a calloop `Ping`.
 
-Core to GPU:
+Core to GPU: `Execute{commands}`, `ImportDmabuf`, `ReadTexture`,
+`SetCustomShader`, device lifecycle (`AddDevice`, `RemoveDevice`,
+`PauseDevices`, `ResumeDevices`, `RescanDevice`, `CleanupDevice`), output
+control (`EnableOutput`, `DisableOutput`, `SetMode`, `SetVrr`,
+`SetMaxBpc`, `SetOutputGeometry`, `SetGamma`, `ClearOutputs`,
+`SetDebugTint`), `Present`, `Shutdown`.
 
-- `RegisterShm { id, fd, size, offset, stride, width, height, format }`,
-  `RegisterDmabuf { id, planes[], width, height, format, modifier }`,
-  `UpdateShm { id, damage[] }`, `DestroyBuffer { id }`.
-- `Frame { output, scene }` per redraw. `scene` is a tree of nodes:
-  `Surface { buffer, geometry, src, transform, alpha, damage, opaque, kind }`,
-  `SolidColor`, `Memory` (CPU-rendered panels), `Shader { program, uniforms,
-  textures }`, `Offscreen { id, children }`, and the geometry wrappers
-  `Crop`, `Relocate`, `Rescale`. Each node carries a stable id and a commit
-  counter so damage tracking works across frames.
-- `RenderToImage { scene, format }` for screenshots, colour pick, tests.
-- Output control: mode set, VRR, gamma, power, cursor position. Later.
+GPU to core: `Ready{caps}`, `Ack`, `Image`, `DeviceAdded{caps}`,
+`Scan{connected: ConnectorInfo[], disconnected}`, `OutputState`,
+`Presented{submitted}`, `Notify(VBlank | DeviceError)`, `Error`.
 
-GPU to core:
+`Caps` carries what the core needs to answer clients without asking again:
+shm and dmabuf formats, dmabuf render formats (screencast, image copy),
+which shader programs compiled.
 
-- `Presented { output, time, sequence, per-element scanout state }` so the
-  core fires frame callbacks and presentation feedback.
-- `BufferReleased { id }` so the core sends `wl_buffer.release`.
-- `Image { … }`, `OutputsChanged`, `Error`.
+## Split of the old tty backend
 
-## Changes
+Core (`src/backend/tty.rs`): libseat session and VT switching, udev
+hotplug, libinput, choosing modes (incl. modelines/CVT), VRR and max-bpc
+policy, `Output` objects and IPC output state, frame clock and redraw
+state, presentation feedback, dmabuf global. It opens DRM fds through
+libseat and hands dups to the GPU process; it never uses them itself.
 
-**smithay.** Add a non-Wayland `UnderlyingStorage` variant carrying a
-`Dmabuf` (and a memory variant for shm) and teach `DrmCompositor` and the
-GBM exporter to scan out from it. Without this, direct scanout is
-impossible from a process with no `WlBuffer`s. Also let `ShmState` track
-pools without mapping them, so the core never maps client memory.
+GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
+allocator, one `DrmCompositor` per enabled CRTC, connector properties
+(max bpc, HDR reset, gamma), EDID parsing for `ConnectorInfo`, page flips,
+vblank forwarding. Secondary GPUs are display-only via the primary's
+allocator with linear buffers.
 
-**niri core.** `Backend::Remote`. Elements become renderer-agnostic:
-`NiriRenderer` bounds drop `GlesTexture`/`AsGlesRenderer`, textures and
-offscreen buffers become ids, `Shaders` become an enum of program kinds
-plus uniforms. `with_primary_renderer` call sites become remote requests.
-Client-side policy (`ClientState.restricted`) becomes a per-UID record.
+## Dropped in v1
 
-**niri GPU side.** `tty.rs` largely moves here: seat fds from the seat
-daemon, `DrmCompositor`, vblank. Plus the buffer registry and scene
-reconstruction into smithay render elements. Screencast rendering to
-PipeWire lives here too.
-
-## Order
-
-1. `src/gpu/{scene,protocol,transport,server,client}.rs`. GPU side renders
-   `SolidColor` and shm `Surface` nodes to an offscreen texture and returns
-   pixels. Test: spawn the process under llvmpipe, register a buffer, render,
-   check pixels. Proves IPC, fd passing, and rendering out of process with
-   no DRM and no hardware.
-2. Move the DRM output path into the GPU side behind `Frame`/`Presented`.
-   Headless tests keep using `RenderToImage`.
-3. Make niri's elements renderer-agnostic and add `Backend::Remote`.
-   This is the bulk of the work and is mostly mechanical.
-4. smithay storage variant for direct scanout.
-5. Sandbox the GPU process: own UID, seccomp, no client sockets.
+DRM leasing, direct scanout and cursor plane, multi-GPU rendering,
+per-surface scanout dmabuf feedback, the winit (nested) backend, the legacy
+EGL `wl_drm` path, and the gnome-screencast default feature. None of these
+affect the security story; they are performance or convenience features to
+revisit once the split is stable on hardware.
 
 ## Testing
 
 llvmpipe via Mesa's surfaceless EGL platform. The dev shell does not ship
 a Mesa driver; tests need `LIBGL_ALWAYS_SOFTWARE=1` and the Mesa EGL vendor
-file on `__EGL_VENDOR_LIBRARY_FILENAMES`. The existing `Headless` backend
-already does surfaceless EGL, so the same environment covers both.
+file on `__EGL_VENDOR_LIBRARY_FILENAMES`. `cargo test --lib gpu::` runs the
+in-process smoke test, `cargo test --test gpu_process` spawns a real
+`niri gpu-process` child and checks pixels.
+
+## Next
+
+1. Run on real hardware: startup, hotplug, VT switch, suspend, VRR.
+2. Sandbox the GPU process: own UID, seccomp, only the DRM fds it is given.
+3. Screencast buffers allocated GPU-side; direct scanout via a
+   non-`WlBuffer` `UnderlyingStorage` in smithay; cursor plane.
