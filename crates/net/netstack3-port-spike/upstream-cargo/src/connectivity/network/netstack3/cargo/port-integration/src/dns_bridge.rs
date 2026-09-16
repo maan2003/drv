@@ -393,6 +393,7 @@ pub struct NativeDnsBridge {
     b: Arc<Bus>,
     pool: LocalPool,
     resolver: Option<Resolver>,
+    servers: Vec<IpAddr>,
     next_query: u64,
     limit: usize,
     results: Rc<RefCell<HashMap<u64, DnsLookupSlot>>>,
@@ -408,6 +409,7 @@ impl NativeDnsBridge {
             b: Arc::new(Bus::new(limit.get())),
             pool: LocalPool::new(),
             resolver: None,
+            servers: Vec::new(),
             next_query: 0,
             limit: limit.get(),
             results: Rc::new(RefCell::new(HashMap::new())),
@@ -416,6 +418,9 @@ impl NativeDnsBridge {
         }
     }
     pub fn configure(&mut self, servers: &[IpAddr]) -> Result<(), NetError> {
+        if self.resolver.is_some() && self.servers == servers {
+            return Ok(()); // Lease renewal is not a new resolver lifetime.
+        }
         let c = ResolverConfig::from_parts(
             None,
             vec![],
@@ -427,7 +432,10 @@ impl NativeDnsBridge {
         );
         let mut builder = HickoryResolver::builder_with_config(c, NativeDnsRuntime(self.b.clone()));
         *builder.options_mut() = native_resolver_options();
-        self.resolver = Some(builder.build()?);
+        let resolver = builder.build()?;
+        self.clear();
+        self.servers = servers.to_vec();
+        self.resolver = Some(resolver);
         Ok(())
     }
     pub fn resolver(&self) -> Option<&Resolver> {
@@ -435,6 +443,21 @@ impl NativeDnsBridge {
     }
     pub fn clear(&mut self) {
         self.resolver = None;
+        self.servers.clear();
+        // A lookup owns a resolver clone. Dropping only the configured resolver
+        // does not cancel its retries or background transports on the old link.
+        for slot in self.results.borrow_mut().values_mut() {
+            slot.abort.abort();
+            slot.result = Some(Err(io::Error::new(
+                io::ErrorKind::NotConnected, "DNS configuration was revoked",
+            ).into()));
+        }
+        self.pool = LocalPool::new();
+        self.b.tasks.lock().unwrap().clear();
+        self.b.cmd.lock().unwrap().clear();
+        self.b.timers.lock().unwrap().clear();
+        // Dropped transport tasks mark End::alive=false. The next pump closes
+        // their core sockets before admitting new transport work.
     }
     pub fn lookup_ip(&mut self, name: impl Into<String>) -> io::Result<DnsLookupHandle> {
         let resolver = self.resolver.clone().ok_or_else(|| {
@@ -496,7 +519,26 @@ impl NativeDnsBridge {
     pub fn spawner(&self) -> futures::executor::LocalSpawner {
         self.pool.spawner()
     }
+    fn reap_transports(&mut self, rt: &mut Runtime) {
+        self.udp.retain(|_, (h, _, _, e)| {
+            if e.alive.load(Ordering::Relaxed) {
+                true
+            } else {
+                let _ = rt.udp_close(*h);
+                false
+            }
+        });
+        self.tcp.retain(|_, (h, e, _)| {
+            if e.alive.load(Ordering::Relaxed) {
+                true
+            } else {
+                let _ = rt.tcp_close(*h);
+                false
+            }
+        });
+    }
     pub fn pump(&mut self, rt: &mut Runtime, now: Duration, budget: usize) -> usize {
+        self.reap_transports(rt);
         let now = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
         self.b.now.store(now, Ordering::Relaxed);
         let mut n = 0;
@@ -541,22 +583,7 @@ impl NativeDnsBridge {
                 self.apply(rt, c)
             }
         }
-        self.udp.retain(|_, (h, _, _, e)| {
-            if e.alive.load(Ordering::Relaxed) {
-                true
-            } else {
-                let _ = rt.udp_close(*h);
-                false
-            }
-        });
-        self.tcp.retain(|_, (h, e, _)| {
-            if e.alive.load(Ordering::Relaxed) {
-                true
-            } else {
-                let _ = rt.tcp_close(*h);
-                false
-            }
-        });
+        self.reap_transports(rt);
         for (h, _, _, e) in self.udp.values().take(budget.saturating_sub(n)) {
             if let Ok(Some(packet)) = rt.udp_receive_msg(*h) {
                 let source = match packet.source.address {
@@ -671,6 +698,40 @@ mod tests {
             native_resolver_options().use_hosts_file,
             ResolveHosts::Never
         ));
+    }
+
+    #[test]
+    fn resolver_reconfiguration_cancels_old_work_but_renewal_preserves_it() {
+        let servers = [IpAddr::from([192, 0, 2, 53])];
+        let mut bridge = NativeDnsBridge::new();
+        bridge.configure(&servers).unwrap();
+        let mut runtime = Runtime::new(
+            64, [9; 8192], NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 2], 1500,
+        ).unwrap();
+        runtime.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
+        let pending = bridge.lookup_ip("pending.test.").unwrap();
+        for _ in 0..8 {
+            bridge.pump(&mut runtime, Duration::ZERO, DEFAULT_LIMIT);
+        }
+        assert!(!bridge.udp.is_empty(), "the cancelled lookup must own a real transport");
+        bridge.configure(&servers).unwrap();
+        assert!(bridge.take_result(pending).is_none());
+        bridge.clear();
+        assert!(bridge.take_result(pending).unwrap().is_err());
+        bridge.pump(&mut runtime, Duration::ZERO, DEFAULT_LIMIT);
+        assert!(bridge.udp.is_empty());
+        assert!(bridge.tcp.is_empty());
+        assert!(bridge.next_timer_deadline().is_none());
+        assert!(bridge.lookup_ip("offline.test.").is_err());
+        bridge.configure(&servers).unwrap();
+        let old = bridge.lookup_ip("old.test.").unwrap();
+        bridge.configure(&[IpAddr::from([192, 0, 2, 54])]).unwrap();
+        assert!(bridge.take_result(old).unwrap().is_err());
+        let current = bridge.lookup_ip("current.test.").unwrap();
+        assert!(bridge.take_result(current).is_none());
+        bridge.cancel_lookup(current);
+        assert!(bridge.results.borrow().is_empty());
     }
 
     #[test]
