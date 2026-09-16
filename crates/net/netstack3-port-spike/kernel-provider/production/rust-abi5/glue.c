@@ -210,7 +210,20 @@ void *ns3_new_accepted(void *p, int family, u64 generation) {
     ret = sock_create_lite(family, SOCK_STREAM, IPPROTO_TCP, &sock);
     if (!ret) {
         ret = create(net, sock, IPPROTO_TCP, generation, family);
-        if (ret) sock_release(sock);
+        if (ret) {
+            sock_release(sock);
+        } else {
+            struct sock *parent = p, *child = sock->sk;
+            /* These are native wait/buffer settings, not TCP protocol policy.
+             * Snapshot under the same lock used by SOL_SOCKET setters. */
+            lock_sock(parent);
+            child->sk_sndbuf = parent->sk_sndbuf;
+            child->sk_rcvbuf = parent->sk_rcvbuf;
+            child->sk_userlocks = parent->sk_userlocks;
+            child->sk_sndtimeo = parent->sk_sndtimeo;
+            child->sk_rcvtimeo = parent->sk_rcvtimeo;
+            release_sock(parent);
+        }
     }
     put_net(net);
     return ret ? ERR_PTR(ret) : sock;

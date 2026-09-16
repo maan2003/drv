@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
@@ -134,6 +135,37 @@ static void tcp(int family, unsigned short port) {
 }
 /* Fill kernel RX, let all unrelated activity settle, then resume the reader.
  * Pending provider RX must wake on restored write capacity, not a TCP timer. */
+static void inherited_options(int family) {
+    struct sockaddr_storage a = addr(family, 0);
+    int listener = socket(family, SOCK_STREAM, 0);
+    int send_size = 65536, recv_size = 32768;
+    struct timeval send_time = { .tv_usec = 222000 }, recv_time = { .tv_usec = 111000 };
+    check(listener >= 0 &&
+          setsockopt(listener, SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == 0 &&
+          setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &recv_size, sizeof(recv_size)) == 0 &&
+          setsockopt(listener, SOL_SOCKET, SO_SNDTIMEO, &send_time, sizeof(send_time)) == 0 &&
+          setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, &recv_time, sizeof(recv_time)) == 0,
+          "set listener native options");
+    check(bind(listener, (void *)&a, alen(family)) == 0 && listen(listener, 1) == 0,
+          "inheritance listener");
+    socklen_t address_len = sizeof(a);
+    check(getsockname(listener, (void *)&a, &address_len) == 0, "inheritance bound address");
+    int client = socket(family, SOCK_STREAM, 0);
+    check(client >= 0 && connect(client, (void *)&a, alen(family)) == 0, "inheritance connect");
+    int accepted = accept(listener, NULL, NULL);
+    check(accepted >= 0, "inheritance accept");
+    const int options[] = { SO_SNDBUF, SO_RCVBUF, SO_SNDTIMEO, SO_RCVTIMEO };
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+        unsigned char expected[sizeof(struct timeval)] = {}, got[sizeof(struct timeval)] = {};
+        socklen_t en = sizeof(expected), gn = sizeof(got);
+        check(getsockopt(listener, SOL_SOCKET, options[i], expected, &en) == 0 &&
+              getsockopt(accepted, SOL_SOCKET, options[i], got, &gn) == 0 &&
+              en == gn && !memcmp(expected, got, en), "accepted native option inheritance");
+    }
+    close(accepted); close(client); close(listener);
+    printf("PASS_ACCEPTED_OPTIONS family=%d\n", family);
+}
+
 static void rx_pressure(int family, unsigned short port) {
     const size_t length = 384 * 1024;
     struct sockaddr_storage a = addr(family, port);
@@ -590,6 +622,11 @@ int main(int argc, char **argv) {
         puts("PASS IDLE_SOCKET_TCP");
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "inheritance")) {
+        inherited_options(AF_INET);
+        inherited_options(AF_INET6);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "rx-pressure")) {
         rx_pressure(AF_INET, 20401);
         rx_pressure(AF_INET6, 20402);
@@ -619,6 +656,7 @@ int main(int argc, char **argv) {
         puts("PASS PROVIDER_DEATH_WAKE_AND_NO_RESURRECTION");
         return 0;
     }
+    inherited_options(AF_INET); inherited_options(AF_INET6);
     shutdown_backpressure(AF_INET); shutdown_backpressure(AF_INET6);
     udp_batch(AF_INET); udp_batch(AF_INET6);
     udp_ancillary(AF_INET); udp_ancillary(AF_INET6);
