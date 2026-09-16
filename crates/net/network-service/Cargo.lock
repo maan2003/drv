@@ -529,6 +529,8 @@ dependencies = [
  "packet_formats",
  "rand 0.9.4",
  "rustix",
+ "serde",
+ "serde_json",
  "wifi-supervisor-wire",
  "wlan-softmac-host",
 ]
@@ -1357,6 +1359,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "serde",
  "zerocopy",
 ]
 

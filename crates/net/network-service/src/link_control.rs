@@ -25,6 +25,7 @@ const MESSAGE_LEN: usize = 16;
 pub(crate) enum Request {
     Attach { generation: u64, frame: OwnedFd },
     Detach { generation: u64 },
+    Watch { generation: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,17 +128,24 @@ pub(crate) fn receive_request(channel: BorrowedFd<'_>) -> Result<Option<Request>
             frame: descriptors.pop().unwrap(),
         })),
         2 if descriptors.is_empty() => Ok(Some(Request::Detach { generation })),
+        4 if descriptors.is_empty() => Ok(Some(Request::Watch { generation })),
         1 => Err("link-control attach requires exactly one descriptor".into()),
         2 => Err("link-control detach must not carry descriptors".into()),
         _ => Err("unknown link-control request".into()),
     }
 }
 
-pub(crate) fn send_ack(
+#[cfg(test)]
+pub(crate) fn send_ack(channel: BorrowedFd<'_>, generation: u64, status: AckStatus) -> Result<(), String> {
+    if try_send_ack(channel, generation, status)? { Ok(()) }
+    else { Err("link-control acknowledgement backpressure".into()) }
+}
+
+pub(crate) fn try_send_ack(
     channel: BorrowedFd<'_>,
     generation: u64,
     status: AckStatus,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let bytes = encode(
         3,
         match status {
@@ -149,8 +157,9 @@ pub(crate) fn send_ack(
     let iov = [IoSlice::new(&bytes)];
     let mut ancillary = SendAncillaryBuffer::default();
     match sendmsg(channel, &iov, &mut ancillary, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
-        Ok(MESSAGE_LEN) => Ok(()),
+        Ok(MESSAGE_LEN) => Ok(true),
         Ok(_) => Err("partial link-control acknowledgement".into()),
+        Err(rustix::io::Errno::AGAIN) => Ok(false),
         Err(error) => Err(format!("send link-control acknowledgement: {error}")),
     }
 }
@@ -172,6 +181,64 @@ pub(crate) fn receive_ack(channel: BorrowedFd<'_>, generation: u64) -> Result<Ac
         1 => Ok(AckStatus::Applied),
         2 => Ok(AckStatus::Rejected),
         _ => Err("invalid link-control acknowledgement status".into()),
+    }
+}
+
+pub(crate) const MAX_REPORT: usize = 65536;
+pub(crate) enum Reply {
+    Ack { generation: u64, status: AckStatus },
+    Interface(netstack3_port_integration::interfaces::InterfaceSnapshot),
+}
+
+/// Opt-in only: older capability installers continue receiving just their ACKs.
+pub(crate) fn watch(channel: BorrowedFd<'_>, generation: u64) -> Result<(), String> {
+    let bytes = encode(4, 0, generation);
+    let mut ancillary = SendAncillaryBuffer::default();
+    match sendmsg(channel, &[IoSlice::new(&bytes)], &mut ancillary,
+        SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
+        Ok(MESSAGE_LEN) => Ok(()),
+        result => Err(format!("subscribe interface watcher: {result:?}")),
+    }
+}
+
+/// False means backpressure. The producer retains only its latest state and
+/// waits for writable readiness rather than spinning or blocking core work.
+pub(crate) fn send_interface(channel: BorrowedFd<'_>, bytes: &[u8]) -> Result<bool, String> {
+    if bytes.len() > MAX_REPORT { return Err("interface report exceeds wire budget".into()); }
+    let mut ancillary = SendAncillaryBuffer::default();
+    match sendmsg(channel, &[IoSlice::new(bytes)], &mut ancillary,
+        SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
+        Ok(n) if n == bytes.len() => Ok(true),
+        Err(rustix::io::Errno::AGAIN) => Ok(false),
+        result => Err(format!("send interface report: {result:?}")),
+    }
+}
+
+pub(crate) fn receive_reply(channel: BorrowedFd<'_>) -> Result<Option<Reply>, String> {
+    let mut bytes = vec![0; MAX_REPORT];
+    let mut ancillary = RecvAncillaryBuffer::default();
+    let message = match recvmsg(channel, &mut [IoSliceMut::new(&mut bytes)],
+        &mut ancillary, RecvFlags::DONTWAIT) {
+        Ok(message) => message,
+        Err(rustix::io::Errno::AGAIN) => return Ok(None),
+        Err(error) => return Err(format!("receive interface report: {error}")),
+    };
+    if message.bytes == 0 { return Err("provider administration channel closed".into()); }
+    if message.flags.intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC) {
+        return Err("truncated interface report or unexpected descriptors".into());
+    }
+    bytes.truncate(message.bytes);
+    if bytes.starts_with(&MAGIC) {
+        let (kind, status, generation) = decode(&bytes)?;
+        let status = match (kind, status) {
+            (3, 1) => AckStatus::Applied,
+            (3, 2) => AckStatus::Rejected,
+            _ => return Err("invalid interface acknowledgement".into()),
+        };
+        Ok(Some(Reply::Ack { generation, status }))
+    } else {
+        serde_json::from_slice(&bytes).map(Reply::Interface).map(Some)
+            .map_err(|error| format!("invalid interface observation: {error}"))
     }
 }
 
@@ -221,4 +288,44 @@ mod tests {
             Ok(Some(Request::Detach { generation: 4 }))
         ));
     }
+    #[test]
+    fn interface_reports_fit_budget_and_backpressure_preserves_ack() {
+        use netstack3_port_integration::interfaces::*;
+        let address = std::net::IpAddr::V6([0xffff; 8].into());
+        let snapshot = InterfaceSnapshot {
+            id: u64::MAX, ipv4_enabled: true, ipv6_enabled: true,
+            addresses: vec![Address { address, prefix: 128, state: AddressState::Unavailable,
+                valid_until: Some(u64::MAX),
+                preferred_until: PreferredUntil::Preferred(Some(u64::MAX)) }; 64],
+            neighbors: vec![Neighbor { address, state: NeighborState::Unreachable,
+                mac: Some([255; 6]), observed_at: u64::MAX }; 64],
+            multicast: vec![[255; 6]; 64],
+            router_advertisement: Some(RouterAdvertisement {
+                source: [0xffff; 8].into(), observed_at: u64::MAX, options: vec![255; 8192],
+            }),
+            incomplete: true,
+        };
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(bytes.len() + 512 < MAX_REPORT, "also reserve the public status envelope");
+        let (sender, receiver) = pair();
+        watch(receiver.as_fd(), 1).unwrap();
+        assert!(matches!(receive_request(sender.as_fd()).unwrap(), Some(Request::Watch { generation: 1 })));
+        let mut queued = 0;
+        while send_interface(sender.as_fd(), &bytes).unwrap() { queued += 1; }
+        assert!(queued > 0);
+        // Fill the remaining small-message credit, too.
+        while try_send_ack(sender.as_fd(), 7, AckStatus::Applied).unwrap() {}
+        assert!(!try_send_ack(sender.as_fd(), 8, AckStatus::Applied).unwrap());
+        for _ in 0..queued {
+            let Some(Reply::Interface(report)) = receive_reply(receiver.as_fd()).unwrap() else {
+                panic!("expected an interface report");
+            };
+            assert_eq!(report, snapshot);
+        }
+        while receive_reply(receiver.as_fd()).unwrap().is_some() {}
+        assert!(try_send_ack(sender.as_fd(), 8, AckStatus::Applied).unwrap());
+        assert!(matches!(receive_reply(receiver.as_fd()).unwrap(),
+            Some(Reply::Ack { generation: 8, status: AckStatus::Applied })));
+    }
+
 }

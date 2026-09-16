@@ -147,6 +147,8 @@ fn run() -> Result<(), String> {
         bind_listener(Path::new("/run/drv/wlancfg.sock"), ListenerKind::Policy)?;
     let (_resolver_lock, resolver) =
         bind_listener(Path::new(drv_dns_wire::PATH), ListenerKind::Resolver)?;
+    let (_netcfg_lock, netcfg_listener) =
+        bind_listener(Path::new(drv_network_service::netcfg::STATUS_PATH), ListenerKind::NetworkStatus)?;
     let resolver = std::os::unix::net::UnixListener::from(resolver);
     let state = File::open(&state_directory)
         .map_err(|error| format!("open saved-network directory: {error}"))?;
@@ -206,7 +208,7 @@ fn run() -> Result<(), String> {
         let _ = policy_child.wait();
         return wait_driver_after_policy_close(driver_child, error);
     }
-    let mut netcfg_child = match spawn_netcfg(&netcfg_binary, &supervisor, &network, mac) {
+    let mut netcfg_child = match spawn_netcfg(&netcfg_binary, &supervisor, &network, mac, &netcfg_listener) {
         Ok(child) => child,
         Err(error) => {
             let _ = policy_child.kill();
@@ -481,12 +483,14 @@ fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
 enum ListenerKind {
     Policy,
     Resolver,
+    NetworkStatus,
 }
 
 fn bind_listener(path: &Path, kind: ListenerKind) -> Result<(File, OwnedFd), String> {
     let (socket_type, permissions) = match kind {
         ListenerKind::Policy => (libc::SOCK_SEQPACKET, 0o600),
         ListenerKind::Resolver => (libc::SOCK_STREAM, 0o666),
+        ListenerKind::NetworkStatus => (libc::SOCK_SEQPACKET, 0o666),
     };
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let lock = OpenOptions::new()
@@ -643,6 +647,7 @@ fn spawn_netcfg(
     device: &OwnedFd,
     network: &NetworkServiceSupervisor,
     mac: [u8; 6],
+    listener: &OwnedFd,
 ) -> Result<Child, String> {
     use std::io::Read as _;
     let device = duplicate(device.as_raw_fd())?;
@@ -651,7 +656,9 @@ fn spawn_netcfg(
         .map_err(|e| format!("netcfg readiness channel: {e}"))?;
     ready.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
     let ready_pass = duplicate(child_ready.as_raw_fd())?;
-    let inherited = [(device.as_raw_fd(), 3), (admin.as_raw_fd(), 4), (ready_pass.as_raw_fd(), 5)];
+    let status_pass = duplicate(listener.as_raw_fd())?;
+    let inherited = [(device.as_raw_fd(), 3), (admin.as_raw_fd(), 4),
+        (ready_pass.as_raw_fd(), 5), (status_pass.as_raw_fd(), 6), (ready_pass.as_raw_fd(), 7)];
     let mut command = Command::new(binary);
     command.env_clear()
         .arg(mac.map(|v| format!("{v:02x}")).join(":"))
@@ -756,7 +763,7 @@ mod tests {
 
     #[test]
     fn local_listeners_reclaim_stale_socket_without_replacing_live_owner() {
-        for kind in [ListenerKind::Policy, ListenerKind::Resolver] {
+        for kind in [ListenerKind::Policy, ListenerKind::Resolver, ListenerKind::NetworkStatus] {
             let directory = std::env::temp_dir().join(format!(
                 "wlan-{}-{:x}",
                 std::process::id(),

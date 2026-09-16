@@ -201,6 +201,11 @@ pub fn run_provider(
     let mut last_network_snapshot = None;
     let mut active_link_generation = None;
     let mut last_link_generation = 0u64;
+    let mut watch_interfaces = false;
+    let mut reported_revision = None;
+    let mut report_blocked = false;
+    let mut pending_ack = None;
+    let mut control_events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32;
     let mut workers: HashMap<u64, SocketWorker> = HashMap::new();
     let start = Instant::now();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
@@ -223,6 +228,7 @@ pub fn run_provider(
             }
         }
         if let Some(control) = &link_control
+            && pending_ack.is_none()
             && events[..event_count]
             .iter()
             .any(|event| event.u64 == LINK_CONTROL_TOKEN)
@@ -233,11 +239,20 @@ pub fn run_provider(
                 )? else {
                     break;
                 };
+                if let crate::link_control::Request::Watch { generation } = request {
+                    watch_interfaces = true;
+                    reported_revision = None;
+                    pending_ack = Some((generation, crate::link_control::AckStatus::Applied));
+                    progress = true;
+                    break;
+                }
                 let generation = match &request {
                     crate::link_control::Request::Attach { generation, .. }
-                    | crate::link_control::Request::Detach { generation } => *generation,
+                    | crate::link_control::Request::Detach { generation }
+                    | crate::link_control::Request::Watch { generation } => *generation,
                 };
                 let valid = match &request {
+                    crate::link_control::Request::Watch { .. } => unreachable!(),
                     crate::link_control::Request::Attach { generation, .. } => {
                         *generation > last_link_generation
                     }
@@ -246,12 +261,9 @@ pub fn run_provider(
                     }
                 };
                 if !valid {
-                    crate::link_control::send_ack(
-                        control.as_fd(),
-                        generation,
-                        crate::link_control::AckStatus::Rejected,
-                    )?;
-                    continue;
+                    pending_ack = Some((generation, crate::link_control::AckStatus::Rejected));
+                    progress = true;
+                    break;
                 }
 
                 if let Some(old) = ethernet.take() {
@@ -265,6 +277,7 @@ pub fn run_provider(
                     drop(old);
                 }
                 match request {
+                    crate::link_control::Request::Watch { .. } => unreachable!(),
                     crate::link_control::Request::Attach { generation, frame } => {
                         // The trusted supervisor validates connected AF_UNIX
                         // SOCK_SEQPACKET direction and nonblocking mode before
@@ -314,12 +327,9 @@ pub fn run_provider(
                         active_link_generation = None;
                     }
                 }
-                crate::link_control::send_ack(
-                    control.as_fd(),
-                    generation,
-                    crate::link_control::AckStatus::Applied,
-                )?;
+                pending_ack = Some((generation, crate::link_control::AckStatus::Applied));
                 progress = true;
+                break;
             }
         }
         if events[..event_count].iter().any(|event| event.u64 == 0) {
@@ -531,6 +541,37 @@ pub fn run_provider(
             progress |= resolver
                 .poll(&mut network, poller)
                 .map_err(|e| format!("resolver: {e}"))?;
+        }
+        if let Some(control) = &link_control {
+            // ACKs are lossless and take precedence over coalesced snapshots.
+            // While an ACK is blocked, don't consume another admin request.
+            if let Some((generation, status)) = pending_ack {
+                if crate::link_control::try_send_ack(control.as_fd(), generation, status)? {
+                    pending_ack = None;
+                }
+            }
+            if watch_interfaces && pending_ack.is_none() {
+                let revision = network.runtime().interface_revision();
+                let writable = events[..event_count].iter().any(|event|
+                    event.u64 == LINK_CONTROL_TOKEN && event.events & libc::EPOLLOUT as u32 != 0);
+                if reported_revision != Some(revision) && (!report_blocked || writable) {
+                    let bytes = serde_json::to_vec(&network.runtime().interface_snapshot())
+                        .map_err(|error| format!("interface observation: {error}"))?;
+                    let sent = crate::link_control::send_interface(control.as_fd(), &bytes)?;
+                    if sent { reported_revision = Some(revision); }
+                    report_blocked = !sent;
+                }
+            }
+            let desired = (libc::EPOLLERR | libc::EPOLLHUP
+                | if pending_ack.is_none() { libc::EPOLLIN } else { 0 }
+                | if report_blocked || pending_ack.is_some() { libc::EPOLLOUT } else { 0 }) as u32;
+            if desired != control_events {
+                let mut event = libc::epoll_event { events: desired, u64: LINK_CONTROL_TOKEN };
+                if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_MOD, control.as_raw_fd(), &mut event) } < 0 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                control_events = desired;
+            }
         }
         let now = start.elapsed();
         // Poll even while runnable: level-triggered IPC readiness provides fair

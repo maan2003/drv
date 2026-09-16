@@ -530,6 +530,8 @@ dependencies = [
  "netstack3-port-spike",
  "rand 0.9.4",
  "rustix",
+ "serde",
+ "serde_json",
  "wifi-supervisor-wire",
 ]
 
@@ -1357,6 +1359,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "serde",
  "zerocopy",
 ]
 

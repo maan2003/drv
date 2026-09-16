@@ -29,8 +29,10 @@ unavailable.
 The policy daemon owns persistence and network intent, and drives the pinned
 Fuchsia selector/state machine over bounded, fd-free control IPC. Application
 queueing, selection scans and retries consume one policy-issued deadline.
-The Wi-Fi process retains only device authority and precreated control,
-Ethernet and runtime-reactor descriptors after lockdown. Netstack3 remains a
+The Wi-Fi process retains device authority and inherited control/reactor
+capabilities after lockdown. It may create anonymous, nonblocking Unix packet
+pairs for replacement Ethernet links; pathname sockets and Internet sockets
+remain forbidden. Netstack3 remains a
 separate process with no device/DMA capabilities, connected through the bounded
 Ethernet lifecycle seam. No-VFIO verification does not qualify physical radio
 recovery or restart.
@@ -68,8 +70,13 @@ for the Wi-Fi data path, and is constrained by [REQ-isolation](REQ-isolation.md)
 
 ## Process topology
 
-The immediate production boundary is three capability-scoped services: Wi-Fi,
-wlancfg policy, and networking. Separate DNS is a later refinement. Persistent
+The implemented boundary has four capability-scoped services: Wi-Fi, wlancfg
+policy, Netstack3 networking, and netcfg device introduction/observation. The
+launcher retains process and hardware-stop ownership; netcfg receives only
+interface administration, lifecycle, and read-only status capabilities. See
+[the network binding contract](ARCH-network-service.md#device-introduction-and-observation-binding).
+The new netcfg process graph is host/native-build tested; physical KVM acceptance
+is still pending. Separate DNS is a later refinement. Persistent
 credential storage stays out of the Wi-Fi process, and device/DMA authority
 stays out of Internet parsers. The Wi-Fi process necessarily receives active
 connection authentication material and session keys; it is not secret-free.

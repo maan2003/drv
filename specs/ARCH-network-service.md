@@ -140,6 +140,46 @@ Linux capabilities and the service executor; do not replace Netstack3 transport
 policy with Linux TCP policy. Linux remains the reference for the application
 socket ABI and kernel resource mechanics.
 
+## Device introduction and observation binding
+
+The launcher owns process lifetime, containment and prebound listeners. A
+separate sandboxed `netcfg-service` receives device introduction/removal and a
+private Netstack administration capability; it does not receive credentials,
+device registers, DMA mappings or process-control authority. A logical Ethernet
+interface and the Netstack socket namespace survive link loss. Frame endpoints
+are link-scoped and created as needed, so old queued frames cannot cross a new
+link and reconnect is not limited by a bootstrap pool.
+
+Core IP-device, neighbor, router-advertisement and Ethernet multicast events
+update a typed, bounded observation view. Netcfg watches coalesced snapshots,
+and the read-only `netcfg-status` endpoint exposes assignment state, lifetimes,
+neighbors, membership and the latest RA. This is not an unbounded event history:
+address/neighbor/membership observations are capped at 64 each, RA options at
+8192 bytes, and overflow explicitly marks the view incomplete. Observations
+retain scalar device identifiers, not core device ownership. Raw RA options are
+excluded from implicit debug output.
+
+The current MT7921 frame binding receives multicast without a programmable
+group-address filter. This matches pinned Linux `mt7921_configure_filter`,
+which does not implement the multicast-list argument or `FIF_ALLMULTI`.
+Netstack3's existing IPv4/IPv6 group-membership checks decide local delivery;
+the host binding must not create a second IGMP/MLD policy or invent firmware
+filter commands. Ethernet join/leave notifications also update the observation
+view. This all-multicast receive contract does not imply multicast forwarding.
+
+Watcher pressure cannot block packet processing: acknowledgements are retained,
+control intake pauses behind a blocked acknowledgement, and observations
+coalesce until writable readiness. Netcfg's accepted status clients are bounded
+and time-limited. Its frame monitor occupies a fixed descriptor slot excluded
+from application-status I/O. Link-down disables both IP families on the Ethernet
+device, flushing its neighbors while leaving the separate loopback device
+available. DHCP run effects, waits and DNS resolver work are cancelled on
+revocation; unchanged DNS configuration preserves pending queries and cache.
+
+These bindings have host/core tests. Full acceptance of the new process graph
+still requires the physical KVM run; this section does not claim that run or
+complete Linux socket-option compatibility.
+
 ## Implementation direction and open choices
 
 These details support the decisions above; they are not additional product

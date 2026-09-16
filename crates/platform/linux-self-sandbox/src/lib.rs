@@ -31,7 +31,7 @@ pub enum Profile {
     },
     /// Device introduction and network configuration, without device,
     /// credential, filesystem or process-management authority.
-    Netcfg { device_fd: RawFd, provider_fd: RawFd, readiness_fd: RawFd },
+    Netcfg { device_fd: RawFd, provider_fd: RawFd, readiness_fd: RawFd, status_listener_fd: RawFd, monitor_fd: RawFd },
     /// Simulated Wi-Fi IPC and single-threaded runtime mechanics.
     WifiSimulated,
     /// One MT7921 PCI function, its precreated IRQ eventfd, and optionally
@@ -307,8 +307,8 @@ impl Sandbox<SetupComplete> {
                 return Err(Error::ProfileAuthorityMismatch);
             }
         }
-        if let Profile::Netcfg { device_fd, provider_fd, readiness_fd } = &profile {
-            let mut expected = vec![*device_fd, *provider_fd, *readiness_fd];
+        if let Profile::Netcfg { device_fd, provider_fd, readiness_fd, status_listener_fd, monitor_fd } = &profile {
+            let mut expected = vec![*device_fd, *provider_fd, *readiness_fd, *status_listener_fd, *monitor_fd];
             expected.sort_unstable();
             if self.persistence_dir_fd.is_some() || expected != self.inherited {
                 return Err(Error::ProfileAuthorityMismatch);
@@ -711,7 +711,7 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
     );
 
     match profile {
-        Profile::Netcfg { device_fd, provider_fd, readiness_fd } => {
+        Profile::Netcfg { device_fd, provider_fd, readiness_fd, status_listener_fd, monitor_fd } => {
             // Received descriptors are validated as connected, nonblocking
             // Unix packet endpoints, then transferred; never read as files.
             for option in [libc::SO_DOMAIN, libc::SO_TYPE] {
@@ -733,7 +733,23 @@ fn compile_filter(profile: &Profile) -> Result<BpfProgram, Error> {
                 eq(0, *provider_fd as u64),
                 eq(2, (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64),
             ]);
-            allow(&mut rules, libc::SYS_poll, vec![condition(1, Qword, Le, 2)]);
+            allow(&mut rules, libc::SYS_poll, vec![condition(1, Qword, Le, 20)]);
+            allow(&mut rules, libc::SYS_accept4, vec![
+                eq(0, *status_listener_fd as u64), eq(1, 0), eq(2, 0),
+                eq(3, (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64),
+            ]);
+            let mut send = vec![
+                condition(0, Qword, Ge, 3), condition(0, Qword, Le, i32::MAX as u64),
+                condition(2, Qword, Le, 65536),
+                eq(3, (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64), eq(4, 0), eq(5, 0),
+            ];
+            for fd in [device_fd, provider_fd, readiness_fd, status_listener_fd, monitor_fd] {
+                send.push(condition(0, Qword, Ne, *fd as u64));
+            }
+            allow(&mut rules, libc::SYS_sendto, send);
+            allow(&mut rules, libc::SYS_dup3, vec![
+                eq(1, *monitor_fd as u64), eq(2, libc::O_CLOEXEC as u64),
+            ]);
             allow_fds(&mut rules, libc::SYS_write, &[1, 2, *readiness_fd]);
         }
         Profile::Wlancfg {
@@ -1083,7 +1099,7 @@ mod filter_tests {
         // Initial inventories remain exact; runtime frame allocation does
         // not add filter rules per connection.
         let profiles = [
-            Profile::Netcfg { device_fd: 3, provider_fd: 4, readiness_fd: 5 },
+            Profile::Netcfg { device_fd: 3, provider_fd: 4, readiness_fd: 5, status_listener_fd: 6, monitor_fd: 7 },
             Profile::WifiSimulated,
             Profile::Wlancfg {
                 control_fd: 3,
@@ -1485,6 +1501,11 @@ mod filter_tests {
             "netcfg:clone3",
             "netcfg:wrong-ioctl-fd",
             "netcfg:tgkill",
+            "netcfg:sendto-wrong-fd",
+            "netcfg:sendto-fd-high",
+            "netcfg:sendto-wrong-flags",
+            "netcfg:sendto-address",
+            "netcfg:poll-count-high",
             "wifi:open",
             "wifi:eventfd",
             "wifi:clone3",
@@ -2346,7 +2367,7 @@ mod filter_tests {
     fn profile(role: &str, fds: [RawFd; 4]) -> Profile {
         match role {
             "netcfg" => Profile::Netcfg {
-                device_fd: fds[0], provider_fd: fds[1], readiness_fd: fds[2],
+                device_fd: fds[0], provider_fd: fds[1], readiness_fd: fds[2], status_listener_fd: fds[3], monitor_fd: fds[2],
             },
             "wifi" => Profile::WifiSimulated,
             "wlancfg" => Profile::Wlancfg {

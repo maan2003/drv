@@ -1601,6 +1601,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "serde",
  "zerocopy",
 ]
 

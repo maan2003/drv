@@ -109,7 +109,9 @@ pub trait EthernetEventSource {
 
 /// The frame-only side of a userspace network stack. Implementations enqueue
 /// ingress and dequeue egress without acquiring device, clock, or filesystem
-/// authority.
+/// authority. The current frame binding receives all multicast; Netstack3's
+/// own IPv4/IPv6 membership state decides local delivery. Hardware-specific
+/// group filtering must not silently suppress groups joined by the core.
 pub trait StackEthernetEndpoint {
     /// Accepts one inbound frame, returning ownership under backpressure.
     fn receive_frame(&mut self, frame: EthernetFrame) -> Result<(), EthernetFrame>;

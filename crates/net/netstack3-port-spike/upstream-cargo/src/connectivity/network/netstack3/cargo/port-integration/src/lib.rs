@@ -10,6 +10,7 @@ pub mod ethernet_transport;
 pub mod service;
 pub mod socket_provider;
 pub mod sockets;
+pub mod interfaces;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -336,6 +337,7 @@ pub struct NativeBindingsCtx {
     socket_capacity: usize,
     queue_capacity: usize,
     queues: Queues,
+    interfaces: interfaces::Interfaces,
     loopback_rx_ready: bool,
     udp_v4: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_v6: HashMap<String, VecDeque<NativeUdpDatagram>>,
@@ -382,6 +384,7 @@ impl NativeBindingsCtx {
             socket_capacity,
             queue_capacity,
             queues: Queues::default(),
+            interfaces: interfaces::Interfaces::default(),
             loopback_rx_ready: false,
             udp_v4: HashMap::new(),
             udp_v6: HashMap::new(),
@@ -1075,6 +1078,7 @@ impl<I: Ip> EventContext<IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeIns
 {
     fn on_event(&mut self, event: IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeInstant>) {
         self.record_core_event(&event);
+        self.interfaces.ip_event(event, self.queue_capacity);
     }
 }
 
@@ -1087,12 +1091,13 @@ impl<I: Ip>
         event: neighbor::Event<Mac, EthernetDeviceId<NativeBindingsCtx>, I, NativeInstant>,
     ) {
         self.record_core_event(&event);
+        self.interfaces.neighbor_event(event, self.queue_capacity);
     }
 }
 
 impl EventContext<RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>> for NativeBindingsCtx {
     fn on_event(&mut self, event: RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>) {
-        self.record_core_event(&event);
+        self.interfaces.ra_event(event, self.now, self.queue_capacity);
     }
 }
 
@@ -1104,6 +1109,7 @@ impl EventContext<CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>>
         event: CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>,
     ) {
         self.record_core_event(&event);
+        self.interfaces.ethernet_event(event, self.queue_capacity);
     }
 }
 
@@ -1582,6 +1588,23 @@ impl Runtime {
         self.set_dynamic_ipv6_link_state(true);
     }
 
+    fn set_link_state(&mut self, up: bool) {
+        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
+            &self.device.clone().into(), Ipv4DeviceConfigurationUpdate {
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
+                ..Default::default()
+            }).expect("valid Ethernet IPv4 link state");
+        if self.dynamic_ipv6 {
+            self.set_dynamic_ipv6_link_state(up);
+        } else {
+            self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
+                &self.device.clone().into(), Ipv6DeviceConfigurationUpdate {
+                    ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
+                    ..Default::default()
+                }).expect("valid Ethernet IPv6 link state");
+        }
+    }
+
     fn set_dynamic_ipv6_link_state(&mut self, up: bool) {
         if !self.dynamic_ipv6 { return; }
         self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
@@ -1685,6 +1708,16 @@ impl Runtime {
         self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
             &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap()).unwrap();
         self.loopback = Some(device);
+    }
+
+    /// Current observations for this Ethernet interface. Unlike diagnostic
+    /// strings this view tracks assignment, lifetimes, neighbor and multicast
+    /// changes and is suitable for configuration/watch consumers.
+    pub fn interface_revision(&self) -> u64 { self.bindings.interfaces.revision }
+
+    pub fn interface_snapshot(&self) -> interfaces::InterfaceSnapshot {
+        self.bindings.interfaces.snapshot(self.device.bindings_id().0.get())
+            .expect("Ethernet IP configuration emits the initial interface state")
     }
 
     pub fn ipv4_address(&self) -> Option<[u8; 4]> {
@@ -3058,7 +3091,7 @@ impl NetworkServiceEndpoint for Runtime {
         match event {
             EthernetDeviceEvent::TransmitReady => self.service_tx(1),
             EthernetDeviceEvent::ReceiveReady => {}
-            EthernetDeviceEvent::LinkStateChanged(up) => self.set_dynamic_ipv6_link_state(up),
+            EthernetDeviceEvent::LinkStateChanged(up) => self.set_link_state(up),
         }
     }
 }
@@ -3462,6 +3495,10 @@ mod tests {
         .unwrap();
         runtime.enable_loopback();
         runtime.enable_dynamic_ipv6();
+        let snapshot = runtime.interface_snapshot();
+        assert!(snapshot.ipv6_enabled);
+        assert!(snapshot.multicast.contains(&[0x33, 0x33, 0, 0, 0, 1]));
+        assert!(snapshot.addresses.iter().any(|a| a.state == interfaces::AddressState::Tentative));
         let router_ip = Ipv6Addr::from_bytes([
             0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
         ]);
@@ -3476,16 +3513,26 @@ mod tests {
             4,
         ));
         assert_eq!(runtime.ipv6_address(), None, "SLAAC address remains tentative during DAD");
+        let advertisement = runtime.interface_snapshot().router_advertisement.unwrap();
+        assert_eq!(advertisement.source.octets(), router_ip.ipv6_bytes());
+        assert!(!advertisement.options.is_empty());
 
         runtime.set_now(NativeInstant::from_nanos(2_000_000_000));
         runtime.dispatch_due(64);
         let address = runtime.ipv6_address().expect("SLAAC address assigned after DAD");
         assert_eq!(&address[..8], &prefix.ipv6_bytes()[..8]);
+        assert!(runtime.interface_snapshot().addresses.iter().any(|a|
+            a.address == std::net::IpAddr::V6(address.into())
+                && a.state == interfaces::AddressState::Assigned));
 
         assert!(runtime.has_ipv6_default_route(), "router lifetime installs a default route");
 
         runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
         assert_eq!(runtime.ipv6_address(), None, "link loss revokes the SLAAC generation");
+        let snapshot = runtime.interface_snapshot();
+        assert!(!snapshot.ipv6_enabled);
+        assert!(!snapshot.multicast.iter().any(|mac| mac[..2] == [0x33, 0x33]));
+        assert!(!snapshot.addresses.iter().any(|a| a.address.is_ipv6()));
         let loopback_server = runtime.udp_socket_ipv6().unwrap();
         runtime.udp_bind_ipv6(
             loopback_server,
@@ -3613,6 +3660,10 @@ mod tests {
             server.udp_receive(server_socket).unwrap().as_deref(),
             Some(&b"bounded native UDP"[..])
         );
+        let snapshot = client.interface_snapshot();
+        assert!(snapshot.neighbors.iter().any(|neighbor|
+            neighbor.address == std::net::IpAddr::V4([192, 0, 2, 2].into())
+                && neighbor.mac == Some([2, 0, 0, 0, 0, 2])));
 
         server
             .udp_send_to(
@@ -3634,6 +3685,16 @@ mod tests {
 
         assert!(client.udp_socket().is_ok());
         assert_eq!(client.udp_socket(), Err(RuntimeError::SocketLimit));
+        client.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
+        let offline = client.interface_snapshot();
+        assert!(!offline.ipv4_enabled);
+        assert!(offline.neighbors.is_empty(), "link loss flushes the old router's ARP identity");
+        client.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+        assert!(client.interface_snapshot().ipv4_enabled);
+        client.revoke_ipv4();
+        assert!(client.interface_snapshot().addresses.is_empty(),
+            "removal updates the observer even when diagnostic queues are full");
+
     }
     #[test]
     fn accept_pressure_preserves_queued_child_until_storage_release() {

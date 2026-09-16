@@ -1007,6 +1007,7 @@ mod tests {
                         continue;
                     };
                     let (generation, accepted) = match request {
+                        crate::link_control::Request::Watch { generation } => (generation, true),
                         crate::link_control::Request::Attach { generation, frame }
                             if generation > last =>
                         {
