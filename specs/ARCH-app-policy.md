@@ -11,7 +11,10 @@ and the forker enforces groups and puts each app in a cgroup. Three crates:
 the root forker). Builds, passes tests, and runs end to end in the
 KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
 the TTY backend and the GPU process on a virgl GPU, apps as their own
-UIDs with the sandbox below, Chromium with GPU and audio.
+UIDs with the sandbox below, Chromium with GPU and audio. The NixOS
+module `nix/module.nix` (`services.niri-desktop`, flake output
+`nixosModules.default`) turns one app list into passwd entries,
+`identity.toml`, the forker's allow and expose lists and the units.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
@@ -178,7 +181,5 @@ command-line command become `Launch` requests (`Niri::launch`);
 - Sub-UID ranges, and a way for an app to ask for them.
 - The forker does not yet pass fds (a log fd, a pre-connected socket) or
   report exits to the identity daemon; nothing kills an app's cgroup yet.
-- The NixOS module that generates `identity.toml`, passwd entries, the
-  forker's allow list and the units.
 - Per-client `wl_shm` sealing and other per-request policy.
 - Any policy on what a client may do once it has bound a global.
