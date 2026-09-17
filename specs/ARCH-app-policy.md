@@ -5,10 +5,11 @@
 Implemented on the `policy` branch of the niri fork at `/src/niri`
 (pushed as `rho/policy`, on top of `gpu-process`). Identities are static
 (fixed UIDs from the system configuration), launches are by app name only,
-and the forker enforces groups and puts each app in a cgroup. Three crates:
+and the forker enforces groups and puts each app in a cgroup. Four crates:
 `niri-policy` (types, protocol, compositor client), `niri-identity`
 (`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
-the root forker). Builds, passes tests, and runs end to end in the
+the root forker), `niri-bridge` (the UID-keyed desktop services server
+and the shim on each app's private bus; notifications so far). Builds, passes tests, and runs end to end in the
 KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
 the TTY backend and the GPU process on a virgl GPU, apps as their own
 UIDs with the sandbox below (mounts, processes, network), Chromium with
@@ -136,6 +137,18 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
   connect; the policy decides what they get, as with Android's binder
   services. Launched apps get that path as `WAYLAND_DISPLAY`.
 - `spawn-sh` stays disabled: a shell string is not an app name.
+- Desktop services (notifications today, portals later) go through
+  `niri-bridge serve`, running as the human on the human's session bus
+  (`dbus-daemon` unit `niri-session-bus`, socket in `/run/niri-session`,
+  which apps never see). Its socket `/run/niri-bridge/bridge.sock` is
+  mode 0666; every connection is keyed on `SO_PEERCRED` plus the identity
+  daemon's answer for that UID, unknown UIDs are dropped, and what the
+  human sees is the manifest name, never anything the app sent. An app
+  with `bus = true` runs under `dbus-run-session -- niri-bridge app --
+  <exec>`: a private bus in its own UID with the shim claiming
+  `org.freedesktop.Notifications` and forwarding to the server. The shim
+  is compatibility for apps that expect a bus, not a boundary; the
+  sandbox already hides every other bus.
 
 ## Compositor behaviour
 
@@ -183,13 +196,11 @@ command-line command become `Launch` requests (`Niri::launch`);
 
 ## Not yet
 
-- D-Bus: the session bus refuses other UIDs. Each app needs a filtered
-  per-app bus or proxy; see [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
-- Portals for other UIDs. An app whose manifest wraps its exec in
-  `dbus-run-session` gets a private session bus in its own UID (Chromium
-  in the dev VM does); that is compatibility only. The trusted, UID-keyed
-  portal service is not built. Screen share and camera through PipeWire likewise wait
-  on that.
+- Portals for other UIDs. The bridge carries notifications only; the
+  portal interfaces (file chooser, screen share, camera) on the app's
+  private bus, forwarded to a UID-keyed portal service on the human's
+  side, are not built. See [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
+- The bridge drops notification actions, hints and close signals.
 - Network isolation is only on/off (`network = true` in the manifest, off
   by default: a fresh, empty network namespace). Per-app firewalling is
   designed separately.

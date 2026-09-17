@@ -7,9 +7,10 @@ split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and the
 identity daemon, sandboxing forker, per-UID compositor policy and
 group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
-Chromium as an untrusted app started from a trusted launcher. Not yet:
-portals and notifications through a trusted, UID-keyed service, the seat
-daemon, the lock lease, sub-UID ranges. This records the agreed direction
+Chromium as an untrusted app started from a trusted launcher, and
+notifications from sandboxed apps through a trusted, UID-keyed bridge.
+Not yet: portals through that bridge, the seat daemon, the lock lease,
+sub-UID ranges. This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
 intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
 specs.

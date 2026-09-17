@@ -48,3 +48,25 @@ Two viable shapes:
 
 Start with 1 to get portals working; 2 is the long-term shape if the
 project wants everything in Rust.
+
+## Decision (2026-09, implemented)
+
+Neither shape above. A filtering proxy would make the bus a security
+boundary, which the design forbids, and one shared bus with UID headers
+means finishing a broker. Instead:
+
+- The human's tools (compositor, notification daemon, launcher, bar) share
+  a plain `dbus-daemon` session bus in the human's UID; sandboxed apps
+  never see its socket.
+- An app that expects a bus gets a private `dbus-run-session` bus in its
+  own UID with `niri-bridge app` on it: a shim that claims the desktop
+  names (`org.freedesktop.Notifications` so far) and forwards over a Unix
+  socket to `niri-bridge serve` on the human's side.
+- The server is the only check: peer UID from `SO_PEERCRED`, name from
+  the identity daemon, unknown UIDs dropped. What the human sees carries
+  the manifest name, never the app's `app_name`.
+
+Portals would follow the same pattern: the shim claims
+`org.freedesktop.portal.Desktop`, the server keys each request on the UID
+and hands back file descriptors (PipeWire remote, document fds) rather
+than paths.
