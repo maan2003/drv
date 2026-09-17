@@ -11,7 +11,8 @@ and the forker enforces groups and puts each app in a cgroup. Three crates:
 the root forker). Builds, passes tests, and runs end to end in the
 KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
 the TTY backend and the GPU process on a virgl GPU, apps as their own
-UIDs with the sandbox below, Chromium with GPU and audio. The NixOS
+UIDs with the sandbox below (mounts, processes, network), Chromium with
+GPU, audio, network and a private session bus, a stock launcher. The NixOS
 module `nix/module.nix` (`services.niri-desktop`, flake output
 `nixosModules.default`) turns one app list into passwd entries,
 `identity.toml`, the forker's allow and expose lists, the units, and a
