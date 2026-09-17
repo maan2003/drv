@@ -14,7 +14,10 @@ the TTY backend and the GPU process on a virgl GPU, apps as their own
 UIDs with the sandbox below, Chromium with GPU and audio. The NixOS
 module `nix/module.nix` (`services.niri-desktop`, flake output
 `nixosModules.default`) turns one app list into passwd entries,
-`identity.toml`, the forker's allow and expose lists and the units.
+`identity.toml`, the forker's allow and expose lists, the units, and a
+launcher entry per app (`Exec=niri msg action spawn -- <name>`), so a
+stock launcher (fuzzel, as the human's trusted tool) starts apps
+through the compositor.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
@@ -114,7 +117,9 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
   `/run/pipewire`). So no system D-Bus, no forker or identity socket, no
   setuid wrappers, no other app's runtime directory. Same UID plus this
   is the floor; anything more an app may reach is a group or a socket.
-  No user namespaces anywhere.
+  No user namespaces anywhere. Apps without `network = true` also get a
+  new, empty network namespace (`CLONE_NEWNET`): no interfaces but a
+  down loopback.
 - The identity daemon serves its own UID only (`SO_PEERCRED`), so only
   the compositor of the same human can look up policy or launch.
 - `identity.toml` has a static `[env]` table (from the system
@@ -184,7 +189,9 @@ command-line command become `Launch` requests (`Niri::launch`);
   in the dev VM does); that is compatibility only. The trusted, UID-keyed
   portal service is not built. Screen share and camera through PipeWire likewise wait
   on that.
-- Network isolation per app.
+- Network isolation is only on/off (`network = true` in the manifest, off
+  by default: a fresh, empty network namespace). Per-app firewalling is
+  designed separately.
 - Nothing kills a still-running app when its manifest goes away.
 - Nothing pushes policy changes to the compositor; lookups are cached per
   UID for the compositor's lifetime.
