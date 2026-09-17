@@ -147,21 +147,37 @@ GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
 (max bpc, HDR reset, gamma), EDID parsing for `ConnectorInfo`, page flips,
 vblank forwarding, plane assignment (direct scanout, cursor plane), and
-allocating capture buffers (`AllocateDmabuf`). The core passes the
-primary render node with every `AddDevice`; the GPU probes EGL on each
-device and creates the renderer on the one whose EGL device resolves to
-that render node (upstream's `try_initialize_gpu`). That is usually the
-GPU's own card, but on Asahi the GPU card has no KMS (`DrmDevice::new`
-fails with EOPNOTSUPP, tolerated like upstream) and Mesa renders through
-the DCP display controller's node, so the renderer lives there.
-`RemoveDevice` replies `DeviceRemoved { renderer_dropped }` so the core
-knows when the renderer went away regardless of which node owned it.
-Ten-bit formats are probed with the compositor that is actually used;
-surfaces are created right before the compositor that consumes them,
-because dropping a smithay `DrmSurface` disables the CRTC and a surface
-created earlier would then page-flip onto a disabled CRTC (EINVAL).
-Secondary GPUs are display-only via the rendering device's allocator
-with linear buffers.
+allocating capture buffers (`AllocateDmabuf`).
+
+The GPU process owns the device model. The core has no notion of a
+primary device: it opens every card node it may use and sends
+`AddDevice { dev, path, render_node_hint }` in whatever order udev lists
+them, then scans connectors (two phases, so an output on a display-only
+device never races the rendering device). The hint is the configured
+`render-drm-device` or udev's primary GPU, and may be `None`. The GPU
+probes EGL on each device and creates the renderer on the first one
+whose EGL display works and matches the hint (upstream's
+`try_initialize_gpu`); the reply `DeviceAdded { render_node, caps }`
+tells the core where rendering happens (dmabuf feedback, `set_node`).
+That is usually the GPU's own card, but on Asahi the GPU card has no KMS
+(`DrmDevice::new` fails with EOPNOTSUPP) and Mesa renders through the
+DCP display controller's node, so the renderer lives there. A device the
+GPU rejects is remembered as unusable core-side and not retried until
+udev removes it. Which device a CRTC allocates from is decided at
+`EnableOutput`: a device on the renderer's render node uses its own GBM,
+anything else is display-only and scans out linear buffers allocated on
+the rendering device. `RemoveDevice` replies
+`DeviceRemoved { renderer_dropped }` so the core knows when the renderer
+went away regardless of which node owned it.
+
+Scanout format selection is one `DrmCompositor::new_with_buffer_test`
+call (fork addition): candidate formats (10-bit first on outputs that
+asked for it, then 8-bit) are each proven by allocation plus test commit
+on the display side and by a bind-and-clear on the renderer side, so a
+format only one side supports is skipped. Dropping a smithay
+`DrmSurface` no longer touches KMS (fork change); outputs are turned off
+with the explicit `DrmSurface::disable`, so surfaces can be created and
+discarded freely.
 
 ## Screencasting
 
@@ -191,7 +207,7 @@ the `xcursor` crate) and uploaded straight into textures; the core's
 `GpuHandle::load_cursor` and keeps only frame geometry plus a
 `RemoteTexture` per frame. Named cursors therefore exist only once the
 GPU renderer is up (before that the pointer is hidden), and the cache is
-dropped when the primary device goes away. Up to 512x512 cursor frames
+dropped when the rendering device goes away. Up to 512x512 cursor frames
 keep a CPU copy on the GPU side so `DrmCompositor` can still put them on
 the cursor plane.
 
@@ -224,8 +240,8 @@ renderer or KMS:
   Max bpc no longer has its own request; the initial state goes with
   `EnableOutput`.
 - Framebuffer formats: SDR outputs are 8-bit. With `prefer_10bit` (HDR
-  allowed or `wide-gamut-p3`) the GPU probes each 10-bit format with a
-  throwaway compositor + `render_frame` and puts the working ones first.
+  allowed or `wide-gamut-p3`) the 10-bit formats go first and each is
+  proven renderable by the compositor's buffer test.
 - Blend space: `SceneFrame.blend: Option<BlendParams>` (`HdrPq{
   ref_lum_scale}` or `DisplayP3`) tells the GPU to install the
   `TextureHdr` program as the frame-wide default texture override and to
