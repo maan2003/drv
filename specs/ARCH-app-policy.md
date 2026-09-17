@@ -57,9 +57,9 @@ order. `rpc::VERSION` is checked in the hello.
 
 `PolicyClient` (compositor side): `connect(path)` does the hello now so a
 missing daemon fails at startup, `lookup(uid)` caches per UID and
-reconnects after an error, 2 s timeouts. `permissive()` is the no-daemon
-mode. `daemon::serve_connection` is the serving loop, reused by tests over
-a socket pair.
+reconnects after an error, 2 s timeouts. There is no mode without a
+daemon. `daemon::serve_connection` is the serving loop, reused by tests
+over a socket pair (the test fixture's daemon says "everyone trusted").
 
 ## Compositor behaviour
 
@@ -73,10 +73,10 @@ a socket pair.
   ready) is filtered the same way; a client without `gpu` gets `wl_shm` only.
 - Gamma control additionally requires the TTY backend, as before.
 - Daemon socket: `$NIRI_POLICY_SOCKET`, else
-  `$XDG_RUNTIME_DIR/niri-policy.sock`. No socket at the default path means
-  single-user mode: everyone trusted, one warning. An explicit socket, or
-  a present one we cannot talk to, is fatal; it never degrades to
-  permissive.
+  `$XDG_RUNTIME_DIR/niri-policy.sock`. Cannot connect or hello fails: the
+  compositor exits. Nobody is trusted unless a daemon says so; a
+  single-user setup runs `niri-policyd` with a file whose default is
+  `trusted = true`.
 - Once connected, a failed lookup (daemon died, garbage reply, timeout)
   gives that client `AppPolicy::unknown()`: nothing optional, no GPU.
   Cached UIDs keep their answers. Fail closed, never open.
