@@ -34,9 +34,10 @@ The GPU process has no layout and no timing policy. Per frame it gets a
 flat scene (nodes bottom to top, each a list of draw ops) and owns
 everything after that: damage history, buffer ages, culling, scanout.
 
-One binary. The core spawns `niri gpu-process --socket-fd 3 --mode drm`
-(`--mode headless` for tests) via `std::env::current_exe`; setting
-`NIRI_GPU_THREAD` runs the server as a thread instead, for debugging.
+One binary. The core spawns `niri gpu-process --socket-fd N --mode drm
+--device dev_t:fd ...` (`--mode headless` for tests) via
+`std::env::current_exe`. The tty backend always uses a real process; only
+the headless backend and the unit tests run the server on a thread.
 
 ## Recording renderer
 
