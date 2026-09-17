@@ -129,8 +129,17 @@ GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
 (max bpc, HDR reset, gamma), EDID parsing for `ConnectorInfo`, page flips,
 vblank forwarding, plane assignment (direct scanout, cursor plane), and
-allocating capture buffers (`AllocateDmabuf`). Secondary GPUs are
-display-only via the primary's allocator with linear buffers.
+allocating capture buffers (`AllocateDmabuf`). The core passes the
+primary render node with every `AddDevice`; the GPU probes EGL on each
+device and creates the renderer on the one whose EGL device resolves to
+that render node (upstream's `try_initialize_gpu`). That is usually the
+GPU's own card, but on Asahi the GPU card has no KMS (`DrmDevice::new`
+fails with EOPNOTSUPP, tolerated like upstream) and Mesa renders through
+the DCP display controller's node, so the renderer lives there.
+`RemoveDevice` replies `DeviceRemoved { renderer_dropped }` so the core
+knows when the renderer went away regardless of which node owned it.
+Secondary GPUs are display-only via the rendering device's allocator
+with linear buffers.
 
 ## Screencasting
 
