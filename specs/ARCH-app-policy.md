@@ -3,7 +3,9 @@
 ## Status
 
 Implemented on the `policy` branch of the niri fork at `/src/niri`
-(pushed as `rho/policy`, on top of `gpu-process`). Three crates:
+(pushed as `rho/policy`, on top of `gpu-process`). Identities are static
+(fixed UIDs from the system configuration), launches are by app name only,
+and the forker enforces groups and puts each app in a cgroup. Three crates:
 `niri-policy` (types, protocol, compositor client), `niri-identity`
 (`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
 the root forker). Builds and passes tests; not yet run on real hardware.
@@ -23,13 +25,14 @@ per request in every protocol handler.
 
 ```text
 niri-forker (root)            niri-identityd (session user)        compositor core
-  --allow 1000:100000:65536     identity.toml: apps, pinned uids     accept -> SO_PEERCRED -> uid
-  {uid, argv, env} from an      uids.toml: allocated, stable         Lookup{uid} -> AppPolicy
-    allowed peer, uid in its    Lookup{uid} -> app's policy   <----    cached per uid
-    range: mkdir runtime+home,  Launch{command, env} -> forker <----  Launch on spawn keybind,
-    setgroups/setresgid/          request, reply Launched{uid}         spawn-at-startup, cli
-    setresuid, no_new_privs,                                         world-connectable apps
-    exec                                                               socket for other uids
+  --allow 1000:100000:65536:    identity.toml: apps with fixed       accept -> SO_PEERCRED -> uid
+    render                        uids, exec, groups, policy         Lookup{uid} -> AppPolicy
+  {uid, groups, argv, env}      Lookup{uid} -> app's policy   <----    cached per uid
+    from an allowed peer, uid   Launch{app, env} -> forker    <----  Launch on spawn keybind,
+    and groups in its lists:      request, reply Launched{uid}         spawn-at-startup, cli
+    dirs, cgroup, setgroups/                                         world-connectable apps
+    setresgid/setresuid,                                               socket for other uids
+    no_new_privs, exec
 ```
 
 Android is the model: PackageManager assigns app UIDs (10000 to 19999,
@@ -68,38 +71,26 @@ reconnects after an error, 2 s timeouts. There is no mode without a
 daemon. `daemon::serve_connection` is the serving loop, reused by tests
 over a socket pair (the test fixture's daemon says "everyone trusted").
 
-## Decided direction (2026-09), not yet in the code
-
-- App identities are static and come from Nix: every `[[app]]` has a fixed
-  `uid` with a passwd entry (`app-<name>`) and home. `uids.toml`,
-  `uid-start`/`uid-count` and runtime allocation go away.
-- Named apps only. `Launch { app }` names a manifest entry; arguments come
-  from the manifest's `exec`, never from the caller. The current
-  `Launch { command, env }` with pass-through arguments is to be removed.
-- Sub-UID ranges (`isolated_app`): a manifest may reserve a range an app
-  can spawn into through the forker, for shells and renderers. This is the
-  only dynamic UID use.
-- D-Bus: per-app bus and bridge in the app's UID, no shared bus, no proxy;
-  see [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
-- Forker gains supplementary groups (`render` for `gpu = true`) and a
-  cgroup per app.
-
 ## Launching
 
-- `Launch { command, env }`: `command[0]` is an app name in `identity.toml`;
-  extra arguments pass through. `env` is what the compositor's children
-  used to inherit: `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's
+- `Launch { app, env }`: `app` is a manifest name in `identity.toml`;
+  arguments are the manifest's `exec` and nothing else, so an app never
+  receives caller-chosen arguments. `env` is what the compositor's
+  children used to inherit: `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's
   `environment {}` block. The daemon prepends its own `PATH`, `LANG`,
   `TZ`, `TERM`.
-- The daemon allocates the app's UID from `[uid-start, uid-start+count)`
-  on first launch and persists it in `uids.toml` (atomic rename), so an
-  app keeps its files. `uid = N` pins an existing user (the human's
-  session, trusted bar, ...) and must lie outside the range.
-- The forker accepts `{uid, argv, env}` only from peers on its `--allow`
-  list, checked with `SO_PEERCRED`, and only for UIDs in that peer's range
-  or the peer's own UID. For range UIDs it creates
+- Every `[[app]]` has a fixed `uid`, generated from the system
+  configuration alongside its passwd entry. The identity daemon never
+  allocates; there is no registry file and no scratch identity. Sub-UID
+  ranges (`isolated_app`) are the only planned dynamic use, not yet built.
+- The forker accepts `{uid, groups, argv, env}` only from peers on its
+  `--allow peer:start:count[:group,group]` list, checked with
+  `SO_PEERCRED`, and only for UIDs in that peer's range or the peer's own
+  UID and groups on that peer's list (so an unprivileged identity daemon
+  cannot hand out `wheel`). For range UIDs it creates
   `/run/niri-apps/<uid>` (`XDG_RUNTIME_DIR`) and `/var/lib/niri-apps/<uid>`
-  (`HOME`, cwd), mode 0700 owned by the UID, then `setgroups`,
+  (`HOME`, cwd), mode 0700 owned by the UID, moves the child into
+  `<forker cgroup>/app-<uid>` (needs `Delegate=yes`), then `setgroups`,
   `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with a cleared
   environment. Children are reaped and their exit logged. It has no
   config file and no notion of an app.
@@ -128,9 +119,9 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
 - Once connected, a failed lookup (daemon died, garbage reply, timeout)
   gives that client `AppPolicy::unknown()`: nothing optional, no GPU.
   Cached UIDs keep their answers. Fail closed, never open.
-- `niri-identityd --config /etc/niri/identity.toml [--state ..] [--socket ..]
-  [--forker ..]` and `niri-forker --allow peer:start:count [--socket ..]`,
-  both also under systemd socket activation (`LISTEN_FDS=1`).
+- `niri-identityd --config /etc/niri/identity.toml [--socket ..] [--forker ..]`
+  and `niri-forker --allow peer:start:count[:groups] [--socket ..]`, both
+  also under systemd socket activation (`LISTEN_FDS=1`).
 
 ## No spawning
 
@@ -157,7 +148,10 @@ command-line command become `Launch` requests (`Niri::launch`);
   as Wayland; same absolute-path answer).
 - Nothing pushes policy changes to the compositor; lookups are cached per
   UID for the compositor's lifetime.
+- Sub-UID ranges, and a way for an app to ask for them.
 - The forker does not yet pass fds (a log fd, a pre-connected socket) or
-  report exits to the identity daemon.
+  report exits to the identity daemon; nothing kills an app's cgroup yet.
+- The NixOS module that generates `identity.toml`, passwd entries, the
+  forker's allow list and the units.
 - Per-client `wl_shm` sealing and other per-request policy.
 - Any policy on what a client may do once it has bound a global.
