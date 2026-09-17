@@ -68,6 +68,22 @@ reconnects after an error, 2 s timeouts. There is no mode without a
 daemon. `daemon::serve_connection` is the serving loop, reused by tests
 over a socket pair (the test fixture's daemon says "everyone trusted").
 
+## Decided direction (2026-09), not yet in the code
+
+- App identities are static and come from Nix: every `[[app]]` has a fixed
+  `uid` with a passwd entry (`app-<name>`) and home. `uids.toml`,
+  `uid-start`/`uid-count` and runtime allocation go away.
+- Named apps only. `Launch { app }` names a manifest entry; arguments come
+  from the manifest's `exec`, never from the caller. The current
+  `Launch { command, env }` with pass-through arguments is to be removed.
+- Sub-UID ranges (`isolated_app`): a manifest may reserve a range an app
+  can spawn into through the forker, for shells and renderers. This is the
+  only dynamic UID use.
+- D-Bus: per-app bus and bridge in the app's UID, no shared bus, no proxy;
+  see [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
+- Forker gains supplementary groups (`render` for `gpu = true`) and a
+  cgroup per app.
+
 ## Launching
 
 - `Launch { command, env }`: `command[0]` is an app name in `identity.toml`;

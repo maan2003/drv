@@ -2,10 +2,13 @@
 
 ## Status
 
-Design discussion only; nothing is implemented. This records the agreed
-direction and the reasoning behind each choice so later work can check
-itself against intent. Details (exact protocols, ioctls, daemon splits) are
-deliberately left open and belong in later ARCH specs.
+Direction record. Implemented so far: the compositor core / GPU process
+split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and a first
+identity daemon, forker and per-UID compositor policy
+([ARCH-app-policy](ARCH-app-policy.md)). This records the agreed direction
+and the reasoning behind each choice so later work can check itself against
+intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
+specs.
 
 Part of the desktop layer of [ARCH-drv](ARCH-drv.md); applies
 [REQ-isolation](REQ-isolation.md) to the GUI.
@@ -50,8 +53,12 @@ recovery to the lock screen instead of a TTY.
 **Identity daemon.** Answers `uid -> app, manifest, permissions, trusted
 flag`. The only parser of manifests. Compositor, portals and spawn daemon all
 ask it and cache per connection. Reason: one parser, one source of truth,
-no config-format bugs inside the compositor. Static by default; dynamic
-grants are a separate append-only store it also reads.
+no config-format bugs inside the compositor. Identities are static: the app
+list and each app's UID come from the system configuration (Nix), so
+installing an app is a configuration change and there are no runtime
+identities, no scratch slots, no UID allocation. A launch names an app and
+nothing else; its arguments come from the manifest, never from the caller.
+Dynamic grants are a separate append-only store it also reads.
 
 **Spawn daemon.** The only thing that can start a process as another UID.
 Builds the environment from scratch (never inherits), passes only the fds
@@ -144,11 +151,14 @@ ZFS remains an option if integrity is judged worth the module surface.
 
 ## IPC and services
 
-Apps never see the system D-Bus. Each app gets its own session bus; a bridge
-in the app's UID claims the names browsers expect (notifications, portals,
-secrets, MPRIS) and translates to project protocols. Same-UID bridges are
-compatibility only, never security; every check lives in the receiving
-service keyed on peer UID. Secrets are a separate daemon with per-app
+Apps never see the system D-Bus. Each app that needs one gets its own
+session bus; a bridge in the app's UID claims the names browsers expect
+(notifications, portals, secrets, MPRIS) and translates to project
+protocols. Same-UID bridges are compatibility only, never security; every
+check lives in the receiving service keyed on peer UID. A D-Bus broker is
+therefore never a security boundary here, which is why there is no shared
+bus and no filtering proxy. The document portal's FUSE view of granted files
+is per app UID. Secrets are a separate daemon with per-app
 namespaces, which gives per-app keyrings for free.
 
 Portals are mandatory: file chooser, screen share, camera, open-URL. They
