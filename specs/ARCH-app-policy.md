@@ -82,9 +82,14 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
 - `Launch { app, env }`: `app` is a manifest name in `identity.toml`;
   arguments are the manifest's `exec` and nothing else, so an app never
   receives caller-chosen arguments. `env` is what the compositor's
-  children used to inherit: `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's
-  `environment {}` block. The daemon prepends its own `PATH`, `LANG`,
-  `TZ`, `TERM`.
+  children used to inherit: its session's `XDG_RUNTIME_DIR` and relative
+  `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's `environment {}` block,
+  plus `NIRI_APPS_WAYLAND_DISPLAY` (the apps socket path). The daemon
+  prepends its own `PATH`, `LANG`, `TZ`, `TERM` and the config's `[env]`.
+  Apps on the human's own UID (launcher, bar: allowed only if every
+  entry on that UID is `trusted`) keep the session and get the daemon's
+  `HOME`; every other app gets the apps socket as `WAYLAND_DISPLAY` and
+  the forker's `HOME` and `XDG_RUNTIME_DIR`.
 - Every `[[app]]` has a fixed `uid`, generated from the system
   configuration alongside its passwd entry. The identity daemon never
   allocates; there is no registry file and no scratch identity. Sub-UID
@@ -158,6 +163,11 @@ command-line command become `Launch` requests (`Niri::launch`);
 ## Invariants
 
 - Identity is the socket UID. PIDs are reused and are never used for policy.
+- No child of the forker is root: a root forker always switches to the
+  requested UID, also when a peer asks for its own UID. (A first version
+  skipped the switch for "as self" launches and left the child as root;
+  the compositor then saw an unknown UID and gave it nothing, but that
+  was a privilege escalation reachable from the identity daemon.)
 - A global the policy denies is never in the client's registry. There is no
   second code path that hands out the same capability.
 - Unknown UIDs get the daemon's `default`; an unreachable daemon is the
