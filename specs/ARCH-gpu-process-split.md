@@ -26,12 +26,13 @@ core process                              gpu process
   libseat, udev, libinput                   DrmDevice / GbmDevice / DrmCompositor
   output policy: modes, VRR, gamma, on/off  swapchain, page flips, vblank
   screencast portal, targets, pacing        PipeWire streams and buffers
-  recorded frames  ---------------------->  replay onto texture, output or cast
+  scene frames  ------------------------->  damage-track and draw to texture, output or cast
   vblank, scan, cast state  <-------------  events / replies
 ```
 
-The GPU process is a dumb renderer. It has no scene graph, no layout, no
-timing policy. It replays what the core recorded.
+The GPU process has no layout and no timing policy. Per frame it gets a
+flat scene (nodes bottom to top, each a list of draw ops) and owns
+everything after that: damage history, buffer ages, culling, scanout.
 
 One binary. The core spawns `niri gpu-process --socket-fd 3 --mode drm`
 (`--mode headless` for tests) via `std::env::current_exe`; setting
@@ -40,34 +41,51 @@ One binary. The core spawns `niri gpu-process --socket-fd 3 --mode drm`
 ## Recording renderer
 
 `src/gpu/remote.rs` implements smithay's `Renderer`, `Frame`, `Texture`,
-`Bind`, `Offscreen`, `ImportMem`, `ImportDma`, `ExportMem` by recording
-`Command`s (`src/gpu/protocol.rs`) instead of issuing GL. Render elements
-in `render_helpers/` are unchanged in structure; `GlesRenderer` became
+`Bind`, `Offscreen`, `ImportMem`, `ImportDma`, `ExportMem`. Resource calls
+(create / import / update / destroy textures, blur) become `Command`s
+(`src/gpu/protocol.rs`) right away. Draw calls do not: a `RemoteFrame`
+collects them into a `SceneFrame` that goes out as one
+`Command::Frame` when the frame finishes. Render elements in
+`render_helpers/` are unchanged in structure; `GlesRenderer` became
 `RemoteRenderer`. Effects that used raw GL (border, shadow, resize,
-open/close shaders, blur, framebuffer capture) became commands
-(`DrawShader`, `Blur`, `CaptureFramebuffer`, `DrawCaptured`) with the GL
+open/close shaders, blur, framebuffer capture) became ops with the GL
 code moved to `src/gpu/gl/`.
 
+A `SceneFrame` is `{target, size, transform, blend, clear, generation,
+cast, nodes}`. A `Node` is `{id, src, geometry, damage, opaque, kind,
+transform, capture: [Op], draw: [Op]}`; ops are `Solid`, `Texture`,
+`Shader`, `Capture`, `Captured`, and the scopes `WithTexProgram{ops}` /
+`Raw{ops}` (tex-program override for a subtree; `Raw` drops even the
+frame's blend override). One coordinate rule: everything in a frame
+(geometry, damage, opaque, op `dst`) is in frame coordinates, the
+untransformed buffer. Ops carry no damage. Draws outside any node (the
+offscreen helpers in `render_helpers/mod.rs`) become an anonymous node.
+
 Damage tracking lives in the GPU process, where `DrmCompositor` is. The
-core records every element each frame wrapped in `BeginElement{id, src,
-geometry, damage-since-last-frame, opaque, kind} … EndElement` markers
-(framebuffer-effect captures go before a `BeginElementDraw` marker). The
-GPU turns each segment into a real smithay element whose `draw` replays
-its commands clipped to the damage the compositor hands it. So there is
-one damage tracker, per-element culling, and the swapchain's buffer age is
-handled by upstream code. `Present` is one-way; the per-element states
-for presentation feedback come back as `GpuEvent::Presented`.
+core `Recorder` (`src/gpu/record.rs`, one per target) only maps smithay
+element ids to stable node ids and asks smithay's element model for
+`damage_since` the last frame that target saw; the GPU `NodeTracks`
+(`src/gpu/scene.rs`) keeps the history buffer ages need and turns each
+node into a real smithay `SceneElement`. `draw_ops` (`src/gpu/draw.rs`)
+is the single interpreter: it clips every op to the node damage the
+compositor hands it (frame space, intersected with the op's `dst`, then
+made `dst`-relative) and runs `DrmCompositor` / `OutputDamageTracker`
+paths and offscreen targets alike. The core bumps `generation` whenever
+it forgot its history (geometry change, failed send); the GPU drops its
+history when it changes, so the two sides cannot drift. `Present` is
+one-way; the per-node states for presentation feedback come back as
+`GpuEvent::Presented`.
 
 Client pixels never touch the core. shm buffers go to the GPU as the pool
 fd plus layout (`ImportShm`); the GPU `pread`s damaged rows into a
 scratch buffer and uploads them, so neither process maps client memory
 and a truncated pool cannot SIGBUS anyone. dmabufs go as fds
 (`ImportDmabuf`). The GPU keeps the `Dmabuf` (and a CPU copy for
-textures up to 512x512) next to each texture: when an element's recording
-is exactly one untinted 1:1 `DrawTexture` of such a texture, the GPU
+textures up to 512x512) next to each texture: when a node's draw is
+exactly one untinted 1:1 `Op::Texture` of such a texture, the GPU
 exposes the buffer as the element's `UnderlyingStorage`, and
 `DrmCompositor` can scan it out directly or copy it to the cursor plane.
-`ElementMeta.transform` carries the buffer transform for that. Which
+`Node.transform` carries the buffer transform for that. Which
 planes are allowed comes from the core each frame in `PresentFlags`
 (the old `debug` config knobs).
 
@@ -106,12 +124,12 @@ DeviceError | Cast(..) | Png)`, `Error`. Cast events: `NodeId` (for the
 portal), `State{active, ready_size, min_frame_time}`, `Redraw`,
 `Rendered` / `Skipped{target_time}` (frame pacing), `Stop`, `PipeWireFatal`.
 
-Render targets (`Command::Begin`): `Texture(id)`, `Dmabuf(id)` (the GPU
-binds the dmabuf itself, needed for image-copy buffers), `Output(ref)`
-(recorded and drawn by `Present`), `Cast(stream)` (rendered into the
-stream's next PipeWire buffer when the frame ends; `CastFrameInfo` before
-it carries scale, target time and cursor position) and
-`CastCursor(stream)` (the cursor bitmap for metadata cursor mode).
+Render targets (`SceneFrame.target`): `Texture(id)`, `Dmabuf(id)` (the
+GPU binds the dmabuf itself, needed for image-copy buffers; both are
+one-shot full renders with no history), `Output(ref)` (kept and drawn by
+`Present`), `Cast(stream)` (rendered into the stream's next PipeWire
+buffer; `SceneFrame.cast` carries scale, target time and cursor position)
+and `CastCursor(stream)` (the cursor bitmap for metadata cursor mode).
 
 `Caps` carries what the core needs to answer clients without asking again:
 shm and dmabuf formats, dmabuf render formats (screencast, image copy),
@@ -151,13 +169,13 @@ Core (`src/screencasting/`): the portal D-Bus session, picking output /
 window / dynamic targets, frame pacing (`min_frame_time` mirrored from
 the stream, redraw timers), and recording the target's elements into a
 `Cast` frame with a per-stream `Recorder` (`src/gpu/record.rs`, the same
-element-marker recording outputs use). It never sees PipeWire, buffer fds
+scene recording outputs use). It never sees PipeWire, buffer fds
 or pixel memory.
 
 GPU (`src/gpu/cast.rs`): the PipeWire connection on the GPU event loop,
 stream negotiation (dmabuf modifiers with test allocations, shm
 fallback), memfd / GBM buffer allocation, per-stream
-`OutputDamageTracker` over the replayed `SceneElement`s
+`OutputDamageTracker` over the `SceneElement`s
 (`src/gpu/scene.rs`, shared with the DRM compositor path), rendering into
 the dequeued buffer, cursor metadata bitmaps, and queueing buffers back
 once their fences signal. A frame the core recorded is dropped when
@@ -208,7 +226,7 @@ renderer or KMS:
 - Framebuffer formats: SDR outputs are 8-bit. With `prefer_10bit` (HDR
   allowed or `wide-gamut-p3`) the GPU probes each 10-bit format with a
   throwaway compositor + `render_frame` and puts the working ones first.
-- Blend space: `Command::Begin{blend: Option<BlendParams>}` (`HdrPq{
+- Blend space: `SceneFrame.blend: Option<BlendParams>` (`HdrPq{
   ref_lum_scale}` or `DisplayP3`) tells the GPU to install the
   `TextureHdr` program as the frame-wide default texture override and to
   encode solid colors on the CPU (`src/gpu/gl/blend.rs`). All GPU-side
