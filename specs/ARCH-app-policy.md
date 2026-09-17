@@ -166,9 +166,10 @@ command-line command become `Launch` requests (`Niri::launch`);
 
 - D-Bus: the session bus refuses other UIDs. Each app needs a filtered
   per-app bus or proxy; see [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
-- Portals for other UIDs: a per-app session bus with the portal in the
-  app's UID is compatibility only; the trusted, UID-keyed portal service
-  is not built. Screen share and camera through PipeWire likewise wait
+- Portals for other UIDs. An app whose manifest wraps its exec in
+  `dbus-run-session` gets a private session bus in its own UID (Chromium
+  in the dev VM does); that is compatibility only. The trusted, UID-keyed
+  portal service is not built. Screen share and camera through PipeWire likewise wait
   on that.
 - Network isolation per app.
 - Nothing kills a still-running app when its manifest goes away.
