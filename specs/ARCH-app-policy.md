@@ -3,10 +3,11 @@
 ## Status
 
 Implemented on the `policy` branch of the niri fork at `/src/niri`
-(pushed as `rho/policy`, on top of `gpu-process`; crate `niri-policy`,
-wired into `src/niri.rs`). The compositor asks a daemon over a socket;
-`niri-policyd` is a file-backed stand-in for the identity daemon, which is
-not written. Implements the "identity and policy" part of
+(pushed as `rho/policy`, on top of `gpu-process`). Three crates:
+`niri-policy` (types, protocol, compositor client), `niri-identity`
+(`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
+the root forker). Builds and passes tests; not yet run on real hardware.
+Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
 
@@ -21,14 +22,20 @@ per request in every protocol handler.
 ## Shape
 
 ```text
-policy daemon                               compositor core
-  today: niri-policyd, answers from a         accept() -> SO_PEERCRED -> uid
-    TOML file (PolicyStore)                   PolicyClient::lookup(uid) -> Arc<AppPolicy>
-  later: identity daemon that also   <-----    (one Lookup per UID, cached; postcard
-    allocates UIDs and launches apps           over $XDG_RUNTIME_DIR/niri-policy.sock)
-  same rpc either way                         ClientState.policy
-                                              global filters: policy.allows(Global)
+niri-forker (root)            niri-identityd (session user)        compositor core
+  --allow 1000:100000:65536     identity.toml: apps, pinned uids     accept -> SO_PEERCRED -> uid
+  {uid, argv, env} from an      uids.toml: allocated, stable         Lookup{uid} -> AppPolicy
+    allowed peer, uid in its    Lookup{uid} -> app's policy   <----    cached per uid
+    range: mkdir runtime+home,  Launch{command, env} -> forker <----  Launch on spawn keybind,
+    setgroups/setresgid/          request, reply Launched{uid}         spawn-at-startup, cli
+    setresuid, no_new_privs,                                         world-connectable apps
+    exec                                                               socket for other uids
 ```
+
+Android is the model: PackageManager assigns app UIDs (10000 to 19999,
+plus 100000 per user) and holds permissions, unprivileged; zygote is root
+and only forks on command from `system`. Here the identity daemon is the
+package manager and the forker is zygote.
 
 ## Types (crate `niri-policy`)
 
@@ -61,6 +68,32 @@ reconnects after an error, 2 s timeouts. There is no mode without a
 daemon. `daemon::serve_connection` is the serving loop, reused by tests
 over a socket pair (the test fixture's daemon says "everyone trusted").
 
+## Launching
+
+- `Launch { command, env }`: `command[0]` is an app name in `identity.toml`;
+  extra arguments pass through. `env` is what the compositor's children
+  used to inherit: `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's
+  `environment {}` block. The daemon prepends its own `PATH`, `LANG`,
+  `TZ`, `TERM`.
+- The daemon allocates the app's UID from `[uid-start, uid-start+count)`
+  on first launch and persists it in `uids.toml` (atomic rename), so an
+  app keeps its files. `uid = N` pins an existing user (the human's
+  session, trusted bar, ...) and must lie outside the range.
+- The forker accepts `{uid, argv, env}` only from peers on its `--allow`
+  list, checked with `SO_PEERCRED`, and only for UIDs in that peer's range
+  or the peer's own UID. For range UIDs it creates
+  `/run/niri-apps/<uid>` (`XDG_RUNTIME_DIR`) and `/var/lib/niri-apps/<uid>`
+  (`HOME`, cwd), mode 0700 owned by the UID, then `setgroups`,
+  `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with a cleared
+  environment. Children are reaped and their exit logged. It has no
+  config file and no notion of an app.
+- Apps run as other UIDs cannot enter the session's `XDG_RUNTIME_DIR`, so
+  with `NIRI_APPS_SOCKET=/run/niri/<user>/wayland` the compositor also
+  listens on that absolute path, socket mode 0666. Anyone local may
+  connect; the policy decides what they get, as with Android's binder
+  services. Launched apps get that path as `WAYLAND_DISPLAY`.
+- `spawn-sh` stays disabled: a shell string is not an app name.
+
 ## Compositor behaviour
 
 - `Niri::insert_client` reads the peer UID and stores the policy in
@@ -72,26 +105,23 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
 - The dmabuf global (created in `backend/tty.rs` once the GPU process is
   ready) is filtered the same way; a client without `gpu` gets `wl_shm` only.
 - Gamma control additionally requires the TTY backend, as before.
-- Daemon socket: `$NIRI_POLICY_SOCKET`, else
-  `$XDG_RUNTIME_DIR/niri-policy.sock`. Cannot connect or hello fails: the
-  compositor exits. Nobody is trusted unless a daemon says so; a
-  single-user setup runs `niri-policyd` with a file whose default is
-  `trusted = true`.
+- Daemon socket: `$NIRI_IDENTITY_SOCKET`, else
+  `$XDG_RUNTIME_DIR/niri-identity.sock`. Cannot connect or hello fails: the
+  compositor exits. Nobody is trusted unless the daemon says so; the
+  human's own UID needs an `[[app]]` entry with `trusted = true`.
 - Once connected, a failed lookup (daemon died, garbage reply, timeout)
   gives that client `AppPolicy::unknown()`: nothing optional, no GPU.
   Cached UIDs keep their answers. Fail closed, never open.
-- `niri-policyd --policy FILE [--socket PATH]`, or under systemd socket
-  activation (`LISTEN_FDS=1`), serves the TOML file.
+- `niri-identityd --config /etc/niri/identity.toml [--state ..] [--socket ..]
+  [--forker ..]` and `niri-forker --allow peer:start:count [--socket ..]`,
+  both also under systemd socket activation (`LISTEN_FDS=1`).
 
 ## No spawning
 
-The compositor does not spawn processes. `spawn`, `spawn-sh`,
-`spawn-at-startup`, `spawn-sh-at-startup`, the command-line command, and
-xwayland-satellite are all logged as disabled (`spawn_disabled`), the
-`utils::xwayland` module is gone, and `DISPLAY` is unset. A separate
-launcher, running with the identity daemon, starts apps under their UIDs.
-The `environment {}` config block is still parsed into `CHILD_ENV` for
-the launcher to consume later.
+The compositor never forks. `spawn`, `spawn-at-startup` and the
+command-line command become `Launch` requests (`Niri::launch`);
+`spawn-sh` and xwayland-satellite are logged as disabled, the
+`utils::xwayland` module is gone, and `DISPLAY` is unset.
 
 ## Invariants
 
@@ -105,8 +135,13 @@ the launcher to consume later.
 
 ## Not yet
 
-- The identity daemon and the launcher; `niri-policyd` is the stand-in.
+- D-Bus: the session bus refuses other UIDs. Each app needs a filtered
+  per-app bus or proxy; see [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
+- PipeWire and portals for other UIDs (same socket-reachability problem
+  as Wayland; same absolute-path answer).
 - Nothing pushes policy changes to the compositor; lookups are cached per
   UID for the compositor's lifetime.
+- The forker does not yet pass fds (a log fd, a pre-connected socket) or
+  report exits to the identity daemon.
 - Per-client `wl_shm` sealing and other per-request policy.
 - Any policy on what a client may do once it has bound a global.
