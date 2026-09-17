@@ -223,47 +223,58 @@ connections.
 
 ## Sandbox
 
-`src/gpu/sandbox.rs`. The GPU process holds nothing ambient: it works
-with the fds it is given and its own memory.
+`src/gpu/sandbox.rs`. The GPU process holds nothing ambient: it starts
+with everything it will ever need on its command line and seals itself
+before it says hello.
 
-Landlock goes on first thing in `niri gpu-process` (before Mesa loads):
-read-only `/nix/store`, `/usr`, `/lib*`, `/etc`, `/run/opengl-driver*`,
-`/run/current-system`, `/sys`, `/proc`, `/dev/*random`; read-write only
-`/dev/dri` (Mesa opens render nodes itself) and `/dev/null`. No home, so
-no user config; the core sets `MESA_SHADER_CACHE_DISABLE=true` when
-spawning. Landlock ABI V2 is used on purpose: later ABIs would restrict
-device ioctls, which Mesa needs.
+Startup: `Tty::new` (core) opens every primary DRM node through libseat,
+then spawns `niri gpu-process --socket-fd N --device <dev_t>:<fd> ...
+--render-node-hint <dev_t>` with those fds inherited (CLOEXEC cleared in
+`pre_exec`, no dup2 renumbering). The process adds the devices (Mesa
+loads drivers and opens render nodes here), applies the seccomp filter,
+and only then sends `Ready { caps, devices }` reporting on each device.
+The core registers the accepted ones in `Tty::init` and closes the
+rejected ones. There is no "seal now" request: an unsealed process is
+never talked to. `NIRI_GPU_SANDBOX=0` in the compositor's environment
+skips the seal, for debugging. The core sets
+`MESA_SHADER_CACHE_DISABLE=true` when spawning (no home directory
+access after the seal anyway).
 
-Seccomp goes on when the core sends `Lockdown`, after the initial
-`AddDevice` round in `Tty::init` (and again after session activation,
-for a compositor that started on an inactive VT; the request is
-idempotent). By then Mesa is initialized. The allowlist is read / write /
-sendmsg / recvmsg and friends, memory management, epoll / poll / timers /
-eventfd, futex and thread creation (`clone` only with `CLONE_THREAD`;
-`clone3` gets ENOSYS from a separate errno filter because glibc calls it
-with all signals blocked, where a trap would kill the process), signals,
-time and identity queries, `memfd_create` / `ftruncate`, `prctl` for
-names only, `tgkill` to our own pid, stat by fd only (`AT_EMPTY_PATH`),
-and `ioctl` restricted by request type to DRM (`'d'`), dma-buf (`'b'`),
-sync_file (`'>'`) plus `FIONBIO` / `FIONREAD`. No open, socket, connect,
-exec, ptrace, or directory listing.
+The allowlist is read / write / sendmsg / recvmsg and friends, memory
+management, epoll / poll / timers / eventfd, futex and thread creation
+(`clone` only with `CLONE_THREAD`; `clone3` gets ENOSYS from a separate
+errno filter because glibc calls it with all signals blocked, where a
+trap would kill the process), signals, time and identity queries,
+`memfd_create` / `ftruncate`, `prctl` for names only, `tgkill` to our
+own pid, stat by fd only (`AT_EMPTY_PATH`), and `ioctl` restricted by
+request type to DRM (`'d'`), dma-buf (`'b'`), sync_file (`'>'`) plus
+`FIONBIO` / `FIONREAD`. No open, socket, connect, exec, ptrace, or
+directory listing. Everything else traps to a SIGSYS handler that
+prints `niri gpu-process: seccomp blocked syscall N` to stderr and fails
+the call with EPERM, so a library degrades instead of the process dying,
+and the log says what to add.
 
-Everything else traps to a SIGSYS handler that prints
-`niri gpu-process: seccomp blocked syscall N` to stderr and fails the
-call with EPERM, so a library degrades instead of the process dying, and
-the log says what to add. Consequences accepted: a device hot-plugged
-after lockdown cannot bring up a renderer (Mesa cannot open it), so it is
-display-only; a PipeWire connection lost after lockdown is re-established
-only through the next `CastStart`, which always carries a fresh socket
-the core connected (`PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` like
-libpipewire). `NIRI_GPU_SANDBOX=0` in the compositor's environment runs
-the GPU process unconfined for debugging; a lockdown failure is fatal for
-the compositor.
+Things the process used to open itself now arrive as fds on the request
+that needs them: the core resolves and opens Xcursor icon files
+(`LoadCursor`), and connects the PipeWire socket for every `CastStart`
+(`PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` like libpipewire; the process
+uses it when it has no connection, so a lost connection heals on the
+next cast). The PipeWire context, which loads modules and config, is
+created at process startup.
 
-The cross-process test (`tests/gpu_process.rs`) sends `Lockdown` before
-the smoke test, so rendering, cursor upload and PNG encoding all run
-under the filter (with llvmpipe). Not yet done: running as a separate
-UID.
+Devices after the seal: `AddDevice` still works for hot-plug, but Mesa
+cannot initialize on a device it did not start with, so such a device is
+display-only at best. When the core has no renderer and the device set
+changes (compositor started on an inactive VT, rendering device
+unplugged and back), it restarts the GPU process with the current
+devices instead (`Tty::respawn_gpu`): without a renderer nothing lives
+on the GPU side, so the swap costs only re-adding devices. A device the
+process already failed on does not trigger another restart.
+
+The cross-process test (`tests/gpu_process.rs`) runs the smoke test
+against a self-sealed headless process, so rendering, cursor upload and
+PNG encoding all run under the filter (with llvmpipe). Not yet done:
+running as a separate UID.
 
 ## HDR and wide gamut
 
