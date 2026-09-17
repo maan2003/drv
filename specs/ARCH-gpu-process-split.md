@@ -4,7 +4,7 @@
 
 Implemented on the `gpu-process` branch of the niri fork at `/src/niri`
 (smithay fork at `/src/smithay`). Builds, passes the test suite under
-llvmpipe, not yet run on real hardware. Implements the "GPU process"
+llvmpipe, runs on real hardware (Asahi); the sandbox is the latest step. Implements the "GPU process"
 component of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
 
 ## Goal
@@ -188,7 +188,9 @@ the stream, redraw timers), and recording the target's elements into a
 scene recording outputs use). It never sees PipeWire, buffer fds
 or pixel memory.
 
-GPU (`src/gpu/cast.rs`): the PipeWire connection on the GPU event loop,
+GPU (`src/gpu/cast.rs`): the PipeWire connection on the GPU event loop
+(the context, which loads PipeWire's modules and config, is created at
+startup; the socket comes from the core with `CastStart`, see Sandbox),
 stream negotiation (dmabuf modifiers with test allocations, shm
 fallback), memfd / GBM buffer allocation, per-stream
 `OutputDamageTracker` over the `SceneElement`s
@@ -201,10 +203,11 @@ counts as sent until the report arrives).
 
 ## Cursors and screenshots
 
-Xcursor theme files are parsed in the GPU process (`src/gpu/cursor.rs`,
-the `xcursor` crate) and uploaded straight into textures; the core's
-`CursorManager` (`src/cursor.rs`) asks for an icon by name through
-`GpuHandle::load_cursor` and keeps only frame geometry plus a
+The core's `CursorManager` (`src/cursor.rs`) resolves an icon name to a
+file in the theme (`xcursor::CursorTheme`), opens it and passes the fd in
+`LoadCursor`; the GPU process parses it (`src/gpu/cursor.rs`,
+`xcursor::parser`) and uploads the frames straight into textures. Through
+`GpuHandle::load_cursor` the core keeps only frame geometry plus a
 `RemoteTexture` per frame. Named cursors therefore exist only once the
 GPU renderer is up (before that the pointer is hidden), and the cache is
 dropped when the rendering device goes away. Up to 512x512 cursor frames
@@ -214,8 +217,53 @@ the cursor plane.
 Screenshots stay on the GPU: the core renders into a texture and sends
 `EncodePng`; a GPU-process thread reads the pixels back, encodes them with
 the `png` crate and returns the bytes. The core only writes the file, sets
-the clipboard selection and emits the IPC event. The `png` and `xcursor`
-crates are thereby out of the process that holds client connections.
+the clipboard selection and emits the IPC event. The `png` crate and the
+Xcursor parser are thereby out of the process that holds client
+connections.
+
+## Sandbox
+
+`src/gpu/sandbox.rs`. The GPU process holds nothing ambient: it works
+with the fds it is given and its own memory.
+
+Landlock goes on first thing in `niri gpu-process` (before Mesa loads):
+read-only `/nix/store`, `/usr`, `/lib*`, `/etc`, `/run/opengl-driver*`,
+`/run/current-system`, `/sys`, `/proc`, `/dev/*random`; read-write only
+`/dev/dri` (Mesa opens render nodes itself) and `/dev/null`. No home, so
+no user config; the core sets `MESA_SHADER_CACHE_DISABLE=true` when
+spawning. Landlock ABI V2 is used on purpose: later ABIs would restrict
+device ioctls, which Mesa needs.
+
+Seccomp goes on when the core sends `Lockdown`, after the initial
+`AddDevice` round in `Tty::init` (and again after session activation,
+for a compositor that started on an inactive VT; the request is
+idempotent). By then Mesa is initialized. The allowlist is read / write /
+sendmsg / recvmsg and friends, memory management, epoll / poll / timers /
+eventfd, futex and thread creation (`clone` only with `CLONE_THREAD`;
+`clone3` gets ENOSYS from a separate errno filter because glibc calls it
+with all signals blocked, where a trap would kill the process), signals,
+time and identity queries, `memfd_create` / `ftruncate`, `prctl` for
+names only, `tgkill` to our own pid, stat by fd only (`AT_EMPTY_PATH`),
+and `ioctl` restricted by request type to DRM (`'d'`), dma-buf (`'b'`),
+sync_file (`'>'`) plus `FIONBIO` / `FIONREAD`. No open, socket, connect,
+exec, ptrace, or directory listing.
+
+Everything else traps to a SIGSYS handler that prints
+`niri gpu-process: seccomp blocked syscall N` to stderr and fails the
+call with EPERM, so a library degrades instead of the process dying, and
+the log says what to add. Consequences accepted: a device hot-plugged
+after lockdown cannot bring up a renderer (Mesa cannot open it), so it is
+display-only; a PipeWire connection lost after lockdown is re-established
+only through the next `CastStart`, which always carries a fresh socket
+the core connected (`PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` like
+libpipewire). `NIRI_GPU_SANDBOX=0` in the compositor's environment runs
+the GPU process unconfined for debugging; a lockdown failure is fatal for
+the compositor.
+
+The cross-process test (`tests/gpu_process.rs`) sends `Lockdown` before
+the smoke test, so rendering, cursor upload and PNG encoding all run
+under the filter (with llvmpipe). Not yet done: running as a separate
+UID.
 
 ## HDR and wide gamut
 
@@ -303,5 +351,6 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
    fullscreen dmabuf clients), cursor plane, screencasting (dmabuf and
    shm streams, metadata cursor, window casts, dynamic casts), named
    cursors from the theme, screenshots (file, clipboard, portal).
-2. Sandbox the GPU process: own UID, seccomp, only the DRM fds it is given.
+2. Run the GPU process under its own UID (the core would need to pass
+   the DRM fds it opens through libseat, which it already does).
 3. Restart the GPU process on crash instead of stopping the compositor.
