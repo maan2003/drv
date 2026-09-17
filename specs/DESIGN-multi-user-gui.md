@@ -3,9 +3,10 @@
 ## Status
 
 Direction record. Implemented so far: the compositor core / GPU process
-split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and a first
-identity daemon, forker and per-UID compositor policy
-([ARCH-app-policy](ARCH-app-policy.md)). This records the agreed direction
+split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and the
+identity daemon, sandboxing forker, per-UID compositor policy and
+group-gated PipeWire ([ARCH-app-policy](ARCH-app-policy.md)), verified in
+a KVM dev VM with Chromium as an untrusted app. This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
 intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
 specs.

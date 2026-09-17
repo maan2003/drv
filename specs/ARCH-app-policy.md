@@ -8,7 +8,10 @@ Implemented on the `policy` branch of the niri fork at `/src/niri`
 and the forker enforces groups and puts each app in a cgroup. Three crates:
 `niri-policy` (types, protocol, compositor client), `niri-identity`
 (`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
-the root forker). Builds and passes tests; not yet run on real hardware.
+the root forker). Builds, passes tests, and runs end to end in the
+KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
+the TTY backend and the GPU process on a virgl GPU, apps as their own
+UIDs with the sandbox below, Chromium with GPU and audio.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
@@ -94,6 +97,25 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
   `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with a cleared
   environment. Children are reaped and their exit logged. It has no
   config file and no notion of an app.
+- Sandbox (the forker, as root, between fork and exec, for range UIDs):
+  a private mount namespace; fresh tmpfs on `/tmp` and `/dev/shm`;
+  `/proc` with `hidepid=invisible`; and a fresh read-only tmpfs on `/run`
+  holding only the app's own runtime directory plus the forker's
+  `--expose` entries (bind-mounted directories or recreated symlinks:
+  the apps' Wayland socket directory, `opengl-driver`, `current-system`,
+  `/run/pipewire`). So no system D-Bus, no forker or identity socket, no
+  setuid wrappers, no other app's runtime directory. Same UID plus this
+  is the floor; anything more an app may reach is a group or a socket.
+  No user namespaces anywhere.
+- The identity daemon serves its own UID only (`SO_PEERCRED`), so only
+  the compositor of the same human can look up policy or launch.
+- `identity.toml` has a static `[env]` table (from the system
+  configuration) every app gets: where the PipeWire socket is, for one.
+- Audio is a group: PipeWire runs system-wide as its own user with its
+  sockets mode 0660 group `pipewire`; an app whose manifest lists
+  `groups = ["pipewire"]` (and whose forker allow list includes it) can
+  connect, anyone else gets `EACCES`. WirePlumber's default access
+  rules give such clients play and record but no management.
 - Apps run as other UIDs cannot enter the session's `XDG_RUNTIME_DIR`, so
   with `NIRI_APPS_SOCKET=/run/niri/<user>/wayland` the compositor also
   listens on that absolute path, socket mode 0666. Anyone local may
@@ -144,8 +166,12 @@ command-line command become `Launch` requests (`Niri::launch`);
 
 - D-Bus: the session bus refuses other UIDs. Each app needs a filtered
   per-app bus or proxy; see [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
-- PipeWire and portals for other UIDs (same socket-reachability problem
-  as Wayland; same absolute-path answer).
+- Portals for other UIDs: a per-app session bus with the portal in the
+  app's UID is compatibility only; the trusted, UID-keyed portal service
+  is not built. Screen share and camera through PipeWire likewise wait
+  on that.
+- Network isolation per app.
+- Nothing kills a still-running app when its manifest goes away.
 - Nothing pushes policy changes to the compositor; lookups are cached per
   UID for the compositor's lifetime.
 - Sub-UID ranges, and a way for an app to ask for them.
