@@ -138,6 +138,10 @@ fails with EOPNOTSUPP, tolerated like upstream) and Mesa renders through
 the DCP display controller's node, so the renderer lives there.
 `RemoveDevice` replies `DeviceRemoved { renderer_dropped }` so the core
 knows when the renderer went away regardless of which node owned it.
+Ten-bit formats are probed with the compositor that is actually used;
+surfaces are created right before the compositor that consumes them,
+because dropping a smithay `DrmSurface` disables the CRTC and a surface
+created earlier would then page-flip onto a disabled CRTC (EINVAL).
 Secondary GPUs are display-only via the rendering device's allocator
 with linear buffers.
 
