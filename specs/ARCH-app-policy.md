@@ -11,7 +11,10 @@ process may do is its globals and grants. Four crates: `drv-policy`
 brain, plus the `drv` CLI), `drv-spawn` (`drv-spawnd`, the root
 supervisor that forks the identity daemon and the apps), `drv-bridge`
 (the UID-keyed desktop services server and the shim on each app's
-private bus: notifications and portals). Builds, passes tests, and runs
+private bus: notifications and portals), `drv-seat` (`drv-seatd`, the
+seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN verifier
+that unlocks the compositor) and `drv-lock` (the lock screen, an app).
+Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
@@ -48,6 +51,11 @@ drv-seatd (root)
   /dev/input/event* for its one client, uid drv-compositor, and passes the fds
   over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket;
   forks the GPU process as uid drv-gpu on the compositor's request (StartGpu)
+
+drv-authd (uid drv-auth)
+  argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
+  Verify only from uid app-lock, Unlock{idle_timeout} pushed only to the
+  connection from uid drv-compositor over /run/drv-auth/auth.sock
 
 drv-compositor (uid)      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
   Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
@@ -225,6 +233,24 @@ launched by the daemon, in order, once the apps socket exists.
   Cannot connect or hello fails: the compositor exits. A failed lookup
   later gives that client `AppPolicy::unknown()`.
 
+## The lock
+
+Locked is the default; the compositor holds a lease "unlocked until T"
+that only `drv-authd` starts. The lock app (`services.drv.apps.lock`,
+`drv-lock`, the one app with the `session-lock` global) draws the PIN
+screen and sends `Verify` to the daemon; on a match the daemon sends
+`Unlock{idle_timeout}` on the compositor's own connection. The compositor
+then grants itself the lease, sends the lock client `finished` and the
+app exits. A client's `unlock_and_destroy` releases its surfaces and
+nothing else: without a lease the outputs stay black and the compositor
+launches the lock app again (3 s backoff, via `Launch` like any app).
+Input extends the lease by `idleTimeout` (module option, 300 s); a
+visible idle-inhibiting surface extends it too; `lock-session` (bound to
+Super+Alt+L) ends it; a compositor restart starts locked. A client `lock`
+while unlocked gets `finished`. While locked, casts and screenshots render
+only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
+`1234` in the unit's pre-start.
+
 ## Invariants
 
 - Identity is the socket UID. PIDs are reused and are never used for
@@ -244,6 +270,9 @@ launched by the daemon, in order, once the apps socket exists.
 - The compositor holds no device group and no VT. Every DRM and evdev fd
   comes from `drv-seatd`, which serves one UID and only the seat's card
   and event nodes (never render nodes or anything else under `/dev`).
+- Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
+  starts a lease; the lock app cannot unlock even if compromised, it can
+  only try PINs, and the daemon slows that down.
 
 ## Not yet
 

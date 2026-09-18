@@ -9,7 +9,8 @@ group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
 every process on its own UID: Chromium started from a launcher that is
 itself just an app, notifications and portals (screen share with
-per-session consent) through a UID-keyed bridge. Not yet: the lock lease, sub-UID ranges, file ownership
+per-session consent) through a UID-keyed bridge, and the lock (locked by
+default, a PIN daemon pushes the unlock). Not yet: sub-UID ranges, file ownership
 ([NOTES-file-ownership](NOTES-file-ownership.md)). This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
 intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
@@ -144,6 +145,14 @@ screen. Defences, layered:
 suspend lock, auth-daemon failure and compositor restart all reduce to the
 lease expiring or never existing. Login is the first unlock, so there is no
 separate greeter. Idle-inhibit becomes "extend the lease while visible".
+
+Status: locked by default, the lease is compositor-local and input
+extends it, `drv-authd` verifies the PIN and pushes the unlock straight to
+the compositor, the lock app only draws and takes input, and casts and
+screenshots of a locked session are black
+([ARCH-app-policy](ARCH-app-policy.md#the-lock)). Not yet: the trusted
+region, the secret image, the attention key; freezing is designed
+separately.
 
 The kernel replays the last framebuffer on resume before userspace runs.
 This is a design gap we intend to fix in the kernel (blank planes on resume)
