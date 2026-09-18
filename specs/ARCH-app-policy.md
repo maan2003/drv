@@ -239,10 +239,10 @@ uid = 902
 grants = ["lookup"]
 
 [[app]]
-name = "portal-gnome"
-uid = 100013
-exec = ["/nix/store/.../xdg-desktop-portal-gnome"]
-grants = ["screencast"]
+name = "mako"
+uid = 100011
+exec = ["/nix/store/.../mako"]
+globals = ["layer-shell"]
 autostart = true
 ```
 
@@ -365,19 +365,13 @@ an entry (a daemon, a probe) out of the app menu.
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
   person's tree, only the file it was given, as its own UID.
-- Other portals: per app the server holds its own connection on the services'
-  bus, registers the app with the portal `Registry` as `drv.app.<name>`,
-  forwards `org.freedesktop.portal.*` bodies unchanged (fds included), and
-  rewrites request and session handle paths so `Response` and `Closed`
-  signals come back to the right caller. xdg-desktop-portal and the GNOME
-  backend are apps with their own UIDs; the backend still holds the
-  `screencast` grant for the compositor's Mutter D-Bus services
-  (screenshots, and its own screencast path, which nothing uses any
-  more). The frontend identifies callers by opening `/proc/<pid>/root`
-  to look for `.flatpak-info`, which only works within one UID; the
-  module builds it with `nix/xdg-desktop-portal-cross-uid.patch`, which
-  treats an unreadable root as "not a flatpak" (there is no Flatpak here
-  and the portal shares a UID with nobody).
+- No other portal. `org.freedesktop.portal.Settings` (version 2:
+  `Read`, `ReadOne`, `ReadAll`) the bridge answers itself with the one
+  look every app gets (`org.freedesktop.appearance`: `color-scheme` 1,
+  dark; `contrast` 0). Every other portal call gets
+  `org.freedesktop.DBus.Error.UnknownMethod`: chromium asks for
+  `Secret` and `Realtime` and goes on without them. Nothing an app says
+  reaches the services' bus; xdg-desktop-portal is not installed.
 - GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
   stream connect, after the seccomp lockdown, so the GPU process loads it
   into PipeWire's plugin registry at startup.
@@ -498,10 +492,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   reporting and cgroup kill from drv-forker.
 - Screen sharing: windows as sources, more than one screen per session,
   consents that outlive the app's run (`persist_mode` 2).
-- The remaining portals (screenshot, settings, OpenURI, ...) still go
-  through xdg-desktop-portal with its GNOME backend; once nothing needs
-  them both go, with the compositor's Mutter D-Bus services and the
-  `screencast` grant.
+- The compositor's Mutter D-Bus services and the `screencast` grant
+  (drv-policy, `src/dbus`) are dead now that no UID holds it; they go
+  next. Portals apps may still want: OpenURI, screenshot.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
   not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a

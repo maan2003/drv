@@ -62,13 +62,13 @@ to and what any discussion means.
   serves each pick to the asking UID alone at `/run/drv-doc/<id>/<name>`
   over FUSE (fd `fuse`, mounted by the supervisor). For a screen it
   lists the outputs and starts the cast at the compositor over its own
-  cast line (fd `compositor`). Not xdg-desktop-portal, which still
-  serves the other portals for now.
+  cast line (fd `compositor`).
 - **bridge** (`drv-bridge serve`, uid drv-bridge, a supervisor service).
-  The apps' desktop services, keyed on the peer UID: notifications and
-  the other portals to the services' bus, the file chooser and the
-  screencast to the portal, and the PipeWire remote for a cast (a
-  connection restricted to the one node before the app gets it).
+  The apps' desktop services, keyed on the peer UID: notifications to
+  the services' bus, the file chooser and the screencast to the portal,
+  settings answered in place, the PipeWire remote for a cast (a
+  connection restricted to the one node before the app gets it), and
+  nothing else (no xdg-desktop-portal).
   `drv-bridge app` is the shim on an app's private bus.
 - **documents mount** (`/run/drv-doc`). Where an app finds the files it
   was given. A grant is one file for one UID; the listing shows a UID
