@@ -4,9 +4,13 @@ The words we use for the GUI stack, so a message means the same thing to
 everyone. "Today" is what runs now; the agreed name is what we are moving
 to and what any discussion means.
 
-- **drv-supervisor** (crate `drv-supervisor`, root). Spawns the trusted
-  set below, creates every socketpair between them at startup and pushes
-  the fds (`Attach`). Takes input from nobody. Restarts what dies.
+- **drv-supervisor** (crate `drv-supervisor`, uid drv-supervisor; its
+  unit grants it CAP_SETUID, SETGID, SETPCAP, CHOWN, KILL, SYS_ADMIN and
+  SYS_TTY_CONFIG as its whole bounding set: what its children keep plus
+  what switching and stopping them takes). Spawns the trusted set below,
+  creates every socketpair between them at startup and pushes the fds
+  (`Attach`). Takes input from nobody. Restarts what dies. Nothing in
+  the tree runs as root.
 - **drv-appd** (crate `drv-appd`, uid drv-appd). The launcher for
   untrusted things. Owns the manifest (`appd.toml`), the public socket
   (`/run/drv/appd.sock`), policy lookups, autostart. Android's

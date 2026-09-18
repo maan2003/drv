@@ -8,8 +8,8 @@ Implemented on the `policy` branch of the niri fork at `/src/niri`
 only, nothing shares a UID, and there is no "trusted" flag: what a
 process may do is its globals and grants. Crates: `drv-policy` (types,
 the SEQPACKET transport `seq`, the `wire`, the forker channel, compositor
-client), `drv-supervisor` (root; starts the trusted set, wires it,
-restarts what dies), `drv-appd` (the launcher for untrusted things, plus
+client), `drv-supervisor` (starts the trusted set, wires it, restarts
+what dies), `drv-appd` (the launcher for untrusted things, plus
 the `drv` CLI), `drv-forker` (drv-appd's privileged helper: the sandbox
 and the fork), `drv-os` (uid/gid lookups, fd and directory helpers),
 `drv-bridge` (the UID-keyed desktop services server and the shim on each
@@ -40,7 +40,9 @@ UIDs, driving the screencast services) are `grants` on the same record.
 ## Process tree
 
 ```text
-drv-supervisor (root, the systemd unit)
+drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
+                SETPCAP, CHOWN, KILL, SYS_ADMIN, SYS_TTY_CONFIG from the unit's
+                AmbientCapabilities, NoNewPrivileges; nothing here is root)
   starts drv-seatd, drv-authd, the compositor, compositor-gpu (niri
   gpu-process, uid drv-gpu), the locker (drv-lock, uid drv-lock),
   drv-forker (uid drv-forker) and drv-appd as their users, from its own
@@ -370,5 +372,5 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Launch authority as an fd handed to the launcher; the supervisor off
-  root; seccomp on the leaves.
+- Launch authority as an fd handed to the launcher; seccomp on the
+  leaves.
