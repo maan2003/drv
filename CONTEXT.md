@@ -10,9 +10,11 @@ to and what any discussion means.
   what switching and stopping them takes). Spawns the trusted set below,
   makes every socketpair between them before the first fork and hands
   each member its ends as named startup fds (`drv_os::fds`, the systemd
-  LISTEN_FDS convention). Takes input from nobody. If any member dies
-  it kills the apps and restarts the whole set. Nothing in the tree runs
-  as root.
+  LISTEN_FDS convention), each in the same sandbox an app gets
+  (`drv_os::sandbox`: private mount namespace, `/run` holding only what
+  is listed for it, no network). Takes input from nobody. If any member
+  dies it kills the apps and restarts the whole set. Nothing in the tree
+  runs as root.
 - **drv-appd** (crate `drv-appd`, uid drv-appd). The launcher for
   untrusted things. Owns the manifest (`appd.toml`), the public socket
   (`/run/drv/appd.sock`, lookups only), the launch channels, autostart. Android's
@@ -47,10 +49,15 @@ to and what any discussion means.
   asks to lock again and the compositor holds the request for the next
   locking. Seccomp-sealed after its first render (fonts stay readable).
 - **menu** (`drv-menu`, uid drv-menu, a supervisor service). Holds a
-  launch channel (fd `appd`) and a poke line from the compositor (fd
-  `compositor`, a byte per `show-launcher` bind); runs the dmenu-style
-  program (fuzzel) as its own uid and launches the name it prints. In
-  the manifest with layer-shell, so its window is like any app's.
+  launch channel (fd `appd`), a poke line from the compositor (fd
+  `compositor`, a byte per `show-launcher` bind) and its own Wayland
+  connection (fd `wayland`, inserted by the compositor as a layer-shell
+  client). Draws the list itself with `drv-ui`, launches the pick by
+  name. One process, sealed like the locker.
+- **drv-ui** (crate). What the set's windows share: connection on a
+  supervisor fd, toolkit boilerplate, Pango text in shm buffers, the
+  seccomp seal after the fonts are warm. The locker and the menu are on
+  it; portal dialogs will be.
 - **the set**: the eight above. If any member dies the supervisor kills
   the apps, stops the rest and starts everything again with fresh
   sockets. There are no smaller groups.

@@ -16,9 +16,10 @@ directory helpers),
 `drv-bridge` (the UID-keyed desktop services server and the shim on each
 app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
 the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
-verifier that unlocks the compositor), `drv-lock` (the lock screen, a
-supervisor service) and `drv-menu` (the app menu, a supervisor service
-that runs fuzzel). Names are in [CONTEXT.md](../CONTEXT.md).
+verifier that unlocks the compositor), `drv-ui` (what the set's windows
+share: a connection on a supervisor fd, the toolkit boilerplate, text in
+shm buffers, sealing), `drv-lock` (the lock screen) and `drv-menu` (the
+app menu), both supervisor services on `drv-ui`. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
@@ -50,17 +51,29 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   drv-appd as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
-  ambient, as its whole bounding set. Every link between two members is
+  ambient, as its whole bounding set. Every member gets the sandbox an
+  app gets (`drv_os::sandbox`, one primitive for both): a private mount
+  namespace, fresh `/tmp` and `/dev/shm`, `/proc` with hidepid, a
+  read-only `/run` holding only its `--<member>-expose` entries, and an
+  empty network namespace (the forker keeps the host's: apps with
+  `network` get it from there). Today: seatd `/run/udev`; the compositor
+  `/run/udev` (libinput), its runtime and apps socket directories,
+  `/run/drv`, the session bus and `/run/pipewire`; the GPU process
+  `/run/opengl-driver`; the forker `/run/drv-apps` plus everything an
+  app may be shown; authd, the locker, the menu and drv-appd nothing.
+  Nobody has the system bus (`/run/dbus`): the compositor's logind and
+  locale1 watchers fail closed and log it.
+  Every link between two members is
   a socketpair the supervisor makes before the first fork; each member
   gets its ends at startup as named fds (`drv_os::fds`: the systemd
   LISTEN_FDS/LISTEN_FDNAMES convention, fds 3.. with names in order):
     seatd        compositor
     authd        compositor, locker
     gpu          compositor
-    compositor   seat, auth, gpu, locker, appd, menu
+    compositor   seat, auth, gpu, locker, appd, menu, menu-client
     locker       compositor (its Wayland connection), auth
-    menu         compositor (a byte per show-launcher), appd (its launch
-                 channel)
+    menu         compositor (a byte per show-launcher), wayland (its
+                 Wayland connection), appd (its launch channel)
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
                  0666), channel (to the forker), compositor and menu
@@ -85,15 +98,18 @@ drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid
     names with an exec                       setresuid, NNP, exec; the child
   Lookup{uid} on the listener: own uid,      inherits no fd at all
     or the lookup grant                    reaps children, logs their exit
-  autostart once, after the apps socket
-    listens (/proc/net/unix)
+  autostart once, on the compositor's
+    Hello down its channel (its apps
+    socket listens by then)
 
-drv-menu (uid drv-menu; the manifest lists it with layer-shell)
-  fd `compositor`: a byte per show-launcher bind; fd `appd`: its launch
-  channel. On each byte: Apps -> the names on the dmenu-style program's
-  stdin (fuzzel --dmenu, the module's `menu`, run as drv-menu with its
-  environment and no fds); what it prints -> Launch{app}. Not dumpable,
-  so the program cannot ptrace it or read its fds.
+drv-menu (uid drv-menu; one process, no children, sealed after the first
+          render like the locker)
+  fd `compositor`: a byte per show-launcher bind; fd `wayland`: its
+  Wayland connection, which the compositor inserted as a layer-shell
+  client (no lookup, no manifest entry); fd `appd`: its launch channel.
+  On each byte: Apps -> a layer surface listing the names, typed
+  filter, Up/Down, Enter -> Launch{app}, Escape -> gone. Drawn with
+  drv-ui, like the lock screen.
 
 drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   holds the seat (libseat builtin backend, no seatd) and udev; announces the
@@ -200,7 +216,9 @@ autostart = true
 One UID per entry, one entry per name, no ranges, no default entry:
 an unlisted UID is `unknown`. An entry without `exec` is a service
 (started by systemd) and cannot be launched. `autostart` entries are
-launched by the daemon, in order, once the apps socket exists.
+launched by the daemon, in order, when the compositor says hello on its
+launch channel (its apps socket listens by then). `menu = false` keeps
+an entry (a daemon, a probe) out of the app menu.
 
 ## Launching
 
@@ -227,7 +245,9 @@ launched by the daemon, in order, once the apps socket exists.
   `PR_SET_NO_NEW_PRIVS`, exec with the request's environment and nothing
   else. The child inherits no fd. Children are reaped and
   their exit logged.
-- Sandbox (drv-forker, with CAP_SYS_ADMIN, between fork and exec): a private mount
+- Sandbox (`drv_os::sandbox`, applied by drv-forker between fork and
+  exec with CAP_SYS_ADMIN; the supervisor applies the same one to every
+  member of the set, with its own expose list): a private mount
   namespace; fresh tmpfs on `/tmp` and `/dev/shm`; `/proc` with
   `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
   the app's own runtime directory plus the `--expose` entries (the
@@ -402,8 +422,7 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   reporting and cgroup kill from drv-forker.
 - Portals become supervisor services, like the menu, once they need
   authority (launch with data, intents over the bus).
-- The menu lists every entry with an `exec`, autostarted daemons
-  included; nothing marks an entry as not for the menu.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
-  not listed yet), the compositor core, and drv-menu (it forks and
-  execs).
+  not listed yet) and the compositor core.
+- Icons in the menu: reading image files an app controls needs a
+  decoder in a sandbox first.
