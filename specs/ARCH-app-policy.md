@@ -40,11 +40,17 @@ UIDs, driving the screencast services) are `grants` on the same record.
 drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
   binds /run/drv/identity.sock 0666     fd 3: the public socket, fd 4: the channel
   socketpair -> forks identityd   ---->   identity.toml: every uid, exec, groups,
-  with fd 3 + fd 4, respawns it            globals, grants, autostart
+  with fd 3 + fd 4, respawns it            globals, grants, autostart, auth
   channel: {uid, groups, argv,    <----   Launch{app} from anyone -> channel
-    env, network} -> range and             Lookup{uid}: own uid, or peer has
-    group check, dirs, cgroup,               the lookup grant
+    env, network, auth} -> range           Lookup{uid}: own uid, or peer has
+    and group check, dirs, cgroup,           the lookup grant
     sandbox, setresuid, NNP, exec           autostart once the apps socket exists
+  forks drv-authd and the compositor as their users too, restarts them, and
+  wires: each child with peers gets a wire on fd 3 (DRV_WIRE_FD) down which
+  the spawner pushes Attach{Auth|Compositor|Verifier} + one fd, both ends of
+  a socketpair it made. Whenever authd or the compositor (re)starts they get
+  a fresh pair; an app with auth=true (the lock app) gets a pair to authd at
+  launch. Nobody connects to anybody, nobody checks a peer's UID.
 
 drv-seatd (root)
   holds the seat (libseat builtin backend, no seatd); opens /dev/dri/card* and
@@ -52,12 +58,13 @@ drv-seatd (root)
   over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket;
   forks the GPU process as uid drv-gpu on the compositor's request (StartGpu)
 
-drv-authd (uid drv-auth)
+drv-authd (uid drv-auth, spawner child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
-  Verify only from uid app-lock, Unlock{idle_timeout} pushed only to the
-  connection from uid drv-compositor over /run/drv-auth/auth.sock
+  Verify arrives on connections the spawner attached as Verifier,
+  Unlock{idle_timeout} goes to the one it attached as Compositor; no socket
 
-drv-compositor (uid)      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
+drv-compositor (uid,      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
+    spawner child)
   Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
   D-Bus callers checked     notifications and     per-user own and      spawner, sandboxed,
   against grants            portals for apps      send policy           reach the identity
@@ -237,9 +244,10 @@ launched by the daemon, in order, once the apps socket exists.
 
 Locked is the default; the compositor holds a lease "unlocked until T"
 that only `drv-authd` starts. The lock app (`services.drv.apps.lock`,
-`drv-lock`, the one app with the `session-lock` global) draws the PIN
-screen and sends `Verify` to the daemon; on a match the daemon sends
-`Unlock{idle_timeout}` on the compositor's own connection. The compositor
+`drv-lock`, the one app with the `session-lock` global and `auth = true`)
+draws the PIN screen and sends `Verify` down the connection the spawner
+handed it at launch; on a match the daemon sends `Unlock{idle_timeout}` on
+the compositor's connection, which the spawner handed both of them. The compositor
 then grants itself the lease, sends the lock client `finished` and the
 app exits. A client's `unlock_and_destroy` releases its surfaces and
 nothing else: without a lease the outputs stay black and the compositor
@@ -282,6 +290,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
   starts a lease; the lock app cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
+- Peers are handed over, never found: the auth daemon has no socket, and
+  what it takes `Verify` from and pushes `Unlock` to are the fds the root
+  spawner attached. Anything that is not the lock app has no path to it.
 
 ## Not yet
 

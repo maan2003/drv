@@ -148,8 +148,9 @@ separate greeter. Idle-inhibit becomes "extend the lease while visible".
 
 Status: locked by default, the lease is compositor-local and input
 extends it, `drv-authd` verifies the PIN and pushes the unlock straight to
-the compositor, the lock app only draws and takes input, and casts and
-screenshots of a locked session are black
+the compositor, the lock app only draws and takes input, the spawner forks
+all three and hands them their connections to each other (no auth socket),
+and casts and screenshots of a locked session are black
 ([ARCH-app-policy](ARCH-app-policy.md#the-lock)). Not yet: the trusted
 region, the secret image, the attention key; freezing is designed
 separately.
