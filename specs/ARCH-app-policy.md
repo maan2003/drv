@@ -320,12 +320,19 @@ an entry (a daemon, a probe) out of the app menu.
   `org.freedesktop.portal.Desktop` and forwarding to the server. The
   shim is compatibility, not a boundary.
 - Screen sharing is ours: `org.freedesktop.portal.ScreenCast` (version
-  4, monitors only, cursor modes hidden/embedded/metadata, restore
-  tokens ignored) and `org.freedesktop.portal.Session` on the app's bus
-  are answered by the bridge. `CreateSession` and `SelectSources` are
-  bookkeeping there; `Start` asks drv-portal (`Cast{id, app, uid,
-  cursor}`), whose dialog lists the screens the compositor reports and
-  is the consent; the pick goes to the compositor over the portal's own
+  4, monitors only, cursor modes hidden/embedded/metadata) and
+  `org.freedesktop.portal.Session` on the app's bus are answered by the
+  bridge. `CreateSession` and `SelectSources` are bookkeeping there;
+  `Start` asks drv-portal (`Cast{id, app, uid, cursor, again}`), whose
+  dialog lists the screens the compositor reports and is the consent;
+  a consent gets a token (`Response::Cast.token`), handed to the app as
+  `restore_token` when it asked for any `persist_mode`, and answered
+  with `persist_mode` 1: a later `Cast` with it (`again`) from the same
+  app and uid starts the same screen with no dialog. drv-portal drops
+  an app's tokens when the bridge says its connection ended
+  (`Forget{app, uid}`), so a consent never outlives the app's run.
+  Chromium needs this: its picker previews a screen in one session,
+  then captures in a second with the first's token. the pick goes to the compositor over the portal's own
   cast line (`drv_portal::compositor`: Outputs, Start{cast, output,
   cursor}, Stop; back Outputs, Started{cast, node_id}, Stopped), which
   starts the cast with no D-Bus and no grant involved, the line being
@@ -333,9 +340,10 @@ an entry (a daemon, a probe) out of the app menu.
   size}` and the bridge emits `Response` with `streams`.
   `OpenPipeWireRemote` is a PipeWire connection the bridge makes and
   restricts before handing it over: the client's permissions are set to
-  the core and the one node (everything else none), a round trip makes
-  sure the daemon has them, then the fd is stolen from the core and
-  sent as the reply. The permissions live in the daemon, so they hold
+  the core, the one node, and read on the client-node factory the app
+  makes its own stream node through (everything else none, as
+  xdg-desktop-portal does), a round trip makes sure the daemon has
+  them, then the fd is stolen from the core and sent as the reply. The permissions live in the daemon, so they hold
   whatever the app does with the fd. WirePlumber would hand every new
   client everything a moment later, so a WirePlumber rule keyed on the
   bridge's uid (set by PipeWire from the socket, not forgeable) gives
@@ -489,7 +497,7 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
 - Screen sharing: windows as sources, more than one screen per session,
-  restore tokens.
+  consents that outlive the app's run (`persist_mode` 2).
 - The remaining portals (screenshot, settings, OpenURI, ...) still go
   through xdg-desktop-portal with its GNOME backend; once nothing needs
   them both go, with the compositor's Mutter D-Bus services and the
