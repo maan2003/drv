@@ -246,7 +246,16 @@ nothing else: without a lease the outputs stay black and the compositor
 launches the lock app again (3 s backoff, via `Launch` like any app).
 Input extends the lease by `idleTimeout` (module option, 300 s); a
 visible idle-inhibiting surface extends it too; `lock-session` (bound to
-Super+Alt+L) ends it; a compositor restart starts locked. A client `lock`
+Super+Alt+L) ends it; a compositor restart starts locked. The lease is a
+`CLOCK_BOOTTIME` deadline and `Niri::check_lease` is the one place that
+turns "expired" into "locked": it runs before every frame, before every
+input event and once a second, so nothing is drawn or delivered on a
+stale lease, and suspend needs no hook (the clock runs while asleep). The
+kernel's own replay of the last framebuffer on resume is switched off by
+`nix/linux-drm-blank-on-resume.patch` (`drm_kms_helper.blank_on_resume=1`,
+set by the module): the DRM resume helper commits the saved state with
+every plane detached, so wake shows black until the compositor's first
+commit. `nix/resume-vm.nix` plus `nix/resume-test.sh` check that on QXL. A client `lock`
 while unlocked gets `finished`. While locked, casts and screenshots render
 only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 `1234` in the unit's pre-start.

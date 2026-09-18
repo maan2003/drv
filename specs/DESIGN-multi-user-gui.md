@@ -154,9 +154,15 @@ screenshots of a locked session are black
 region, the secret image, the attention key; freezing is designed
 separately.
 
-The kernel replays the last framebuffer on resume before userspace runs.
-This is a design gap we intend to fix in the kernel (blank planes on resume)
-rather than work around with pre-suspend hooks.
+Suspend needs no handling of its own: the lease is `CLOCK_BOOTTIME`, which
+keeps running while asleep, so a long sleep expires it before the first frame
+after wake. What the kernel does on its own is replay the last framebuffer on
+resume before userspace runs; a kernel patch (`drm_kms_helper.blank_on_resume`,
+`nix/linux-drm-blank-on-resume.patch` in niri) makes the DRM resume helper
+commit that saved state with every plane detached, so the screen comes back
+black until the compositor's first commit. Status: patched and verified in KVM
+on QXL (S3, plane detached after resume, relit by the next commit); i915's own
+resume path is patched but only build-tested.
 
 ## Storage lock
 
