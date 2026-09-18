@@ -419,7 +419,7 @@ The compositor then grants itself the lease and sends the lock client
 again, and the compositor holds that request (`LockState::Pending`) until
 the lease ends, when it becomes the lock without anything being launched.
 Without a lease the outputs stay black whether or not a lock client is
-there.
+there, and so is every cast, windows included.
 Input extends the lease by `idleTimeout` (module option, 300 s); a
 visible idle-inhibiting surface extends it too; `lock-session` (bound to
 Super+Alt+L) ends it; a compositor restart starts locked. The lease is a
