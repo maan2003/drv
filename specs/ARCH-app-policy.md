@@ -74,21 +74,22 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
     authd        compositor, locker
     gpu          compositor
     compositor   seat, auth, gpu, locker, appd, menu, menu-client,
-                 portal-client
+                 portal-client, portal (the cast line)
     locker       compositor (its Wayland connection), auth
     menu         compositor (a byte per show-launcher), wayland (its
                  Wayland connection), appd (its launch channel)
-    portal       wayland (its Wayland connection), bridge (chooser
-                 requests), fuse (the /dev/fuse end of the documents
-                 mount the supervisor made at --docs, /run/drv-doc)
+    portal       wayland (its Wayland connection), compositor (the
+                 cast line), bridge (chooser and cast requests), fuse
+                 (the /dev/fuse end of the documents mount the
+                 supervisor made at --docs, /run/drv-doc)
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
                  0666), channel (to the forker), compositor and menu
                  (the two launch channels)
     bridge       listener (/run/drv-bridge/bridge.sock, bound by the
                  supervisor, 0666), portal
-  seat, auth, the forker channel and the bridge's portal line are
-  SEQPACKET, the rest streams.
+  seat, auth, the forker channel, the bridge's portal line and the
+  portal's cast line are SEQPACKET, the rest streams.
   Nothing is linked at runtime: the ten are one set, and when any
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
@@ -114,11 +115,16 @@ drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid
 
 drv-portal (uid drv-portal; one process, sealed like the locker with
             file writes allowed; owns the person's files, `--files`)
-  fd `bridge`: Choose{id, app, uid, title, Open | Save{name}} from the
-  bridge, one at a time on a layer surface: the tree under --files,
+  fd `bridge`: Choose{id, app, uid, title, Open | Save{name}} and
+  Cast{id, app, uid, cursor} from the bridge, one dialog at a time on
+  a layer surface. Choose shows the tree under --files,
   Enter descends or picks (Save: types a name; an existing one is
   picked to overwrite), Escape cancels; Cancel{id} takes a request
-  down unanswered. A pick opens the file itself (O_NOFOLLOW, regular
+  down unanswered. Cast lists the screens the compositor reports (fd
+  `compositor`: Outputs is asked with every request); Enter sends
+  Start{cast: id, output, cursor} down that line and the dialog goes
+  down; Started{node_id} is answered as Cast{id, node_id, output,
+  size}, Stopped as Closed{id}; Cancel{id} on a live cast sends Stop. A pick opens the file itself (O_NOFOLLOW, regular
   files only, created for Save) and files a grant {uid, name, fd,
   write}; the answer is Chosen{paths: ["/run/drv-doc/<id>/<name>"]}.
   fd `fuse`: the documents mount, served in a thread (fuser): the
@@ -313,6 +319,34 @@ an entry (a daemon, a probe) out of the app menu.
   own UID with the shim claiming `org.freedesktop.Notifications` and
   `org.freedesktop.portal.Desktop` and forwarding to the server. The
   shim is compatibility, not a boundary.
+- Screen sharing is ours: `org.freedesktop.portal.ScreenCast` (version
+  4, monitors only, cursor modes hidden/embedded/metadata, restore
+  tokens ignored) and `org.freedesktop.portal.Session` on the app's bus
+  are answered by the bridge. `CreateSession` and `SelectSources` are
+  bookkeeping there; `Start` asks drv-portal (`Cast{id, app, uid,
+  cursor}`), whose dialog lists the screens the compositor reports and
+  is the consent; the pick goes to the compositor over the portal's own
+  cast line (`drv_portal::compositor`: Outputs, Start{cast, output,
+  cursor}, Stop; back Outputs, Started{cast, node_id}, Stopped), which
+  starts the cast with no D-Bus and no grant involved, the line being
+  the authority. The node comes back as `Cast{id, node_id, output,
+  size}` and the bridge emits `Response` with `streams`.
+  `OpenPipeWireRemote` is a PipeWire connection the bridge makes and
+  restricts before handing it over: the client's permissions are set to
+  the core and the one node (everything else none), a round trip makes
+  sure the daemon has them, then the fd is stolen from the core and
+  sent as the reply. The permissions live in the daemon, so they hold
+  whatever the app does with the fd. WirePlumber would hand every new
+  client everything a moment later, so a WirePlumber rule keyed on the
+  bridge's uid (set by PipeWire from the socket, not forgeable) gives
+  the bridge's clients no default permissions and no permission
+  manager; the bridge has no other use for PipeWire. `Session.Close`, `Request.Close`
+  before consent, or the app's connection ending send `Cancel{id}`,
+  which takes the dialog down or stops the cast; the compositor ending
+  it (`stop-all-casts`, the output going away) comes back as `Stopped`,
+  then `Closed{id}`, then the `Session.Closed` signal. While any cast
+  is live the compositor draws the "Screen is being shared" indicator
+  above everything (never into the cast).
 - The file chooser is ours: `org.freedesktop.portal.FileChooser`
   (`OpenFile`, `SaveFile`, `version` 4) on the app's bus is answered by
   the bridge itself, which asks drv-portal down its supervisor link
@@ -328,19 +362,14 @@ an entry (a daemon, a probe) out of the app menu.
   forwards `org.freedesktop.portal.*` bodies unchanged (fds included), and
   rewrites request and session handle paths so `Response` and `Closed`
   signals come back to the right caller. xdg-desktop-portal and the GNOME
-  backend are apps with their own UIDs; the frontend needs the `pipewire`
-  group for `OpenPipeWireRemote`, the backend holds the `screencast`
-  grant. The frontend identifies callers by opening `/proc/<pid>/root`
+  backend are apps with their own UIDs; the backend still holds the
+  `screencast` grant for the compositor's Mutter D-Bus services
+  (screenshots, and its own screencast path, which nothing uses any
+  more). The frontend identifies callers by opening `/proc/<pid>/root`
   to look for `.flatpak-info`, which only works within one UID; the
   module builds it with `nix/xdg-desktop-portal-cross-uid.patch`, which
   treats an unreadable root as "not a flatpak" (there is no Flatpak here
-  and the portal shares a UID with nobody). Screen sharing is per-session consent: the portal dialog is the
-  consent, the portal session is the lease, and no app has a static
-  screencast capability. While any session is live the compositor draws
-  a "Screen is being shared" indicator above everything (never into the
-  cast) naming the `stop-all-casts` key (`Mod+Shift+Escape` by
-  default), which closes every session so the portal and app see the
-  lease end.
+  and the portal shares a UID with nobody).
 - GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
   stream connect, after the seccomp lockdown, so the GPU process loads it
   into PipeWire's plugin registry at startup.
@@ -459,8 +488,12 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- The remaining portals (screencast first) move into drv-portal, and
-  xdg-desktop-portal with its GNOME backend go.
+- Screen sharing: windows as sources, more than one screen per session,
+  restore tokens.
+- The remaining portals (screenshot, settings, OpenURI, ...) still go
+  through xdg-desktop-portal with its GNOME backend; once nothing needs
+  them both go, with the compositor's Mutter D-Bus services and the
+  `screencast` grant.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
   not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a

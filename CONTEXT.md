@@ -55,16 +55,21 @@ to and what any discussion means.
   client). Draws the list itself with `drv-ui`, launches the pick by
   name. One process, sealed like the locker.
 - **portal** (`drv-portal`, uid drv-portal, a supervisor service). The
-  file chooser and the documents mount. Owns the person's files
+  person's side of the portals: the file chooser with its documents
+  mount, and screen sharing consent. Owns the person's files
   (`--files`, `/var/lib/drv-files`), shows them on its own Wayland
   connection (fd `wayland`) when the bridge asks (fd `bridge`), and
   serves each pick to the asking UID alone at `/run/drv-doc/<id>/<name>`
-  over FUSE (fd `fuse`, mounted by the supervisor). Not
-  xdg-desktop-portal, which still serves the other portals for now.
+  over FUSE (fd `fuse`, mounted by the supervisor). For a screen it
+  lists the outputs and starts the cast at the compositor over its own
+  cast line (fd `compositor`). Not xdg-desktop-portal, which still
+  serves the other portals for now.
 - **bridge** (`drv-bridge serve`, uid drv-bridge, a supervisor service).
   The apps' desktop services, keyed on the peer UID: notifications and
-  the other portals to the services' bus, the file chooser to the
-  portal. `drv-bridge app` is the shim on an app's private bus.
+  the other portals to the services' bus, the file chooser and the
+  screencast to the portal, and the PipeWire remote for a cast (a
+  connection restricted to the one node before the app gets it).
+  `drv-bridge app` is the shim on an app's private bus.
 - **documents mount** (`/run/drv-doc`). Where an app finds the files it
   was given. A grant is one file for one UID; the listing shows a UID
   only its own.
