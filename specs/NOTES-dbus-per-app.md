@@ -66,7 +66,8 @@ means finishing a broker. Instead:
   the identity daemon, unknown UIDs dropped. What the human sees carries
   the manifest name, never the app's `app_name`.
 
-Portals would follow the same pattern: the shim claims
-`org.freedesktop.portal.Desktop`, the server keys each request on the UID
-and hands back file descriptors (PipeWire remote, document fds) rather
-than paths.
+Portals follow the same pattern: the shim also claims
+`org.freedesktop.portal.Desktop`; the server forwards each app's calls on
+its own bus connection, registered with the portal as `niri.app.<name>`,
+rewriting handle paths so responses find their way back. File
+descriptors (the PipeWire remote) pass through unchanged.

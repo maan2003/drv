@@ -9,7 +9,8 @@ and the forker enforces groups and puts each app in a cgroup. Four crates:
 `niri-policy` (types, protocol, compositor client), `niri-identity`
 (`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
 the root forker), `niri-bridge` (the UID-keyed desktop services server
-and the shim on each app's private bus; notifications so far). Builds, passes tests, and runs end to end in the
+and the shim on each app's private bus: notifications and portals).
+Builds, passes tests, and runs end to end in the
 KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
 the TTY backend and the GPU process on a virgl GPU, apps as their own
 UIDs with the sandbox below (mounts, processes, network), Chromium with
@@ -137,7 +138,7 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
   connect; the policy decides what they get, as with Android's binder
   services. Launched apps get that path as `WAYLAND_DISPLAY`.
 - `spawn-sh` stays disabled: a shell string is not an app name.
-- Desktop services (notifications today, portals later) go through
+- Desktop services (notifications and portals) go through
   `niri-bridge serve`, running as the human on the human's session bus
   (`dbus-daemon` unit `niri-session-bus`, socket in `/run/niri-session`,
   which apps never see). Its socket `/run/niri-bridge/bridge.sock` is
@@ -146,9 +147,27 @@ over a socket pair (the test fixture's daemon says "everyone trusted").
   human sees is the manifest name, never anything the app sent. An app
   with `bus = true` runs under `dbus-run-session -- niri-bridge app --
   <exec>`: a private bus in its own UID with the shim claiming
-  `org.freedesktop.Notifications` and forwarding to the server. The shim
-  is compatibility for apps that expect a bus, not a boundary; the
+  `org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`
+  and forwarding to the server (D-Bus peer-to-peer over the socket). The
+  shim is compatibility for apps that expect a bus, not a boundary; the
   sandbox already hides every other bus.
+- Portals: per app the server holds its own connection on the human's
+  bus, registers the app with the portal `Registry` as `niri.app.<name>`
+  (the module installs a desktop entry by that name, so dialogs show the
+  manifest name), forwards `org.freedesktop.portal.*` bodies unchanged
+  (fds included), and rewrites request and session handle paths between
+  the app's sender and its own unique name so `Response` and `Closed`
+  signals come back to the right caller. xdg-desktop-portal and the
+  GNOME backend run as the human's trusted apps; the frontend needs the
+  `pipewire` group because `OpenPipeWireRemote` hands the app a socket
+  to the system-wide PipeWire. niri serves the Mutter screencast API
+  outside session mode under `debug {
+  dbus-interfaces-in-non-session-instances; }`. A sandboxed Chromium's
+  screen share runs this whole path.
+- GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` (ffmpeg behind
+  it) on the first stream connect, after the seccomp lockdown. The GPU
+  process loads it into PipeWire's plugin registry at startup instead;
+  without that the connect fails with EINVAL.
 
 ## Compositor behaviour
 
@@ -196,10 +215,9 @@ command-line command become `Launch` requests (`Niri::launch`);
 
 ## Not yet
 
-- Portals for other UIDs. The bridge carries notifications only; the
-  portal interfaces (file chooser, screen share, camera) on the app's
-  private bus, forwarded to a UID-keyed portal service on the human's
-  side, are not built. See [NOTES-dbus-per-app](NOTES-dbus-per-app.md).
+- The bridge forwards every `org.freedesktop.portal.*` interface alike;
+  nothing yet narrows which portals an app may use, and the document
+  portal's FUSE view is not exposed into the sandbox.
 - The bridge drops notification actions, hints and close signals.
 - Network isolation is only on/off (`network = true` in the manifest, off
   by default: a fresh, empty network namespace). Per-app firewalling is
