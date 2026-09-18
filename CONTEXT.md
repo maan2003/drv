@@ -8,9 +8,11 @@ to and what any discussion means.
   unit grants it CAP_SETUID, SETGID, SETPCAP, CHOWN, KILL, SYS_ADMIN and
   SYS_TTY_CONFIG as its whole bounding set: what its children keep plus
   what switching and stopping them takes). Spawns the trusted set below,
-  creates every socketpair between them at startup and pushes the fds
-  (`Attach`). Takes input from nobody. Restarts what dies. Nothing in
-  the tree runs as root.
+  makes every socketpair between them before the first fork and hands
+  each member its ends as named startup fds (`drv_os::fds`, the systemd
+  LISTEN_FDS convention). Takes input from nobody. If any member dies
+  it kills the apps and restarts the whole set. Nothing in the tree runs
+  as root.
 - **drv-appd** (crate `drv-appd`, uid drv-appd). The launcher for
   untrusted things. Owns the manifest (`appd.toml`), the public socket
   (`/run/drv/appd.sock`, lookups only), the launch channels, autostart. Android's
@@ -23,9 +25,8 @@ to and what any discussion means.
   from the supervisor, one fixed-shape request per app, builds the
   sandbox, forks, reports the pid. Its children leave with every
   capability set empty, bounding set included. Android's Zygote. An implementation detail of drv-appd, not a
-  peer. drv-appd and drv-forker are one group: if either dies the
-  supervisor replaces both; the apps stay up and the new forker finds
-  them through their cgroups.
+  peer. Apps die with the set: a restart of any member kills them
+  through `apps/cgroup.kill` and autostart brings them back.
 - **seatd** (`drv-seatd`, uid drv-seat with groups video, input, tty and
   `CAP_SYS_TTY_CONFIG` as its whole bounding set). libseat, udev, opens
   devices, on its own VT (7). Pushes device fds at runtime to the
@@ -41,18 +42,17 @@ to and what any discussion means.
   through seatd, then it seals itself.
 - **locker** (`drv-lock`, uid drv-lock, a supervisor service). Draws the
   lock screen, collects the PIN. Its Wayland connection and its authd
-  verifier both come down its wire from the supervisor; it finds no
+  verifier are its startup fds `compositor` and `auth`; it finds no
   socket and none finds it. Always running: after every `finished` it
   asks to lock again and the compositor holds the request for the next
   locking. Seccomp-sealed after its first render (fonts stay readable).
-- **compositor group**: compositor, compositor-gpu and locker. If any
-  member dies the supervisor stops the rest and starts the whole group
-  again.
+- **the set**: the seven above. If any member dies the supervisor kills
+  the apps, stops the rest and starts everything again with fresh
+  sockets. There are no smaller groups.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
-- **launcher**: an app that may start other apps. Launch authority is an
-  fd, not a grant: `launcher = true` in the manifest hands the app a
-  launch channel (`DRV_LAUNCH_FD`), and `drv launch` uses it. The
-  compositor's channel is a supervisor link (`Attach::Appd`).
+- **launcher**: whoever holds a launch channel, a supervisor socketpair
+  to drv-appd. Only a member of the set can (today the compositor, fd
+  `appd`); no app is trusted, and `drv` only looks up.
 
 Retired words: "spawner" (meant supervisor plus forker), "identityd".
