@@ -454,9 +454,10 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   what each needs: DRM/dma-buf/sync-file ioctls and a stat by path (Mesa
   reads its device's PCI ids off sysfs) for the GPU process; accept,
   read-only opens, anonymous files (the keymap copy for old
-  wl_keyboards), DRM/dma-buf/sync-file/evdev ioctls and connecting to
-  Unix sockets (PipeWire, per cast) for the core, which can therefore
-  not write a screenshot to disk; opening existing nodes
+  wl_keyboards), DRM/dma-buf/sync-file/evdev ioctls, connecting to
+  Unix sockets (PipeWire, per cast) and unlinking (its own socket and
+  lock file on exit) for the core, which can therefore not write a
+  screenshot to disk; opening existing nodes
   (never creating), DRM/evdev/VT ioctls and udev's database for
   drv-seatd; accept and read-only opens for drv-appd; its state
   directory for drv-authd; read-only opens (fonts) for the locker and
