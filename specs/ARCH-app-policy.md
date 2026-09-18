@@ -43,11 +43,17 @@ drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
     group check, dirs, cgroup,               the lookup grant
     sandbox, setresuid, NNP, exec           autostart once the apps socket exists
 
+drv-seatd (root)
+  holds the seat (libseat builtin backend, no seatd); opens /dev/dri/card* and
+  /dev/input/event* for its one client, uid drv-compositor, and passes the fds
+  over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket
+
 drv-compositor (uid)      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
   Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
   D-Bus callers checked     notifications and     per-user own and      spawner, sandboxed,
   against grants            portals for apps      send policy           reach the identity
-  no IPC socket                                                         socket to launch
+  no IPC socket, no                                                     socket to launch
+  device groups
 ```
 
 Android is the model: the zygote is root and forks on command from
@@ -233,6 +239,9 @@ launched by the daemon, in order, once the apps socket exists.
 - The compositor never reads a policy file, never forks, never launches
   on its own authority: a spawn key bind is a `Launch` request like any
   launcher's.
+- The compositor holds no device group and no VT. Every DRM and evdev fd
+  comes from `drv-seatd`, which serves one UID and only the seat's card
+  and event nodes (never render nodes or anything else under `/dev`).
 
 ## Not yet
 
@@ -242,8 +251,11 @@ launched by the daemon, in order, once the apps socket exists.
 - The bridge drops notification actions, hints and close signals.
 - Files: no UID owns the person's files yet
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
-- Seat daemon: the compositor still holds `seat`, `video` and `input`
-  groups and starts the GPU process itself.
+- The compositor still owns udev and hotplug, starts the GPU process
+  itself under its own UID, and is restarted by systemd rather than
+  re-handed its fds by the seat daemon.
+- Autostart happens once, when the identity daemon starts; a compositor
+  restart does not relaunch the apps that died with it.
 - Network isolation is only on/off. Per-app firewalling is designed
   separately.
 - Nothing kills a still-running app when its manifest goes away; nothing

@@ -9,8 +9,8 @@ group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
 every process on its own UID: Chromium started from a launcher that is
 itself just an app, notifications and portals (screen share with
-per-session consent) through a UID-keyed bridge. Not yet: the seat
-daemon, the lock lease, sub-UID ranges, file ownership
+per-session consent) through a UID-keyed bridge. Not yet: the GPU
+process on its own UID, the lock lease, sub-UID ranges, file ownership
 ([NOTES-file-ownership](NOTES-file-ownership.md)). This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
 intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
@@ -54,7 +54,10 @@ messages are tiny, the heavy work was already GPU-side.
 **Seat daemon.** Opens `/dev/dri` and `/dev/input`, owns udev and hotplug,
 hands fds to the core and GPU process. Respawns the compositor with the same
 fds on crash. Reason: keeps the compositor unprivileged and gives fast
-recovery to the lock screen instead of a TTY.
+recovery to the lock screen instead of a TTY. Status: `drv-seatd`
+opens the devices and hands the fds to the core, which forwards the DRM
+ones to the GPU process; udev, hotplug and respawn are still the
+compositor's.
 
 **Identity daemon.** Answers `uid -> app, manifest, globals, grants`.
 The only parser of manifests. Compositor and bridge ask it and cache per

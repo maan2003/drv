@@ -23,7 +23,7 @@ The protocol stays in the core. Whoever owns a client connection can send
 core process                              gpu process
   wayland clients, focus, input             GlesRenderer, shaders, blur
   layout, animation, damage tracking        texture tables (ids -> GL)
-  libseat, udev, libinput                   DrmDevice / GbmDevice / DrmCompositor
+  seat daemon client, udev, libinput        DrmDevice / GbmDevice / DrmCompositor
   output policy: modes, VRR, gamma, on/off  swapchain, page flips, vblank
   screencast portal, targets, pacing        PipeWire streams and buffers
   scene frames  ------------------------->  damage-track and draw to texture, output or cast
@@ -138,11 +138,12 @@ which shader programs compiled.
 
 ## Split of the old tty backend
 
-Core (`src/backend/tty.rs`): libseat session and VT switching, udev
+Core (`src/backend/tty.rs`): the seat daemon's session (`drv-seatd`,
+[ARCH-app-policy](ARCH-app-policy.md)) and VT switching, udev
 hotplug, libinput, choosing modes (incl. modelines/CVT), VRR and max-bpc
 policy, `Output` objects and IPC output state, frame clock and redraw
 state, presentation feedback, dmabuf global. It opens DRM fds through
-libseat and hands dups to the GPU process; it never uses them itself.
+the seat daemon and hands dups to the GPU process; it never uses them itself.
 
 GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
@@ -228,7 +229,7 @@ connections.
 with everything it will ever need on its command line and seals itself
 before it says hello.
 
-Startup: `Tty::new` (core) opens every primary DRM node through libseat,
+Startup: `Tty::new` (core) opens every primary DRM node through the seat daemon,
 then spawns `niri gpu-process --socket-fd N --device <dev_t>:<fd> ...
 --render-node-hint <dev_t>` with those fds inherited (CLOEXEC cleared in
 `pre_exec`, no dup2 renumbering). The process adds the devices (Mesa
@@ -364,5 +365,5 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
    shm streams, metadata cursor, window casts, dynamic casts), named
    cursors from the theme, screenshots (file, clipboard, portal).
 2. Run the GPU process under its own UID (the core would need to pass
-   the DRM fds it opens through libseat, which it already does).
+   the DRM fds it opens through the seat daemon, which it already does).
 3. Restart the GPU process on crash instead of stopping the compositor.
