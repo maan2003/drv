@@ -45,18 +45,20 @@ drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
     env, network, auth} -> range           Lookup{uid}: own uid, or peer has
     and group check, dirs, cgroup,           the lookup grant
     sandbox, setresuid, NNP, exec           autostart once the apps socket exists
-  forks drv-authd and the compositor as their users too, restarts them, and
-  wires: each child with peers gets a wire on fd 3 (DRV_WIRE_FD) down which
-  the spawner pushes Attach{Auth|Compositor|Verifier} + one fd, both ends of
-  a socketpair it made. Whenever authd or the compositor (re)starts they get
-  a fresh pair; an app with auth=true (the lock app) gets a pair to authd at
-  launch. Nobody connects to anybody, nobody checks a peer's UID.
+  forks drv-seatd (root), drv-authd and the compositor too, restarts them,
+  and wires: each child with peers gets a wire on fd 3 (DRV_WIRE_FD) down
+  which the spawner pushes Attach{Seat|Auth|Compositor|Verifier} + one fd,
+  both ends of a socketpair it made. Whenever a daemon or the compositor
+  (re)starts, that pair is linked afresh; an app with auth=true (the lock
+  app) gets a pair to authd at launch. Nobody connects to anybody, nobody
+  checks a peer's UID.
 
-drv-seatd (root)
+drv-seatd (root, spawner child)
   holds the seat (libseat builtin backend, no seatd); opens /dev/dri/card* and
-  /dev/input/event* for its one client, uid drv-compositor, and passes the fds
-  over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket;
-  forks the GPU process as uid drv-gpu on the compositor's request (StartGpu)
+  /dev/input/event* for its one client, the compositor connection the spawner
+  attached, and passes the fds; enable/disable (VT switch) ride a second
+  socket; forks the GPU process as uid drv-gpu on the compositor's request
+  (StartGpu). A seat daemon restart makes the compositor exit and come back.
 
 drv-authd (uid drv-auth, spawner child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
@@ -285,8 +287,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   request like any launcher's, and the GPU process is the seat daemon's
   child, from the daemon's configured binary, as `drv-gpu`.
 - The compositor holds no device group and no VT. Every DRM and evdev fd
-  comes from `drv-seatd`, which serves one UID and only the seat's card
-  and event nodes (never render nodes or anything else under `/dev`).
+  comes from `drv-seatd`, which serves the one connection the spawner
+  attached and only the seat's card and event nodes (never render nodes or
+  anything else under `/dev`).
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
   starts a lease; the lock app cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
