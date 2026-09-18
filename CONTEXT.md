@@ -11,10 +11,13 @@ to and what any discussion means.
   untrusted things. Owns the manifest (`appd.toml`), the public socket
   (`/run/drv/appd.sock`), policy lookups, autostart. Android's
   PackageManager plus ActivityManager.
-- **drv-forker** (crate `drv-forker`, root today). drv-appd's privileged
-  helper, a separate minimal binary: one socketpair from the supervisor,
-  one fixed-shape request per app, builds the sandbox, forks, reports the
-  pid. Android's Zygote. An implementation detail of drv-appd, not a
+- **drv-forker** (crate `drv-forker`, uid drv-forker with CAP_SETUID,
+  SETGID, SETPCAP, SYS_ADMIN and CHOWN as its whole bounding set; owns
+  the supervisor's cgroup subtree and the apps' directory parents).
+  drv-appd's privileged helper, a separate minimal binary: one socketpair
+  from the supervisor, one fixed-shape request per app, builds the
+  sandbox, forks, reports the pid. Its children leave with every
+  capability set empty, bounding set included. Android's Zygote. An implementation detail of drv-appd, not a
   peer. drv-appd and drv-forker are one group: if either dies the
   supervisor replaces both; the apps stay up and the new forker finds
   them through their cgroups.

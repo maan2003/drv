@@ -43,9 +43,12 @@ UIDs, driving the screencast services) are `grants` on the same record.
 drv-supervisor (root, the systemd unit)
   starts drv-seatd, drv-authd, the compositor, compositor-gpu (niri
   gpu-process, uid drv-gpu), the locker (drv-lock, uid drv-lock),
-  drv-forker (root) and drv-appd as their users, from its own command line; takes input from nobody. A non-root
-  service keeps only the capabilities listed for it (`--seatd-cap`),
-  ambient, as its whole bounding set. Every pair of
+  drv-forker (uid drv-forker) and drv-appd as their users, from its own
+  command line; takes input from nobody. A non-root service keeps only
+  the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
+  ambient, as its whole bounding set. The forker gets the supervisor's
+  own cgroup subtree (chowned to it) and `--forker-dir` parents for the
+  apps' runtime and home directories. Every pair of
   peers gets both ends of a socketpair it made, pushed down each child's
   wire (fd 3, DRV_WIRE_FD) as Attach{..} + one fd:
     compositor <-> seatd (Seat / Compositor)
@@ -60,7 +63,8 @@ drv-supervisor (root, the systemd unit)
   the compositor with compositor-gpu and the locker. Every compositor start is announced
   to drv-appd as Notice::CompositorStarted.
 
-drv-appd (uid drv-appd)                  drv-forker (root)
+drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
+                                           setgid, setpcap, sys_admin, chown)
   fd 3 wire, fd 4 the public socket        fd 3: the channel to drv-appd, its
   /run/drv/appd.sock (bound by the           only input. --range, --group,
   supervisor, 0666), fd 5 notices,           --expose from the command line.
@@ -103,7 +107,7 @@ drv-compositor (uid,      drv-bridge (uid)      drv-bus (uid)        app-<name> 
   device groups
 ```
 
-Android is the model: the zygote is root and forks on command from
+Android is the model: the zygote is privileged and forks on command from
 `system_server`, which is the only thing holding its pipe; the package
 manager owns UIDs and permissions, unprivileged. Here drv-forker is the
 zygote and drv-appd is `system_server` plus the package manager; the
@@ -202,7 +206,7 @@ launched by the daemon, in order, once the apps socket exists.
   else. The fds that came with the request are the child's fds 3.. as the
   request names them; nothing else is inherited. Children are reaped and
   their exit logged.
-- Sandbox (drv-forker, as root, between fork and exec): a private mount
+- Sandbox (drv-forker, with CAP_SYS_ADMIN, between fork and exec): a private mount
   namespace; fresh tmpfs on `/tmp` and `/dev/shm`; `/proc` with
   `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
   the app's own runtime directory plus the `--expose` entries (the
@@ -322,8 +326,11 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Identity is the socket UID. PIDs are reused and are never used for
   policy. No two processes on the desktop share a UID; there is no human
   UID on the desktop at all.
-- No child of drv-forker is root: it always switches to the requested
-  UID, which is always inside its range.
+- No child of drv-forker is root or keeps a capability: it always
+  switches to the requested UID, which is always inside its range, then
+  empties its bounding, ambient, permitted, effective and inheritable
+  sets (a non-root forker's would otherwise survive the UID switch and,
+  ambient, the exec) before `PR_SET_NO_NEW_PRIVS`.
 - drv-forker's only peer is the channel the supervisor gave it, held by
   drv-appd; there is no path to it from the filesystem. The supervisor
   takes input from nobody.
@@ -363,5 +370,5 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Launch authority as an fd handed to the launcher; forker and
-  supervisor off root with bounded capabilities; seccomp on the leaves.
+- Launch authority as an fd handed to the launcher; the supervisor off
+  root; seccomp on the leaves.
