@@ -38,7 +38,7 @@ globals its policy grants. A client that never sees
 `zwlr_screencopy_manager_v1` cannot bind it, so the capability check
 happens once, at the registry, instead of per request in every protocol
 handler. Capabilities that are not Wayland globals (asking about other
-UIDs, driving the screencast services) are `grants` on the same record.
+UIDs) are `grants` on the same record.
 
 ## Process tree
 
@@ -188,9 +188,7 @@ pointer, input method, security context. Everything else
 constraints, ...) is always advertised.
 
 `Grant` is `lookup` (ask drv-appd about other UIDs: the
-compositor, the bridge) and `screencast` (call the compositor's
-screencast, screenshot and service-channel D-Bus services: the portal
-backend only).
+compositor, the bridge); there is no other grant.
 
 `AppPolicy { name, gpu, globals, grants, icon }`. `allows(global)`:
 `gpu` grants dmabuf, otherwise the global must be listed. `has(grant)`.
@@ -309,8 +307,7 @@ an entry (a daemon, a probe) out of the app menu.
   serve`, a member of the set on the services' bus (a `dbus-daemon` as
   user `drv-bus`, socket in `/run/drv-session`, which apps never see).
   The bus config lets each listed user own only its names
-  (`sessionBusNames`) and lets only `screencast`-granted users send to
-  the compositor's names. The bridge socket `/run/drv-bridge/bridge.sock`
+  (`sessionBusNames`). The bridge socket `/run/drv-bridge/bridge.sock`
   is bound by the supervisor (fd `listener`), mode 0666;
   every connection is keyed on `SO_PEERCRED` plus drv-appd's
   answer for that UID, unknown UIDs are dropped, and what the human sees
@@ -387,10 +384,11 @@ an entry (a daemon, a probe) out of the app menu.
 - Every optional global is created with a filter from
   `client_allows(Global)`: the policy grants it and the connection is not
   a security-context one. The dmabuf global is filtered the same way.
-- D-Bus services (`org.gnome.Mutter.ScreenCast`, `ServiceChannel`,
-  `org.gnome.Shell.Screenshot`) resolve the caller's UID through
-  `GetConnectionCredentials` and refuse it without the `screencast` grant
-  (`dbus/caller.rs`, its own `PolicyClient` on the D-Bus thread).
+- No D-Bus services of its own: the Mutter screencast, service-channel
+  and Shell screenshot services are gone, and the rest of upstream's
+  (display config, screensaver, introspect, a11y) never start under the
+  supervisor (not a session instance; the bus lets it own no name).
+  Casts start only down the drv-portal link (`src/screencasting`).
 - No IPC socket. `IpcServer` is never started: a client that can act as
   the compositor would bypass every policy. `niri msg` has nothing to
   talk to.
@@ -492,9 +490,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   reporting and cgroup kill from drv-forker.
 - Screen sharing: windows as sources, more than one screen per session,
   consents that outlive the app's run (`persist_mode` 2).
-- The compositor's Mutter D-Bus services and the `screencast` grant
-  (drv-policy, `src/dbus`) are dead now that no UID holds it; they go
-  next. Portals apps may still want: OpenURI, screenshot.
+- Portals apps may still want: OpenURI, screenshot.
+- `OpenPipeWireRemote` timed out once in nine tries, right after a cast
+  was closed and restarted; the error now names the round trip.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
   not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a
