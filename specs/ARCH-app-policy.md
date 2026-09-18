@@ -6,19 +6,22 @@ Implemented on the `policy` branch of the niri fork at `/src/niri`
 (pushed as `rho/policy`, on top of `gpu-process`). Identities are static
 (fixed UIDs from the system configuration), launches are by app name
 only, nothing shares a UID, and there is no "trusted" flag: what a
-process may do is its globals and grants. Four crates: `drv-policy`
-(types, protocol, compositor client), `drv-identity` (the unprivileged
-brain, plus the `drv` CLI), `drv-spawn` (`drv-spawnd`, the root
-supervisor that forks the identity daemon and the apps), `drv-bridge`
-(the UID-keyed desktop services server and the shim on each app's
-private bus: notifications and portals), `drv-seat` (`drv-seatd`, the
-seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN verifier
-that unlocks the compositor) and `drv-lock` (the lock screen, an app).
+process may do is its globals and grants. Crates: `drv-policy` (types,
+the SEQPACKET transport `seq`, the `wire`, the forker channel, compositor
+client), `drv-supervisor` (root; starts the trusted set, wires it,
+restarts what dies), `drv-appd` (the launcher for untrusted things, plus
+the `drv` CLI), `drv-forker` (drv-appd's privileged helper: the sandbox
+and the fork), `drv-os` (uid/gid lookups, fd and directory helpers),
+`drv-bridge` (the UID-keyed desktop services server and the shim on each
+app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
+the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
+verifier that unlocks the compositor) and `drv-lock` (the lock screen, an
+app). Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
-`identity.toml`, the session bus policy, the units, and a launcher entry
+`appd.toml`, the session bus policy, the units, and a launcher entry
 per app (`Exec=drv launch <name>`).
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
@@ -37,54 +40,67 @@ UIDs, driving the screencast services) are `grants` on the same record.
 ## Process tree
 
 ```text
-drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
-  binds /run/drv/identity.sock 0666     fd 3: the public socket, fd 4: the channel,
-                                        fd 5: notices (CompositorStarted{running})
-  socketpair -> forks identityd   ---->   identity.toml: every uid, exec, groups,
-  with fd 3 + fd 4 + fd 5, respawns it     globals, grants, autostart, auth
-  channel: {uid, groups, argv,    <----   Launch{app} from anyone -> channel
-    env, network, auth} -> range           Lookup{uid}: own uid, or peer has
-    and group check, dirs, cgroup,           the lookup grant
-    sandbox, setresuid, NNP, exec           autostart on every CompositorStarted:
-                                            the apps not in `running`, once the
-                                            apps socket listens (/proc/net/unix)
-  forks drv-seatd (root), drv-authd and the compositor too, restarts them,
-  and wires: each child with peers gets a wire on fd 3 (DRV_WIRE_FD) down
-  which the spawner pushes Attach{Seat|Auth|Compositor|Verifier} + one fd,
-  both ends of a socketpair it made. Whenever a daemon or the compositor
-  (re)starts, that pair is linked afresh; an app with auth=true (the lock
-  app) gets a pair to authd at launch. Nobody connects to anybody, nobody
-  checks a peer's UID.
+drv-supervisor (root, the systemd unit)
+  starts drv-seatd (root), drv-authd, the compositor, drv-forker (root) and
+  drv-appd as their users, from its own command line; takes input from
+  nobody. Every pair of peers gets both ends of a socketpair it made,
+  pushed down each child's wire (fd 3, DRV_WIRE_FD) as Attach{..} + one fd:
+    compositor <-> seatd (Seat / Compositor)
+    compositor <-> authd (Auth / Compositor)
+    appd       <-> authd (Auth / Verifiers)
+  Whenever one side (re)starts its pairs are linked afresh. Restarts what
+  dies; drv-appd and drv-forker are one group: if either dies both are
+  replaced (the apps stay up). Every compositor start is announced to
+  drv-appd as Notice::CompositorStarted.
 
-drv-seatd (root, spawner child)
+drv-appd (uid drv-appd)                  drv-forker (root)
+  fd 3 wire, fd 4 the public socket        fd 3: the channel to drv-appd, its
+  /run/drv/appd.sock (bound by the           only input. --range, --group,
+  supervisor, 0666), fd 5 notices,           --expose from the command line.
+  fd 6 the channel to drv-forker           Launch{uid, groups, argv, env,
+  appd.toml: every uid, exec, groups,        network, expose, fds} + fds ->
+    globals, grants, autostart, auth         range and group check, dirs,
+  Launch{app} from anyone -> Launch  ---->   cgroup app-<uid>, sandbox,
+  Lookup{uid}: own uid, or the lookup        setresuid, NNP, exec; the passed
+    grant                                    fds land on the numbers in `fds`
+  auth=true: a wire for the app with       Running -> the uids whose app-<uid>
+    Attach::Auth already on it; the          cgroup has a process (so a new
+    other end went to authd as Verifier      forker still knows the old apps)
+  autostart on every CompositorStarted:    reaps children, logs their exit
+    what Running lacks, once the apps
+    socket listens (/proc/net/unix)
+
+drv-seatd (root, supervisor child)
   holds the seat (libseat builtin backend, no seatd) and udev; announces the
   seat's /dev/dri/card* and /dev/input/event* nodes to its one client, the
-  compositor connection the spawner attached (Hello lists them, hotplug
+  compositor connection the supervisor attached (Hello lists them, hotplug
   follows on a second socket with enable/disable), opens only those and
   passes the fds; forks the GPU process as uid drv-gpu on the compositor's
   request (StartGpu). A seat daemon restart makes the compositor exit and
   come back.
 
-drv-authd (uid drv-auth, spawner child)
+drv-authd (uid drv-auth, supervisor child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
-  Verify arrives on connections the spawner attached as Verifier,
-  Unlock{idle_timeout} goes to the one it attached as Compositor; no socket
+  Verify arrives on connections attached as Verifier (by the supervisor, or
+  by drv-appd down its Verifiers socket, one per app launched with auth),
+  Unlock{idle_timeout} goes to the one attached as Compositor; no socket
 
 drv-compositor (uid,      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
-    spawner child)
-  Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
-  D-Bus callers checked     notifications and     per-user own and      spawner, sandboxed,
-  against grants            portals for apps      send policy           reach the identity
-  no IPC socket, no                                                     socket to launch
+    supervisor child)
+  Lookup for each client    Lookup per peer       dbus-daemon with      forked by drv-forker
+  D-Bus callers checked     notifications and     per-user own and      on drv-appd's say,
+  against grants            portals for apps      send policy           sandboxed, reach
+  no IPC socket, no                                                     appd.sock to launch
   device groups
 ```
 
 Android is the model: the zygote is root and forks on command from
 `system_server`, which is the only thing holding its pipe; the package
-manager owns UIDs and permissions, unprivileged. Here the spawner is the
-zygote and the identity daemon is `system_server` plus the package
-manager. The spawner has no filesystem socket and no allow list: its
-only peer is the child it forked over a socketpair.
+manager owns UIDs and permissions, unprivileged. Here drv-forker is the
+zygote and drv-appd is `system_server` plus the package manager; the
+supervisor is init for the trusted set. The forker has no filesystem
+socket and no allow list of callers: its only peer is the channel the
+supervisor gave it, whose other end is drv-appd's.
 
 ## Types (crate `drv-policy`)
 
@@ -95,7 +111,7 @@ pointer, input method, security context. Everything else
 (`wl_compositor`, `xdg_wm_base`, `wl_shm`, seats, outputs, pointer
 constraints, ...) is always advertised.
 
-`Grant` is `lookup` (ask the identity daemon about other UIDs: the
+`Grant` is `lookup` (ask drv-appd about other UIDs: the
 compositor, the bridge) and `screencast` (call the compositor's
 screencast, screenshot and service-channel D-Bus services: the portal
 backend only).
@@ -112,16 +128,23 @@ behind a little-endian `u32` length, 64 KiB cap, answered in order.
 `daemon::Handler { lookup(peer, uid), launch(peer, app) }` gets the
 peer's UID from `SO_PEERCRED`; `serve` accepts every peer.
 
-`spawn`: the spawner channel. `Request { uid, groups, argv, env,
-network }`, `Response::{Forked { pid }, Error}`, `CHANNEL_FD = 4`,
-`Channel` (a mutex around the stream; one request at a time).
+`seq`: the one transport for every daemon-to-daemon socket: `SOCK_SEQPACKET`,
+one postcard message per datagram (64 KiB cap) with up to 16 fds in
+`SCM_RIGHTS`. `wire`: `Attach::{Auth, Compositor, Verifier, Seat,
+Verifiers}` plus one fd, on fd 3 (`DRV_WIRE_FD`). `forker`: the channel
+between drv-appd and drv-forker (`CHANNEL_FD = 3` on the forker's side):
+`Request::{Launch(Launch), Running}`, `Launch { uid, groups, argv, env,
+network, expose, fds }` where `fds` names the child fd numbers (3..10) the
+attached fds land on, `Response::{Forked { pid }, Running { uids },
+Error}`; `Notice::CompositorStarted` from the supervisor to drv-appd;
+`Channel` (a mutex around the socket; one request at a time).
 
 `PolicyClient`: `connect(path)` does the hello now so a missing daemon
 fails at startup, `lookup(uid)` caches per UID and reconnects after an
 error, `launch(app)`, `reconnect()` for another thread, 2 s timeouts.
 There is no mode without a daemon.
 
-## identity.toml
+## appd.toml
 
 ```toml
 wayland-socket = "/run/drv-wayland/wayland"   # every app's WAYLAND_DISPLAY
@@ -150,7 +173,7 @@ launched by the daemon, in order, once the apps socket exists.
 ## Launching
 
 - Launch is not a privilege. Anyone who can reach
-  `/run/drv/identity.sock` (mode 0666; the spawner exposes `/run/drv` to
+  `/run/drv/appd.sock` (mode 0666; the forker exposes `/run/drv` to
   apps) may send `Launch { app }`; the launcher's desktop entries run
   `drv launch <name>`, key binds in the compositor do the same over its
   own connection. `app` is a manifest name; arguments are the manifest's
@@ -159,28 +182,33 @@ launched by the daemon, in order, once the apps socket exists.
   `PATH`, `[env]`, the entry's `env` and `WAYLAND_DISPLAY`.
 - Lookups of other UIDs need the `lookup` grant; every UID may look up
   itself.
-- The spawner accepts `{uid, groups, argv, env, network}` only on the
-  channel, only for UIDs in its `--range` and groups on its `--group`
-  list (so the identity daemon cannot hand out `wheel`). It creates
-  `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and `/var/lib/drv-apps/<uid>`
-  (`HOME`, cwd), mode 0700 owned by the UID, moves the child into
-  `<spawner cgroup>/app-<uid>` (needs `Delegate=yes`), then `setgroups`,
-  `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with the request's
-  environment and nothing else. Children are reaped and their exit logged.
-- Sandbox (the spawner, as root, between fork and exec): a private mount
+- drv-forker accepts `Launch` only on the channel, only for UIDs in its
+  `--range`, groups on its `--group` list (so drv-appd cannot hand out
+  `wheel`) and `/run` entries on its `--expose`/`--expose-optional` lists.
+  It creates `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and
+  `/var/lib/drv-apps/<uid>` (`HOME`, cwd), mode 0700 owned by the UID,
+  moves the child into `<supervisor cgroup>/app-<uid>` (needs
+  `Delegate=yes`), then `setgroups`, `setresgid`, `setresuid`,
+  `PR_SET_NO_NEW_PRIVS`, exec with the request's environment and nothing
+  else. The fds that came with the request are the child's fds 3.. as the
+  request names them; nothing else is inherited. Children are reaped and
+  their exit logged.
+- Sandbox (drv-forker, as root, between fork and exec): a private mount
   namespace; fresh tmpfs on `/tmp` and `/dev/shm`; `/proc` with
   `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
   the app's own runtime directory plus the `--expose` entries (the
-  identity socket directory, the apps' Wayland socket directory, the
+  appd socket directory, the apps' Wayland socket directory, the
   bridge socket directory, `opengl-driver`, `current-system`,
   `/run/pipewire`, `/run/pulse`). No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.
-- The identity daemon runs as the `drv-identity` system user with no
-  filesystem socket of its own: the spawner binds the public socket and
-  hands it over as fd 3, the channel as fd 4. When it dies the spawner
-  forks a new one.
+- drv-appd runs as the `drv-appd` system user with no filesystem socket
+  of its own: the supervisor binds the public socket and hands it over as
+  fd 4, the channel to the forker as fd 6. drv-appd and drv-forker are a
+  group: when either dies the supervisor stops the other and starts both
+  again, with a fresh channel; the apps keep running and the new forker
+  sees them through their cgroups.
 - Audio is a group: PipeWire runs system-wide with sockets mode 0660
   group `pipewire`; an app whose manifest lists `groups = ["pipewire"]`
   can connect, anyone else gets `EACCES`.
@@ -196,7 +224,7 @@ launched by the daemon, in order, once the apps socket exists.
   config lets each listed user own only its names (`sessionBusNames`)
   and lets only `screencast`-granted users send to the compositor's
   names. The bridge socket `/run/drv-bridge/bridge.sock` is mode 0666;
-  every connection is keyed on `SO_PEERCRED` plus the identity daemon's
+  every connection is keyed on `SO_PEERCRED` plus drv-appd's
   answer for that UID, unknown UIDs are dropped, and what the human sees
   is the manifest name. An app with `bus = true` runs under
   `dbus-run-session -- drv-bridge app -- <exec>`: a private bus in its
@@ -243,7 +271,7 @@ launched by the daemon, in order, once the apps socket exists.
 - No IPC socket. `IpcServer` is never started: a client that can act as
   the compositor would bypass every policy. `niri msg` has nothing to
   talk to.
-- Daemon socket: `$DRV_IDENTITY_SOCKET`, else `/run/drv/identity.sock`.
+- Daemon socket: `$DRV_APPD_SOCKET`, else `/run/drv/appd.sock`.
   Cannot connect or hello fails: the compositor exits. A failed lookup
   later gives that client `AppPolicy::unknown()`.
 
@@ -252,9 +280,11 @@ launched by the daemon, in order, once the apps socket exists.
 Locked is the default; the compositor holds a lease "unlocked until T"
 that only `drv-authd` starts. The lock app (`services.drv.apps.lock`,
 `drv-lock`, the one app with the `session-lock` global and `auth = true`)
-draws the PIN screen and sends `Verify` down the connection the spawner
-handed it at launch; on a match the daemon sends `Unlock{idle_timeout}` on
-the compositor's connection, which the spawner handed both of them. The compositor
+draws the PIN screen and sends `Verify` down the connection drv-appd put
+on its wire at launch (the other end went to `drv-authd` as a `Verifier`
+down the socket the supervisor linked between them); on a match the
+daemon sends `Unlock{idle_timeout}` on the compositor's connection, which
+the supervisor handed both of them. The compositor
 then grants itself the lease, sends the lock client `finished` and the
 app exits. A client's `unlock_and_destroy` releases its surfaces and
 nothing else: without a lease the outputs stay black and the compositor
@@ -280,27 +310,30 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Identity is the socket UID. PIDs are reused and are never used for
   policy. No two processes on the desktop share a UID; there is no human
   UID on the desktop at all.
-- No child of the spawner is root: it always switches to the requested
+- No child of drv-forker is root: it always switches to the requested
   UID, which is always inside its range.
-- The spawner's only peer is the identity daemon it forked; there is no
-  path to it from the filesystem.
+- drv-forker's only peer is the channel the supervisor gave it, held by
+  drv-appd; there is no path to it from the filesystem. The supervisor
+  takes input from nobody.
 - A global the policy denies is never in the client's registry. There is
   no second code path that hands out the same capability.
 - Unknown UIDs get nothing; an unreachable daemon is the same as unknown.
 - The compositor never reads a policy file, never forks, never execs,
   never launches on its own authority: a spawn key bind is a `Launch`
   request like any launcher's, and the GPU process is the seat daemon's
-  child, from the daemon's configured binary, as `drv-gpu`.
+  child, from the daemon's configured binary, as `drv-gpu` (to become a
+  supervisor service).
 - The compositor holds no device group, no udev socket and no VT. Every
   DRM and evdev fd comes from `drv-seatd`, which serves the one connection
-  the spawner attached and opens only the seat's card and event nodes it
+  the supervisor attached and opens only the seat's card and event nodes it
   announced itself (never render nodes or anything else under `/dev`).
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
   starts a lease; the lock app cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
 - Peers are handed over, never found: the auth daemon has no socket, and
-  what it takes `Verify` from and pushes `Unlock` to are the fds the root
-  spawner attached. Anything that is not the lock app has no path to it.
+  what it takes `Verify` from and pushes `Unlock` to are the fds the
+  supervisor attached, or drv-appd forwarded down the supervisor's link.
+  Anything that is not the lock app has no path to it.
 
 ## Not yet
 
@@ -314,4 +347,7 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   separately.
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
-  reporting and cgroup kill from the spawner.
+  reporting and cgroup kill from drv-forker.
+- Launch authority as an fd handed to the launcher; compositor-gpu and
+  the locker as supervisor services; seatd, forker and supervisor off
+  root with bounded capabilities; seccomp on the leaves.

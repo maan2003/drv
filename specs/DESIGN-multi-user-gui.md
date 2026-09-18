@@ -4,7 +4,7 @@
 
 Direction record. Implemented so far: the compositor core / GPU process
 split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and the
-identity daemon forked by a root spawner, per-UID compositor policy and
+app daemon and its forker under a root supervisor, per-UID compositor policy and
 group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
 every process on its own UID: Chromium started from a launcher that is
@@ -70,9 +70,9 @@ identities, no scratch slots, no UID allocation. A launch names an app and
 nothing else; its arguments come from the manifest, never from the caller.
 Dynamic grants are a separate append-only store it also reads.
 
-**Spawn daemon.** The only thing that can start a process as another UID.
-Root, forks the identity daemon over a socketpair and takes orders from
-nothing else. Builds the environment from scratch (never inherits),
+**Forker.** The only thing that can start a process as an app UID.
+Root, one channel from the supervisor whose other end is the app daemon's,
+and takes orders from nothing else. Builds the environment from scratch (never inherits),
 passes only the fds the caller is allowed to pass. Apps may spawn only into a UID range they
 own (Android `isolated_app` idea), so the terminal can start shells in
 sub-UIDs without any path to privilege escalation.
@@ -148,8 +148,9 @@ separate greeter. Idle-inhibit becomes "extend the lease while visible".
 
 Status: locked by default, the lease is compositor-local and input
 extends it, `drv-authd` verifies the PIN and pushes the unlock straight to
-the compositor, the lock app only draws and takes input, the spawner forks
-all three and hands them their connections to each other (no auth socket),
+the compositor, the lock app only draws and takes input, the supervisor
+starts the daemons and hands them their connections to each other (no
+auth socket; the lock app's comes through the app daemon at launch),
 and casts and screenshots of a locked session are black
 ([ARCH-app-policy](ARCH-app-policy.md#the-lock)). Not yet: the trusted
 region, the secret image, the attention key; freezing is designed

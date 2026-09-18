@@ -37,12 +37,12 @@ binder carries the caller UID and every service checks it.
 
 Two viable shapes:
 
-1. Keep the session bus as is and run `xdg-dbus-proxy` per app from the
-   identity daemon, socket placed in the app's `XDG_RUNTIME_DIR`,
-   policy from `identity.toml` (`talk = [...]`, `own = [...]`). Least
+1. Keep the session bus as is and run `xdg-dbus-proxy` per app from
+   drv-appd, socket placed in the app's `XDG_RUNTIME_DIR`,
+   policy from `appd.toml` (`talk = [...]`, `own = [...]`). Least
    code, proven, C.
 2. Replace the session bus with a fork of `busd` that accepts any local
-   UID and enforces per-UID policy from the identity daemon (same
+   UID and enforces per-UID policy from drv-appd (same
    `Lookup` protocol). All Rust, one process, but busd needs finishing
    (activation, full spec) before it can carry a desktop.
 
@@ -64,7 +64,7 @@ means finishing a broker. Instead:
   names (`org.freedesktop.Notifications` so far) and forwards over a Unix
   socket to `drv-bridge serve` on the services' side.
 - The server is the only check: peer UID from `SO_PEERCRED`, name from
-  the identity daemon, unknown UIDs dropped. What the human sees carries
+  drv-appd, unknown UIDs dropped. What the human sees carries
   the manifest name, never the app's `app_name`.
 
 Portals follow the same pattern: the shim also claims

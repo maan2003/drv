@@ -13,13 +13,13 @@ not create without someone owning it first.
 Some UID owns the person's files and hands them out, never the whole
 tree at once:
 
-- A files service (its own UID, like the identity daemon) that owns the
+- A files service (its own UID, like drv-appd) that owns the
   tree and serves it through the document portal: an app gets a
   per-file, per-session view (a FUSE mount or an fd), chosen through the
   file chooser dialog, which is the consent. This is Flatpak's shape
   (`xdg-document-portal`) with the owner being a daemon instead of the
   user.
-- A redirect at the sandbox level: the spawner bind-mounts a per-app
+- A redirect at the sandbox level: drv-forker bind-mounts a per-app
   slice of the tree into the app's `HOME`, decided by the manifest
   (static grants: "this app sees `~/Music`").
 - Both: static slices for media-type apps, the portal for everything
