@@ -14,7 +14,8 @@ to and what any discussion means.
 - **drv-appd** (crate `drv-appd`, uid drv-appd). The launcher for
   untrusted things. Owns the manifest (`appd.toml`), the public socket
   (`/run/drv/appd.sock`), policy lookups, autostart. Android's
-  PackageManager plus ActivityManager.
+  PackageManager plus ActivityManager. Seccomp-sealed once its fds are in
+  place.
 - **drv-forker** (crate `drv-forker`, uid drv-forker with CAP_SETUID,
   SETGID, SETPCAP, SYS_ADMIN and CHOWN as its whole bounding set; owns
   the supervisor's cgroup subtree and the apps' directory parents).
@@ -30,7 +31,8 @@ to and what any discussion means.
   devices, on its own VT (7). Pushes device fds at runtime to the
   compositor (cards go on to compositor-gpu through the compositor).
 - **authd** (`drv-authd`). PIN store and verifier. The only source of
-  unlock. No socket.
+  unlock. No socket. Seccomp-sealed after startup (its state directory
+  stays writable).
 - **compositor** (niri core, uid drv-compositor). Never forks, never
   holds a device.
 - **compositor-gpu** (`niri gpu-process --mode drm`, uid drv-gpu, a
@@ -42,7 +44,7 @@ to and what any discussion means.
   verifier both come down its wire from the supervisor; it finds no
   socket and none finds it. Always running: after every `finished` it
   asks to lock again and the compositor holds the request for the next
-  locking.
+  locking. Seccomp-sealed after its first render (fonts stay readable).
 - **compositor group**: compositor, compositor-gpu and locker. If any
   member dies the supervisor stops the rest and starts the whole group
   again.

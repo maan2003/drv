@@ -333,6 +333,15 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   empties its bounding, ambient, permitted, effective and inheritable
   sets (a non-root forker's would otherwise survive the UID switch and,
   ambient, the exec) before `PR_SET_NO_NEW_PRIVS`.
+- The leaves are sealed. compositor-gpu, drv-authd, drv-appd and the
+  locker apply one seccomp allowlist (`drv_os::seccomp`: the fds they
+  hold, memory, threads, time, signals; never socket, exec, a new process
+  or an ioctl outside the listed ones) once their fds are in place, plus
+  what each needs: DRM/dma-buf/sync-file ioctls for the GPU process,
+  accept and read-only opens for drv-appd, its state directory for
+  drv-authd, read-only opens (fonts) for the locker. A denied call fails
+  with EPERM and the journal names the syscall number. `DRV_SECCOMP=0`
+  from the supervisor's command line is the only way to run one open.
 - drv-forker's only peer is the channel the supervisor gave it, held by
   drv-appd; there is no path to it from the filesystem. The supervisor
   takes input from nobody.
@@ -372,5 +381,6 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Launch authority as an fd handed to the launcher; seccomp on the
-  leaves.
+- Launch authority as an fd handed to the launcher; seccomp on
+  drv-seatd (libseat, udev's netlink and the VT ioctls are not listed
+  yet) and the compositor core.
