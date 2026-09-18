@@ -139,11 +139,13 @@ which shader programs compiled.
 ## Split of the old tty backend
 
 Core (`src/backend/tty.rs`): the seat daemon's session (`drv-seatd`,
-[ARCH-app-policy](ARCH-app-policy.md)) and VT switching, udev
-hotplug, libinput, choosing modes (incl. modelines/CVT), VRR and max-bpc
-policy, `Output` objects and IPC output state, frame clock and redraw
-state, presentation feedback, dmabuf global. It opens DRM fds through
-the seat daemon and hands dups to the GPU process; it never uses them itself.
+[ARCH-app-policy](ARCH-app-policy.md)), VT switching and the device
+list it announces (hotplug included; the core has no udev socket),
+libinput on the path backend fed from that list, choosing modes (incl.
+modelines/CVT), VRR and max-bpc policy, `Output` objects and IPC output
+state, frame clock and redraw state, presentation feedback, dmabuf
+global. It opens DRM fds through the seat daemon and hands dups to the
+GPU process; it never uses them itself.
 
 GPU (`src/gpu/drm.rs`, `src/gpu/server.rs`): `DrmDevice`, `GbmDevice`,
 allocator, one `DrmCompositor` per enabled CRTC, connector properties
@@ -153,10 +155,11 @@ allocating capture buffers (`AllocateDmabuf`).
 
 The GPU process owns the device model. The core has no notion of a
 primary device: it opens every card node it may use and sends
-`AddDevice { dev, path, render_node_hint }` in whatever order udev lists
-them, then scans connectors (two phases, so an output on a display-only
-device never races the rendering device). The hint is the configured
-`render-drm-device` or udev's primary GPU, and may be `None`. The GPU
+`AddDevice { dev, path, render_node_hint }` in whatever order the seat
+daemon lists them, then scans connectors (two phases, so an output on a
+display-only device never races the rendering device). The hint is the
+configured `render-drm-device` or the seat daemon's boot VGA card, and
+may be `None`. The GPU
 probes EGL on each device and creates the renderer on the first one
 whose EGL display works and matches the hint (upstream's
 `try_initialize_gpu`); the reply `DeviceAdded { render_node, caps }`
@@ -165,7 +168,7 @@ That is usually the GPU's own card, but on Asahi the GPU card has no KMS
 (`DrmDevice::new` fails with EOPNOTSUPP) and Mesa renders through the
 DCP display controller's node, so the renderer lives there. A device the
 GPU rejects is remembered as unusable core-side and not retried until
-udev removes it. Which device a CRTC allocates from is decided at
+the seat daemon removes it. Which device a CRTC allocates from is decided at
 `EnableOutput`: a device on the renderer's render node uses its own GBM,
 anything else is display-only and scans out linear buffers allocated on
 the rendering device. `RemoveDevice` replies

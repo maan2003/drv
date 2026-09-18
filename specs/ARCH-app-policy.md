@@ -54,11 +54,13 @@ drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
   checks a peer's UID.
 
 drv-seatd (root, spawner child)
-  holds the seat (libseat builtin backend, no seatd); opens /dev/dri/card* and
-  /dev/input/event* for its one client, the compositor connection the spawner
-  attached, and passes the fds; enable/disable (VT switch) ride a second
-  socket; forks the GPU process as uid drv-gpu on the compositor's request
-  (StartGpu). A seat daemon restart makes the compositor exit and come back.
+  holds the seat (libseat builtin backend, no seatd) and udev; announces the
+  seat's /dev/dri/card* and /dev/input/event* nodes to its one client, the
+  compositor connection the spawner attached (Hello lists them, hotplug
+  follows on a second socket with enable/disable), opens only those and
+  passes the fds; forks the GPU process as uid drv-gpu on the compositor's
+  request (StartGpu). A seat daemon restart makes the compositor exit and
+  come back.
 
 drv-authd (uid drv-auth, spawner child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
@@ -286,10 +288,10 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   never launches on its own authority: a spawn key bind is a `Launch`
   request like any launcher's, and the GPU process is the seat daemon's
   child, from the daemon's configured binary, as `drv-gpu`.
-- The compositor holds no device group and no VT. Every DRM and evdev fd
-  comes from `drv-seatd`, which serves the one connection the spawner
-  attached and only the seat's card and event nodes (never render nodes or
-  anything else under `/dev`).
+- The compositor holds no device group, no udev socket and no VT. Every
+  DRM and evdev fd comes from `drv-seatd`, which serves the one connection
+  the spawner attached and opens only the seat's card and event nodes it
+  announced itself (never render nodes or anything else under `/dev`).
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
   starts a lease; the lock app cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
@@ -305,8 +307,6 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - The bridge drops notification actions, hints and close signals.
 - Files: no UID owns the person's files yet
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
-- The compositor still owns udev and hotplug, and is restarted by
-  systemd rather than re-handed its fds by the seat daemon.
 - Autostart happens once, when the identity daemon starts; a compositor
   restart does not relaunch the apps that died with it.
 - Network isolation is only on/off. Per-app firewalling is designed
