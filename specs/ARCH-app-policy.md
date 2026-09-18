@@ -187,7 +187,11 @@ launched by the daemon, in order, once the apps socket exists.
   treats an unreadable root as "not a flatpak" (there is no Flatpak here
   and the portal shares a UID with nobody). Screen sharing is per-session consent: the portal dialog is the
   consent, the portal session is the lease, and no app has a static
-  screencast capability.
+  screencast capability. While any session is live the compositor draws
+  a "Screen is being shared" indicator above everything (never into the
+  cast) naming the `stop-all-casts` key (`Mod+Shift+Escape` by
+  default), which closes every session so the portal and app see the
+  lease end.
 - GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
   stream connect, after the seccomp lockdown, so the GPU process loads it
   into PipeWire's plugin registry at startup.
@@ -238,7 +242,6 @@ launched by the daemon, in order, once the apps socket exists.
 - The bridge drops notification actions, hints and close signals.
 - Files: no UID owns the person's files yet
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
-- A compositor-owned screencast indicator and a compositor-side stop.
 - Seat daemon: the compositor still holds `seat`, `video` and `input`
   groups and starts the GPU process itself.
 - Network isolation is only on/off. Per-app firewalling is designed
