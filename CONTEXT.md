@@ -25,15 +25,17 @@ to and what any discussion means.
   unlock. No socket.
 - **compositor** (niri core, uid drv-compositor). Never forks, never
   holds a device.
-- **compositor-gpu** (today: `niri gpu-process`, seatd's child). DRM and
-  Mesa. To become a supervisor service, wired to the compositor and
-  seatd at startup.
+- **compositor-gpu** (`niri gpu-process --mode drm`, uid drv-gpu, a
+  supervisor service). DRM and Mesa. Wired to the compositor by the
+  supervisor at startup; the compositor hands it the devices it opened
+  through seatd, then it seals itself.
 - **locker** (today: `drv-lock`, an app with `auth = true` launched
   through drv-appd). Draws the lock screen, collects the PIN. To become
   a supervisor service: Wayland connection and authd verifier both
   handed by the supervisor.
-- **compositor group**: compositor, compositor-gpu, locker. Restart
-  semantics of the group are still to be decided.
+- **compositor group**: compositor and compositor-gpu today (the locker
+  joins when it becomes a service). If any member dies the supervisor
+  stops the rest and starts the whole group again.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
 - **launcher**: an app that may start other apps. Launch authority will

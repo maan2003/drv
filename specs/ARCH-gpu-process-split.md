@@ -228,26 +228,34 @@ connections.
 
 ## Sandbox
 
-`src/gpu/sandbox.rs`. The GPU process holds nothing ambient: it starts
-with everything it will ever need on its command line and seals itself
+`src/gpu/sandbox.rs`. The GPU process holds nothing ambient: it gets
+everything it will ever need before it seals itself, and seals itself
 before it says hello.
 
-Startup: `Tty::new` (core) opens every primary DRM node through the seat
-daemon, then asks it to start the GPU process (`StartGpu`, the fds
-attached). The daemon forks its configured `niri` binary as user
-`drv-gpu` (group `render` for the render nodes Mesa opens itself), with
-the environment cleared, the socket on fd 3, devices on 4.., no new
-privileges: `niri gpu-process --socket-fd 3 --device <dev_t>:4 ...
---render-node-hint <dev_t>`. The core gets its end of the socket back;
-the process is nobody's child there and exits when the socket closes. The process adds the devices (Mesa
-loads drivers and opens render nodes here), applies the seccomp filter,
-and only then sends `Ready { caps, devices }` reporting on each device.
-The core registers the accepted ones in `Tty::init` and closes the
-rejected ones. There is no "seal now" request: an unsealed process is
-never talked to. `NIRI_GPU_SANDBOX=0` in the seat daemon's environment
-skips the seal, for debugging. The core sets
-`MESA_SHADER_CACHE_DISABLE=true` when spawning (no home directory
-access after the seal anyway).
+Startup: drv-supervisor starts `niri gpu-process --mode drm` as user
+`drv-gpu` (group `render` for the render nodes Mesa opens itself) with
+the environment exactly as listed on the supervisor's command line
+(`MESA_SHADER_CACHE_DISABLE=true`: no home directory after the seal),
+no new privileges and a wire on fd 3, alongside the compositor; the
+supervisor links the two with a stream socketpair (`Attach::Gpu` to the
+core, `Attach::Compositor` to the process). The process takes the core's
+connection off the wire and waits. `Tty::new` (core) opens every primary
+DRM node through the seat daemon, takes the GPU connection off its own
+wire, and sends `Start { devices, render_node_hint }` with the fds
+attached. The process adds the devices (Mesa loads drivers and opens
+render nodes here), applies the seccomp filter, and only then sends
+`Ready { caps, devices }` reporting on each device. The core registers
+the accepted ones in `Tty::init` and closes the rejected ones. There is
+no "seal now" request: an unsealed process is never talked to. `Start`
+is refused after startup. `NIRI_GPU_SANDBOX=0` in the process's
+environment skips the seal, for debugging. Without a supervisor
+(`--socket-fd` and `--device` on the command line, tests) the devices
+come with the command line as before.
+
+The core and the GPU process are one group at the supervisor: either
+dying stops the other and both come back. A sealed process cannot bring
+up a renderer for a new core, and a core has nothing to draw with
+without its process, so there is no other useful recovery.
 
 The allowlist is read / write / sendmsg / recvmsg and friends, memory
 management, epoll / poll / timers / eventfd, futex and thread creation
@@ -275,15 +283,16 @@ Devices after the seal: `AddDevice` still works for hot-plug, but Mesa
 cannot initialize on a device it did not start with, so such a device is
 display-only at best. When the core has no renderer and the device set
 changes (compositor started on an inactive VT, rendering device
-unplugged and back), it restarts the GPU process with the current
-devices instead (`Tty::respawn_gpu`): without a renderer nothing lives
-on the GPU side, so the swap costs only re-adding devices. A device the
-process already failed on does not trigger another restart.
+unplugged and back), it exits (`Tty::respawn_gpu`) and the supervisor
+starts the compositor group again on the current devices: only the
+supervisor can start a GPU process, and without a renderer nothing was
+on the GPU side to lose. A device the process already failed on does
+not trigger another restart.
 
 The cross-process test (`tests/gpu_process.rs`) runs the smoke test
 against a self-sealed headless process, so rendering, cursor upload and
 PNG encoding all run under the filter (with llvmpipe). In production it runs
-as its own UID, forked by the seat daemon.
+as its own UID, started by drv-supervisor.
 
 ## HDR and wide gamut
 

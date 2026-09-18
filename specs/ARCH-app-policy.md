@@ -41,17 +41,19 @@ UIDs, driving the screencast services) are `grants` on the same record.
 
 ```text
 drv-supervisor (root, the systemd unit)
-  starts drv-seatd (root), drv-authd, the compositor, drv-forker (root) and
-  drv-appd as their users, from its own command line; takes input from
-  nobody. Every pair of peers gets both ends of a socketpair it made,
-  pushed down each child's wire (fd 3, DRV_WIRE_FD) as Attach{..} + one fd:
+  starts drv-seatd (root), drv-authd, the compositor, compositor-gpu
+  (niri gpu-process, uid drv-gpu), drv-forker (root) and drv-appd as their
+  users, from its own command line; takes input from nobody. Every pair of
+  peers gets both ends of a socketpair it made, pushed down each child's
+  wire (fd 3, DRV_WIRE_FD) as Attach{..} + one fd:
     compositor <-> seatd (Seat / Compositor)
     compositor <-> authd (Auth / Compositor)
+    compositor <-> compositor-gpu (Gpu / Compositor; a stream socket)
     appd       <-> authd (Auth / Verifiers)
   Whenever one side (re)starts its pairs are linked afresh. Restarts what
-  dies; drv-appd and drv-forker are one group: if either dies both are
-  replaced (the apps stay up). Every compositor start is announced to
-  drv-appd as Notice::CompositorStarted.
+  dies, in two groups: drv-appd with drv-forker (the apps stay up), and
+  the compositor with compositor-gpu. Every compositor start is announced
+  to drv-appd as Notice::CompositorStarted.
 
 drv-appd (uid drv-appd)                  drv-forker (root)
   fd 3 wire, fd 4 the public socket        fd 3: the channel to drv-appd, its
@@ -75,9 +77,8 @@ drv-seatd (root, supervisor child)
   seat's /dev/dri/card* and /dev/input/event* nodes to its one client, the
   compositor connection the supervisor attached (Hello lists them, hotplug
   follows on a second socket with enable/disable), opens only those and
-  passes the fds; forks the GPU process as uid drv-gpu on the compositor's
-  request (StartGpu). A seat daemon restart makes the compositor exit and
-  come back.
+  passes the fds. Forks nothing. A seat daemon restart makes the compositor
+  exit and come back.
 
 drv-authd (uid drv-auth, supervisor child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
@@ -320,9 +321,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Unknown UIDs get nothing; an unreachable daemon is the same as unknown.
 - The compositor never reads a policy file, never forks, never execs,
   never launches on its own authority: a spawn key bind is a `Launch`
-  request like any launcher's, and the GPU process is the seat daemon's
-  child, from the daemon's configured binary, as `drv-gpu` (to become a
-  supervisor service).
+  request like any launcher's, and the GPU process is the supervisor's,
+  from the supervisor's command line, as `drv-gpu`, handed to the
+  compositor down the wire.
 - The compositor holds no device group, no udev socket and no VT. Every
   DRM and evdev fd comes from `drv-seatd`, which serves the one connection
   the supervisor attached and opens only the seat's card and event nodes it
@@ -348,6 +349,6 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Launch authority as an fd handed to the launcher; compositor-gpu and
-  the locker as supervisor services; seatd, forker and supervisor off
-  root with bounded capabilities; seccomp on the leaves.
+- Launch authority as an fd handed to the launcher; the locker as a
+  supervisor service; seatd, forker and supervisor off root with bounded
+  capabilities; seccomp on the leaves.
