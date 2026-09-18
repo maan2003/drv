@@ -497,8 +497,9 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Screen sharing: more than one source per session, consents that
   outlive the app's run (`persist_mode` 2).
 - Portals apps may still want: OpenURI, screenshot.
-- `OpenPipeWireRemote` timed out once in nine tries, right after a cast
-  was closed and restarted; the error now names the round trip.
+- `OpenPipeWireRemote` timed out once in 27 tries, right after a cast
+  was closed and restarted, and never under a stress loop since; the
+  bridge names the round trip and tries once more before failing.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
   not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a
