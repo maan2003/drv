@@ -30,13 +30,15 @@ to and what any discussion means.
   supervisor service). DRM and Mesa. Wired to the compositor by the
   supervisor at startup; the compositor hands it the devices it opened
   through seatd, then it seals itself.
-- **locker** (today: `drv-lock`, an app with `auth = true` launched
-  through drv-appd). Draws the lock screen, collects the PIN. To become
-  a supervisor service: Wayland connection and authd verifier both
-  handed by the supervisor.
-- **compositor group**: compositor and compositor-gpu today (the locker
-  joins when it becomes a service). If any member dies the supervisor
-  stops the rest and starts the whole group again.
+- **locker** (`drv-lock`, uid drv-lock, a supervisor service). Draws the
+  lock screen, collects the PIN. Its Wayland connection and its authd
+  verifier both come down its wire from the supervisor; it finds no
+  socket and none finds it. Always running: after every `finished` it
+  asks to lock again and the compositor holds the request for the next
+  locking.
+- **compositor group**: compositor, compositor-gpu and locker. If any
+  member dies the supervisor stops the rest and starts the whole group
+  again.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
 - **launcher**: an app that may start other apps. Launch authority will

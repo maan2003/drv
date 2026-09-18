@@ -15,8 +15,8 @@ and the fork), `drv-os` (uid/gid lookups, fd and directory helpers),
 `drv-bridge` (the UID-keyed desktop services server and the shim on each
 app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
 the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
-verifier that unlocks the compositor) and `drv-lock` (the lock screen, an
-app). Names are in [CONTEXT.md](../CONTEXT.md).
+verifier that unlocks the compositor) and `drv-lock` (the lock screen, a
+supervisor service). Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
@@ -42,8 +42,8 @@ UIDs, driving the screencast services) are `grants` on the same record.
 ```text
 drv-supervisor (root, the systemd unit)
   starts drv-seatd, drv-authd, the compositor, compositor-gpu (niri
-  gpu-process, uid drv-gpu), drv-forker (root) and drv-appd as their
-  users, from its own command line; takes input from nobody. A non-root
+  gpu-process, uid drv-gpu), the locker (drv-lock, uid drv-lock),
+  drv-forker (root) and drv-appd as their users, from its own command line; takes input from nobody. A non-root
   service keeps only the capabilities listed for it (`--seatd-cap`),
   ambient, as its whole bounding set. Every pair of
   peers gets both ends of a socketpair it made, pushed down each child's
@@ -51,10 +51,13 @@ drv-supervisor (root, the systemd unit)
     compositor <-> seatd (Seat / Compositor)
     compositor <-> authd (Auth / Compositor)
     compositor <-> compositor-gpu (Gpu / Compositor; a stream socket)
+    compositor <-> locker (Locker / Compositor; a stream socket, the
+                   locker's Wayland connection)
+    locker     <-> authd (Auth / Verifier)
     appd       <-> authd (Auth / Verifiers)
   Whenever one side (re)starts its pairs are linked afresh. Restarts what
   dies, in two groups: drv-appd with drv-forker (the apps stay up), and
-  the compositor with compositor-gpu. Every compositor start is announced
+  the compositor with compositor-gpu and the locker. Every compositor start is announced
   to drv-appd as Notice::CompositorStarted.
 
 drv-appd (uid drv-appd)                  drv-forker (root)
@@ -284,17 +287,20 @@ launched by the daemon, in order, once the apps socket exists.
 ## The lock
 
 Locked is the default; the compositor holds a lease "unlocked until T"
-that only `drv-authd` starts. The lock app (`services.drv.apps.lock`,
-`drv-lock`, the one app with the `session-lock` global and `auth = true`)
-draws the PIN screen and sends `Verify` down the connection drv-appd put
-on its wire at launch (the other end went to `drv-authd` as a `Verifier`
-down the socket the supervisor linked between them); on a match the
-daemon sends `Unlock{idle_timeout}` on the compositor's connection, which
-the supervisor handed both of them. The compositor
-then grants itself the lease, sends the lock client `finished` and the
-app exits. A client's `unlock_and_destroy` releases its surfaces and
-nothing else: without a lease the outputs stay black and the compositor
-launches the lock app again (3 s backoff, via `Launch` like any app).
+that only `drv-authd` starts. The locker (`drv-lock`, uid drv-lock, in the
+compositor's group) draws the PIN screen. Its Wayland connection came down
+its wire from the supervisor and the compositor inserted it as the one
+client with the `session-lock` global, no lookup; its `drv-authd`
+connection came down the same wire (the other end went to the daemon as a
+`Verifier`), and a restarted daemon arrives there again. `Verify` goes
+down that connection; on a match the daemon sends `Unlock{idle_timeout}`
+on the compositor's connection, which the supervisor handed both of them.
+The compositor then grants itself the lease and sends the lock client
+`finished`; the locker releases its surfaces and immediately asks to lock
+again, and the compositor holds that request (`LockState::Pending`) until
+the lease ends, when it becomes the lock without anything being launched.
+Without a lease the outputs stay black whether or not a lock client is
+there.
 Input extends the lease by `idleTimeout` (module option, 300 s); a
 visible idle-inhibiting surface extends it too; `lock-session` (bound to
 Super+Alt+L) ends it; a compositor restart starts locked. The lease is a
@@ -306,8 +312,8 @@ kernel's own replay of the last framebuffer on resume is switched off by
 `nix/linux-drm-blank-on-resume.patch` (`drm_kms_helper.blank_on_resume=1`,
 set by the module): the DRM resume helper commits the saved state with
 every plane detached, so wake shows black until the compositor's first
-commit. `nix/resume-vm.nix` plus `nix/resume-test.sh` check that on QXL. A client `lock`
-while unlocked gets `finished`. While locked, casts and screenshots render
+commit. `nix/resume-vm.nix` plus `nix/resume-test.sh` check that on QXL.
+While locked, casts and screenshots render
 only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 `1234` in the unit's pre-start.
 
@@ -337,12 +343,12 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   covers the VT ioctls, and DRM master needs no privilege for the process
   that opened the card.
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
-  starts a lease; the lock app cannot unlock even if compromised, it can
+  starts a lease; the locker cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
 - Peers are handed over, never found: the auth daemon has no socket, and
   what it takes `Verify` from and pushes `Unlock` to are the fds the
   supervisor attached, or drv-appd forwarded down the supervisor's link.
-  Anything that is not the lock app has no path to it.
+  Anything that is not the locker has no path to it.
 
 ## Not yet
 
@@ -357,6 +363,5 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Launch authority as an fd handed to the launcher; the locker as a
-  supervisor service; forker and supervisor off root with bounded
-  capabilities; seccomp on the leaves.
+- Launch authority as an fd handed to the launcher; forker and
+  supervisor off root with bounded capabilities; seccomp on the leaves.
