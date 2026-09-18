@@ -46,7 +46,8 @@ drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
 drv-seatd (root)
   holds the seat (libseat builtin backend, no seatd); opens /dev/dri/card* and
   /dev/input/event* for its one client, uid drv-compositor, and passes the fds
-  over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket
+  over /run/drv-seat/seat.sock; enable/disable (VT switch) ride a second socket;
+  forks the GPU process as uid drv-gpu on the compositor's request (StartGpu)
 
 drv-compositor (uid)      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
   Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
@@ -236,9 +237,10 @@ launched by the daemon, in order, once the apps socket exists.
 - A global the policy denies is never in the client's registry. There is
   no second code path that hands out the same capability.
 - Unknown UIDs get nothing; an unreachable daemon is the same as unknown.
-- The compositor never reads a policy file, never forks, never launches
-  on its own authority: a spawn key bind is a `Launch` request like any
-  launcher's.
+- The compositor never reads a policy file, never forks, never execs,
+  never launches on its own authority: a spawn key bind is a `Launch`
+  request like any launcher's, and the GPU process is the seat daemon's
+  child, from the daemon's configured binary, as `drv-gpu`.
 - The compositor holds no device group and no VT. Every DRM and evdev fd
   comes from `drv-seatd`, which serves one UID and only the seat's card
   and event nodes (never render nodes or anything else under `/dev`).
@@ -251,9 +253,8 @@ launched by the daemon, in order, once the apps socket exists.
 - The bridge drops notification actions, hints and close signals.
 - Files: no UID owns the person's files yet
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
-- The compositor still owns udev and hotplug, starts the GPU process
-  itself under its own UID, and is restarted by systemd rather than
-  re-handed its fds by the seat daemon.
+- The compositor still owns udev and hotplug, and is restarted by
+  systemd rather than re-handed its fds by the seat daemon.
 - Autostart happens once, when the identity daemon starts; a compositor
   restart does not relaunch the apps that died with it.
 - Network isolation is only on/off. Per-app firewalling is designed

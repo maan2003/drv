@@ -229,15 +229,19 @@ connections.
 with everything it will ever need on its command line and seals itself
 before it says hello.
 
-Startup: `Tty::new` (core) opens every primary DRM node through the seat daemon,
-then spawns `niri gpu-process --socket-fd N --device <dev_t>:<fd> ...
---render-node-hint <dev_t>` with those fds inherited (CLOEXEC cleared in
-`pre_exec`, no dup2 renumbering). The process adds the devices (Mesa
+Startup: `Tty::new` (core) opens every primary DRM node through the seat
+daemon, then asks it to start the GPU process (`StartGpu`, the fds
+attached). The daemon forks its configured `niri` binary as user
+`drv-gpu` (group `render` for the render nodes Mesa opens itself), with
+the environment cleared, the socket on fd 3, devices on 4.., no new
+privileges: `niri gpu-process --socket-fd 3 --device <dev_t>:4 ...
+--render-node-hint <dev_t>`. The core gets its end of the socket back;
+the process is nobody's child there and exits when the socket closes. The process adds the devices (Mesa
 loads drivers and opens render nodes here), applies the seccomp filter,
 and only then sends `Ready { caps, devices }` reporting on each device.
 The core registers the accepted ones in `Tty::init` and closes the
 rejected ones. There is no "seal now" request: an unsealed process is
-never talked to. `NIRI_GPU_SANDBOX=0` in the compositor's environment
+never talked to. `NIRI_GPU_SANDBOX=0` in the seat daemon's environment
 skips the seal, for debugging. The core sets
 `MESA_SHADER_CACHE_DISABLE=true` when spawning (no home directory
 access after the seal anyway).
@@ -275,8 +279,8 @@ process already failed on does not trigger another restart.
 
 The cross-process test (`tests/gpu_process.rs`) runs the smoke test
 against a self-sealed headless process, so rendering, cursor upload and
-PNG encoding all run under the filter (with llvmpipe). Not yet done:
-running as a separate UID.
+PNG encoding all run under the filter (with llvmpipe). In production it runs
+as its own UID, forked by the seat daemon.
 
 ## HDR and wide gamut
 
@@ -364,6 +368,4 @@ in-process smoke test, `cargo test --test gpu_process` spawns a real
    fullscreen dmabuf clients), cursor plane, screencasting (dmabuf and
    shm streams, metadata cursor, window casts, dynamic casts), named
    cursors from the theme, screenshots (file, clipboard, portal).
-2. Run the GPU process under its own UID (the core would need to pass
-   the DRM fds it opens through the seat daemon, which it already does).
-3. Restart the GPU process on crash instead of stopping the compositor.
+2. Restart the GPU process on crash instead of stopping the compositor.
