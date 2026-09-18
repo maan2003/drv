@@ -13,7 +13,7 @@ to and what any discussion means.
   the tree runs as root.
 - **drv-appd** (crate `drv-appd`, uid drv-appd). The launcher for
   untrusted things. Owns the manifest (`appd.toml`), the public socket
-  (`/run/drv/appd.sock`), policy lookups, autostart. Android's
+  (`/run/drv/appd.sock`, lookups only), the launch channels, autostart. Android's
   PackageManager plus ActivityManager. Seccomp-sealed once its fds are in
   place.
 - **drv-forker** (crate `drv-forker`, uid drv-forker with CAP_SETUID,
@@ -50,7 +50,9 @@ to and what any discussion means.
   again.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
-- **launcher**: an app that may start other apps. Launch authority will
-  be an fd handed to it, not a grant.
+- **launcher**: an app that may start other apps. Launch authority is an
+  fd, not a grant: `launcher = true` in the manifest hands the app a
+  launch channel (`DRV_LAUNCH_FD`), and `drv launch` uses it. The
+  compositor's channel is a supervisor link (`Attach::Appd`).
 
 Retired words: "spawner" (meant supervisor plus forker), "identityd".
