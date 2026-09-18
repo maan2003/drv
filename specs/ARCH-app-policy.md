@@ -120,11 +120,13 @@ drv-portal (uid drv-portal; one process, sealed like the locker with
   a layer surface. Choose shows the tree under --files,
   Enter descends or picks (Save: types a name; an existing one is
   picked to overwrite), Escape cancels; Cancel{id} takes a request
-  down unanswered. Cast lists the screens the compositor reports (fd
-  `compositor`: Outputs is asked with every request); Enter sends
-  Start{cast: id, output, cursor} down that line and the dialog goes
-  down; Started{node_id} is answered as Cast{id, node_id, output,
-  size}, Stopped as Closed{id}; Cancel{id} on a live cast sends Stop. A pick opens the file itself (O_NOFOLLOW, regular
+  down unanswered. Cast lists the screens and windows the compositor
+  reports (fd `compositor`: Outputs and Windows are asked with every
+  request; a window shows its app's manifest name first, its own title
+  after); Enter sends Start{cast: id, source, cursor} down that line and
+  the dialog goes down; Started{node_id, size} is answered as Cast{id,
+  node_id, source, size}, Stopped as Closed{id}; Cancel{id} on a live
+  cast sends Stop. A pick opens the file itself (O_NOFOLLOW, regular
   files only, created for Save) and files a grant {uid, name, fd,
   write}; the answer is Chosen{paths: ["/run/drv-doc/<id>/<name>"]}.
   fd `fuse`: the documents mount, served in a thread (fuser): the
@@ -317,24 +319,28 @@ an entry (a daemon, a probe) out of the app menu.
   `org.freedesktop.portal.Desktop` and forwarding to the server. The
   shim is compatibility, not a boundary.
 - Screen sharing is ours: `org.freedesktop.portal.ScreenCast` (version
-  4, monitors only, cursor modes hidden/embedded/metadata) and
+  4, source types monitor and window, cursor modes
+  hidden/embedded/metadata) and
   `org.freedesktop.portal.Session` on the app's bus are answered by the
   bridge. `CreateSession` and `SelectSources` are bookkeeping there;
-  `Start` asks drv-portal (`Cast{id, app, uid, cursor, again}`), whose
-  dialog lists the screens the compositor reports and is the consent;
+  `Start` asks drv-portal (`Cast{id, app, uid, cursor, screens, windows,
+  again}`, the two flags from `SelectSources.types`), whose dialog lists
+  what the compositor reports and is the consent;
   a consent gets a token (`Response::Cast.token`), handed to the app as
   `restore_token` when it asked for any `persist_mode`, and answered
   with `persist_mode` 1: a later `Cast` with it (`again`) from the same
-  app and uid starts the same screen with no dialog. drv-portal drops
+  app and uid starts the same source with no dialog. drv-portal drops
   an app's tokens when the bridge says its connection ended
   (`Forget{app, uid}`), so a consent never outlives the app's run.
   Chromium needs this: its picker previews a screen in one session,
-  then captures in a second with the first's token. the pick goes to the compositor over the portal's own
-  cast line (`drv_portal::compositor`: Outputs, Start{cast, output,
-  cursor}, Stop; back Outputs, Started{cast, node_id}, Stopped), which
-  starts the cast with no D-Bus and no grant involved, the line being
-  the authority. The node comes back as `Cast{id, node_id, output,
-  size}` and the bridge emits `Response` with `streams`.
+  then captures in a second with the first's token. The pick goes to
+  the compositor over the portal's own cast line
+  (`drv_portal::compositor`: Outputs, Windows, Start{cast, source,
+  cursor}, Stop; back Outputs, Windows, Started{cast, node_id, size},
+  Stopped), which starts the cast with no D-Bus and no grant involved,
+  the line being the authority. The node comes back as `Cast{id,
+  node_id, source, size}` and the bridge emits `Response` with `streams`
+  (`source_type` 1 or 2, `id` the connector name or the window id).
   `OpenPipeWireRemote` is a PipeWire connection the bridge makes and
   restricts before handing it over: the client's permissions are set to
   the core, the one node, and read on the client-node factory the app
@@ -488,8 +494,8 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Screen sharing: windows as sources, more than one screen per session,
-  consents that outlive the app's run (`persist_mode` 2).
+- Screen sharing: more than one source per session, consents that
+  outlive the app's run (`persist_mode` 2).
 - Portals apps may still want: OpenURI, screenshot.
 - `OpenPipeWireRemote` timed out once in nine tries, right after a cast
   was closed and restarted; the error now names the round trip.
