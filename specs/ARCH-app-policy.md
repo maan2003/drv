@@ -38,13 +38,16 @@ UIDs, driving the screencast services) are `grants` on the same record.
 
 ```text
 drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
-  binds /run/drv/identity.sock 0666     fd 3: the public socket, fd 4: the channel
+  binds /run/drv/identity.sock 0666     fd 3: the public socket, fd 4: the channel,
+                                        fd 5: notices (CompositorStarted{running})
   socketpair -> forks identityd   ---->   identity.toml: every uid, exec, groups,
-  with fd 3 + fd 4, respawns it            globals, grants, autostart, auth
+  with fd 3 + fd 4 + fd 5, respawns it     globals, grants, autostart, auth
   channel: {uid, groups, argv,    <----   Launch{app} from anyone -> channel
     env, network, auth} -> range           Lookup{uid}: own uid, or peer has
     and group check, dirs, cgroup,           the lookup grant
-    sandbox, setresuid, NNP, exec           autostart once the apps socket exists
+    sandbox, setresuid, NNP, exec           autostart on every CompositorStarted:
+                                            the apps not in `running`, once the
+                                            apps socket listens (/proc/net/unix)
   forks drv-seatd (root), drv-authd and the compositor too, restarts them,
   and wires: each child with peers gets a wire on fd 3 (DRV_WIRE_FD) down
   which the spawner pushes Attach{Seat|Auth|Compositor|Verifier} + one fd,
@@ -307,8 +310,6 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - The bridge drops notification actions, hints and close signals.
 - Files: no UID owns the person's files yet
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
-- Autostart happens once, when the identity daemon starts; a compositor
-  restart does not relaunch the apps that died with it.
 - Network isolation is only on/off. Per-app firewalling is designed
   separately.
 - Nothing kills a still-running app when its manifest goes away; nothing
