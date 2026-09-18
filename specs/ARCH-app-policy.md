@@ -151,8 +151,10 @@ drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   seat's /dev/dri/card* and /dev/input/event* nodes to its one client, the
   compositor connection the supervisor attached (Hello lists them, hotplug
   follows on a second socket with enable/disable), opens only those and
-  passes the fds. Forks nothing. A seat daemon restart makes the compositor
-  exit and come back. Sits on its own VT (`--vt`, default 7, above logind's
+  passes the fds. libseat's builtin backend forks the seatd server that does
+  the opening; the seccomp seal goes on before that fork, so both processes
+  wear it (the parent drops fork and netlink again once the seat and udev
+  are up). A seat daemon restart makes the compositor exit and come back. Sits on its own VT (`--vt`, default 7, above logind's
   autovt range) because agetty resets the VT it owns to 0620 and a non-root
   seatd could not open it; a udev rule makes tty0 and that tty 0660 group
   tty. tty1 keeps its getty (ctrl-alt-f1).
@@ -444,15 +446,24 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   empties its bounding, ambient, permitted, effective and inheritable
   sets (a non-root forker's would otherwise survive the UID switch and,
   ambient, the exec) before `PR_SET_NO_NEW_PRIVS`.
-- The leaves are sealed. compositor-gpu, drv-authd, drv-appd and the
-  locker apply one seccomp allowlist (`drv_os::seccomp`: the fds they
+- The leaves are sealed. The compositor core, compositor-gpu, drv-seatd
+  (both of its processes), drv-authd, drv-appd, drv-portal, drv-menu and
+  the locker apply one seccomp allowlist (`drv_os::seccomp`: the fds they
   hold, memory, threads, time, signals; never socket, exec, a new process
   or an ioctl outside the listed ones) once their fds are in place, plus
-  what each needs: DRM/dma-buf/sync-file ioctls for the GPU process,
-  accept and read-only opens for drv-appd, its state directory for
-  drv-authd, read-only opens (fonts) for the locker. A denied call fails
-  with EPERM and the journal names the syscall number. `DRV_SECCOMP=0`
-  from the supervisor's command line is the only way to run one open.
+  what each needs: DRM/dma-buf/sync-file ioctls and a stat by path (Mesa
+  reads its device's PCI ids off sysfs) for the GPU process; accept,
+  read-only opens, anonymous files (the keymap copy for old
+  wl_keyboards), DRM/dma-buf/sync-file/evdev ioctls and connecting to
+  Unix sockets (PipeWire, per cast) for the core, which can therefore
+  not write a screenshot to disk; opening existing nodes
+  (never creating), DRM/evdev/VT ioctls and udev's database for
+  drv-seatd; accept and read-only opens for drv-appd; its state
+  directory for drv-authd; read-only opens (fonts) for the locker and
+  the menu; file writes for drv-portal. A denied call fails with EPERM
+  and the journal names the syscall number, the path for an open or
+  stat, the request for an ioctl. `DRV_SECCOMP=0` from the supervisor's
+  command line is the only way to run one open.
 - drv-forker's only peer is the channel the supervisor gave it, held by
   drv-appd; there is no path to it from the filesystem. The supervisor
   takes input from nobody.
@@ -500,7 +511,5 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - `OpenPipeWireRemote` timed out once in 27 tries, right after a cast
   was closed and restarted, and never under a stress loop since; the
   bridge names the round trip and tries once more before failing.
-- Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
-  not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a
   decoder in a sandbox first.
