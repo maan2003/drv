@@ -181,7 +181,11 @@ launched by the daemon, in order, once the apps socket exists.
   signals come back to the right caller. xdg-desktop-portal and the GNOME
   backend are apps with their own UIDs; the frontend needs the `pipewire`
   group for `OpenPipeWireRemote`, the backend holds the `screencast`
-  grant. Screen sharing is per-session consent: the portal dialog is the
+  grant. The frontend identifies callers by opening `/proc/<pid>/root`
+  to look for `.flatpak-info`, which only works within one UID; the
+  module builds it with `nix/xdg-desktop-portal-cross-uid.patch`, which
+  treats an unreadable root as "not a flatpak" (there is no Flatpak here
+  and the portal shares a UID with nobody). Screen sharing is per-session consent: the portal dialog is the
   consent, the portal session is the lease, and no app has a static
   screencast capability.
 - GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
