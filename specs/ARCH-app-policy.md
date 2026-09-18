@@ -4,214 +4,227 @@
 
 Implemented on the `policy` branch of the niri fork at `/src/niri`
 (pushed as `rho/policy`, on top of `gpu-process`). Identities are static
-(fixed UIDs from the system configuration), launches are by app name only,
-and the forker enforces groups and puts each app in a cgroup. Four crates:
-`niri-policy` (types, protocol, compositor client), `niri-identity`
-(`niri-identityd`, the unprivileged brain), `niri-forker` (`niri-forker`,
-the root forker), `niri-bridge` (the UID-keyed desktop services server
-and the shim on each app's private bus: notifications and portals).
-Builds, passes tests, and runs end to end in the
-KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in the fork): seatd,
-the TTY backend and the GPU process on a virgl GPU, apps as their own
-UIDs with the sandbox below (mounts, processes, network), Chromium with
-GPU, audio, network and a private session bus, a stock launcher. The NixOS
-module `nix/module.nix` (`services.niri-desktop`, flake output
-`nixosModules.default`) turns one app list into passwd entries,
-`identity.toml`, the forker's allow and expose lists, the units, and a
-launcher entry per app (`Exec=niri msg action spawn -- <name>`), so a
-stock launcher (fuzzel, as the human's trusted tool) starts apps
-through the compositor.
+(fixed UIDs from the system configuration), launches are by app name
+only, nothing shares a UID, and there is no "trusted" flag: what a
+process may do is its globals and grants. Four crates: `drv-policy`
+(types, protocol, compositor client), `drv-identity` (the unprivileged
+brain, plus the `drv` CLI), `drv-spawn` (`drv-spawnd`, the root
+supervisor that forks the identity daemon and the apps), `drv-bridge`
+(the UID-keyed desktop services server and the shim on each app's
+private bus: notifications and portals). Builds, passes tests, and runs
+end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
+the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
+output `nixosModules.default`) turns one app list into passwd entries,
+`identity.toml`, the session bus policy, the units, and a launcher entry
+per app (`Exec=drv launch <name>`).
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
 
 ## Goal
 
-Every app runs as its own UID. The compositor identifies a client by the
-UID on its socket (`SO_PEERCRED`) and shows it only the Wayland globals its
-policy grants. A client that never sees `zwlr_screencopy_manager_v1` cannot
-bind it, so the capability check happens once, at the registry, instead of
-per request in every protocol handler.
+Every process runs as its own UID. The compositor identifies a client by
+the UID on its socket (`SO_PEERCRED`) and shows it only the Wayland
+globals its policy grants. A client that never sees
+`zwlr_screencopy_manager_v1` cannot bind it, so the capability check
+happens once, at the registry, instead of per request in every protocol
+handler. Capabilities that are not Wayland globals (asking about other
+UIDs, driving the screencast services) are `grants` on the same record.
 
-## Shape
+## Process tree
 
 ```text
-niri-forker (root)            niri-identityd (session user)        compositor core
-  --allow 1000:100000:65536:    identity.toml: apps with fixed       accept -> SO_PEERCRED -> uid
-    render                        uids, exec, groups, policy         Lookup{uid} -> AppPolicy
-  {uid, groups, argv, env}      Lookup{uid} -> app's policy   <----    cached per uid
-    from an allowed peer, uid   Launch{app, env} -> forker    <----  Launch on spawn keybind,
-    and groups in its lists:      request, reply Launched{uid}         spawn-at-startup, cli
-    dirs, cgroup, setgroups/                                         world-connectable apps
-    setresgid/setresuid,                                               socket for other uids
-    no_new_privs, exec
+drv-spawnd (root)                     drv-spawnd identityd (uid drv-identity)
+  binds /run/drv/identity.sock 0666     fd 3: the public socket, fd 4: the channel
+  socketpair -> forks identityd   ---->   identity.toml: every uid, exec, groups,
+  with fd 3 + fd 4, respawns it            globals, grants, autostart
+  channel: {uid, groups, argv,    <----   Launch{app} from anyone -> channel
+    env, network} -> range and             Lookup{uid}: own uid, or peer has
+    group check, dirs, cgroup,               the lookup grant
+    sandbox, setresuid, NNP, exec           autostart once the apps socket exists
+
+drv-compositor (uid)      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
+  Lookup for each client    Lookup per peer       dbus-daemon with      launched by the
+  D-Bus callers checked     notifications and     per-user own and      spawner, sandboxed,
+  against grants            portals for apps      send policy           reach the identity
+  no IPC socket                                                         socket to launch
 ```
 
-Android is the model: PackageManager assigns app UIDs (10000 to 19999,
-plus 100000 per user) and holds permissions, unprivileged; zygote is root
-and only forks on command from `system`. Here the identity daemon is the
-package manager and the forker is zygote.
+Android is the model: the zygote is root and forks on command from
+`system_server`, which is the only thing holding its pipe; the package
+manager owns UIDs and permissions, unprivileged. Here the spawner is the
+zygote and the identity daemon is `system_server` plus the package
+manager. The spawner has no filesystem socket and no allow list: its
+only peer is the child it forked over a socketpair.
 
-## Types (crate `niri-policy`)
+## Types (crate `drv-policy`)
 
 `Global` enumerates the optional globals: dmabuf, layer shell, session
-lock, data control, foreign toplevel, workspaces, output management, gamma
-control, screencopy, image copy capture, virtual keyboard, virtual pointer,
-input method, security context. Everything else (`wl_compositor`,
-`xdg_wm_base`, `wl_shm`, seats, outputs, pointer constraints, ...) is
-always advertised.
+lock, data control, foreign toplevel, workspaces, output management,
+gamma control, screencopy, image copy capture, virtual keyboard, virtual
+pointer, input method, security context. Everything else
+(`wl_compositor`, `xdg_wm_base`, `wl_shm`, seats, outputs, pointer
+constraints, ...) is always advertised.
 
-`AppPolicy { name, trusted, gpu, globals, icon }` is the record the
-identity daemon will own. `allows(global)` is: trusted grants all; `gpu`
-grants dmabuf; otherwise the global must be listed. `name` and `icon` are
-what the compositor shows the user; apps never supply them.
+`Grant` is `lookup` (ask the identity daemon about other UIDs: the
+compositor, the bridge) and `screencast` (call the compositor's
+screencast, screenshot and service-channel D-Bus services: the portal
+backend only).
 
-`PolicyFile { default, app: [AppEntry { uid, uid-end?, ..AppPolicy }] }`
-is the TOML shape. Overlapping UID ranges are rejected at load.
+`AppPolicy { name, gpu, globals, grants, icon }`. `allows(global)`:
+`gpu` grants dmabuf, otherwise the global must be listed. `has(grant)`.
+`name` and `icon` are what the compositor shows the user; apps never
+supply them. `AppPolicy::unknown()` is nothing; `everything(name)` is
+every global and grant, for tests.
 
-`PolicyStore::lookup(uid)` (daemon side) returns the entry covering the
-UID, else `default`.
+`rpc`: `Request::{Hello, Lookup { uid }, Launch { app }}`,
+`Response::{Hello, Policy, Launched { uid }, Error}`, postcard payloads
+behind a little-endian `u32` length, 64 KiB cap, answered in order.
+`daemon::Handler { lookup(peer, uid), launch(peer, app) }` gets the
+peer's UID from `SO_PEERCRED`; `serve` accepts every peer.
 
-`rpc`: `Request::{Hello { version }, Lookup { uid }}`,
-`Response::{Hello { version }, Policy(AppPolicy)}`, postcard payloads
-behind a little-endian `u32` length, 64 KiB cap, requests answered in
-order. `rpc::VERSION` is checked in the hello.
+`spawn`: the spawner channel. `Request { uid, groups, argv, env,
+network }`, `Response::{Forked { pid }, Error}`, `CHANNEL_FD = 4`,
+`Channel` (a mutex around the stream; one request at a time).
 
-`PolicyClient` (compositor side): `connect(path)` does the hello now so a
-missing daemon fails at startup, `lookup(uid)` caches per UID and
-reconnects after an error, 2 s timeouts. There is no mode without a
-daemon. `daemon::serve_connection` is the serving loop, reused by tests
-over a socket pair (the test fixture's daemon says "everyone trusted").
+`PolicyClient`: `connect(path)` does the hello now so a missing daemon
+fails at startup, `lookup(uid)` caches per UID and reconnects after an
+error, `launch(app)`, `reconnect()` for another thread, 2 s timeouts.
+There is no mode without a daemon.
+
+## identity.toml
+
+```toml
+wayland-socket = "/run/drv-wayland/wayland"   # every app's WAYLAND_DISPLAY
+
+[env]                                          # every app, from the system config
+PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
+
+[[app]]
+name = "compositor"      # a service: identified, never launched
+uid = 902
+grants = ["lookup"]
+
+[[app]]
+name = "portal-gnome"
+uid = 100013
+exec = ["/nix/store/.../xdg-desktop-portal-gnome"]
+grants = ["screencast"]
+autostart = true
+```
+
+One UID per entry, one entry per name, no ranges, no default entry:
+an unlisted UID is `unknown`. An entry without `exec` is a service
+(started by systemd) and cannot be launched. `autostart` entries are
+launched by the daemon, in order, once the apps socket exists.
 
 ## Launching
 
-- `Launch { app, env }`: `app` is a manifest name in `identity.toml`;
-  arguments are the manifest's `exec` and nothing else, so an app never
-  receives caller-chosen arguments. `env` is what the compositor's
-  children used to inherit: its session's `XDG_RUNTIME_DIR` and relative
-  `WAYLAND_DISPLAY`, `NIRI_SOCKET`, the config's `environment {}` block,
-  plus `NIRI_APPS_WAYLAND_DISPLAY` (the apps socket path). The daemon
-  prepends its own `PATH`, `LANG`, `TZ`, `TERM` and the config's `[env]`.
-  Apps on the human's own UID (launcher, bar: allowed only if every
-  entry on that UID is `trusted`) keep the session and get the daemon's
-  `HOME`; every other app gets the apps socket as `WAYLAND_DISPLAY` and
-  the forker's `HOME` and `XDG_RUNTIME_DIR`.
-- Every `[[app]]` has a fixed `uid`, generated from the system
-  configuration alongside its passwd entry. The identity daemon never
-  allocates; there is no registry file and no scratch identity. Sub-UID
-  ranges (`isolated_app`) are the only planned dynamic use, not yet built.
-- The forker accepts `{uid, groups, argv, env}` only from peers on its
-  `--allow peer:start:count[:group,group]` list, checked with
-  `SO_PEERCRED`, and only for UIDs in that peer's range or the peer's own
-  UID and groups on that peer's list (so an unprivileged identity daemon
-  cannot hand out `wheel`). For range UIDs it creates
-  `/run/niri-apps/<uid>` (`XDG_RUNTIME_DIR`) and `/var/lib/niri-apps/<uid>`
+- Launch is not a privilege. Anyone who can reach
+  `/run/drv/identity.sock` (mode 0666; the spawner exposes `/run/drv` to
+  apps) may send `Launch { app }`; the launcher's desktop entries run
+  `drv launch <name>`, key binds in the compositor do the same over its
+  own connection. `app` is a manifest name; arguments are the manifest's
+  `exec` and nothing else, so an app never receives caller-chosen
+  arguments or environment. The daemon builds the environment from its
+  `PATH`, `[env]`, the entry's `env` and `WAYLAND_DISPLAY`.
+- Lookups of other UIDs need the `lookup` grant; every UID may look up
+  itself.
+- The spawner accepts `{uid, groups, argv, env, network}` only on the
+  channel, only for UIDs in its `--range` and groups on its `--group`
+  list (so the identity daemon cannot hand out `wheel`). It creates
+  `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and `/var/lib/drv-apps/<uid>`
   (`HOME`, cwd), mode 0700 owned by the UID, moves the child into
-  `<forker cgroup>/app-<uid>` (needs `Delegate=yes`), then `setgroups`,
-  `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with a cleared
-  environment. Children are reaped and their exit logged. It has no
-  config file and no notion of an app.
-- Sandbox (the forker, as root, between fork and exec, for range UIDs):
-  a private mount namespace; fresh tmpfs on `/tmp` and `/dev/shm`;
-  `/proc` with `hidepid=invisible`; and a fresh read-only tmpfs on `/run`
-  holding only the app's own runtime directory plus the forker's
-  `--expose` entries (bind-mounted directories or recreated symlinks:
-  the apps' Wayland socket directory, `opengl-driver`, `current-system`,
-  `/run/pipewire`). So no system D-Bus, no forker or identity socket, no
-  setuid wrappers, no other app's runtime directory. Same UID plus this
-  is the floor; anything more an app may reach is a group or a socket.
-  No user namespaces anywhere. Apps without `network = true` also get a
-  new, empty network namespace (`CLONE_NEWNET`): no interfaces but a
-  down loopback.
-- The identity daemon serves its own UID only (`SO_PEERCRED`), so only
-  the compositor of the same human can look up policy or launch.
-- `identity.toml` has a static `[env]` table (from the system
-  configuration) every app gets: where the PipeWire socket is, for one.
-- Audio is a group: PipeWire runs system-wide as its own user with its
-  sockets mode 0660 group `pipewire`; an app whose manifest lists
-  `groups = ["pipewire"]` (and whose forker allow list includes it) can
-  connect, anyone else gets `EACCES`. WirePlumber's default access
-  rules give such clients play and record but no management.
-- Apps run as other UIDs cannot enter the session's `XDG_RUNTIME_DIR`, so
-  with `NIRI_APPS_SOCKET=/run/niri/<user>/wayland` the compositor also
-  listens on that absolute path, socket mode 0666. Anyone local may
-  connect; the policy decides what they get, as with Android's binder
-  services. Launched apps get that path as `WAYLAND_DISPLAY`.
-- `spawn-sh` stays disabled: a shell string is not an app name.
-- Desktop services (notifications and portals) go through
-  `niri-bridge serve`, running as the human on the human's session bus
-  (`dbus-daemon` unit `niri-session-bus`, socket in `/run/niri-session`,
-  which apps never see). Its socket `/run/niri-bridge/bridge.sock` is
-  mode 0666; every connection is keyed on `SO_PEERCRED` plus the identity
-  daemon's answer for that UID, unknown UIDs are dropped, and what the
-  human sees is the manifest name, never anything the app sent. An app
-  with `bus = true` runs under `dbus-run-session -- niri-bridge app --
-  <exec>`: a private bus in its own UID with the shim claiming
-  `org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`
-  and forwarding to the server (D-Bus peer-to-peer over the socket). The
-  shim is compatibility for apps that expect a bus, not a boundary; the
-  sandbox already hides every other bus.
-- Portals: per app the server holds its own connection on the human's
-  bus, registers the app with the portal `Registry` as `niri.app.<name>`
-  (the module installs a desktop entry by that name, so dialogs show the
-  manifest name), forwards `org.freedesktop.portal.*` bodies unchanged
-  (fds included), and rewrites request and session handle paths between
-  the app's sender and its own unique name so `Response` and `Closed`
-  signals come back to the right caller. xdg-desktop-portal and the
-  GNOME backend run as the human's trusted apps; the frontend needs the
-  `pipewire` group because `OpenPipeWireRemote` hands the app a socket
-  to the system-wide PipeWire. niri serves the Mutter screencast API
-  outside session mode under `debug {
-  dbus-interfaces-in-non-session-instances; }`. A sandboxed Chromium's
-  screen share runs this whole path.
-- GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` (ffmpeg behind
-  it) on the first stream connect, after the seccomp lockdown. The GPU
-  process loads it into PipeWire's plugin registry at startup instead;
-  without that the connect fails with EINVAL.
+  `<spawner cgroup>/app-<uid>` (needs `Delegate=yes`), then `setgroups`,
+  `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with the request's
+  environment and nothing else. Children are reaped and their exit logged.
+- Sandbox (the spawner, as root, between fork and exec): a private mount
+  namespace; fresh tmpfs on `/tmp` and `/dev/shm`; `/proc` with
+  `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
+  the app's own runtime directory plus the `--expose` entries (the
+  identity socket directory, the apps' Wayland socket directory, the
+  bridge socket directory, `opengl-driver`, `current-system`,
+  `/run/pipewire`, `/run/pulse`). No system D-Bus, no services' bus, no
+  other app's runtime directory, no setuid wrappers. No user namespaces
+  anywhere. Apps without `network = true` also get a new, empty network
+  namespace.
+- The identity daemon runs as the `drv-identity` system user with no
+  filesystem socket of its own: the spawner binds the public socket and
+  hands it over as fd 3, the channel as fd 4. When it dies the spawner
+  forks a new one.
+- Audio is a group: PipeWire runs system-wide with sockets mode 0660
+  group `pipewire`; an app whose manifest lists `groups = ["pipewire"]`
+  can connect, anyone else gets `EACCES`.
+- The compositor listens on `$DRV_APPS_SOCKET` (`/run/drv-wayland/wayland`,
+  mode 0666) besides its own runtime directory. Anyone local may connect;
+  the policy decides what they get, as with Android's binder services.
+- `spawn-sh` and `spawn-at-startup` are disabled: a shell string is not
+  an app name, and what starts with the desktop is `autostart` in the
+  manifest, not the compositor's config.
+- Desktop services (notifications and portals) go through `drv-bridge
+  serve`, its own UID on the services' bus (a `dbus-daemon` as user
+  `drv-bus`, socket in `/run/drv-session`, which apps never see). The bus
+  config lets each listed user own only its names (`sessionBusNames`)
+  and lets only `screencast`-granted users send to the compositor's
+  names. The bridge socket `/run/drv-bridge/bridge.sock` is mode 0666;
+  every connection is keyed on `SO_PEERCRED` plus the identity daemon's
+  answer for that UID, unknown UIDs are dropped, and what the human sees
+  is the manifest name. An app with `bus = true` runs under
+  `dbus-run-session -- drv-bridge app -- <exec>`: a private bus in its
+  own UID with the shim claiming `org.freedesktop.Notifications` and
+  `org.freedesktop.portal.Desktop` and forwarding to the server. The
+  shim is compatibility, not a boundary.
+- Portals: per app the server holds its own connection on the services'
+  bus, registers the app with the portal `Registry` as `drv.app.<name>`,
+  forwards `org.freedesktop.portal.*` bodies unchanged (fds included), and
+  rewrites request and session handle paths so `Response` and `Closed`
+  signals come back to the right caller. xdg-desktop-portal and the GNOME
+  backend are apps with their own UIDs; the frontend needs the `pipewire`
+  group for `OpenPipeWireRemote`, the backend holds the `screencast`
+  grant. Screen sharing is per-session consent: the portal dialog is the
+  consent, the portal session is the lease, and no app has a static
+  screencast capability.
+- GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
+  stream connect, after the seccomp lockdown, so the GPU process loads it
+  into PipeWire's plugin registry at startup.
 
 ## Compositor behaviour
 
 - `Niri::insert_client` reads the peer UID and stores the policy in
   `ClientState.policy` before the client is inserted, so the registry the
-  client sees on its first roundtrip is already filtered.
-- Every optional global is created with a filter from `client_allows(Global)`:
-  the policy grants it and the connection is not a security-context
-  (sandboxed) one. Security-context clients see nothing optional regardless.
-- The dmabuf global (created in `backend/tty.rs` once the GPU process is
-  ready) is filtered the same way; a client without `gpu` gets `wl_shm` only.
-- Gamma control additionally requires the TTY backend, as before.
-- Daemon socket: `$NIRI_IDENTITY_SOCKET`, else
-  `$XDG_RUNTIME_DIR/niri-identity.sock`. Cannot connect or hello fails: the
-  compositor exits. Nobody is trusted unless the daemon says so; the
-  human's own UID needs an `[[app]]` entry with `trusted = true`.
-- Once connected, a failed lookup (daemon died, garbage reply, timeout)
-  gives that client `AppPolicy::unknown()`: nothing optional, no GPU.
-  Cached UIDs keep their answers. Fail closed, never open.
-- `niri-identityd --config /etc/niri/identity.toml [--socket ..] [--forker ..]`
-  and `niri-forker --allow peer:start:count[:groups] [--socket ..]`, both
-  also under systemd socket activation (`LISTEN_FDS=1`).
-
-## No spawning
-
-The compositor never forks. `spawn`, `spawn-at-startup` and the
-command-line command become `Launch` requests (`Niri::launch`);
-`spawn-sh` and xwayland-satellite are logged as disabled, the
-`utils::xwayland` module is gone, and `DISPLAY` is unset.
+  client sees on its first roundtrip is already filtered. A socket that
+  arrived over D-Bus (the Mutter service channel) has no peer of its own;
+  the D-Bus side supplies the caller's UID from the bus daemon's
+  credentials.
+- Every optional global is created with a filter from
+  `client_allows(Global)`: the policy grants it and the connection is not
+  a security-context one. The dmabuf global is filtered the same way.
+- D-Bus services (`org.gnome.Mutter.ScreenCast`, `ServiceChannel`,
+  `org.gnome.Shell.Screenshot`) resolve the caller's UID through
+  `GetConnectionCredentials` and refuse it without the `screencast` grant
+  (`dbus/caller.rs`, its own `PolicyClient` on the D-Bus thread).
+- No IPC socket. `IpcServer` is never started: a client that can act as
+  the compositor would bypass every policy. `niri msg` has nothing to
+  talk to.
+- Daemon socket: `$DRV_IDENTITY_SOCKET`, else `/run/drv/identity.sock`.
+  Cannot connect or hello fails: the compositor exits. A failed lookup
+  later gives that client `AppPolicy::unknown()`.
 
 ## Invariants
 
-- Identity is the socket UID. PIDs are reused and are never used for policy.
-- No child of the forker is root: a root forker always switches to the
-  requested UID, also when a peer asks for its own UID. (A first version
-  skipped the switch for "as self" launches and left the child as root;
-  the compositor then saw an unknown UID and gave it nothing, but that
-  was a privilege escalation reachable from the identity daemon.)
-- A global the policy denies is never in the client's registry. There is no
-  second code path that hands out the same capability.
-- Unknown UIDs get the daemon's `default`; an unreachable daemon is the
-  same as `unknown`: nothing optional, no GPU.
-- The compositor never reads a policy file. Only the daemon knows where
-  policy comes from.
+- Identity is the socket UID. PIDs are reused and are never used for
+  policy. No two processes on the desktop share a UID; there is no human
+  UID on the desktop at all.
+- No child of the spawner is root: it always switches to the requested
+  UID, which is always inside its range.
+- The spawner's only peer is the identity daemon it forked; there is no
+  path to it from the filesystem.
+- A global the policy denies is never in the client's registry. There is
+  no second code path that hands out the same capability.
+- Unknown UIDs get nothing; an unreachable daemon is the same as unknown.
+- The compositor never reads a policy file, never forks, never launches
+  on its own authority: a spawn key bind is a `Launch` request like any
+  launcher's.
 
 ## Not yet
 
@@ -219,14 +232,13 @@ command-line command become `Launch` requests (`Niri::launch`);
   nothing yet narrows which portals an app may use, and the document
   portal's FUSE view is not exposed into the sandbox.
 - The bridge drops notification actions, hints and close signals.
-- Network isolation is only on/off (`network = true` in the manifest, off
-  by default: a fresh, empty network namespace). Per-app firewalling is
-  designed separately.
-- Nothing kills a still-running app when its manifest goes away.
-- Nothing pushes policy changes to the compositor; lookups are cached per
-  UID for the compositor's lifetime.
-- Sub-UID ranges, and a way for an app to ask for them.
-- The forker does not yet pass fds (a log fd, a pre-connected socket) or
-  report exits to the identity daemon; nothing kills an app's cgroup yet.
-- Per-client `wl_shm` sealing and other per-request policy.
-- Any policy on what a client may do once it has bound a global.
+- Files: no UID owns the person's files yet
+  ([NOTES-file-ownership](NOTES-file-ownership.md)).
+- A compositor-owned screencast indicator and a compositor-side stop.
+- Seat daemon: the compositor still holds `seat`, `video` and `input`
+  groups and starts the GPU process itself.
+- Network isolation is only on/off. Per-app firewalling is designed
+  separately.
+- Nothing kills a still-running app when its manifest goes away; nothing
+  pushes policy changes to the compositor; sub-UID ranges; exit
+  reporting and cgroup kill from the spawner.

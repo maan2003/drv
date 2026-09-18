@@ -55,19 +55,20 @@ Neither shape above. A filtering proxy would make the bus a security
 boundary, which the design forbids, and one shared bus with UID headers
 means finishing a broker. Instead:
 
-- The human's tools (compositor, notification daemon, launcher, bar) share
-  a plain `dbus-daemon` session bus in the human's UID; sandboxed apps
-  never see its socket.
+- The desktop services (compositor, notification daemon, portals, the
+  bridge) share a plain `dbus-daemon` run as its own user, each service
+  on its own UID; the bus config says which user may own which names and
+  who may call the compositor's. Sandboxed apps never see its socket.
 - An app that expects a bus gets a private `dbus-run-session` bus in its
-  own UID with `niri-bridge app` on it: a shim that claims the desktop
+  own UID with `drv-bridge app` on it: a shim that claims the desktop
   names (`org.freedesktop.Notifications` so far) and forwards over a Unix
-  socket to `niri-bridge serve` on the human's side.
+  socket to `drv-bridge serve` on the services' side.
 - The server is the only check: peer UID from `SO_PEERCRED`, name from
   the identity daemon, unknown UIDs dropped. What the human sees carries
   the manifest name, never the app's `app_name`.
 
 Portals follow the same pattern: the shim also claims
 `org.freedesktop.portal.Desktop`; the server forwards each app's calls on
-its own bus connection, registered with the portal as `niri.app.<name>`,
+its own bus connection, registered with the portal as `drv.app.<name>`,
 rewriting handle paths so responses find their way back. File
 descriptors (the PipeWire remote) pass through unchanged.

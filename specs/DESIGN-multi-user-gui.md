@@ -4,13 +4,14 @@
 
 Direction record. Implemented so far: the compositor core / GPU process
 split ([ARCH-gpu-process-split](ARCH-gpu-process-split.md)) and the
-identity daemon, sandboxing forker, per-UID compositor policy and
+identity daemon forked by a root spawner, per-UID compositor policy and
 group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
-Chromium as an untrusted app started from a trusted launcher, and
-notifications and portals (screen share from a sandboxed Chromium)
-through a trusted, UID-keyed bridge. Not yet: the seat daemon, the lock
-lease, sub-UID ranges. This records the agreed direction
+every process on its own UID: Chromium started from a launcher that is
+itself just an app, notifications and portals (screen share with
+per-session consent) through a UID-keyed bridge. Not yet: the seat
+daemon, the lock lease, sub-UID ranges, file ownership
+([NOTES-file-ownership](NOTES-file-ownership.md)). This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
 intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
 specs.
@@ -55,9 +56,10 @@ hands fds to the core and GPU process. Respawns the compositor with the same
 fds on crash. Reason: keeps the compositor unprivileged and gives fast
 recovery to the lock screen instead of a TTY.
 
-**Identity daemon.** Answers `uid -> app, manifest, permissions, trusted
-flag`. The only parser of manifests. Compositor, portals and spawn daemon all
-ask it and cache per connection. Reason: one parser, one source of truth,
+**Identity daemon.** Answers `uid -> app, manifest, globals, grants`.
+The only parser of manifests. Compositor and bridge ask it and cache per
+connection; anyone may ask it to launch an app by name, so launching is
+not a privilege and does not pass through the compositor. Reason: one parser, one source of truth,
 no config-format bugs inside the compositor. Identities are static: the app
 list and each app's UID come from the system configuration (Nix), so
 installing an app is a configuration change and there are no runtime
@@ -66,20 +68,28 @@ nothing else; its arguments come from the manifest, never from the caller.
 Dynamic grants are a separate append-only store it also reads.
 
 **Spawn daemon.** The only thing that can start a process as another UID.
-Builds the environment from scratch (never inherits), passes only the fds
-the caller is allowed to pass. Apps may spawn only into a UID range they
+Root, forks the identity daemon over a socketpair and takes orders from
+nothing else. Builds the environment from scratch (never inherits),
+passes only the fds the caller is allowed to pass. Apps may spawn only into a UID range they
 own (Android `isolated_app` idea), so the terminal can start shells in
 sub-UIDs without any path to privilege escalation.
 
 **Auth daemon.** Verifies PIN, fingerprint, or FIDO and is the only thing
 that can unlock. Has no display and no network.
 
-**Trusted clients.** Bar, launcher, notifications, lock UI, portals, file
-manager, settings, IME, accessibility. Ordinary Wayland clients whose
-identity record carries a `trusted` flag; the compositor exposes extra
-globals to them. Reason: keeps the compositor core small and lets these
-crash independently. Accessibility (AT-SPI) is trusted by necessity: it
-sees all text and injects actions.
+**Desktop clients.** Bar, launcher, notifications, lock UI, portals, file
+manager, settings, IME, accessibility. Ordinary Wayland clients, each
+its own UID, whose identity record lists exactly the globals and grants
+it needs (layer shell for the bar, the screencast grant for the portal
+backend). There is no `trusted` flag and no shared "human" UID: nothing
+on the desktop runs as the person. Reason: keeps the compositor core
+small, lets these crash independently, and keeps a compromised launcher
+from being a compromised portal. Accessibility (AT-SPI) needs the most:
+it sees all text and injects actions.
+
+**Consent, not capability.** Screen sharing is a per-session lease: the
+portal dialog is the consent, the portal session is the lease, and only
+the portal backend may open one. No app has a static screencast right.
 
 ## Compositor policy
 
@@ -196,7 +206,7 @@ compositor alive under memory pressure; nothing more.
 ## Build order
 
 Two workstreams sharing one early contract, the per-UID policy record
-(trusted flag, allowed globals, GPU, display name, icon):
+(allowed globals, grants, GPU, display name, icon):
 
 1. Compositor: seat daemon, core, GPU process, static policy file. First
    milestone is one `wl_shm` client shown with no Mesa in the core; then
