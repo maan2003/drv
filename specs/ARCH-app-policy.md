@@ -41,9 +41,11 @@ UIDs, driving the screencast services) are `grants` on the same record.
 
 ```text
 drv-supervisor (root, the systemd unit)
-  starts drv-seatd (root), drv-authd, the compositor, compositor-gpu
-  (niri gpu-process, uid drv-gpu), drv-forker (root) and drv-appd as their
-  users, from its own command line; takes input from nobody. Every pair of
+  starts drv-seatd, drv-authd, the compositor, compositor-gpu (niri
+  gpu-process, uid drv-gpu), drv-forker (root) and drv-appd as their
+  users, from its own command line; takes input from nobody. A non-root
+  service keeps only the capabilities listed for it (`--seatd-cap`),
+  ambient, as its whole bounding set. Every pair of
   peers gets both ends of a socketpair it made, pushed down each child's
   wire (fd 3, DRV_WIRE_FD) as Attach{..} + one fd:
     compositor <-> seatd (Seat / Compositor)
@@ -72,13 +74,16 @@ drv-appd (uid drv-appd)                  drv-forker (root)
     what Running lacks, once the apps
     socket listens (/proc/net/unix)
 
-drv-seatd (root, supervisor child)
+drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   holds the seat (libseat builtin backend, no seatd) and udev; announces the
   seat's /dev/dri/card* and /dev/input/event* nodes to its one client, the
   compositor connection the supervisor attached (Hello lists them, hotplug
   follows on a second socket with enable/disable), opens only those and
   passes the fds. Forks nothing. A seat daemon restart makes the compositor
-  exit and come back.
+  exit and come back. Sits on its own VT (`--vt`, default 7, above logind's
+  autovt range) because agetty resets the VT it owns to 0620 and a non-root
+  seatd could not open it; a udev rule makes tty0 and that tty 0660 group
+  tty. tty1 keeps its getty (ctrl-alt-f1).
 
 drv-authd (uid drv-auth, supervisor child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
@@ -327,7 +332,10 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - The compositor holds no device group, no udev socket and no VT. Every
   DRM and evdev fd comes from `drv-seatd`, which serves the one connection
   the supervisor attached and opens only the seat's card and event nodes it
-  announced itself (never render nodes or anything else under `/dev`).
+  announced itself (never render nodes or anything else under `/dev`). It
+  is not root: the device groups open the nodes, `CAP_SYS_TTY_CONFIG`
+  covers the VT ioctls, and DRM master needs no privilege for the process
+  that opened the card.
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
   starts a lease; the lock app cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
@@ -350,5 +358,5 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
 - Launch authority as an fd handed to the launcher; the locker as a
-  supervisor service; seatd, forker and supervisor off root with bounded
+  supervisor service; forker and supervisor off root with bounded
   capabilities; seccomp on the leaves.

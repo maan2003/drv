@@ -18,9 +18,10 @@ to and what any discussion means.
   peer. drv-appd and drv-forker are one group: if either dies the
   supervisor replaces both; the apps stay up and the new forker finds
   them through their cgroups.
-- **seatd** (`drv-seatd`). libseat, udev, opens devices. Pushes device fds
-  at runtime: cards to compositor-gpu, evdev to the compositor. To run as
-  its own user with `CAP_SYS_TTY_CONFIG`, no setuid.
+- **seatd** (`drv-seatd`, uid drv-seat with groups video, input, tty and
+  `CAP_SYS_TTY_CONFIG` as its whole bounding set). libseat, udev, opens
+  devices, on its own VT (7). Pushes device fds at runtime to the
+  compositor (cards go on to compositor-gpu through the compositor).
 - **authd** (`drv-authd`). PIN store and verifier. The only source of
   unlock. No socket.
 - **compositor** (niri core, uid drv-compositor). Never forks, never
