@@ -46,13 +46,19 @@ to and what any discussion means.
   socket and none finds it. Always running: after every `finished` it
   asks to lock again and the compositor holds the request for the next
   locking. Seccomp-sealed after its first render (fonts stay readable).
-- **the set**: the seven above. If any member dies the supervisor kills
+- **menu** (`drv-menu`, uid drv-menu, a supervisor service). Holds a
+  launch channel (fd `appd`) and a poke line from the compositor (fd
+  `compositor`, a byte per `show-launcher` bind); runs the dmenu-style
+  program (fuzzel) as its own uid and launches the name it prints. In
+  the manifest with layer-shell, so its window is like any app's.
+- **the set**: the eight above. If any member dies the supervisor kills
   the apps, stops the rest and starts everything again with fresh
   sockets. There are no smaller groups.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
 - **launcher**: whoever holds a launch channel, a supervisor socketpair
-  to drv-appd. Only a member of the set can (today the compositor, fd
-  `appd`); no app is trusted, and `drv` only looks up.
+  to drv-appd. Only a member of the set can (the compositor for key
+  binds and the menu, each on its fd `appd`); no app is trusted, and
+  `drv` only looks up.
 
 Retired words: "spawner" (meant supervisor plus forker), "identityd".

@@ -16,8 +16,9 @@ directory helpers),
 `drv-bridge` (the UID-keyed desktop services server and the shim on each
 app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
 the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
-verifier that unlocks the compositor) and `drv-lock` (the lock screen, a
-supervisor service). Names are in [CONTEXT.md](../CONTEXT.md).
+verifier that unlocks the compositor), `drv-lock` (the lock screen, a
+supervisor service) and `drv-menu` (the app menu, a supervisor service
+that runs fuzzel). Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
@@ -44,8 +45,9 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
                 SETPCAP, CHOWN, KILL, SYS_ADMIN, SYS_TTY_CONFIG from the unit's
                 AmbientCapabilities, NoNewPrivileges; nothing here is root)
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
-  drv-gpu), the compositor, the locker (drv-lock, uid drv-lock),
-  drv-forker (uid drv-forker) and drv-appd as their users, from its own
+  drv-gpu), the compositor, the locker (drv-lock, uid drv-lock), the
+  menu (drv-menu, uid drv-menu), drv-forker (uid drv-forker) and
+  drv-appd as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
   ambient, as its whole bounding set. Every link between two members is
@@ -55,14 +57,16 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
     seatd        compositor
     authd        compositor, locker
     gpu          compositor
-    compositor   seat, auth, gpu, locker, appd
+    compositor   seat, auth, gpu, locker, appd, menu
     locker       compositor (its Wayland connection), auth
+    menu         compositor (a byte per show-launcher), appd (its launch
+                 channel)
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
-                 0666), channel (to the forker), compositor (the
-                 compositor's launch channel)
+                 0666), channel (to the forker), compositor and menu
+                 (the two launch channels)
   seat, auth and the forker channel are SEQPACKET, the rest streams.
-  Nothing is linked at runtime: the seven are one set, and when any
+  Nothing is linked at runtime: the eight are one set, and when any
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
   again with fresh socketpairs. The forker owns `<supervisor
@@ -71,16 +75,25 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
 
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
                                            setgid, setpcap, sys_admin, chown)
-  fds: listener, channel, compositor       fd `channel` from the supervisor,
-  appd.toml: every uid, exec, groups,        its only input. --range, --group,
-    globals, grants, autostart               --expose from the command line.
-  Launch{app} on a launch channel -------> Launch{uid, groups, argv, env,
-    (the compositor's, today the only        network, expose} -> range and
-    one) -> the manifest's exec              group check, dirs, cgroup
-  Lookup{uid} on the listener: own uid,      apps/app-<uid>, sandbox,
-    or the lookup grant                      setresuid, NNP, exec; the child
-  autostart once, after the apps socket      inherits no fd at all
-    listens (/proc/net/unix)               reaps children, logs their exit
+  fds: listener, channel, compositor,      fd `channel` from the supervisor,
+    menu                                     its only input. --range, --group,
+  appd.toml: every uid, exec, groups,        --expose from the command line.
+    globals, grants, autostart             Launch{uid, groups, argv, env,
+  Launch{app} on a launch channel ------->   network, expose} -> range and
+    (the compositor's or the menu's) ->      group check, dirs, cgroup
+    the manifest's exec; Apps -> the         apps/app-<uid>, sandbox,
+    names with an exec                       setresuid, NNP, exec; the child
+  Lookup{uid} on the listener: own uid,      inherits no fd at all
+    or the lookup grant                    reaps children, logs their exit
+  autostart once, after the apps socket
+    listens (/proc/net/unix)
+
+drv-menu (uid drv-menu; the manifest lists it with layer-shell)
+  fd `compositor`: a byte per show-launcher bind; fd `appd`: its launch
+  channel. On each byte: Apps -> the names on the dmenu-style program's
+  stdin (fuzzel --dmenu, the module's `menu`, run as drv-menu with its
+  environment and no fds); what it prints -> Launch{app}. Not dumpable,
+  so the program cannot ptrace it or read its fds.
 
 drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   holds the seat (libseat builtin backend, no seatd) and udev; announces the
@@ -193,10 +206,11 @@ launched by the daemon, in order, once the apps socket exists.
 
 - Launch authority is an fd, never a grant and never the public socket.
   drv-appd serves `Launch { app }` only on launch channels, and a
-  launch channel is a supervisor socketpair: today the one named `appd`
-  on the compositor's side and `compositor` on drv-appd's, so a spawn
-  key bind is the only launcher. Apps get no fd from anyone; something
-  that must launch (a menu) becomes a supervisor service instead. `/run/drv/appd.sock` (0666) answers
+  launch channel is a supervisor socketpair: `appd` on the compositor's
+  side (spawn key binds) and on drv-menu's (what the menu picked), each
+  a named fd on drv-appd's side. `Apps` on a channel lists the names
+  `Launch` takes. Apps get no fd from anyone; something that must launch
+  is a supervisor service, never an app. `/run/drv/appd.sock` (0666) answers
   lookups only. `app` is a manifest name; arguments are the manifest's
   `exec` and nothing else, so an app never receives caller-chosen
   arguments or environment. The daemon builds the environment from its
@@ -386,9 +400,10 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- A menu: no app can launch, so the only launcher is a key bind. Next
-  is `drv-menu`, a supervisor service holding a launch channel that runs
-  fuzzel on a `show-launcher` bind; portals become services the same way
-  when they need authority.
+- Portals become supervisor services, like the menu, once they need
+  authority (launch with data, intents over the bus).
+- The menu lists every entry with an `exec`, autostarted daemons
+  included; nothing marks an entry as not for the menu.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
-  not listed yet) and the compositor core.
+  not listed yet), the compositor core, and drv-menu (it forks and
+  execs).
