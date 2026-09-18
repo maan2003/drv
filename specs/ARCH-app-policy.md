@@ -18,8 +18,9 @@ app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
 the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
 verifier that unlocks the compositor), `drv-ui` (what the set's windows
 share: a connection on a supervisor fd, the toolkit boilerplate, text in
-shm buffers, sealing), `drv-lock` (the lock screen) and `drv-menu` (the
-app menu), both supervisor services on `drv-ui`. Names are in [CONTEXT.md](../CONTEXT.md).
+shm buffers, sealing), `drv-lock` (the lock screen), `drv-menu` (the
+app menu) and `drv-portal` (the file chooser and the documents mount),
+supervisor services on `drv-ui`. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
@@ -47,8 +48,9 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
                 AmbientCapabilities, NoNewPrivileges; nothing here is root)
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
   drv-gpu), the compositor, the locker (drv-lock, uid drv-lock), the
-  menu (drv-menu, uid drv-menu), drv-forker (uid drv-forker) and
-  drv-appd as their users, from its own
+  menu (drv-menu, uid drv-menu), the portal (drv-portal, uid
+  drv-portal), drv-forker (uid drv-forker), drv-appd and the bridge
+  (drv-bridge, uid drv-bridge) as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
   ambient, as its whole bounding set. Every member gets the sandbox an
@@ -60,7 +62,8 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   `/run/udev` (libinput), its runtime and apps socket directories,
   `/run/drv`, the session bus and `/run/pipewire`; the GPU process
   `/run/opengl-driver`; the forker `/run/drv-apps` plus everything an
-  app may be shown; authd, the locker, the menu and drv-appd nothing.
+  app may be shown; the bridge `/run/drv` and the session bus; authd,
+  the locker, the menu, the portal and drv-appd nothing.
   Nobody has the system bus (`/run/dbus`): the compositor's logind and
   locale1 watchers fail closed and log it.
   Every link between two members is
@@ -70,16 +73,23 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
     seatd        compositor
     authd        compositor, locker
     gpu          compositor
-    compositor   seat, auth, gpu, locker, appd, menu, menu-client
+    compositor   seat, auth, gpu, locker, appd, menu, menu-client,
+                 portal-client
     locker       compositor (its Wayland connection), auth
     menu         compositor (a byte per show-launcher), wayland (its
                  Wayland connection), appd (its launch channel)
+    portal       wayland (its Wayland connection), bridge (chooser
+                 requests), fuse (the /dev/fuse end of the documents
+                 mount the supervisor made at --docs, /run/drv-doc)
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
                  0666), channel (to the forker), compositor and menu
                  (the two launch channels)
-  seat, auth and the forker channel are SEQPACKET, the rest streams.
-  Nothing is linked at runtime: the eight are one set, and when any
+    bridge       listener (/run/drv-bridge/bridge.sock, bound by the
+                 supervisor, 0666), portal
+  seat, auth, the forker channel and the bridge's portal line are
+  SEQPACKET, the rest streams.
+  Nothing is linked at runtime: the ten are one set, and when any
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
   again with fresh socketpairs. The forker owns `<supervisor
@@ -101,6 +111,23 @@ drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid
   autostart once, on the compositor's
     Hello down its channel (its apps
     socket listens by then)
+
+drv-portal (uid drv-portal; one process, sealed like the locker with
+            file writes allowed; owns the person's files, `--files`)
+  fd `bridge`: Choose{id, app, uid, title, Open | Save{name}} from the
+  bridge, one at a time on a layer surface: the tree under --files,
+  Enter descends or picks (Save: types a name; an existing one is
+  picked to overwrite), Escape cancels; Cancel{id} takes a request
+  down unanswered. A pick opens the file itself (O_NOFOLLOW, regular
+  files only, created for Save) and files a grant {uid, name, fd,
+  write}; the answer is Chosen{paths: ["/run/drv-doc/<id>/<name>"]}.
+  fd `fuse`: the documents mount, served in a thread (fuser): the
+  kernel reports the caller's UID on every request, a grant's directory
+  and file exist only for that UID (a stranger gets ENOENT), reads and
+  writes go through the held fd, writes and truncation only on a Save
+  grant. Apps see the mount because `/run/drv-doc` is on their expose
+  list; the forker binds it from the mount the supervisor made before
+  the set started, so a set restart drops every grant with the apps.
 
 drv-menu (uid drv-menu; one process, no children, sealed after the first
           render like the locker)
@@ -273,11 +300,12 @@ an entry (a daemon, a probe) out of the app menu.
   an app name, and what starts with the desktop is `autostart` in the
   manifest, not the compositor's config.
 - Desktop services (notifications and portals) go through `drv-bridge
-  serve`, its own UID on the services' bus (a `dbus-daemon` as user
-  `drv-bus`, socket in `/run/drv-session`, which apps never see). The bus
-  config lets each listed user own only its names (`sessionBusNames`)
-  and lets only `screencast`-granted users send to the compositor's
-  names. The bridge socket `/run/drv-bridge/bridge.sock` is mode 0666;
+  serve`, a member of the set on the services' bus (a `dbus-daemon` as
+  user `drv-bus`, socket in `/run/drv-session`, which apps never see).
+  The bus config lets each listed user own only its names
+  (`sessionBusNames`) and lets only `screencast`-granted users send to
+  the compositor's names. The bridge socket `/run/drv-bridge/bridge.sock`
+  is bound by the supervisor (fd `listener`), mode 0666;
   every connection is keyed on `SO_PEERCRED` plus drv-appd's
   answer for that UID, unknown UIDs are dropped, and what the human sees
   is the manifest name. An app with `bus = true` runs under
@@ -285,7 +313,17 @@ an entry (a daemon, a probe) out of the app menu.
   own UID with the shim claiming `org.freedesktop.Notifications` and
   `org.freedesktop.portal.Desktop` and forwarding to the server. The
   shim is compatibility, not a boundary.
-- Portals: per app the server holds its own connection on the services'
+- The file chooser is ours: `org.freedesktop.portal.FileChooser`
+  (`OpenFile`, `SaveFile`, `version` 4) on the app's bus is answered by
+  the bridge itself, which asks drv-portal down its supervisor link
+  (`drv_portal::protocol`, postcard over SEQPACKET) with the manifest
+  name and UID, hands the handle back at once and emits the `Response`
+  signal (`uris` as `file:///run/drv-doc/<id>/<name>`) when the person
+  has picked; `Request.Close` cancels at the portal. `directory` and
+  `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
+  this goes through xdg-desktop-portal, and no app ever sees the
+  person's tree, only the file it was given, as its own UID.
+- Other portals: per app the server holds its own connection on the services'
   bus, registers the app with the portal `Registry` as `drv.app.<name>`,
   forwards `org.freedesktop.portal.*` bodies unchanged (fds included), and
   rewrites request and session handle paths so `Response` and `Closed`
@@ -409,19 +447,20 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 
 ## Not yet
 
-- The bridge forwards every `org.freedesktop.portal.*` interface alike;
-  nothing yet narrows which portals an app may use, and the document
-  portal's FUSE view is not exposed into the sandbox.
+- The bridge forwards every other `org.freedesktop.portal.*` interface
+  alike; nothing yet narrows which portals an app may use.
 - The bridge drops notification actions, hints and close signals.
-- Files: no UID owns the person's files yet
+- Files: drv-portal owns the tree and hands out single files; no
+  directory grants, no multiple selection, no filters, no overwrite
+  confirmation, no file manager, no sync or backup
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
 - Network isolation is only on/off. Per-app firewalling is designed
   separately.
 - Nothing kills a still-running app when its manifest goes away; nothing
   pushes policy changes to the compositor; sub-UID ranges; exit
   reporting and cgroup kill from drv-forker.
-- Portals become supervisor services, like the menu, once they need
-  authority (launch with data, intents over the bus).
+- The remaining portals (screencast first) move into drv-portal, and
+  xdg-desktop-portal with its GNOME backend go.
 - Seccomp on drv-seatd (libseat, udev's netlink and the VT ioctls are
   not listed yet) and the compositor core.
 - Icons in the menu: reading image files an app controls needs a

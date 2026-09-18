@@ -54,13 +54,28 @@ to and what any discussion means.
   connection (fd `wayland`, inserted by the compositor as a layer-shell
   client). Draws the list itself with `drv-ui`, launches the pick by
   name. One process, sealed like the locker.
+- **portal** (`drv-portal`, uid drv-portal, a supervisor service). The
+  file chooser and the documents mount. Owns the person's files
+  (`--files`, `/var/lib/drv-files`), shows them on its own Wayland
+  connection (fd `wayland`) when the bridge asks (fd `bridge`), and
+  serves each pick to the asking UID alone at `/run/drv-doc/<id>/<name>`
+  over FUSE (fd `fuse`, mounted by the supervisor). Not
+  xdg-desktop-portal, which still serves the other portals for now.
+- **bridge** (`drv-bridge serve`, uid drv-bridge, a supervisor service).
+  The apps' desktop services, keyed on the peer UID: notifications and
+  the other portals to the services' bus, the file chooser to the
+  portal. `drv-bridge app` is the shim on an app's private bus.
+- **documents mount** (`/run/drv-doc`). Where an app finds the files it
+  was given. A grant is one file for one UID; the listing shows a UID
+  only its own.
 - **drv-ui** (crate). What the set's windows share: connection on a
   supervisor fd, toolkit boilerplate, Pango text in shm buffers, the
-  seccomp seal after the fonts are warm. The locker and the menu are on
-  it; portal dialogs will be.
-- **the set**: the eight above. If any member dies the supervisor kills
-  the apps, stops the rest and starts everything again with fresh
-  sockets. There are no smaller groups.
+  seccomp seal after the fonts are warm. The locker, the menu and the
+  portal are on it.
+- **the set**: the ten above (seatd, authd, compositor-gpu, compositor,
+  locker, menu, portal, forker, appd, bridge). If any member dies the
+  supervisor kills the apps, stops the rest and starts everything again
+  with fresh sockets. There are no smaller groups.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
 - **launcher**: whoever holds a launch channel, a supervisor socketpair
