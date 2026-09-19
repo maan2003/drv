@@ -287,7 +287,7 @@ an entry (a daemon, a probe) out of the app menu.
   the app's own runtime directory plus the `--expose` entries (the
   appd socket directory, the apps' Wayland socket directory, the
   bridge socket directory, `opengl-driver`, `current-system`,
-  `/run/pipewire`, `/run/pulse`). No system D-Bus, no services' bus, no
+  `/run/drv-audio` and `/run/drv-pulse` for audio apps). No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.
@@ -297,9 +297,24 @@ an entry (a daemon, a probe) out of the app menu.
   set: when any member dies the supervisor kills the apps through
   `apps/cgroup.kill` and restarts everything, and autostart brings the
   apps back.
-- Audio is a group: PipeWire runs system-wide with sockets mode 0660
-  group `pipewire`; an app whose manifest lists `groups = ["pipewire"]`
-  can connect, anyone else gets `EACCES`.
+- Audio is a manifest flag, `audio = true`: PipeWire runs system-wide,
+  and such an app gets the apps' socket (`/run/drv-audio/apps`; the
+  daemon tags every connection through it `pipewire.access = "drv-app"`
+  with the uid it saw) and its own `pipewire-pulse` on it
+  (`/run/drv-pulse/<app>`), nothing else. What a tagged client sees
+  and may do is `nix/drv-access.lua` in WirePlumber: play and list
+  devices freely, nothing of another app's, capture only under a
+  grant. A capture stream (audio, sink monitors included, is "mic";
+  video is "camera") with no grant waits unlinked while the script asks
+  the bridge through the bridge's `drv-access` metadata
+  (`request:<uid>:<kind>`), the bridge asks drv-portal, drv-portal asks
+  the person; yes writes `grant:<uid>` and the stream links, no
+  destroys it. A grant lasts until the app's last connection closes or
+  the person revokes everything with Mod+Shift+Esc, which destroys the
+  streams and disconnects camera remotes. Cameras also come the portal
+  way: `org.freedesktop.portal.Camera.AccessCamera` asks the same
+  question, and `OpenPipeWireRemote` hands out a connection that sees
+  every camera node (browsers use that, not V4L2).
 - The compositor listens on `$DRV_APPS_SOCKET` (`/run/drv-wayland/wayland`,
   mode 0666) besides its own runtime directory. Anyone local may connect;
   the policy decides what they get, as with Android's binder services.
@@ -350,7 +365,13 @@ an entry (a daemon, a probe) out of the app menu.
   makes its own stream node through (everything else none, as
   xdg-desktop-portal does), a round trip makes sure the daemon has
   them, then the fd is stolen from the core and sent as the reply. The permissions live in the daemon, so they hold
-  whatever the app does with the fd. WirePlumber would hand every new
+  whatever the app does with the fd. Linking is WirePlumber's, not the
+  app's, and would join a stream from the remote to a default source
+  the remote cannot see, so before replying the bridge marks the remote
+  in its `drv-access` metadata under the client id (`drv.remote`:
+  `node:<id>` for a cast, `camera` for cameras), and the script lets a
+  marked client's streams reach that only, destroying any other. The
+  mark goes when the client does. WirePlumber would hand every new
   client everything a moment later, so a WirePlumber rule keyed on the
   bridge's uid (set by PipeWire from the socket, not forgeable) gives
   the bridge's clients no default permissions and no permission
@@ -512,9 +533,10 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Screen sharing: more than one source per session, consents that
   outlive the app's run (`persist_mode` 2).
 - Portals apps may still want: OpenURI, screenshot.
-- Microphone and camera are a group (`pipewire`) today, not a grant: an
-  app with the group can capture at any time. They become prompted
-  grants like a cast.
+- Capture is gated on the apps' socket only; a client on PipeWire's
+  own sockets (a system service) is not. A revoked camera reaches the
+  app as a connection error and no more: Chromium keeps the camera it
+  enumerated until its capture service restarts.
 - The GPU process dying restarts the set, apps included. Deliberate: a
   core that outlives its GPU process is not worth the buffer
   bookkeeping, and Wayland clients do not survive a compositor restart

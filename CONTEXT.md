@@ -66,9 +66,11 @@ to and what any discussion means.
 - **bridge** (`drv-bridge serve`, uid drv-bridge, a supervisor service).
   The apps' desktop services, keyed on the peer UID: notifications to
   the services' bus, the file chooser and the screencast to the portal,
-  settings answered in place, the PipeWire remote for a cast (a
-  connection restricted to the one node before the app gets it), and
-  nothing else (no xdg-desktop-portal).
+  settings answered in place, the PipeWire remotes for a cast and for
+  cameras (connections restricted to those nodes before the app gets
+  them), the microphone and camera questions WirePlumber's gate raises
+  through the bridge's `drv-access` metadata, and nothing else (no
+  xdg-desktop-portal).
   `drv-bridge app` is the shim on an app's private bus.
 - **notifier** (`services.drv.notifier`, mako by default; uid drv-notifier, a
   supervisor service). The notification daemon: a layer-shell client on fd
