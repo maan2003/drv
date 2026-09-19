@@ -56,7 +56,8 @@ to and what any discussion means.
   name. One process, sealed like the locker.
 - **portal** (`drv-portal`, uid drv-portal, a supervisor service). The
   person's side of the portals: the file chooser with its documents
-  mount, and screen sharing consent. Owns the person's files
+  mount, screen sharing consent, and the microphone and camera
+  consents (it tells the compositor who holds them, for the indicator). Owns the person's files
   (`--files`, `/var/lib/drv-files`), shows them on its own Wayland
   connection (fd `wayland`) when the bridge asks (fd `bridge`), and
   serves each pick to the asking UID alone at `/run/drv-doc/<id>/<name>`
@@ -69,8 +70,9 @@ to and what any discussion means.
   settings answered in place, the PipeWire remotes for a cast and for
   cameras (connections restricted to those nodes before the app gets
   them), the microphone and camera questions WirePlumber's gate raises
-  through the bridge's `drv-access` metadata, and nothing else (no
-  xdg-desktop-portal).
+  through the bridge's `drv-access` metadata, OpenURI (drv-appd starts
+  the scheme's manifest handler over the bridge's launch channel, fd
+  `appd`), and nothing else (no xdg-desktop-portal).
   `drv-bridge app` is the shim on an app's private bus.
 - **notifier** (`services.drv.notifier`, mako by default; uid drv-notifier, a
   supervisor service). The notification daemon: a layer-shell client on fd

@@ -282,8 +282,9 @@ an entry (a daemon, a probe) out of the app menu.
 - Sandbox (`drv_os::sandbox`, applied by drv-forker between fork and
   exec with CAP_SYS_ADMIN; the supervisor applies the same one to every
   member of the set, with its own expose list): a private mount
-  namespace; fresh tmpfs on `/tmp` and `/dev/shm`; `/proc` with
-  `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
+  namespace; a fresh tmpfs on `/dev/shm` and, for an app, its own
+  `/tmp` bound from `/run/drv-apps/tmp/<uid>` (kept between its launches;
+  a set member gets a fresh tmpfs); `/proc` with `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
   the app's own runtime directory plus the `--expose` entries (the
   appd socket directory, the apps' Wayland socket directory, the
   bridge socket directory, `opengl-driver`, `current-system`,
@@ -382,7 +383,10 @@ an entry (a daemon, a probe) out of the app menu.
   it (`stop-all-casts`, the output going away) comes back as `Stopped`,
   then `Closed{id}`, then the `Session.Closed` signal. While any cast
   is live the compositor draws the "Screen is being shared" indicator
-  above everything (never into the cast).
+  above everything (never into the cast). The same indicator names the
+  apps holding the microphone and the camera: drv-portal sends
+  `Devices{mic, camera}` down its cast line whenever a grant starts or
+  ends, and the compositor is the only one who can draw there.
 - The file chooser is ours: `org.freedesktop.portal.FileChooser`
   (`OpenFile`, `SaveFile`, `version` 4) on the app's bus is answered by
   the bridge itself, which asks drv-portal down its supervisor link
@@ -393,6 +397,19 @@ an entry (a daemon, a probe) out of the app menu.
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
   person's tree, only the file it was given, as its own UID.
+- `org.freedesktop.portal.OpenURI` (`OpenURI` only, `version` 1) the
+  bridge answers by asking drv-appd, over a launch channel of its own
+  (`Request::Open{uri}`), to start the app whose manifest `opens` the
+  scheme with the URI as its last argument: the one argument that ever
+  comes from outside the manifest, and only a well-formed absolute URI
+  (`rpc::uri_scheme`: ASCII printable, RFC 3986 scheme, at most 8 KiB)
+  for a scheme some app declares; one handler per scheme. No prompt:
+  the handler is what the manifest says it is. `writable`, `ask` and
+  the parent window are ignored; `OpenFile` and `OpenDirectory` are
+  not offered. The forker binds an app's `/tmp` from
+  `/run/drv-apps/tmp/<uid>` (kept between launches, gone with the boot) so a second
+  launch reaches the first one's single-instance socket instead of
+  fighting it over the profile.
 - No other portal. `org.freedesktop.portal.Settings` (version 2:
   `Read`, `ReadOne`, `ReadAll`) the bridge answers itself with the one
   look every app gets (`org.freedesktop.appearance`: `color-scheme` 1,
@@ -533,7 +550,8 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
   reporting and cgroup kill from drv-forker.
 - Screen sharing: more than one source per session, consents that
   outlive the app's run (`persist_mode` 2).
-- Portals apps may still want: OpenURI, screenshot.
+- Portals apps may still want: screenshot. OpenURI has no consent and
+  no rate limit: an app may start its handler as often as it likes.
 - Capture is gated on the apps' socket only; a client on PipeWire's
   own sockets (a system service) is not. A revoked camera reaches the
   app as a connection error and no more: Chromium keeps the camera it
