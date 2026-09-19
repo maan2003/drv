@@ -88,8 +88,9 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
                  (the two launch channels)
     bridge       listener (/run/drv-bridge/bridge.sock, bound by the
                  supervisor, 0666), portal
-  seat, auth, the forker channel, the bridge's portal line and the
-  portal's cast line are SEQPACKET, the rest streams.
+  seat, auth, the forker channel, the bridge listener, the bridge's
+  portal line and the portal's cast line are SEQPACKET, the rest
+  streams.
   Nothing is linked at runtime: the ten are one set, and when any
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
@@ -335,8 +336,16 @@ an entry (a daemon, a probe) out of the app menu.
   is the manifest name. An app with `bus = true` runs under
   `dbus-run-session -- drv-bridge app -- <exec>`: a private bus in its
   own UID with the shim claiming `org.freedesktop.Notifications` and
-  `org.freedesktop.portal.Desktop` and forwarding to the server. The
-  shim is compatibility, not a boundary.
+  `org.freedesktop.portal.Desktop`. The shim terminates all of the
+  app's D-Bus (handles, sessions, `Response` and `Closed` signals, the
+  in-place answers) and speaks `drv_bridge::wire` to the server:
+  postcard over SEQPACKET, a fixed set of small variants (`Choose`,
+  `Cast`, `CastRemote`, `CastClose`, `Camera`, `CameraRemote`,
+  `CameraPresent`, `Open`, `Notify`, `Cancel`), texts clipped at 2 KiB,
+  file descriptors only from server to shim. The server never parses
+  D-Bus from an app. The shim is compatibility, not a boundary: it runs
+  as the app and can lie, and everything it says is checked as if the
+  app said it.
 - Screen sharing is ours: `org.freedesktop.portal.ScreenCast` (version
   4, source types monitor and window, cursor modes
   hidden/embedded/metadata) and

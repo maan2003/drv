@@ -73,7 +73,10 @@ to and what any discussion means.
   through the bridge's `drv-access` metadata, OpenURI (drv-appd starts
   the scheme's manifest handler over the bridge's launch channel, fd
   `appd`), and nothing else (no xdg-desktop-portal).
-  `drv-bridge app` is the shim on an app's private bus.
+  `drv-bridge app` is the shim on an app's private bus: it terminates
+  all of the app's D-Bus in the app's UID and speaks `drv_bridge::wire`
+  (postcard over SEQPACKET) to the server, which never reads D-Bus from
+  an app.
 - **notifier** (`services.drv.notifier`, mako by default; uid drv-notifier, a
   supervisor service). The notification daemon: a layer-shell client on fd
   `wayland` (`WAYLAND_SOCKET=3`), the one owner of
