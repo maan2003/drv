@@ -70,6 +70,11 @@ to and what any discussion means.
   connection restricted to the one node before the app gets it), and
   nothing else (no xdg-desktop-portal).
   `drv-bridge app` is the shim on an app's private bus.
+- **notifier** (`services.drv.notifier`, mako by default; uid drv-notifier, a
+  supervisor service). The notification daemon: a layer-shell client on fd
+  `wayland` (`WAYLAND_SOCKET=3`), the one owner of
+  `org.freedesktop.Notifications` on the services' bus. It sees every
+  notification, so it is a member of the set, never an app.
 - **documents mount** (`/run/drv-doc`). Where an app finds the files it
   was given. A grant is one file for one UID; the listing shows a UID
   only its own.

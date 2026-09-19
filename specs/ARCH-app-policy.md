@@ -241,10 +241,9 @@ uid = 902
 grants = ["lookup"]
 
 [[app]]
-name = "mako"
-uid = 100011
-exec = ["/nix/store/.../mako"]
-globals = ["layer-shell"]
+name = "flower"
+uid = 100003
+exec = ["/nix/store/.../weston-flower"]
 autostart = true
 ```
 
@@ -310,8 +309,10 @@ an entry (a daemon, a probe) out of the app menu.
 - Desktop services (notifications and portals) go through `drv-bridge
   serve`, a member of the set on the services' bus (a `dbus-daemon` as
   user `drv-bus`, socket in `/run/drv-session`, which apps never see).
-  The bus config lets each listed user own only its names
-  (`sessionBusNames`). The bridge socket `/run/drv-bridge/bridge.sock`
+  The bus config lets the notification daemon (`services.drv.notifier`,
+  mako by default: a member of the set as uid drv-notifier, its Wayland
+  connection the supervisor's fd 3) own `org.freedesktop.Notifications`
+  and nobody else own anything; apps are never on it. The bridge socket `/run/drv-bridge/bridge.sock`
   is bound by the supervisor (fd `listener`), mode 0666;
   every connection is keyed on `SO_PEERCRED` plus drv-appd's
   answer for that UID, unknown UIDs are dropped, and what the human sees
@@ -426,7 +427,9 @@ Super+Alt+L) ends it; a compositor restart starts locked. The lease is a
 `CLOCK_BOOTTIME` deadline and `Niri::check_lease` is the one place that
 turns "expired" into "locked": it runs before every frame, before every
 input event and once a second, so nothing is drawn or delivered on a
-stale lease, and suspend needs no hook (the clock runs while asleep). The
+stale lease, and suspend needs no hook (the clock runs while asleep);
+waking locks at once regardless: the first `check_lease` after resume
+sees `CLOCK_BOOTTIME` jump ahead of `CLOCK_MONOTONIC`. The
 kernel's own replay of the last framebuffer on resume is switched off by
 `nix/linux-drm-blank-on-resume.patch` (`drm_kms_helper.blank_on_resume=1`,
 set by the module): the DRM resume helper commits the saved state with
@@ -509,6 +512,13 @@ only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
 - Screen sharing: more than one source per session, consents that
   outlive the app's run (`persist_mode` 2).
 - Portals apps may still want: OpenURI, screenshot.
+- Microphone and camera are a group (`pipewire`) today, not a grant: an
+  app with the group can capture at any time. They become prompted
+  grants like a cast.
+- The GPU process dying restarts the set, apps included. Deliberate: a
+  core that outlives its GPU process is not worth the buffer
+  bookkeeping, and Wayland clients do not survive a compositor restart
+  anyway.
 - `OpenPipeWireRemote` timed out once in 27 tries, right after a cast
   was closed and restarted, and never under a stress loop since; the
   bridge names the round trip and tries once more before failing.

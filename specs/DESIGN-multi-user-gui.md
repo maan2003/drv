@@ -158,7 +158,8 @@ separately.
 
 Suspend needs no handling of its own: the lease is `CLOCK_BOOTTIME`, which
 keeps running while asleep, so a long sleep expires it before the first frame
-after wake. What the kernel does on its own is replay the last framebuffer on
+after wake. A short one locks too: the compositor notices `CLOCK_BOOTTIME`
+jumping ahead of `CLOCK_MONOTONIC` on the first check after resume. What the kernel does on its own is replay the last framebuffer on
 resume before userspace runs; a kernel patch (`drm_kms_helper.blank_on_resume`,
 `nix/linux-drm-blank-on-resume.patch` in niri) makes the DRM resume helper
 commit that saved state with every plane detached, so the screen comes back
