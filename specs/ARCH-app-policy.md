@@ -487,8 +487,10 @@ kernel's own replay of the last framebuffer on resume is switched off by
 set by the module): the DRM resume helper commits the saved state with
 every plane detached, so wake shows black until the compositor's first
 commit. `nix/resume-vm.nix` plus `nix/resume-test.sh` check that on QXL.
-While locked, casts and screenshots render
-only the backdrop. Enrol with `drv-authd set-pin`; the dev VM enrols
+Locking (idle, `lock-session`, waking) also
+stops every cast and revokes every microphone and camera grant, as
+Super+Shift+Escape does: the person is gone, nothing streams on their
+behalf. Enrol with `drv-authd set-pin`; the dev VM enrols
 `1234` in the unit's pre-start.
 
 ## Invariants
