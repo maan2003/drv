@@ -25,7 +25,9 @@ Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork); `nix/smoke.sh` drives a fresh boot through unlock, the
 isolation probe, notification, chooser, cast, mic, OpenURI and the
-revoke and fails on missing evidence. The NixOS module `nix/module.nix` (`services.drv`, flake
+revoke and fails on missing evidence; `nix/drill.sh` then kills each
+member and checks the set restarts, the apps die with it and the
+desktop comes back. The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
 `appd.toml`, the session bus policy and the units.
 Implements the "identity and policy" part of
