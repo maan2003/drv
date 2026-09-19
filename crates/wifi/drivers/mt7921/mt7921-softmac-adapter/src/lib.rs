@@ -658,6 +658,8 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
         self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
         if let Err(error) = self.issue(PassiveMcuCommand::StartScan {
             scan_sequence: self.scan_sequence,
+            min_channel_time_ns: 0,
+            max_channel_time_ns: 0,
             channels: vec![channel],
         }) {
             eprintln!("passive_scan_start_rejected reason=start_scan_command");
@@ -768,6 +770,8 @@ impl<M: SourceExactPassiveMechanics> Mt7921PassiveTransport for SourceExactPassi
                     self.scan_sequence = (self.scan_sequence + 1) & 0x7f;
                     self.issue(PassiveMcuCommand::StartScan {
                         scan_sequence: self.scan_sequence,
+                        min_channel_time_ns: 0,
+                        max_channel_time_ns: 0,
                         channels: vec![channel],
                     })?;
                     active.scan_sequence = self.scan_sequence;

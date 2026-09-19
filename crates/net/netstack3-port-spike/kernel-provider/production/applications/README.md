@@ -53,6 +53,29 @@ recovery. Nix fetch/substitution only in isolated state/store, never Nix builds.
   localhost, using fresh fixture-only keys and pinned host-key verification.
   Unsupported IP_TOS/VRF queries produce warnings but do not prevent this gate.
 
+### OpenSSH listener revocation
+
+The production image must stage `packages.<system>.openssh-revocation` instead
+of the stock OpenSSH package. The package pins the adaptation to OpenSSH 10.4p1
+and applies `openssh-listener-revocation.patch` at the application packaging
+boundary. When poll reports `POLLHUP` or `POLLNVAL`, sshd closes only that
+terminal listener. It retains healthy listeners and continues to treat
+`POLLERR` and an `ENETDOWN` from accept as potentially transient. If no listener
+remains, sshd exits instead of repeatedly logging accept failures.
+
+Build the deployable closure and deterministic application regression with:
+
+```sh
+nix build .#openssh-revocation -o result-openssh-revocation
+nix build .#checks.x86_64-linux.openssh-listener-revocation
+```
+
+The regression injects the production frontend's terminal poll contract into
+the actual patched sshd, verifies a second listener completes an SSH transport
+handshake, and verifies a sole terminal listener logs once and exits. A separate
+case injects `POLLERR` plus one transient `ENETDOWN` from accept and then
+completes a handshake on the retained listener.
+
 For WebSocket tests, install the locked `ws` fixture dependency with
 `npm ci --ignore-scripts --no-audit --no-fund` in a disposable staging directory
 and copy its `node_modules` beside `http-fixture.js` in the guest.

@@ -17,11 +17,14 @@ unsafe extern "C" {
     fn ns3_current_net() -> *mut c_void;
     fn ns3_put_net(p: *mut c_void);
     fn ns3_net_state(p: *mut c_void) -> *mut c_void;
-    fn ns3_new_accepted(p: *mut c_void, family: i32) -> *mut c_void;
+    fn ns3_new_accepted(p: *mut c_void, family: i32, generation: u64) -> *mut c_void;
     fn ns3_accepted_state(p: *mut c_void) -> *mut c_void;
     fn ns3_accept_transfer(p: *mut c_void, new: *mut c_void);
     fn ns3_accept_drop(p: *mut c_void);
     fn ns3_sigpipe();
+    fn ns3_nl_deliver(sk: *mut c_void, bytes: *const u8, len: usize, group: u32) -> i32;
+    fn ns3_nl_writable(sk: *mut c_void) -> bool;
+    fn ns3_nl_loss(sk: *mut c_void);
 }
 pub(crate) struct NativeSock(NonNull<c_void>);
 // SAFETY: holds a native sock reference; helpers use native atomic/locked
@@ -46,8 +49,16 @@ impl NativeSock {
     pub(crate) fn shutdown(&self, how: i32) {
         unsafe { ns3_set_shutdown(self.0.as_ptr(), how) }
     }
-    pub(crate) fn accepted(&self, family: i32) -> Result<Accepted> {
-        let p = from_err_ptr(unsafe { ns3_new_accepted(self.0.as_ptr(), family) })?;
+    pub(crate) fn netlink_deliver(&self, bytes: &[u8], group: u32) -> Result {
+        let result = unsafe { ns3_nl_deliver(self.0.as_ptr(), bytes.as_ptr(), bytes.len(), group) };
+        if result < 0 { Err(kernel::error::Error::from_errno(result)) } else { Ok(()) }
+    }
+    pub(crate) fn netlink_loss(&self) { unsafe { ns3_nl_loss(self.0.as_ptr()) }; }
+    pub(crate) fn netlink_writable(&self) -> u32 {
+        if unsafe { ns3_nl_writable(self.0.as_ptr()) } { bindings::POLLOUT } else { 0 }
+    }
+    pub(crate) fn accepted(&self, family: i32, generation: u64) -> Result<Accepted> {
+        let p = from_err_ptr(unsafe { ns3_new_accepted(self.0.as_ptr(), family, generation) })?;
         Ok(Accepted(unsafe { NonNull::new_unchecked(p) }))
     }
 }

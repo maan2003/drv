@@ -2550,6 +2550,7 @@ mod tests {
                 self.0.lock().unwrap().push(bytes);
             }
             fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+            fn notify_connection_loss(&mut self, _: [u8; 6]) {}
             fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
         }
 
@@ -2585,6 +2586,7 @@ mod tests {
                 self.0.lock().unwrap().push(bytes);
             }
             fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+            fn notify_connection_loss(&mut self, _: [u8; 6]) {}
             fn notify_scan_complete(&mut self, _: zx::Status, _: u64) {}
         }
 
@@ -3401,6 +3403,7 @@ mod tests {
             impl wlan_softmac_class_support::WlanSoftmacUpcalls for Upcalls {
                 fn recv(&mut self, _: Vec<u8>, _: fidl_softmac::WlanRxInfo) {}
                 fn report_tx_result(&mut self, _: fidl_softmac::WlanTxResult) {}
+                fn notify_connection_loss(&mut self, _: [u8; 6]) {}
                 fn notify_scan_complete(&mut self, status: zx::Status, scan_id: u64) {
                     self.0.lock().unwrap().push((status, scan_id));
                 }

@@ -48,6 +48,7 @@ cp "$here/upstream-cargo/LICENSE.fuchsia" "$refroot/LICENSE"
 
 patch_dir="$here/upstream-cargo/patches"
 host_patches=(
+  "$patch_dir/tcp-passive-storage-admission-host.patch"
   "$patch_dir/dhcp-client-core-host.patch"
   "$patch_dir/trust-dns-workspace.patch"
   "$patch_dir/wlan-common-host.patch"

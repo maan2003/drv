@@ -60,7 +60,15 @@ impl DhcpInstant for NativeInstant {
 struct Wakes {
     packet: Option<Waker>,
     udp: Option<Waker>,
-    timers: Vec<(NativeInstant, Waker)>,
+    timers: std::collections::BTreeMap<u64, (NativeInstant, Waker)>,
+    next_timer: u64,
+}
+struct ClockRegistration {
+    id: u64,
+    wakes: Rc<RefCell<Wakes>>,
+}
+impl Drop for ClockRegistration {
+    fn drop(&mut self) { self.wakes.borrow_mut().timers.remove(&self.id); }
 }
 #[derive(Clone)]
 struct NativeClock {
@@ -70,6 +78,12 @@ struct NativeClock {
 impl Clock for NativeClock {
     type Instant = NativeInstant;
     async fn wait_until(&self, at: Self::Instant) {
+        let id = {
+            let mut wakes = self.wakes.borrow_mut();
+            wakes.next_timer = wakes.next_timer.checked_add(1).expect("DHCP timer ID exhausted");
+            wakes.next_timer
+        };
+        let _registration = ClockRegistration { id, wakes: self.wakes.clone() };
         poll_fn(|cx| {
             if self.now.get() >= at {
                 Poll::Ready(())
@@ -77,7 +91,7 @@ impl Clock for NativeClock {
                 self.wakes
                     .borrow_mut()
                     .timers
-                    .push((at, cx.waker().clone()));
+                    .insert(id, (at, cx.waker().clone()));
                 Poll::Pending
             }
         })
@@ -214,6 +228,7 @@ impl<R: Rng> RngProvider for NativeRng<R> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DhcpStatus {
+    Offline,
     Acquiring,
     Bound,
     Failed,
@@ -255,6 +270,7 @@ impl DhcpService {
         mac: [u8; 6],
         dns_capacity: NonZeroUsize,
     ) -> Self {
+        let ethernet = runtime.has_ethernet();
         let rt = Rc::new(RefCell::new(runtime));
         let now = Rc::new(Cell::new(NativeInstant::ZERO));
         let wakes = Rc::new(RefCell::new(Wakes::default()));
@@ -289,11 +305,15 @@ impl DhcpService {
         let pool = LocalPool::new();
         let (stop, mut stop_receiver) = mpsc::unbounded();
         let (resume, mut resume_receiver) = mpsc::unbounded();
+        if ethernet {
         pool.spawner()
             .spawn_local(async move {
                 let counters = Counters::default();
                 let mut rng = NativeRng(rng);
                 loop {
+                    // Assignment feedback belongs to the previous DHCP run,
+                    // not a lease acquired after a new link is introduced.
+                    while arx.try_recv().is_ok() {}
                     let mut state = State::default();
                     loop {
                         match state
@@ -331,6 +351,7 @@ impl DhcpService {
                 }
             })
             .expect("spawn DHCP core");
+        }
         let owned_sockets = crate::sockets::Sockets::new(rt.clone());
         Self {
             owned_sockets,
@@ -343,11 +364,13 @@ impl DhcpService {
             address,
             stop,
             resume,
-            dhcp_enabled: true,
-            link_up: true,
-            status: DhcpStatus::Acquiring,
+            dhcp_enabled: ethernet,
+            link_up: ethernet,
+            status: if ethernet { DhcpStatus::Acquiring } else { DhcpStatus::Offline },
         }
     }
+
+    pub fn set_loopback_up(&mut self, up: bool) { self.rt.borrow_mut().set_loopback_up(up); }
 
     pub fn status(&self) -> DhcpStatus {
         self.status
@@ -500,11 +523,9 @@ impl NetworkServiceEndpoint for DhcpService {
         self.now.set(now);
         {
             let mut w = self.wakes.borrow_mut();
-            let mut p = Vec::new();
-            for (d, x) in w.timers.drain(..) {
-                if d <= now { x.wake() } else { p.push((d, x)) }
+            for (id, (d, x)) in std::mem::take(&mut w.timers) {
+                if d <= now { x.wake() } else { w.timers.insert(id, (d, x)); }
             }
-            w.timers = p
         }
         self.rt.borrow_mut().set_now(now);
         let mut work = self.rt.borrow_mut().dispatch_due(budget);
@@ -525,7 +546,7 @@ impl NetworkServiceEndpoint for DhcpService {
             .borrow()
             .timers
             .iter()
-            .map(|(deadline, _)| Duration::from_nanos(deadline.as_nanos()))
+            .map(|(_, (deadline, _))| Duration::from_nanos(deadline.as_nanos()))
             .min();
         let runtime = self.rt.borrow().next_timer_deadline();
         [dhcp, runtime, self.dns.next_timer_deadline()]
@@ -540,19 +561,27 @@ impl NetworkServiceEndpoint for DhcpService {
             EthernetDeviceEvent::LinkStateChanged(up) if up == self.link_up => {}
             EthernetDeviceEvent::LinkStateChanged(false) => {
                 self.link_up = false;
+                if self.dhcp_enabled {
+                    let _ = self.stop.unbounded_send(());
+                    self.pool.run_until_stalled();
+                    // No transition from the stopped run may install an old
+                    // lease/DNS configuration after the next link comes up.
+                    while self.effects.try_recv().is_ok() {}
+                    let mut wakes = self.wakes.borrow_mut();
+                    wakes.packet = None;
+                    wakes.udp = None;
+                }
+                self.rt.borrow_mut().set_link_state(false);
                 self.clear_configuration(if self.dhcp_enabled {
                     DhcpStatus::Acquiring
                 } else {
                     DhcpStatus::Failed
                 });
-                if self.dhcp_enabled {
-                    let _ = self.stop.unbounded_send(());
-                    self.pool.run_until_stalled();
-                }
                 while self.rt.borrow_mut().take_tx().is_some() {}
             }
             EthernetDeviceEvent::LinkStateChanged(true) => {
                 self.link_up = true;
+                self.rt.borrow_mut().set_link_state(true);
                 if self.dhcp_enabled {
                     self.status = DhcpStatus::Acquiring;
                     let _ = self.resume.unbounded_send(());
@@ -662,6 +691,8 @@ mod tests {
         assert_eq!(service.runtime().ipv4_address(), None);
         assert_eq!(service.runtime().dns_servers(), [None, None]);
         assert!(service.dns.resolver().is_none());
+        assert!(service.wakes.borrow().timers.is_empty(), "stopped DHCP run retains no wake deadline");
+        assert!(!service.runtime().interface_snapshot().ipv4_enabled);
 
         service.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
         service.poll_at(Duration::from_secs(1), 8);
@@ -700,4 +731,18 @@ mod tests {
             "static mode emits no DHCP discovery"
         );
     }
+    #[test]
+    fn dhcp_clock_repoll_and_cancellation_do_not_retain_timers() {
+        let wakes = Rc::new(RefCell::new(Wakes::default()));
+        let clock = NativeClock { now: Rc::new(Cell::new(NativeInstant::ZERO)), wakes: wakes.clone() };
+        let mut wait = Box::pin(clock.wait_until(NativeInstant::from_nanos(1_000_000)));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..64 {
+            assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());
+            assert_eq!(wakes.borrow().timers.len(), 1);
+        }
+        drop(wait);
+        assert!(wakes.borrow().timers.is_empty());
+    }
+
 }

@@ -28,6 +28,23 @@ forks. The Netstack3/Fuchsia revision is unchanged. Host changes are isolated as
 patch files; no algorithm, constant, state transition, cache, or retry policy is
 forked into the native adapter.
 
+## Passive TCP storage admission
+
+`tcp-passive-storage-admission-host.patch` adds a fallible, context-bearing
+buffer admission hook before a validated SYN publishes connection state or
+emits SYN-ACK. An admitted buffer triple stays on the connection until the
+final ACK transfers it into established state. Existing bindings default to
+their existing constructor, now called at SYN admission; the native binding's
+payload storage is lazy and carries one shared-budget lease.
+
+Idle listeners no longer reserve storage for their entire backlog, and accept
+does not charge the same connection again. Buffer-size, socket-count, backlog
+and total storage limits remain unchanged. Passive handshake timeout removes
+the dead accept-queue entry and destroys the connection, matching reset/close
+cleanup, rather than retaining capacity until listener closure. The native
+tests cover IPv4/IPv6 shared pressure, retry, duplicate SYNs, timeout, reset,
+listener closure and retained buffers after handle closure.
+
 ## Overlay extension contract
 
 This directory is the shared Cargo overlay for portable code at the project

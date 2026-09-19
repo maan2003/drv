@@ -525,10 +525,13 @@ version = "0.1.0"
 dependencies = [
  "drv-dns-wire",
  "libc",
+ "linux-self-sandbox",
  "netstack3-port-integration",
  "netstack3-port-spike",
  "rand 0.9.4",
  "rustix",
+ "serde",
+ "serde_json",
  "wifi-supervisor-wire",
 ]
 
@@ -1356,6 +1359,7 @@ dependencies = [
  "packet",
  "packet_formats",
  "rand 0.9.4",
+ "serde",
  "zerocopy",
 ]
 
@@ -2929,6 +2933,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "drv-dns-wire",
  "drv-network-service",
  "fidl-fuchsia-wlan-common",
  "fidl-fuchsia-wlan-ieee80211",

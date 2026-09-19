@@ -2,10 +2,20 @@
 fn main() {
     let result = (|| {
         let mut args: Vec<_> = std::env::args().skip(1).collect();
-        let resolver = args.iter().any(|arg| arg == "--resolver");
-        args.retain(|arg| arg != "--resolver");
-        let bootstrap = args.last().is_some_and(|arg| arg == "--bootstrap");
-        if bootstrap { args.pop(); }
+        let bind_resolver = args.iter().any(|arg| arg == "--resolver");
+        let inherited_resolver = args.iter().any(|arg| arg == "--resolver-fd");
+        let resolver = match (bind_resolver, inherited_resolver) {
+            (true, true) => return Err("resolver sources are mutually exclusive".into()),
+            (true, false) => Some(drv_network_service::ResolverEndpoint::BindDefault),
+            (false, true) => Some(drv_network_service::ResolverEndpoint::Inherited),
+            (false, false) => None,
+        };
+        args.retain(|arg| arg != "--resolver" && arg != "--resolver-fd");
+        let namespace = args.iter().any(|arg| arg == "--namespace");
+        args.retain(|arg| arg != "--namespace");
+        let bootstrap = args.iter().any(|arg| arg == "--bootstrap");
+        let link_control = args.iter().any(|arg| arg == "--link-control");
+        args.retain(|arg| arg != "--bootstrap" && arg != "--link-control");
         let mac = match args.as_slice() {
             [] => None,
             [flag, value] if flag == "--ethernet-mac" => {
@@ -18,9 +28,9 @@ fn main() {
                 }
                 Some(mac)
             }
-            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver] (frame capability on FD4, bootstrap on FD5)".into()),
+            _ => return Err("usage: netstack3-provider [--ethernet-mac XX:XX:XX:XX:XX:XX] [--bootstrap] [--resolver | --resolver-fd] [--link-control] [--namespace] (registration FD3, initial frame FD4, bootstrap FD5, resolver FD7, link control FD8)".into()),
         };
-        drv_network_service::run_provider(mac, bootstrap, resolver)
+        drv_network_service::run_provider(mac, bootstrap, resolver, link_control, namespace)
     })();
     if let Err(error) = result {
         eprintln!("netstack3-provider: {error}");

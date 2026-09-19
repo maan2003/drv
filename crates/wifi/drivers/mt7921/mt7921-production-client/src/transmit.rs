@@ -87,6 +87,19 @@ impl Default for ClientTx {
 }
 
 impl ClientTx {
+    pub(super) fn has_published(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Ring reset does not discard CPU-owned queued frames or PID retirement.
+    pub(super) fn rebase_after_wpdma_reset(&mut self) -> Result<(), zx::Status> {
+        if self.pending.is_some() {
+            return Err(zx::Status::BAD_STATE);
+        }
+        self.producer = 0;
+        Ok(())
+    }
+
     pub fn idle(&self) -> bool {
         self.queue.is_empty() && self.pending.is_none() && self.roc.is_none()
     }
@@ -183,6 +196,7 @@ impl ClientTx {
 
     pub fn tx_status(&mut self, status: Mt7921TxStatus) -> Result<(), zx::Status> {
         if let Some(pending) = self.pending.as_mut()
+            && pending.pid != mt7921_core::MT7921_PACKET_ID_NO_SKB
             && status.pid == pending.pid
             && status.wcid == 1
         {
@@ -246,7 +260,11 @@ impl ClientTx {
             return Err(zx::Status::BAD_STATE);
         }
         let result = (|| {
-            let mut progressed = false;
+            // Revocation discards only CPU-owned admissions. Published
+            // descriptors remain owned until their existing reclamation proof.
+            let queued = self.queue.len();
+            self.queue.retain(|frame| frame.context.check(now).is_ok());
+            let mut progressed = queued != self.queue.len();
             if self.roc.is_none()
                 && let Some(frame) = self.queue.front()
                 && !frame.data
@@ -296,28 +314,53 @@ impl ClientTx {
                         deadline,
                         grant,
                     } => {
-                        roc.context.check(now)?;
-                        if now >= *deadline {
-                            eprintln!(
-                                "mt7921_tx_timeout stage=roc grant_received={} command_reclaimed={}",
-                                grant.is_some(),
-                                commands.ready()
-                            );
-                            return Err(zx::Status::TIMED_OUT);
-                        }
-                        progressed |= commands.drive(
-                            resources,
-                            mechanics,
-                            receive,
-                            start,
-                            now,
-                            Some(&roc.context),
-                        )?;
-                        if commands.ready()
-                            && let Some(until) = *grant
-                        {
-                            roc.phase = RocPhase::Granted { until };
-                            progressed = true;
+                        if roc.context.check(now).is_err() {
+                            // Acquisition contains exactly one command. If it
+                            // is still queued, nothing reached firmware.
+                            if commands.discard_queued() != 0 {
+                                self.roc = None;
+                                progressed = true;
+                            } else {
+                                // Reclaim a published request under cleanup
+                                // ownership, then abort its token even if its
+                                // grant has not arrived. Revocation must not
+                                // authorize another acquisition or DMA TX.
+                                progressed |= commands.drive(
+                                    resources, mechanics, receive, start, now, None,
+                                )?;
+                                if commands.ready() {
+                                    let command = mt7921_core::encode_client_join_roc_abort(
+                                        1, 0, roc.token,
+                                    ).map_err(|_| zx::Status::INTERNAL)?;
+                                    roc.phase = RocPhase::Releasing(FirmwareCommands::new(
+                                        [(command, RadioResponse::None)].into(),
+                                    ));
+                                    progressed = true;
+                                }
+                            }
+                        } else {
+                            if now >= *deadline {
+                                eprintln!(
+                                    "mt7921_tx_timeout stage=roc grant_received={} command_reclaimed={}",
+                                    grant.is_some(),
+                                    commands.ready()
+                                );
+                                return Err(zx::Status::TIMED_OUT);
+                            }
+                            progressed |= commands.drive(
+                                resources,
+                                mechanics,
+                                receive,
+                                start,
+                                now,
+                                Some(&roc.context),
+                            )?;
+                            if commands.ready()
+                                && let Some(until) = *grant
+                            {
+                                roc.phase = RocPhase::Granted { until };
+                                progressed = true;
+                            }
                         }
                     }
                     RocPhase::Granted { until } => {
@@ -352,7 +395,10 @@ impl ClientTx {
             progressed |= self.drive_dma(resources, now, grant_until)?;
             Ok(progressed)
         })();
-        if result.is_err() {
+        if let Err(status) = result {
+            eprintln!("mt7921_tx_fault status={status:?} queued={} front_data={:?} pending={} roc={}",
+                self.queue.len(), self.queue.front().map(|frame| frame.data),
+                self.pending.is_some(), self.roc.is_some());
             self.failed = true;
         }
         result
@@ -384,9 +430,9 @@ impl ClientTx {
         grant_until: Option<Instant>,
     ) -> Result<bool, zx::Status> {
         if let Some(pending) = self.pending.as_mut() {
-            // Revocation never frees a published DMA buffer. Propagate the
-            // fault to containment while retaining this entire pending entry.
-            pending.frame.context.check(now)?;
+            // The device owner may drain an already published frame after
+            // attempt revocation. This grants no new TX authority and never
+            // substitutes for descriptor and token reclamation.
             let didx = resources
                 .bar0
                 .read_u32(0xd430c)
@@ -417,7 +463,9 @@ impl ClientTx {
                 }
                 return Ok(changed);
             }
-            if pending.status.is_none() {
+            // Ordinary data asks for no host TXS. DMA+TXFREE is its complete
+            // reclamation proof, independent of optional acknowledgment telemetry.
+            if pending.pid != mt7921_core::MT7921_PACKET_ID_NO_SKB && pending.status.is_none() {
                 if now < pending.deadline {
                     return Ok(changed);
                 }
@@ -475,20 +523,21 @@ impl ClientTx {
             .device_address(0)
             .map_err(|_| zx::Status::IO)?
             .bits();
-        let Some(pid) = (0..124u16)
-            .map(|offset| (((u16::from(self.next_pid) - 3 + offset) % 124) + 3) as u8)
-            .find(|pid| !self.retired_pids[usize::from(*pid)])
-        else {
-            return Err(zx::Status::NO_RESOURCES);
+        let pid = if frame.data && !frame.control_port {
+            mt7921_core::MT7921_PACKET_ID_NO_SKB
+        } else {
+            (0..124u16)
+                .map(|offset| (((u16::from(self.next_pid) - 3 + offset) % 124) + 3) as u8)
+                .find(|pid| !self.retired_pids[usize::from(*pid)])
+                .ok_or(zx::Status::NO_RESOURCES)?
         };
-        self.next_pid = pid;
         let mut encoded = if frame.data {
             let qos = frame.control_port && frame.bytes[0] == 0x88;
             let txwi = mt7921_core::encode_client_data_txwi(
                 frame.bytes.len(),
                 frame_iova,
                 self.next_token,
-                self.next_pid,
+                pid,
                 frame.control_port,
                 !frame.control_port,
                 qos,
@@ -510,7 +559,7 @@ impl ClientTx {
                 txwi,
                 descriptor,
                 token: self.next_token,
-                pid: self.next_pid,
+                pid,
             }
         } else {
             mt7921_core::encode_client_management_tx(
@@ -518,7 +567,7 @@ impl ClientTx {
                 txwi_iova,
                 frame_iova,
                 self.next_token,
-                self.next_pid,
+                pid,
                 1,
                 frame.rate,
             )
@@ -546,7 +595,7 @@ impl ClientTx {
             slot: self.producer,
             next: ((u32::from(self.producer) + 1) % MT7921_BAND0_TX_RING_COUNT) as u16,
             token: self.next_token,
-            pid: self.next_pid,
+            pid,
             deadline: now + Duration::from_secs(1),
             descriptor_done: false,
             freed: false,
@@ -554,11 +603,9 @@ impl ClientTx {
         };
         self.producer = pending.next;
         self.next_token = (self.next_token + 1) % 8192;
-        self.next_pid = if self.next_pid == 126 {
-            3
-        } else {
-            self.next_pid + 1
-        };
+        if pid != mt7921_core::MT7921_PACKET_ID_NO_SKB {
+            self.next_pid = if pid == 126 { 3 } else { pid + 1 };
+        }
         self.pending = Some(pending);
         let pending = self.pending.as_ref().unwrap();
         resources
@@ -996,6 +1043,40 @@ mod tests {
     }
 
     #[test]
+    fn data_reclaims_on_dma_and_token_without_requesting_or_waiting_for_txs() {
+        let (device, _, model) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
+        let mut data = vec![0; 40];
+        data[0..2].copy_from_slice(&[0x08, 0x41]);
+        data[4..10].copy_from_slice(&[2; 6]);
+        data[24..32].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0]);
+        let mut tx = ClientTx::default();
+        tx.enqueue(context, &data, 12, channel()).unwrap();
+        assert!(tx.drive_dma(&mut resources, now, None).unwrap());
+        assert_eq!(tx.pending.as_ref().unwrap().pid, mt7921_core::MT7921_PACKET_ID_NO_SKB);
+        tx.tx_status(Mt7921TxStatus { wcid: 1, pid: 1, acked: true }).unwrap();
+        assert!(tx.pending.as_ref().unwrap().status.is_none());
+        revoke(); // Attempt cancellation cannot release published DMA early.
+        tx.tx_free(Mt7921TxFree {
+            wcid: Some(1), token: 0, dropped: false, attempts: 1,
+            status: 0, pair_word: None, info_word: 0,
+        }).unwrap();
+        assert!(!tx.drive_dma(&mut resources, now, None).unwrap());
+        assert!(tx.pending.is_some()); // TXFREE alone never releases DMA.
+        mark_done(&mut resources.dma.management_tx_ring, &model, 0);
+        resources.bar0.write_u32(0xd430c, 1).unwrap();
+        assert!(tx.drive_dma(&mut resources, now, None).unwrap());
+        assert!(tx.idle());
+        assert_eq!(tx.next_pid, 3);
+        assert!(!tx.retired_pids.iter().any(|retired| *retired));
+    }
+
+    #[test]
     fn missing_status_expires_only_after_dma_return_and_retires_pid() {
         let (device, _, model) =
             DeterministicBackend::recording_mt7921_device_with_model(Default::default());
@@ -1072,7 +1153,7 @@ mod tests {
             revocation();
             assert_eq!(
                 tx.drive_dma(&mut resources, now, Some(now + Duration::from_secs(1))),
-                Err(zx::Status::CANCELED)
+                if published { Ok(false) } else { Err(zx::Status::CANCELED) }
             );
             assert_eq!(tx.pending.is_some(), published);
             assert_eq!(tx.queue.len(), usize::from(!published));
@@ -1091,9 +1172,92 @@ mod tests {
             );
             assert_eq!(
                 tx.drive_dma(&mut resources, now, None),
-                Err(zx::Status::BAD_STATE)
+                if published { Ok(false) } else { Err(zx::Status::BAD_STATE) }
             );
         }
+    }
+
+    #[test]
+    fn revoked_roc_acquisition_reclaims_before_abort_without_transmitting() {
+        for published in [false, true] {
+            let (device, log, model) =
+                DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+            let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+            resources.interrupt = Some(resources.device.open_interrupt(0).unwrap());
+            let now = Instant::now();
+            let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+                now + Duration::from_secs(10),
+            );
+            let mut tx = ClientTx::default();
+            tx.enqueue(context.clone(), &frame(), 12, channel()).unwrap();
+            let command = mt7921_core::encode_client_join_roc_acquire(
+                1, 0, 1,
+                mt7921_core::ClientPhysicalChannel {
+                    band: 1, primary: 149, center: 149, center2: 0, bandwidth: 0,
+                },
+                1000,
+            ).unwrap();
+            tx.roc = Some(Roc {
+                token: 1, channel: channel(), context,
+                phase: RocPhase::Acquiring {
+                    commands: FirmwareCommands::new([(command, RadioResponse::None)].into()),
+                    deadline: now + Duration::from_secs(1), grant: None,
+                },
+            });
+            let mut mechanics = mt7921_core::LoaderMechanics::default();
+            let mut receive = crate::receive::RxRouting::default();
+            if published {
+                tx.drive(&mut resources, &mut mechanics, &mut receive, now, now).unwrap();
+            }
+            revoke();
+            tx.drive(&mut resources, &mut mechanics, &mut receive, now, now).unwrap();
+            if published {
+                assert!(matches!(tx.roc.as_ref().unwrap().phase, RocPhase::Acquiring { .. }));
+                assert!(!tx.idle());
+                assert!(!log.borrow().iter().any(|op| matches!(
+                    op, Operation::WriteU32 { offset: 0xd4418, value: 2, .. }
+                )));
+                mark_done(&mut resources.dma.mcu_tx_ring, &model, 0);
+                resources.bar0.write_u32(0xd441c, 1).unwrap();
+                tx.drive(&mut resources, &mut mechanics, &mut receive, now, now).unwrap();
+                assert!(matches!(tx.roc.as_ref().unwrap().phase, RocPhase::Releasing(_)));
+                tx.drive(&mut resources, &mut mechanics, &mut receive, now, now).unwrap();
+                assert!(!tx.idle());
+                mark_done(&mut resources.dma.mcu_tx_ring, &model, 1);
+                resources.bar0.write_u32(0xd441c, 2).unwrap();
+                tx.drive(&mut resources, &mut mechanics, &mut receive, now, now).unwrap();
+            }
+            assert!(tx.idle());
+            assert!(!tx.failed);
+            let operations = log.borrow();
+            assert!(!operations.iter().any(|op| matches!(
+                op, Operation::WriteU32 { offset: 0xd4308, .. }
+            )));
+            assert_eq!(operations.iter().filter(|op| matches!(
+                op, Operation::WriteU32 { offset: 0xd4418, .. }
+            )).count(), if published { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn canceled_unpublished_admission_is_discarded_without_a_roc_or_dma_effect() {
+        let (device, log, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = OwnedHardwareResources::acquire(device).unwrap();
+        let now = Instant::now();
+        let (context, revoke) = wlan_softmac_class_support::conformance::operation_context(
+            now + Duration::from_secs(10),
+        );
+        let mut tx = ClientTx::default();
+        tx.enqueue(context, &frame(), 12, channel()).unwrap();
+        revoke();
+        assert!(tx.drive(
+            &mut resources, &mut Default::default(), &mut Default::default(), now, now,
+        ).unwrap());
+        assert!(tx.idle());
+        assert!(!log.borrow().iter().any(|op| matches!(
+            op, Operation::WriteU32 { offset: 0xd4308 | 0xd4418, .. }
+        )));
     }
 
     #[test]
@@ -1120,5 +1284,38 @@ mod tests {
             tx.enqueue(context, &frame(), 12, channel()),
             Err(zx::Status::NO_RESOURCES)
         );
+    }
+    #[test]
+    fn wpdma_rebase_resets_only_hardware_cursor() {
+        let mut tx = ClientTx::default();
+        tx.producer = 9;
+        tx.retired_pids[4] = true;
+        tx.rebase_after_wpdma_reset().unwrap();
+        assert_eq!(tx.producer, 0);
+        assert!(tx.retired_pids[4]);
+
+        let (context, _) = wlan_softmac_class_support::conformance::operation_context(
+            Instant::now() + Duration::from_secs(1),
+        );
+        tx.pending = Some(PublishedFrame {
+            frame: QueuedFrame {
+                context,
+                bytes: zeroize::Zeroizing::new(frame()),
+                control_port: false,
+                data: false,
+                tid: 0,
+                rate: 12,
+                channel: channel(),
+            },
+            slot: 0,
+            next: 1,
+            token: 0,
+            pid: 3,
+            deadline: Instant::now() + Duration::from_secs(1),
+            descriptor_done: false,
+            freed: false,
+            status: None,
+        });
+        assert_eq!(tx.rebase_after_wpdma_reset(), Err(zx::Status::BAD_STATE));
     }
 }

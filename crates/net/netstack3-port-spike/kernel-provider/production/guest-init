@@ -1,13 +1,16 @@
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
 set -eu
-trap 'cat /run/provider.log 2>/dev/null || true; echo GUEST_TEST_FAILED; reboot -f' EXIT
+trap 'cat /run/provider.log /run/namespaces.log 2>/dev/null || true; echo GUEST_TEST_FAILED; reboot -f' EXIT
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 zcat /proc/config.gz | grep -E "CONFIG_(INET|NETSTACK3|SECCOMP)"
 zcat /proc/config.gz | grep -q '^# CONFIG_INET is not set$'
 /bin/loopback-test absent
+/bin/namespace-test
+/bin/namespace-test broker
+/bin/namespace-test managed
 /bin/endpoint-test
 /bin/loopback-test absent
 start_provider() {
@@ -50,9 +53,36 @@ cat /run/death.log
 kill -KILL "$provider"
 wait "$provider" || true
 /bin/loopback-test absent
-LD_LIBRARY_PATH=/lib DRV_KERNEL_PROVIDER_ETHERNET_GUEST=1 /bin/network-service-tests --exact \
+/bin/netlink-test
+LD_LIBRARY_PATH=/lib DRV_KERNEL_PROVIDER_ETHERNET_GUEST=1 DRV_KERNEL_PROVIDER_NETLINK_GUEST=1 /bin/network-service-tests --exact \
     integration_test::kernel_provider_ethernet_guest_fixture --nocapture
 /bin/loopback-test absent
+/bin/netstack3-supervisor /bin/netstack3-provider > /run/namespaces.log 2>&1 &
+manager=$!
+for i in $(seq 1 50); do
+    if test "$(readlink /proc/$manager/fd/3)" = /dev/netstack3-namespaces; then break; fi
+    sleep .1
+done
+kill -0 "$manager"
+/bin/loopback-test absent # Explicit root supervision is not replaced by the lazy broker.
+unshare -n sh -ec '
+    ip link show
+    ip addr show
+    ip link set lo up
+    ip addr show
+    /bin/loopback-test
+    ip link set lo down
+    ip link show
+'
+unshare -Urn sh -ec '
+    ip link set lo up
+    /bin/loopback-test
+'
+echo PASS_USER_AND_NETWORK_NAMESPACE
+kill "$manager"
+wait "$manager" || true
+cat /run/namespaces.log
+echo PASS_GENERIC_UNSHARE
 echo PASS_KVM_PRODUCTION_LOOPBACK
 trap - EXIT
 reboot -f

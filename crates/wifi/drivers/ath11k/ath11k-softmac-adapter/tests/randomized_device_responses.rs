@@ -271,6 +271,7 @@ impl WlanSoftmacUpcalls for RecordingUpcalls {
         self.0.lock().unwrap().frames.push(bytes);
     }
     fn report_tx_result(&mut self, _: WlanTxResult) {}
+    fn notify_connection_loss(&mut self, _: [u8; 6]) {}
     fn notify_scan_complete(&mut self, _: zx::Status, scan_id: u64) {
         self.0.lock().unwrap().scan_ids.push(scan_id);
     }

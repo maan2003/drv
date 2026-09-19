@@ -176,38 +176,6 @@ pub fn pci_device_info(device: &File) -> Result<PciDeviceInfo, String> {
     })
 }
 
-/// Prove that the MT7921 seccomp filter rejects requests on the wrong authority.
-pub fn prove_mt7921_sandbox_ioctl_denials(
-    pci: &File,
-    device: &File,
-    iommu: &File,
-) -> Result<(), String> {
-    for (fd, request, name) in [
-        (
-            device.as_raw_fd(),
-            IOMMU_IOAS_ALLOC,
-            "iommufd request on VFIO fd",
-        ),
-        (
-            iommu.as_raw_fd(),
-            VFIO_DEVICE_GET_INFO,
-            "VFIO request on iommufd",
-        ),
-        (
-            pci.as_raw_fd(),
-            VFIO_DEVICE_GET_INFO,
-            "VFIO request on PCI config",
-        ),
-        (device.as_raw_fd(), u64::MAX, "unknown request on VFIO fd"),
-    ] {
-        let result = unsafe { ioctl(fd, request, std::ptr::null_mut::<u8>()) };
-        if result != -1 || std::io::Error::last_os_error().raw_os_error() != Some(1) {
-            return Err(format!("seccomp admitted {name}"));
-        }
-    }
-    Ok(())
-}
-
 fn validate_platform_info(info: &DeviceInfo) -> Result<(), String> {
     if info.flags & VFIO_DEVICE_FLAGS_PLATFORM == 0 || info.flags & VFIO_DEVICE_FLAGS_PCI != 0 {
         return Err("VFIO cdev is not a platform device".into());

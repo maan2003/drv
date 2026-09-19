@@ -31,6 +31,7 @@ pub(crate) struct Request {
 }
 
 pub(crate) enum DriverEvent {
+    ConnectionLoss([u8; 6]),
     Stop {
         responder: oneshot::Sender<()>,
     },
@@ -225,6 +226,9 @@ async fn main_loop_impl<T: MlmeImpl>(
                         *execution.operation.lock().unwrap() = context;
                         execution.rejected.set(false);
                         match event {
+                            DriverEvent::ConnectionLoss(peer) => {
+                                mlme_impl.handle_connection_loss(peer).await;
+                            }
                             DriverEvent::Stop { responder } => {
                                 responder.send(()).map_err(|_| format_err!("Stop receiver closed"))?;
                                 pending.fetch_sub(1, Ordering::AcqRel);

@@ -5,9 +5,10 @@
 //! This process creates capabilities and starts independently sandboxed
 //! services. It owns no association policy and never reads a credential.
 
-use drv_network_service::{NetworkServiceSupervisor, WifiLifecycleReceiver};
+use drv_network_service::NetworkServiceSupervisor;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
@@ -55,22 +56,26 @@ enum ShutdownCause {
     SuspendPreparation,
 }
 
-fn requested_shutdown(now: Instant, deadline: Instant) -> Option<ShutdownCause> {
+fn requested_shutdown(now: Instant, deadline: Option<Instant>) -> Option<ShutdownCause> {
     if SUSPEND_REQUESTED.load(Ordering::Acquire) {
         Some(ShutdownCause::SuspendPreparation)
-    } else if STOP_REQUESTED.load(Ordering::Acquire) || now >= deadline {
+    } else if STOP_REQUESTED.load(Ordering::Acquire) || deadline.is_some_and(|deadline| now >= deadline) {
         Some(ShutdownCause::Ordinary)
     } else {
         None
     }
 }
 
-fn completion_marker(cause: Option<ShutdownCause>, succeeded: bool) -> Option<&'static str> {
-    match (cause, succeeded) {
-        (Some(ShutdownCause::SuspendPreparation), true) => {
+fn completion_marker(
+    cause: Option<ShutdownCause>,
+    succeeded: bool,
+    network_revoked: bool,
+) -> Option<&'static str> {
+    match (cause, succeeded, network_revoked) {
+        (Some(ShutdownCause::SuspendPreparation), true, true) => {
             Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
         }
-        (Some(ShutdownCause::Ordinary), true) => {
+        (Some(ShutdownCause::Ordinary), true, true) => {
             Some("wlan_stack_driver_exit=0 hardware_stopped=true")
         }
         _ => None,
@@ -79,7 +84,7 @@ fn completion_marker(cause: Option<ShutdownCause>, succeeded: bool) -> Option<&'
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("wlan_stack_kvm=REFUSED detail={error}");
+        let _ = writeln!(std::io::stderr(), "wlan_stack_kvm=REFUSED detail={error}");
         std::process::exit(1);
     }
 }
@@ -90,11 +95,12 @@ fn run() -> Result<(), String> {
     let driver = PathBuf::from(args.next().ok_or_else(usage)?);
     let wlancfg_binary = PathBuf::from(args.next().ok_or_else(usage)?);
     let network_binary = PathBuf::from(args.next().ok_or_else(usage)?);
+    let netcfg_binary = PathBuf::from(args.next().ok_or_else(usage)?);
     let state_directory = PathBuf::from(args.next().ok_or_else(usage)?);
     if args.next().is_some() {
         return Err(usage());
     }
-    for binary in [&driver, &wlancfg_binary, &network_binary] {
+    for binary in [&driver, &wlancfg_binary, &network_binary, &netcfg_binary] {
         if !binary.is_file() {
             return Err(format!(
                 "service binary does not exist: {}",
@@ -126,16 +132,33 @@ fn run() -> Result<(), String> {
         &std::env::var("DRV_SAE_CLIENT_MAC")
             .map_err(|_| "DRV_SAE_CLIENT_MAC is required".to_string())?,
     )?;
-    let max_seconds = std::env::var("DRV_STACK_MAX_SECONDS")
-        .map_or(Ok(60), |value| value.parse::<u64>())
-        .map_err(|_| "DRV_STACK_MAX_SECONDS is invalid")?;
-    if !(30..=300).contains(&max_seconds) {
-        return Err("DRV_STACK_MAX_SECONDS must be 30..=300".into());
-    }
+    // Continuous service by default; an explicit deadline is useful for KVM
+    // qualification but is not a production lifetime/resource limit.
+    let deadline = std::env::var("DRV_STACK_MAX_SECONDS").ok().map(|value| {
+        let seconds = value.parse::<std::num::NonZeroU64>()
+            .map_err(|_| "DRV_STACK_MAX_SECONDS must be positive")?;
+        Instant::now().checked_add(Duration::from_secs(seconds.get()))
+            .ok_or("DRV_STACK_MAX_SECONDS exceeds clock range")
+    }).transpose()?;
     std::fs::create_dir_all("/run/drv").map_err(|error| format!("create /run/drv: {error}"))?;
     std::fs::create_dir_all(&state_directory)
         .map_err(|error| format!("create saved-network directory: {error}"))?;
-    let (_application_lock, application) = bind_application(Path::new("/run/drv/wlancfg.sock"))?;
+    let (_application_lock, application) =
+        bind_listener(Path::new("/run/drv/wlancfg.sock"), ListenerKind::Policy)?;
+    // Standalone DNS owns NSS and wire DNS in the host deployment. Keep the
+    // integrated endpoint for fixtures that do not launch the DNS service.
+    let resolver = if std::env::var_os("DRV_EXTERNAL_DNS").is_some() {
+        None
+    } else {
+        Some(bind_listener(Path::new(drv_dns_wire::PATH), ListenerKind::Resolver)?)
+    };
+    let (_resolver_lock, resolver) = match resolver {
+        Some((lock, listener)) => (Some(lock), Some(std::os::unix::net::UnixListener::from(listener))),
+        None => (None, None),
+    };
+    let integrated_resolver = resolver.is_some();
+    let (_netcfg_lock, netcfg_listener) =
+        bind_listener(Path::new(drv_network_service::netcfg::STATUS_PATH), ListenerKind::NetworkStatus)?;
     let state = File::open(&state_directory)
         .map_err(|error| format!("open saved-network directory: {error}"))?;
     if unsafe { libc::fchown(state.as_raw_fd(), 65534, 65534) } != 0 {
@@ -176,16 +199,10 @@ fn run() -> Result<(), String> {
     };
     drop((driver_policy, policy, driver_supervisor, application, state));
 
-    let mut lifecycle = match WifiLifecycleReceiver::new(supervisor) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => {
-            let _ = policy_child.kill();
-            let _ = policy_child.wait();
-            return wait_driver_after_policy_close(driver_child, error);
-        }
-    };
     let mut network =
-        match NetworkServiceSupervisor::new_kernel(network_binary, "/dev/netstack3", mac) {
+        match NetworkServiceSupervisor::new_kernel(
+            network_binary, "/dev/netstack3", mac, resolver,
+        ) {
             Ok(network) => network,
             Err(error) => {
                 let _ = policy_child.kill();
@@ -193,20 +210,46 @@ fn run() -> Result<(), String> {
                 return wait_driver_after_policy_close(driver_child, error);
             }
         };
-    println!(
-        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider resolver=false"
+    // The socket namespace exists before Wi-Fi produces an Ethernet link and
+    // remains the same provider generation through ordinary link replacement.
+    if let Err(error) = network.start_provider() {
+        let _ = policy_child.kill();
+        let _ = policy_child.wait();
+        return wait_driver_after_policy_close(driver_child, error);
+    }
+    let mut netcfg_child = match spawn_netcfg(&netcfg_binary, &supervisor, &network, mac, &netcfg_listener) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = policy_child.kill();
+            let _ = policy_child.wait();
+            // Keep Netstack and both lifecycle peers alive during hardware stop.
+            return wait_driver_after_policy_close(driver_child, error);
+        }
+    };
+    // Diagnostic output must not unwind past live hardware-owning children.
+    let _ = writeln!(
+        std::io::stdout(),
+        "wlan_stack_launcher_ready=true policy=wlancfg driver=mt7921 network=netstack3-provider netcfg=netcfg-service resolver={integrated_resolver}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(max_seconds);
     let mut shutdown_cause = None;
     let mut shutdown_deadline = None;
     let mut policy_done = false;
     let mut driver_done = false;
+    let mut network_revoked = false;
     let result = loop {
         match driver_child.try_wait() {
             Ok(Some(status)) => {
                 driver_done = true;
                 if status.success() && shutdown_cause.is_some() {
+                    // The runtime has synchronously revoked its Ethernet peer
+                    // and certified hardware containment. Revoke the external
+                    // network capability now, before any completion marker.
+                    if let Err(error) = network.terminate() {
+                        break Err(format!("revoke network after driver stop: {error}"));
+                    }
+                    network_revoked = true;
+                    let _ = writeln!(std::io::stdout(), "wlan_stack_shutdown=network_revoked");
                     break Ok(());
                 }
                 let policy_detail = match policy_child.try_wait() {
@@ -243,6 +286,9 @@ fn run() -> Result<(), String> {
             && let Some(cause) = requested_shutdown(Instant::now(), deadline)
         {
             shutdown_cause = Some(cause);
+            if let Err(error) = stop_netcfg(&mut netcfg_child) {
+                break Err(error);
+            }
             shutdown_deadline = Some(Instant::now() + Duration::from_secs(10));
             if !policy_done {
                 if let Err(error) = policy_child.kill() {
@@ -251,37 +297,32 @@ fn run() -> Result<(), String> {
                 let _ = policy_child.wait();
                 policy_done = true;
             }
-            println!(
+            let _ = writeln!(
+                std::io::stdout(),
                 "wlan_stack_shutdown=policy_closed cause={}",
                 match cause {
                     ShutdownCause::Ordinary => "ordinary",
                     ShutdownCause::SuspendPreparation => "suspend-preparation",
                 }
             );
-            // Revoke the frame-only network generation before waiting for
-            // firmware/DMA containment. A suspend coordinator must never
-            // observe readiness while an Internet-facing process retains the
-            // old Ethernet generation.
-            if let Err(error) = network.terminate() {
-                break Err(format!("revoke network before shutdown: {error}"));
-            }
-            println!("wlan_stack_shutdown=network_revoked");
+            // Keep the network peer alive until policy EOF makes the driver
+            // revoke its own Ethernet endpoint. Closing the peer first is a
+            // protocol error to the callback bridge and can race orderly stop.
+            // The network child is still terminated before certification.
         }
 
-        // Once revocation starts, never consume a queued Install and recreate
-        // an old Ethernet generation while firmware containment is pending.
         if shutdown_cause.is_none() {
-            match lifecycle.receive(&mut network) {
-                Ok(Some(update)) => println!("wlan_stack_network_lifecycle={update:?}"),
+            match netcfg_child.try_wait() {
+                Ok(Some(status)) => break Err(format!("netcfg exited unexpectedly: {status}")),
                 Ok(None) => {}
-                Err(error) => break Err(error),
+                Err(error) => break Err(format!("poll netcfg: {error}")),
             }
         }
         match network.poll_exit() {
             Ok(Some(exit)) if shutdown_cause.is_none() => {
                 break Err(format!(
                     "network-service generation {} exited success={}",
-                    exit.generation, exit.success
+                    exit.provider_generation, exit.success
                 ));
             }
             Ok(_) => {}
@@ -290,6 +331,13 @@ fn run() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(1));
     };
 
+    let result = match stop_netcfg(&mut netcfg_child) {
+        Ok(()) => result,
+        Err(error) => Err(match result {
+            Ok(()) => error,
+            Err(original) => format!("{original}; {error}"),
+        }),
+    };
     let result = finish_children(
         &mut policy_child,
         policy_done,
@@ -298,14 +346,17 @@ fn run() -> Result<(), String> {
         &mut network,
         result,
     );
-    if let Some(marker) = completion_marker(shutdown_cause, result.is_ok()) {
-        println!("{marker}");
+    if let Some(marker) = completion_marker(shutdown_cause, result.is_ok(), network_revoked) {
+        // All children have been reaped; failed certificate delivery is an
+        // ordinary error now, not a panic that can bypass containment.
+        writeln!(std::io::stdout(), "{marker}")
+            .map_err(|error| format!("write shutdown completion: {error}"))?;
     }
     result
 }
 
 fn usage() -> String {
-    "usage: wlan-stack-kvm MT7921_DRIVER WLANCFG_SERVICE NETSTACK3_PROVIDER STATE_DIRECTORY".into()
+    "usage: wlan-stack-kvm MT7921_DRIVER WLANCFG_SERVICE NETSTACK3_PROVIDER NETCFG_SERVICE STATE_DIRECTORY".into()
 }
 
 fn wait_driver_after_policy_close(mut driver: Child, original: String) -> Result<(), String> {
@@ -437,7 +488,19 @@ fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
+#[derive(Clone, Copy)]
+enum ListenerKind {
+    Policy,
+    Resolver,
+    NetworkStatus,
+}
+
+fn bind_listener(path: &Path, kind: ListenerKind) -> Result<(File, OwnedFd), String> {
+    let (socket_type, permissions) = match kind {
+        ListenerKind::Policy => (libc::SOCK_SEQPACKET, 0o600),
+        ListenerKind::Resolver => (libc::SOCK_STREAM, 0o666),
+        ListenerKind::NetworkStatus => (libc::SOCK_SEQPACKET, 0o666),
+    };
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let lock = OpenOptions::new()
         .read(true)
@@ -446,31 +509,31 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
         .truncate(false)
         .mode(0o600)
         .open(path.with_extension("lock"))
-        .map_err(|error| format!("open application ownership lock: {error}"))?;
+        .map_err(|error| format!("open local ownership lock: {error}"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(format!(
-            "application listener already owned: {}",
+            "local listener already owned: {}",
             std::io::Error::last_os_error()
         ));
     }
     let encoded_path = CString::new(
         path.to_str()
-            .ok_or("application socket path is not UTF-8")?,
+            .ok_or("local socket path is not UTF-8")?,
     )
-    .map_err(|_| "application socket path contains NUL")?;
+    .map_err(|_| "local socket path contains NUL")?;
     if encoded_path.as_bytes_with_nul().len() > 108 {
-        return Err("application socket path is too long".into());
+        return Err("local socket path is too long".into());
     }
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            socket_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             0,
         )
     };
     if fd < 0 {
         return Err(format!(
-            "create application listener: {}",
+            "create local listener: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -500,18 +563,18 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
                 )
             };
             if connected == 0 {
-                return Err("application listener is still live".into());
+                return Err("local listener is still live".into());
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ECONNREFUSED) {
-                return Err(format!("probe existing application listener: {error}"));
+                return Err(format!("probe existing local listener: {error}"));
             }
             std::fs::remove_file(path)
-                .map_err(|error| format!("remove stale application socket: {error}"))?;
+                .map_err(|error| format!("remove stale local socket: {error}"))?;
         }
-        Ok(_) => return Err("application socket path is not a socket".into()),
+        Ok(_) => return Err("local socket path is not a socket".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("inspect application socket: {error}")),
+        Err(error) => return Err(format!("inspect local socket: {error}")),
     }
     if unsafe {
         libc::bind(
@@ -522,16 +585,16 @@ fn bind_application(path: &Path) -> Result<(File, OwnedFd), String> {
     } != 0
     {
         return Err(format!(
-            "bind application listener: {}",
+            "bind local listener: {}",
             std::io::Error::last_os_error()
         ));
     }
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("protect application listener: {error}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(permissions))
+        .map_err(|error| format!("protect local listener: {error}"))?;
     if unsafe { libc::listen(fd.as_raw_fd(), 16) } != 0 {
         return Err(format!(
-            "listen on application socket: {}",
+            "listen on local socket: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -588,6 +651,78 @@ fn spawn_driver(
         .map_err(|error| format!("spawn MT7921 service: {error}"))
 }
 
+fn spawn_netcfg(
+    binary: &Path,
+    device: &OwnedFd,
+    network: &NetworkServiceSupervisor,
+    mac: [u8; 6],
+    listener: &OwnedFd,
+) -> Result<Child, String> {
+    use std::io::Read as _;
+    let device = duplicate(device.as_raw_fd())?;
+    let (admin, generation) = network.configuration_capability()?;
+    let (mut ready, child_ready) = std::os::unix::net::UnixStream::pair()
+        .map_err(|e| format!("netcfg readiness channel: {e}"))?;
+    ready.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let ready_pass = duplicate(child_ready.as_raw_fd())?;
+    let status_pass = duplicate(listener.as_raw_fd())?;
+    let inherited = [(device.as_raw_fd(), 3), (admin.as_raw_fd(), 4),
+        (ready_pass.as_raw_fd(), 5), (status_pass.as_raw_fd(), 6)];
+    let mut command = Command::new(binary);
+    command.env_clear()
+        .arg(mac.map(|v| format!("{v:02x}")).join(":"))
+        .arg(generation.to_string())
+        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in inherited {
+                if libc::dup2(source, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| format!("spawn netcfg: {e}"))?;
+    drop((ready_pass, child_ready));
+    let mut reply = [0; 5];
+    if let Err(error) = ready.read_exact(&mut reply).and_then(|()| {
+        if &reply == b"READY" { Ok(()) }
+        else { Err(std::io::Error::other("invalid netcfg readiness")) }
+    }) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("netcfg startup: {error}"));
+    }
+    Ok(child)
+}
+
+fn stop_netcfg(child: &mut Child) -> Result<(), String> {
+    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        return if status.success() { Ok(()) }
+            else { Err(format!("netcfg failed: {status}")) };
+    }
+    // Unlike a hardware owner, netcfg can be killed safely if its bounded
+    // control operation fails to drain. Its peer capabilities remain held by
+    // the launcher until Wi-Fi has stopped, preserving shutdown ordering.
+    if unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } != 0 {
+        return Err(format!("stop netcfg: {}", std::io::Error::last_os_error()));
+    }
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return if status.success() { Ok(()) }
+                else { Err(format!("netcfg stop failed: {status}")) };
+        }
+        if Instant::now() >= deadline {
+            child.kill().map_err(|e| e.to_string())?;
+            child.wait().map_err(|e| e.to_string())?;
+            return Err("netcfg stop timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn spawn_policy(
     binary: &Path,
     generation: &str,
@@ -636,32 +771,34 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn application_listener_reclaims_stale_socket_without_replacing_live_owner() {
-        let directory = std::env::temp_dir().join(format!(
-            "wlan-{}-{:x}",
-            std::process::id(),
-            u64::from_le_bytes(generation().unwrap()[..8].try_into().unwrap()),
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("application.sock");
-        let first = bind_application(&path).unwrap();
-        assert!(bind_application(&path).is_err());
-        assert!(path.exists());
-        // Simulate a listener retained by a child after parent-lock release.
-        assert_eq!(
-            unsafe { libc::flock(first.0.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
-        assert!(bind_application(&path).is_err());
-        assert!(path.exists());
-        drop(first);
-        let second = bind_application(&path).unwrap();
-        drop(second);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"not a socket").unwrap();
-        assert!(bind_application(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
-        std::fs::remove_dir_all(directory).unwrap();
+    fn local_listeners_reclaim_stale_socket_without_replacing_live_owner() {
+        for kind in [ListenerKind::Policy, ListenerKind::Resolver, ListenerKind::NetworkStatus] {
+            let directory = std::env::temp_dir().join(format!(
+                "wlan-{}-{:x}",
+                std::process::id(),
+                u64::from_le_bytes(generation().unwrap()[..8].try_into().unwrap()),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("application.sock");
+            let first = bind_listener(&path, kind).unwrap();
+            assert!(bind_listener(&path, kind).is_err());
+            assert!(path.exists());
+            // Simulate a listener retained by a child after parent-lock release.
+            assert_eq!(
+                unsafe { libc::flock(first.0.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+            assert!(bind_listener(&path, kind).is_err());
+            assert!(path.exists());
+            drop(first);
+            let second = bind_listener(&path, kind).unwrap();
+            drop(second);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"not a socket").unwrap();
+            assert!(bind_listener(&path, kind).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -686,16 +823,17 @@ mod tests {
         let now = Instant::now();
         STOP_REQUESTED.store(false, Ordering::Release);
         SUSPEND_REQUESTED.store(false, Ordering::Release);
-        assert_eq!(requested_shutdown(now, now + Duration::from_secs(1)), None);
-        assert_eq!(requested_shutdown(now, now), Some(ShutdownCause::Ordinary));
+        assert_eq!(requested_shutdown(now, Some(now + Duration::from_secs(1))), None);
+        assert_eq!(requested_shutdown(now, None), None);
+        assert_eq!(requested_shutdown(now, Some(now)), Some(ShutdownCause::Ordinary));
         STOP_REQUESTED.store(true, Ordering::Release);
         assert_eq!(
-            requested_shutdown(now, now + Duration::from_secs(1)),
+            requested_shutdown(now, Some(now + Duration::from_secs(1))),
             Some(ShutdownCause::Ordinary)
         );
         SUSPEND_REQUESTED.store(true, Ordering::Release);
         assert_eq!(
-            requested_shutdown(now, now + Duration::from_secs(1)),
+            requested_shutdown(now, Some(now + Duration::from_secs(1))),
             Some(ShutdownCause::SuspendPreparation)
         );
         STOP_REQUESTED.store(false, Ordering::Release);
@@ -705,14 +843,19 @@ mod tests {
     #[test]
     fn failed_containment_never_authorizes_suspend() {
         assert_eq!(
-            completion_marker(Some(ShutdownCause::SuspendPreparation), false),
+            completion_marker(Some(ShutdownCause::SuspendPreparation), false, true),
             None
         );
         assert_eq!(
-            completion_marker(Some(ShutdownCause::SuspendPreparation), true),
+            completion_marker(Some(ShutdownCause::SuspendPreparation), true, true),
             Some("wlan_stack_suspend_ready=true hardware_stopped=true network_revoked=true")
         );
-        assert_eq!(completion_marker(None, true), None);
+        assert_eq!(completion_marker(None, true, true), None);
+        assert_eq!(
+            completion_marker(Some(ShutdownCause::SuspendPreparation), true, false),
+            None,
+            "hardware success cannot certify suspend before network revocation"
+        );
     }
 
     #[test]

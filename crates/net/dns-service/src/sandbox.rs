@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io,
     net::{TcpListener, UdpSocket},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::FromRawFd,
     os::unix::net::UnixListener,
 };
 
@@ -62,8 +62,31 @@ pub fn lockdown() -> io::Result<Capabilities> {
     }
     input(3, 8192)?;
     input(4, 2097152)?;
+    let inherited_nss = std::env::var_os("DRV_DNS_INHERIT_NSS").is_some();
+    let nss = if inherited_nss {
+        // FD 5 is a pre-bound listener from the trusted service manager.
+        for (option, expected) in [
+            (libc::SO_DOMAIN, libc::AF_UNIX),
+            (libc::SO_TYPE, libc::SOCK_STREAM),
+            (libc::SO_ACCEPTCONN, 1),
+        ] {
+            let mut value = 0i32;
+            let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+            unsafe {
+                check(libc::getsockopt(5, libc::SOL_SOCKET, option,
+                    (&mut value as *mut i32).cast(), &mut len) as _)?;
+            }
+            if value != expected {
+                return Err(io::Error::other("invalid inherited NSS listener"));
+            }
+        }
+        Some(unsafe { UnixListener::from_raw_fd(5) })
+    } else {
+        None
+    };
     unsafe {
-        check(libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0))?;
+        check(libc::syscall(libc::SYS_close_range,
+            if inherited_nss { 6u32 } else { 5u32 }, u32::MAX, 0))?;
     }
     unsafe {
         let mut pipe = [-1; 2];
@@ -83,10 +106,16 @@ pub fn lockdown() -> io::Result<Capabilities> {
         tcp.push(t);
     }
     // The trusted launcher owns stale-path removal after the previous process exits.
-    let nss = UnixListener::bind(drv_dns_wire::PATH)?;
+    let nss = match nss {
+        Some(listener) => listener,
+        None => {
+            let listener = UnixListener::bind(drv_dns_wire::PATH)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))?;
+            listener
+        }
+    };
     nss.set_nonblocking(true)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))?;
     unsafe {
         check(libc::unshare(libc::CLONE_NEWNS) as _)?;
         check(libc::mount(
@@ -169,12 +198,7 @@ pub fn lockdown() -> io::Result<Capabilities> {
         }
         check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) as _)?;
     }
-    let accepted: Vec<_> = tcp
-        .iter()
-        .map(AsRawFd::as_raw_fd)
-        .chain([nss.as_raw_fd()])
-        .collect();
-    install(&accepted)?;
+    install()?;
     Ok(Capabilities {
         config: unsafe { File::from_raw_fd(3) },
         ca: unsafe { File::from_raw_fd(4) },
@@ -212,7 +236,7 @@ fn rule(f: &mut Vec<libc::sock_filter>, nr: libc::c_long, body: Vec<libc::sock_f
     f.extend(body);
     f.push(stmt(0x20, 0));
 }
-fn install(listeners: &[i32]) -> io::Result<()> {
+fn install() -> io::Result<()> {
     #[cfg(target_arch = "x86_64")]
     const ARCH: u32 = 0xc000003e;
     #[cfg(target_arch = "aarch64")]
@@ -270,13 +294,8 @@ fn install(listeners: &[i32]) -> io::Result<()> {
             stmt(6, KILL),
         ],
     );
-    // Only service-owned listeners can create accepted socket capabilities.
-    let mut accept = vec![arg(0)];
-    for fd in listeners {
-        accept.extend([eq(*fd as _, 0, 1), stmt(6, ALLOW)]);
-    }
-    accept.push(stmt(6, KILL));
-    rule(&mut f, libc::SYS_accept4, accept);
+    // Possession of a listening socket authorizes accept; its FD number is irrelevant.
+    allow(&mut f, libc::SYS_accept4);
     let mut fcntl = vec![arg(1)];
     for cmd in [
         libc::F_GETFD,

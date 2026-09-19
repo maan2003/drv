@@ -18,6 +18,119 @@ Current [ABI6 acceptance](rust-abi5/evidence.txt) records native tests, lock-deb
 no-INET KVM and private-overlay OpenSSH. The captures below are historical
 baselines, not ABI6 acceptance evidence.
 
+## Delegated route metadata
+
+Linux retains native AF_NETLINK socket transport, port binding, subscriptions,
+credentials, receive limits and unrelated protocols. The same `/dev/netstack3`
+serving object owns INET, NETLINK_ROUTE and interface-control requests in the
+launcher's namespace. There is one generation and one revocation boundary;
+the separate Netlink registration device has been removed. Claimed FDs identify single
+sockets; publication is restricted to that generation's current subscribers.
+Provider loss fails closed, including after replacement. The wire contract and
+limits are in [netlink-protocol.h](netlink-protocol.h).
+
+Every worker serves metadata on its inherited serving object (internally
+duplicated for the adapter's poll registration). The userspace adapter renders
+link/address dumps and change
+notifications from actual Netstack3 observations, including loopback, DHCP,
+IPv6 address state and link loss. It does not synthesize configured IP addresses.
+Route queries and unsupported mutations return explicit unsupported errors;
+all workers also support authorized loopback up/down. Per-application
+metadata privacy remains deferred; this is a namespace-wide compatibility view.
+
+The standard guest fixture now also needs these clients, built from this
+directory (no Go module or external Go dependency is required):
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -pthread netlink-test.c -o "$ROOT/bin/netlink-test"
+gcc -O2 -Wall -Wextra -Werror netlink-client-test.c -o "$ROOT/bin/netlink-client-test"
+CGO_ENABLED=0 go build -p 16 -o "$ROOT/bin/netlink-go-test" netlink-go-test.go
+```
+
+The boundary fixture checks endpoint isolation, subscriptions, bounded queues,
+overrun reporting, sender credentials, namespace isolation, native Generic
+Netlink, revocation and replacement. The real Ethernet fixture checks glibc
+`getifaddrs`/`AI_ADDRCONFIG`, pure-Go interface discovery and address-removal
+notifications before/after link loss, alongside existing TCP/UDP and NSS tests.
+These are no-INET KVM checks, not physical deployment or full rtnetlink coverage.
+
+## Generic network namespaces
+
+`netstack3-supervisor /absolute/path/to/netstack3-provider` owns
+`/dev/netstack3-namespaces` (initial-user-namespace `CAP_SYS_ADMIN`, exclusive
+registration). First Internet/route-metadata socket or interface-control request
+in an unowned namespace requests a worker;
+creation alone does not. Each worker receives one namespace-bound serving
+object through inherited FD3, enters the existing empty-root,
+unprivileged process sandbox, and owns independent Netstack3 state with **no
+Ethernet device or DHCP socket**. The supervisor closes every serving copy and
+retains only a separate monitor/revoke capability plus a process handle.
+
+Ordinary `unshare -n` starts with loopback down and no addresses. Both
+`SIOCSIFFLAGS` and authenticated `RTM_NEWLINK` can enable/disable loopback;
+completion waits for actual core configuration. `ip link set lo up` enables
+IPv4/IPv6 localhost TCP/UDP. Other link mutations and route operations remain
+unsupported. Explicit registrations retain their original supervisor,
+including across restart, and use the same administration implementation.
+Register the machine's explicit network service before starting lazy provisioning.
+
+Interface ioctls on INET, Unix and Netlink sockets are marshalled into the same
+worker's bounded control lane. It interprets authenticated credentials and reads
+the same core observations as rtnetlink. Configuration is not mirrored in Linux:
+isolated replacement workers start down and must be configured again.
+The serving `READY` operation acknowledges initialized userspace state.
+`CLAIM_CONTROL` returns a one-request FD: read 48 bytes (LE command, LE
+namespace-relative CAP_NET_ADMIN bit, native 40-byte ifreq), then write LE signed
+errno plus up to 4096 reply bytes. Internal kernel statuses (512–4095) complete
+with EPROTO, never native fallback or syscall restart. At most 32 requests wait per scope, with
+interruptible 10-second waits. Cancellation/death retires each transaction.
+
+`CONFIG_NETSTACK3_RUST` omits native loopback registration and its private
+implementation, retaining shared statistics and blackhole helpers. Page-pool
+unregister uses the existing wipe/deferred-release path rather than orphaning
+onto native `lo`; BPF skb/XDP/netfilter test runs report unsupported; native MPLS
+routing is excluded. Other configurations retain the native implementation.
+The optional `page-pool-test.c` guest module exercises device removal while a
+pool page is outstanding; `namespace-test native` checks AF_PACKET,
+NETLINK_GENERIC and skb/XDP BPF test-run boundaries (netfilter program loading
+is unavailable without INET). Enable `CONFIG_PACKET=y` for that guest check. Never install that test
+module as part of the production service.
+
+Build the optional fixture against the same configured guest kernel:
+```sh
+mkdir -p "$WORK/page-pool-test"
+cp page-pool-test.c "$WORK/page-pool-test/"
+printf 'obj-m += page-pool-test.o\\n' > "$WORK/page-pool-test/Makefile"
+make -C "$KERNEL" M="$WORK/page-pool-test" modules
+# In the no-INET guest, before starting providers:
+namespace-test native
+insmod page-pool-test.ko
+rmmod page_pool_test
+```
+
+At most 64 lazy namespaces are admitted; startup has a 10-second interruptible
+budget. Native namespace teardown, worker death, monitor revocation and
+supervisor loss terminate the affected generation. New sockets can request a
+replacement; existing sockets never attach to it. Serving and monitoring FDs
+retain pure Rust scope state, not an active Linux namespace reference.
+Namespace handles
+and application sockets do retain it, including across `setns` and `SCM_RIGHTS`.
+
+The standard KVM suite includes `namespace-test` lifetime, faulted handoff,
+old-generation rejection, independent identical-port namespaces, descriptor
+transfer, administration permissions, worker/supervisor restart and worker
+reaping, plus an ordinary `unshare -n` shell running the full localhost suite.
+The [recorded run](evidence/namespaces.log) uses kernel #43 with native INET/lo
+absent, built-in AF_PACKET, and lockdep/mutex/list/atomic-sleep diagnostics.
+It includes page-pool deferred release, BPF failure boundaries, Unix-socket
+interface ioctls and read-only setter input. The native-control build (#40,
+same patches with the provider disabled) retains native loopback and passes
+IPv4/IPv6 bulk TCP. The 67 host service tests also pass. Unsupported ioctls
+such as TX queue-length queries remain explicit errors, not synthetic values.
+
+These checks do not establish arbitrary virtual-link/routing support or host
+deployment.
+
 ## Original C baseline proof
 
 Linux 6.18.40 in KVM on np registers our implementation for AF_INET/AF_INET6,
@@ -50,9 +163,11 @@ offline `backtrace` dev dependency; it is not counted as passing.
 
 `netstack3-provider --ethernet-mac XX:XX:XX:XX:XX:XX` additionally accepts a
 trusted launcher's nonblocking AF_UNIX SOCK_SEQPACKET frame capability on FD4.
-FD3 still owns the application namespace. FD4 cannot be used for endpoint
-ioctls or raw reads/writes; the sandbox permits only the frame transport's
-nonblocking datagram operations. No device/DMA authority crosses this boundary.
+FD3 still owns the application namespace. These numbers are startup conventions:
+seccomp checks syscall/command/flag constraints, not descriptor slots. Native
+file operations reject endpoint ioctls on a frame socket; its socket capability
+authorizes frame I/O. Replacement frames retain their received descriptors, with
+no reserved offline slot. No device/DMA authority crosses this boundary.
 
 The same runtime now runs the existing Fuchsia `DhcpService`, not a second
 stack or DHCP implementation. It reports address/DNS acquisition. Link loss
@@ -234,6 +349,20 @@ full-duplex throughput. Optimization alone did not fix the old configuration.
 [Raw before/after results](evidence/throughput.txt),
 [final maintained KVM suite](evidence/throughput-serial.log), and
 [37 service tests](evidence/throughput-tests.log) retain delivery evidence.
+Accepted sockets inherit kernel-owned buffer sizes and wait timeouts from
+their listener. Passive core storage is charged per admitted SYN, not per
+idle listener backlog; the lease follows the buffers through accept and final
+destruction. Exhaustion leaves the SYN unadmitted, allowing retransmission
+after capacity returns. [Candidate acceptance](evidence/socket-storage.log)
+runs all 67 service tests on the no-INET kernel, including the previously
+failing listener and buffer-inheritance cases.
+
+`rx-pressure` pauses an application reader until kernel RX fills, then resumes
+without unrelated traffic. Provider endpoints arm write readiness only while an
+RX record is pending; the kernel advertises enough capacity for a maximum atomic
+record. This prevents both missed wakeups and writable/EAGAIN spinning. The
+[red→green regression](evidence/rx-backpressure.log) covers IPv4 and IPv6.
+
 The maintained suite includes `bench-long` (64 MiB per direction) to exhaust
 quick ACKs and catch timer-paced regressions within its existing 50-second
 whole-VM timeout. The old 64 KiB optimized configuration times out (exit 124);
@@ -283,16 +412,18 @@ make -C "$LINUX" olddefconfig
 make -C "$LINUX" -j4 bzImage
 cc -O2 -Wall -Wextra -Werror loopback-test.c -o "$ROOT/bin/loopback-test"
 cc -O2 -Wall -Wextra -Werror endpoint-test.c -o "$ROOT/bin/endpoint-test"
+cc -O2 -Wall -Wextra -Werror namespace-test.c -o "$ROOT/bin/namespace-test"
 ```
 
-Build `netstack3-provider` from `crates/net/network-service` with the repository's
+Build `netstack3-provider` and `netstack3-supervisor` from `crates/net/network-service` with the repository's
 materialized upstream Cargo overlay and vendor setup. The changed
-`port-integration/src/{lib.rs,socket_provider.rs}` overlay files must be copied
+`port-integration/src` overlay files must be copied
 into that reference tree, as for other service builds. Use `cargo build --release`
 for throughput measurements. No Nix build is required.
 
 Stage a static Busybox as `$ROOT/bin/busybox`, the provider as
-`$ROOT/bin/netstack3-provider`, and both test clients above. Build service tests
+`$ROOT/bin/netstack3-provider`, the namespace supervisor as
+`$ROOT/bin/netstack3-supervisor`, and the test clients above. Build service tests
 with `cargo test --no-run --lib` and stage the reported library test executable
 as `$ROOT/bin/network-service-tests` (strip debug symbols to keep the initrd small).
 For dynamically linked
@@ -421,9 +552,11 @@ updated launcher.
 ### Laptop power lifecycle contract
 
 The production launcher accepts `SIGUSR1` as a **suspend-preparation request**.
-It first closes policy admission, then terminates the network-service generation,
-then waits up to ten seconds for the Wi-Fi service's normal
-`ClientRuntime::shutdown` path to contain the MT7921. Only successful common
+It first closes policy admission, then waits up to ten seconds for the Wi-Fi
+service's normal `ClientRuntime::shutdown` path to revoke its Ethernet endpoint
+and contain the MT7921. It then terminates the network-service generation.
+This order keeps external peer EOF from racing the driver's protocol stop;
+network and application capabilities are still revoked before successful common
 child cleanup emits:
 
 ```

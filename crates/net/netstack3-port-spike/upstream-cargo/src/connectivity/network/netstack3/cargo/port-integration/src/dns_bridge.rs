@@ -393,6 +393,7 @@ pub struct NativeDnsBridge {
     b: Arc<Bus>,
     pool: LocalPool,
     resolver: Option<Resolver>,
+    servers: Vec<IpAddr>,
     next_query: u64,
     limit: usize,
     results: Rc<RefCell<HashMap<u64, DnsLookupSlot>>>,
@@ -408,6 +409,7 @@ impl NativeDnsBridge {
             b: Arc::new(Bus::new(limit.get())),
             pool: LocalPool::new(),
             resolver: None,
+            servers: Vec::new(),
             next_query: 0,
             limit: limit.get(),
             results: Rc::new(RefCell::new(HashMap::new())),
@@ -416,6 +418,9 @@ impl NativeDnsBridge {
         }
     }
     pub fn configure(&mut self, servers: &[IpAddr]) -> Result<(), NetError> {
+        if self.resolver.is_some() && self.servers == servers {
+            return Ok(()); // Lease renewal is not a new resolver lifetime.
+        }
         let c = ResolverConfig::from_parts(
             None,
             vec![],
@@ -427,7 +432,10 @@ impl NativeDnsBridge {
         );
         let mut builder = HickoryResolver::builder_with_config(c, NativeDnsRuntime(self.b.clone()));
         *builder.options_mut() = native_resolver_options();
-        self.resolver = Some(builder.build()?);
+        let resolver = builder.build()?;
+        self.clear();
+        self.servers = servers.to_vec();
+        self.resolver = Some(resolver);
         Ok(())
     }
     pub fn resolver(&self) -> Option<&Resolver> {
@@ -435,6 +443,21 @@ impl NativeDnsBridge {
     }
     pub fn clear(&mut self) {
         self.resolver = None;
+        self.servers.clear();
+        // A lookup owns a resolver clone. Dropping only the configured resolver
+        // does not cancel its retries or background transports on the old link.
+        for slot in self.results.borrow_mut().values_mut() {
+            slot.abort.abort();
+            slot.result = Some(Err(io::Error::new(
+                io::ErrorKind::NotConnected, "DNS configuration was revoked",
+            ).into()));
+        }
+        self.pool = LocalPool::new();
+        self.b.tasks.lock().unwrap().clear();
+        self.b.cmd.lock().unwrap().clear();
+        self.b.timers.lock().unwrap().clear();
+        // Dropped transport tasks mark End::alive=false. The next pump closes
+        // their core sockets before admitting new transport work.
     }
     pub fn lookup_ip(&mut self, name: impl Into<String>) -> io::Result<DnsLookupHandle> {
         let resolver = self.resolver.clone().ok_or_else(|| {
@@ -496,51 +519,7 @@ impl NativeDnsBridge {
     pub fn spawner(&self) -> futures::executor::LocalSpawner {
         self.pool.spawner()
     }
-    pub fn pump(&mut self, rt: &mut Runtime, now: Duration, budget: usize) -> usize {
-        let now = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
-        self.b.now.store(now, Ordering::Relaxed);
-        let mut n = 0;
-        {
-            let mut t = self.b.timers.lock().unwrap();
-            let mut p = vec![];
-            for (d, w) in t.drain(..) {
-                if d <= now && n < budget {
-                    w.wake();
-                    n += 1;
-                } else {
-                    p.push((d, w));
-                }
-            }
-            *t = p
-        }
-        while n < budget {
-            let Some(t) = self.b.tasks.lock().unwrap().pop_front() else {
-                break;
-            };
-            self.pool
-                .spawner()
-                .spawn_local(async move {
-                    let _ = t.await;
-                })
-                .unwrap();
-            n += 1;
-        }
-        for _ in 0..2 {
-            if n >= budget {
-                break;
-            }
-            // DNS futures only wake for bounded bus commands, socket input,
-            // or timers. Drain the finite ready chain as one work quantum.
-            let g = Guard::enter(self.b.clone());
-            self.pool.run_until_stalled();
-            drop(g);
-            while n < budget {
-                let c = { self.b.cmd.lock().unwrap().pop_front() };
-                let Some(c) = c else { break };
-                n += 1;
-                self.apply(rt, c)
-            }
-        }
+    fn reap_transports(&mut self, rt: &mut Runtime) {
         self.udp.retain(|_, (h, _, _, e)| {
             if e.alive.load(Ordering::Relaxed) {
                 true
@@ -557,6 +536,60 @@ impl NativeDnsBridge {
                 false
             }
         });
+    }
+    pub fn pump(&mut self, rt: &mut Runtime, now: Duration, budget: usize) -> usize {
+        self.reap_transports(rt);
+        let now = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+        self.b.now.store(now, Ordering::Relaxed);
+        let mut n = 0;
+        {
+            let mut t = self.b.timers.lock().unwrap();
+            let mut p = vec![];
+            for (d, w) in t.drain(..) {
+                if d <= now && n < budget {
+                    w.wake();
+                    n += 1;
+                } else {
+                    p.push((d, w));
+                }
+            }
+            *t = p
+        }
+        for _ in 0..2 {
+            if n >= budget {
+                break;
+            }
+            // A ready lookup can spawn background transport work. Admit it
+            // again after polling the pool, rather than stranding it until
+            // an unrelated packet or the request timeout wakes the embedding.
+            while n < budget {
+                let Some(t) = self.b.tasks.lock().unwrap().pop_front() else {
+                    break;
+                };
+                self.pool
+                    .spawner()
+                    .spawn_local(async move {
+                        let _ = t.await;
+                    })
+                    .unwrap();
+                n += 1;
+            }
+            if n >= budget {
+                break;
+            }
+            // DNS futures only wake for bounded bus commands, socket input,
+            // or timers. Drain the finite ready chain as one work quantum.
+            let g = Guard::enter(self.b.clone());
+            self.pool.run_until_stalled();
+            drop(g);
+            while n < budget {
+                let c = { self.b.cmd.lock().unwrap().pop_front() };
+                let Some(c) = c else { break };
+                n += 1;
+                self.apply(rt, c)
+            }
+        }
+        self.reap_transports(rt);
         for (h, _, _, e) in self.udp.values().take(budget.saturating_sub(n)) {
             if let Ok(Some(packet)) = rt.udp_receive_msg(*h) {
                 let source = match packet.source.address {
@@ -674,6 +707,40 @@ mod tests {
     }
 
     #[test]
+    fn resolver_reconfiguration_cancels_old_work_but_renewal_preserves_it() {
+        let servers = [IpAddr::from([192, 0, 2, 53])];
+        let mut bridge = NativeDnsBridge::new();
+        bridge.configure(&servers).unwrap();
+        let mut runtime = Runtime::new(
+            64, [9; 8192], NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 2], 1500,
+        ).unwrap();
+        runtime.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
+        let pending = bridge.lookup_ip("pending.test.").unwrap();
+        for _ in 0..8 {
+            bridge.pump(&mut runtime, Duration::ZERO, DEFAULT_LIMIT);
+        }
+        assert!(!bridge.udp.is_empty(), "the cancelled lookup must own a real transport");
+        bridge.configure(&servers).unwrap();
+        assert!(bridge.take_result(pending).is_none());
+        bridge.clear();
+        assert!(bridge.take_result(pending).unwrap().is_err());
+        bridge.pump(&mut runtime, Duration::ZERO, DEFAULT_LIMIT);
+        assert!(bridge.udp.is_empty());
+        assert!(bridge.tcp.is_empty());
+        assert!(bridge.next_timer_deadline().is_none());
+        assert!(bridge.lookup_ip("offline.test.").is_err());
+        bridge.configure(&servers).unwrap();
+        let old = bridge.lookup_ip("old.test.").unwrap();
+        bridge.configure(&[IpAddr::from([192, 0, 2, 54])]).unwrap();
+        assert!(bridge.take_result(old).unwrap().is_err());
+        let current = bridge.lookup_ip("current.test.").unwrap();
+        assert!(bridge.take_result(current).is_none());
+        bridge.cancel_lookup(current);
+        assert!(bridge.results.borrow().is_empty());
+    }
+
+    #[test]
     fn pinned_resolver_reaches_native_udp_bridge() {
         let mut runtime = Runtime::new(
             64,
@@ -725,73 +792,80 @@ mod tests {
 
     #[test]
     fn pinned_resolver_transaction_trace_returns_answer() {
-        let mut client = Runtime::new(
-            16,
-            [3; 8192],
-            NonZeroU64::new(1).unwrap(),
-            [2, 0, 0, 0, 0, 1],
-            1500,
-        )
-        .unwrap();
-        let mut server = Runtime::new(
-            16,
-            [4; 8192],
-            NonZeroU64::new(2).unwrap(),
-            [2, 0, 0, 0, 0, 2],
-            1500,
-        )
-        .unwrap();
-        client.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
-        server.apply_ipv4([192, 0, 2, 53], 24, None).unwrap();
-        let server_socket = server.udp_socket().unwrap();
-        server
-            .udp_bind(
-                server_socket,
-                Some([192, 0, 2, 53]),
-                NonZeroU16::new(53).unwrap(),
+        for budget in [1, 2, DEFAULT_LIMIT] {
+            let mut client = Runtime::new(
+                16,
+                [3; 8192],
+                NonZeroU64::new(1).unwrap(),
+                [2, 0, 0, 0, 0, 1],
+                1500,
             )
             .unwrap();
+            let mut server = Runtime::new(
+                16,
+                [4; 8192],
+                NonZeroU64::new(2).unwrap(),
+                [2, 0, 0, 0, 0, 2],
+                1500,
+            )
+            .unwrap();
+            client.apply_ipv4([192, 0, 2, 2], 24, None).unwrap();
+            server.apply_ipv4([192, 0, 2, 53], 24, None).unwrap();
+            let server_socket = server.udp_socket().unwrap();
+            server
+                .udp_bind(
+                    server_socket,
+                    Some([192, 0, 2, 53]),
+                    NonZeroU16::new(53).unwrap(),
+                )
+                .unwrap();
 
-        let mut bridge = NativeDnsBridge::new();
-        bridge.configure(&[IpAddr::from([192, 0, 2, 53])]).unwrap();
-        let query = bridge.lookup_ip("native.test.").unwrap();
-        assert!(bridge.take_result(query).is_none());
-        assert!(bridge.take_result(query).is_none());
-        for _ in 0..32 {
-            bridge.pump(&mut client, Duration::ZERO, DEFAULT_LIMIT);
-            exchange(&mut client, &mut server);
-            while let Some(packet) = server.udp_receive_msg(server_socket).unwrap() {
-                let request = Message::from_vec(&packet.body).unwrap();
-                let mut response = Message::new(
-                    request.id,
-                    hickory_proto::op::MessageType::Response,
-                    hickory_proto::op::OpCode::Query,
+            let mut bridge = NativeDnsBridge::new();
+            bridge.configure(&[IpAddr::from([192, 0, 2, 53])]).unwrap();
+            let query = bridge.lookup_ip("native.test.").unwrap();
+            assert!(bridge.take_result(query).is_none());
+            assert!(bridge.take_result(query).is_none());
+            for _ in 0..32 {
+                let work = bridge.pump(&mut client, Duration::ZERO, budget);
+                assert!(
+                    work != 0 || bridge.b.tasks.lock().unwrap().is_empty(),
+                    "queued DNS tasks must keep the embedding runnable"
                 );
-                response.add_query(request.queries[0].clone());
-                if request.queries[0].query_type() == hickory_proto::rr::RecordType::A {
-                    response.add_answer(Record::from_rdata(
-                        Name::from_ascii("native.test.").unwrap(),
-                        60,
-                        RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
-                            192, 0, 2, 99,
-                        ))),
-                    ));
+                exchange(&mut client, &mut server);
+                while let Some(packet) = server.udp_receive_msg(server_socket).unwrap() {
+                    let request = Message::from_vec(&packet.body).unwrap();
+                    let mut response = Message::new(
+                        request.id,
+                        hickory_proto::op::MessageType::Response,
+                        hickory_proto::op::OpCode::Query,
+                    );
+                    response.add_query(request.queries[0].clone());
+                    if request.queries[0].query_type() == hickory_proto::rr::RecordType::A {
+                        response.add_answer(Record::from_rdata(
+                            Name::from_ascii("native.test.").unwrap(),
+                            60,
+                            RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
+                                192, 0, 2, 99,
+                            ))),
+                        ));
+                    }
+                    server
+                        .udp_send_to(
+                            server_socket,
+                            [192, 0, 2, 2],
+                            NonZeroU16::new(packet.source.port).unwrap(),
+                            &response.to_vec().unwrap(),
+                        )
+                        .unwrap();
                 }
-                server
-                    .udp_send_to(
-                        server_socket,
-                        [192, 0, 2, 2],
-                        NonZeroU16::new(packet.source.port).unwrap(),
-                        &response.to_vec().unwrap(),
-                    )
-                    .unwrap();
+                exchange(&mut client, &mut server);
             }
-            exchange(&mut client, &mut server);
+            assert_eq!(
+                bridge.take_result(query).unwrap().unwrap(),
+                [IpAddr::from([192, 0, 2, 99])]
+            );
+
         }
-        assert_eq!(
-            bridge.take_result(query).unwrap().unwrap(),
-            [IpAddr::from([192, 0, 2, 99])]
-        );
     }
 
     #[test]

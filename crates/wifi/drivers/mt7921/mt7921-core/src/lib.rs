@@ -1697,8 +1697,194 @@ where
     Err(OwnershipError::Timeout)
 }
 
+/// Caller authority for one deferred HIF wake.
+///
+/// The epoch prevents a wake retained by an old association from acquiring
+/// ownership for its replacement. The absolute deadline remains the caller's
+/// budget; retry mechanics may shorten it but never extend it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DriverOwnershipWakeAuthority {
+    pub epoch: u64,
+    pub deadline_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriverOwnershipWakeProgress {
+    Pending { next_poll_ms: u64 },
+    Acquired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriverOwnershipWakeError<E> {
+    Revoked,
+    Deadline,
+    Transport(E),
+    UnexpectedState(u32),
+}
+
+/// Nonblocking PCIe driver-ownership acquisition for an actor-owned TX queue.
+///
+/// Each call performs at most one CLR_OWN write and one status read. This
+/// preserves Linux's ten 50 ms attempts, conservative ASPM settling, and 1 ms
+/// poll interval without sleeping the exclusive hardware owner. `epoch` must be the currently live authority
+/// generation on every call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DriverOwnershipWake {
+    authority: DriverOwnershipWakeAuthority,
+    attempts: u8,
+    attempt_deadline_ms: u64,
+    next_poll_ms: u64,
+}
+
+impl DriverOwnershipWake {
+    pub fn new(
+        authority: DriverOwnershipWakeAuthority,
+        now_ms: u64,
+    ) -> Result<Self, DriverOwnershipWakeError<core::convert::Infallible>> {
+        if now_ms >= authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+        Ok(Self {
+            authority,
+            attempts: 0,
+            attempt_deadline_ms: now_ms,
+            next_poll_ms: now_ms,
+        })
+    }
+
+    pub fn poll<T: OwnershipTransport>(
+        &mut self,
+        transport: &mut T,
+        epoch: u64,
+    ) -> Result<DriverOwnershipWakeProgress, DriverOwnershipWakeError<T::Error>> {
+        if epoch != self.authority.epoch {
+            return Err(DriverOwnershipWakeError::Revoked);
+        }
+        let now = transport.now_ms();
+        if now >= self.authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+
+        if self.attempts == 0 || now >= self.attempt_deadline_ms {
+            if self.attempts == DRIVER_OWN_ATTEMPTS {
+                return Err(DriverOwnershipWakeError::Deadline);
+            }
+            transport
+                .write_clear_own()
+                .map_err(DriverOwnershipWakeError::Transport)?;
+            self.attempts += 1;
+            // A userspace/VFIO caller cannot infer the physical upstream
+            // link's ASPM state from a virtual PCI topology. Honor Linux's
+            // maximum ASPM settling interval without blocking the owner.
+            self.next_poll_ms = now
+                .saturating_add(DRIVER_OWN_ASPM_DELAY_MAX_US.div_ceil(1_000))
+                .min(self.authority.deadline_ms);
+            self.attempt_deadline_ms = self
+                .next_poll_ms
+                .saturating_add(DRIVER_OWN_ATTEMPT_MS)
+                .min(self.authority.deadline_ms);
+        }
+
+        if now < self.next_poll_ms {
+            return Ok(DriverOwnershipWakeProgress::Pending {
+                next_poll_ms: self.next_poll_ms,
+            });
+        }
+        let raw = transport
+            .read_low_power_control()
+            .map_err(DriverOwnershipWakeError::Transport)?;
+        if raw == u32::MAX || raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
+            return Err(DriverOwnershipWakeError::UnexpectedState(raw));
+        }
+        if raw & PCIE_LPCR_HOST_OWN_SYNC == 0 {
+            return Ok(DriverOwnershipWakeProgress::Acquired);
+        }
+        self.next_poll_ms = now
+            .saturating_add(DRIVER_OWN_POLL_MS)
+            .min(self.attempt_deadline_ms)
+            .min(self.authority.deadline_ms);
+        Ok(DriverOwnershipWakeProgress::Pending {
+            next_poll_ms: self.next_poll_ms,
+        })
+    }
+}
+
 pub trait OwnershipRoundTripTransport: OwnershipTransport {
     fn write_set_own(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Nonblocking inverse of [`DriverOwnershipWake`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareOwnershipSleep {
+    authority: DriverOwnershipWakeAuthority,
+    attempts: u8,
+    attempt_deadline_ms: u64,
+    next_poll_ms: u64,
+}
+
+impl FirmwareOwnershipSleep {
+    pub fn new(
+        authority: DriverOwnershipWakeAuthority,
+        now_ms: u64,
+    ) -> Result<Self, DriverOwnershipWakeError<core::convert::Infallible>> {
+        if now_ms >= authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+        Ok(Self {
+            authority,
+            attempts: 0,
+            attempt_deadline_ms: now_ms,
+            next_poll_ms: now_ms,
+        })
+    }
+
+    pub fn poll<T: OwnershipRoundTripTransport>(
+        &mut self,
+        transport: &mut T,
+        epoch: u64,
+    ) -> Result<DriverOwnershipWakeProgress, DriverOwnershipWakeError<T::Error>> {
+        if epoch != self.authority.epoch {
+            return Err(DriverOwnershipWakeError::Revoked);
+        }
+        let now = transport.now_ms();
+        if now >= self.authority.deadline_ms {
+            return Err(DriverOwnershipWakeError::Deadline);
+        }
+        if self.attempts == 0 || now >= self.attempt_deadline_ms {
+            if self.attempts == DRIVER_OWN_ATTEMPTS {
+                return Err(DriverOwnershipWakeError::Deadline);
+            }
+            transport
+                .write_set_own()
+                .map_err(DriverOwnershipWakeError::Transport)?;
+            self.attempts += 1;
+            self.attempt_deadline_ms = now
+                .saturating_add(DRIVER_OWN_ATTEMPT_MS)
+                .min(self.authority.deadline_ms);
+            self.next_poll_ms = now;
+        }
+        if now < self.next_poll_ms {
+            return Ok(DriverOwnershipWakeProgress::Pending {
+                next_poll_ms: self.next_poll_ms,
+            });
+        }
+        let raw = transport
+            .read_low_power_control()
+            .map_err(DriverOwnershipWakeError::Transport)?;
+        if raw == u32::MAX || raw & (PCIE_LPCR_HOST_SET_OWN | PCIE_LPCR_HOST_CLR_OWN) != 0 {
+            return Err(DriverOwnershipWakeError::UnexpectedState(raw));
+        }
+        if raw & PCIE_LPCR_HOST_OWN_SYNC != 0 {
+            return Ok(DriverOwnershipWakeProgress::Acquired);
+        }
+        self.next_poll_ms = now
+            .saturating_add(DRIVER_OWN_POLL_MS)
+            .min(self.attempt_deadline_ms)
+            .min(self.authority.deadline_ms);
+        Ok(DriverOwnershipWakeProgress::Pending {
+            next_poll_ms: self.next_poll_ms,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3648,6 +3834,8 @@ pub enum PassiveMcuCommand {
     StartScan {
         scan_sequence: u8,
         channels: Vec<CandidateChannel>,
+        min_channel_time_ns: i64,
+        max_channel_time_ns: i64,
     },
     CancelScan {
         scan_sequence: u8,
@@ -3661,6 +3849,7 @@ pub enum PassiveMcuCommandError {
     InvalidAntennaMask,
     InvalidScanSequence,
     InvalidScanChannelCount,
+    InvalidScanDwell,
     ActiveScanMaterial,
 }
 
@@ -3910,7 +4099,9 @@ pub fn encode_client_interface_bss_command(enable: bool, sequence: u8) -> Result
 
 /// Encode only the pinned Linux commands required by the conservative passive
 /// one-channel milestone. START_HW_SCAN has no SSID, probe, IE, random-MAC, or
-/// transmit material and uses Connac2's firmware-selected dwell fields (zero).
+/// transmit material. Explicit dwell uses TU (1024us); the aggregate timeout
+/// uses milliseconds. A zero/zero range retains firmware defaults for the
+/// legacy diagnostic caller; production requests provide explicit bounds.
 pub fn encode_passive_mcu_command(
     command: &PassiveMcuCommand,
     sequence: u8,
@@ -4057,6 +4248,8 @@ pub fn encode_passive_mcu_command(
         PassiveMcuCommand::StartScan {
             scan_sequence,
             channels,
+            min_channel_time_ns,
+            max_channel_time_ns,
         } => {
             if *scan_sequence > 0x7f {
                 return Err(PassiveMcuCommandError::InvalidScanSequence);
@@ -4066,7 +4259,27 @@ pub fn encode_passive_mcu_command(
             if !(1..=64).contains(&channels.len()) {
                 return Err(PassiveMcuCommandError::InvalidScanChannelCount);
             }
+            // CMD_SCAN_REQ_V2 timing units are documented in the pinned
+            // MediaTek gen4m scan message; see SOURCE-MAP.md. Round inward:
+            // never shorten the minimum or exceed the requested maximum.
+            let min_ns = u64::try_from(*min_channel_time_ns)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let max_ns = u64::try_from(*max_channel_time_ns)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let min_tu = u16::try_from(min_ns.div_ceil(1_024_000))
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            let max_tu = u16::try_from(max_ns / 1_024_000)
+                .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
+            if min_tu > max_tu || (max_ns != 0 && max_tu == 0) {
+                return Err(PassiveMcuCommandError::InvalidScanDwell);
+            }
+            let timeout_ms =
+                u16::try_from((u64::from(max_tu) * channels.len() as u64 * 1024).div_ceil(1000))
+                    .map_err(|_| PassiveMcuCommandError::InvalidScanDwell)?;
             let mut payload = vec![0; 1186];
+            payload[154..156].copy_from_slice(&max_tu.to_le_bytes());
+            payload[156..158].copy_from_slice(&timeout_ms.to_le_bytes());
+            payload[828..830].copy_from_slice(&min_tu.to_le_bytes());
             payload[0] = *scan_sequence;
             payload[3] = 1;
             payload[7] = 1;
@@ -4397,6 +4610,24 @@ pub fn validate_passive_mac_bar_read(
 /// an immediate hardware readback to match it.
 pub const fn passive_mac_source_rmw_value(initial: u32, mask: u32, value: u32) -> u32 {
     mt76_mmio_rmw_value(initial, mask, value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientBeaconLoss {
+    pub bss_index: u8,
+    pub reason: u8,
+}
+
+/// Decode the legacy unsolicited beacon-loss event.
+/// Linux's mt76_connac_beacon_loss_event has a four-byte body; its reason is
+/// informational, and every reason reports loss of the associated connection.
+pub fn parse_client_beacon_loss(bytes: &[u8]) -> Result<ClientBeaconLoss, PassiveRxError> {
+    let response = parse_download_response(bytes, 0).map_err(|_| PassiveRxError::Truncated)?;
+    if response.event_id != 0x13 || response.sequence != 0 {
+        return Err(PassiveRxError::WrongEvent);
+    }
+    let body = bytes.get(36..40).ok_or(PassiveRxError::Truncated)?;
+    Ok(ClientBeaconLoss { bss_index: body[0], reason: body[1] })
 }
 
 pub fn parse_passive_scan_done(bytes: &[u8]) -> Result<PassiveScanDone, PassiveRxError> {
@@ -7474,6 +7705,15 @@ pub fn encode_client_post_assoc_rx_filter_command(sequence: u8) -> Result<Vec<u8
     encode_client_post_assoc_rx_filter_bitmap_command(sequence, 1)
 }
 
+/// Linux `mt7921_mcu_set_bss_pm(false)`: stop the firmware BSS monitor.
+/// CE SET_BSS_ABORT has no reply; the caller must drain transport completion.
+pub fn encode_client_bss_abort_command(sequence: u8, bss_index: u8) -> Result<Vec<u8>, String> {
+    if !(1..=15).contains(&sequence) || bss_index != 0 {
+        return Err("BSS abort escaped client interface bounds".into());
+    }
+    Ok(encode_legacy_mcu(0x17, 0, &[bss_index, 0, 0, 0], sequence))
+}
+
 /// Linux beacon-filter teardown uses `BIT_CLR` (bit operation 2) for the
 /// same `MT_WF_RFCR_DROP_OTHER_BEACON` bitmap before dismantling the BSS.
 pub fn encode_client_post_assoc_rx_filter_clear_command(sequence: u8) -> Result<Vec<u8>, String> {
@@ -8252,6 +8492,9 @@ pub struct ClientRxCandidate {
     pub pn: [u8; 6],
 }
 
+/// Linux's reserved PID for a frame without host TX-status correlation.
+pub const MT7921_PACKET_ID_NO_SKB: u8 = 1;
+
 pub fn encode_client_data_txwi(
     payload_len: usize,
     payload_iova: u64,
@@ -8270,7 +8513,7 @@ pub fn encode_client_data_txwi(
             .checked_add(payload_len as u64 - 1)
             .is_none_or(|end| end > u64::from(u32::MAX))
         || token >= 8192
-        || !(3..127).contains(&pid)
+        || (!(3..127).contains(&pid) && (eapol || pid != MT7921_PACKET_ID_NO_SKB))
         || tid > 7
         || wcid >= 20
     {
@@ -8314,7 +8557,7 @@ pub fn encode_client_data_txwi(
             0x0000_0028,
             0x0000_7802,
             0,
-            0x400 | u32::from(pid),
+            u32::from(pid) | if pid >= 3 { 0x400 } else { 0 },
             0,
             0x0028_0000,
         ]
@@ -13061,6 +13304,164 @@ mod tests {
     }
 
     #[test]
+    fn deferred_tx_wake_waits_for_owned_hif_without_blocking() {
+        let authority = DriverOwnershipWakeAuthority {
+            epoch: 7,
+            deadline_ms: 500,
+        };
+        let mut wake = DriverOwnershipWake::new(authority, 0).unwrap();
+        let mut transport = FakeOwnership {
+            now: 0,
+            status: PCIE_LPCR_HOST_OWN_SYNC,
+            clear_after_writes: None,
+            writes: 0,
+        };
+        assert_eq!(
+            wake.poll(&mut transport, 7),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
+        );
+        assert_eq!(transport.writes, 1);
+
+        transport.now = 1;
+        assert_eq!(
+            wake.poll(&mut transport, 7),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
+        );
+        assert_eq!(
+            transport.writes, 1,
+            "a pending poll must not reissue CLR_OWN"
+        );
+
+        transport.now = 3;
+        assert_eq!(
+            wake.poll(&mut transport, 7),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 4 })
+        );
+        transport.now = 4;
+        transport.status = 0;
+        assert_eq!(
+            wake.poll(&mut transport, 7),
+            Ok(DriverOwnershipWakeProgress::Acquired)
+        );
+        assert_eq!(transport.writes, 1);
+    }
+
+    #[test]
+    fn deferred_tx_wake_rejects_revoked_epoch_before_hardware_access() {
+        let mut wake = DriverOwnershipWake::new(
+            DriverOwnershipWakeAuthority {
+                epoch: 11,
+                deadline_ms: 500,
+            },
+            0,
+        )
+        .unwrap();
+        let mut transport = FakeOwnership {
+            now: 0,
+            status: PCIE_LPCR_HOST_OWN_SYNC,
+            clear_after_writes: None,
+            writes: 0,
+        };
+        assert_eq!(
+            wake.poll(&mut transport, 12),
+            Err(DriverOwnershipWakeError::Revoked)
+        );
+        assert_eq!(transport.writes, 0);
+    }
+
+    #[test]
+    fn deferred_tx_wake_honors_the_callers_shorter_deadline() {
+        let mut wake = DriverOwnershipWake::new(
+            DriverOwnershipWakeAuthority {
+                epoch: 3,
+                deadline_ms: 20,
+            },
+            0,
+        )
+        .unwrap();
+        let mut transport = FakeOwnership {
+            now: 0,
+            status: PCIE_LPCR_HOST_OWN_SYNC,
+            clear_after_writes: None,
+            writes: 0,
+        };
+        assert!(matches!(
+            wake.poll(&mut transport, 3),
+            Ok(DriverOwnershipWakeProgress::Pending { .. })
+        ));
+        transport.now = 20;
+        assert_eq!(
+            wake.poll(&mut transport, 3),
+            Err(DriverOwnershipWakeError::Deadline)
+        );
+        assert_eq!(transport.writes, 1);
+    }
+
+    struct FailingWakeTransport {
+        now: u64,
+        fail_write: bool,
+        raw: Result<u32, &'static str>,
+        writes: u8,
+    }
+
+    impl OwnershipTransport for FailingWakeTransport {
+        type Error = &'static str;
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn write_clear_own(&mut self) -> Result<(), Self::Error> {
+            self.writes += 1;
+            if self.fail_write {
+                Err("write")
+            } else {
+                Ok(())
+            }
+        }
+        fn read_low_power_control(&mut self) -> Result<u32, Self::Error> {
+            self.raw
+        }
+        fn sleep_ms(&mut self, _: u64) {
+            panic!("nonblocking wake must not sleep");
+        }
+    }
+
+    #[test]
+    fn deferred_tx_wake_contains_transport_and_ambiguous_status_errors() {
+        let authority = DriverOwnershipWakeAuthority {
+            epoch: 1,
+            deadline_ms: 500,
+        };
+        let mut wake = DriverOwnershipWake::new(authority, 0).unwrap();
+        let mut transport = FailingWakeTransport {
+            now: 0,
+            fail_write: true,
+            raw: Ok(0),
+            writes: 0,
+        };
+        assert_eq!(
+            wake.poll(&mut transport, 1),
+            Err(DriverOwnershipWakeError::Transport("write"))
+        );
+
+        let mut wake = DriverOwnershipWake::new(authority, 0).unwrap();
+        let mut transport = FailingWakeTransport {
+            now: 0,
+            fail_write: false,
+            raw: Ok(u32::MAX),
+            writes: 0,
+        };
+        assert_eq!(
+            wake.poll(&mut transport, 1),
+            Ok(DriverOwnershipWakeProgress::Pending { next_poll_ms: 3 })
+        );
+        transport.now = 3;
+        assert_eq!(
+            wake.poll(&mut transport, 1),
+            Err(DriverOwnershipWakeError::UnexpectedState(u32::MAX))
+        );
+    }
+
+    #[test]
     fn driver_ownership_times_out_at_hard_deadline() {
         let mut transport = FakeOwnership {
             now: 0,
@@ -13246,6 +13647,29 @@ mod tests {
             fail_set_after_write: false,
             aspm_delays: Vec::new(),
         }
+    }
+
+    #[test]
+    fn deferred_firmware_sleep_is_bounded_and_epoch_guarded() {
+        let authority = DriverOwnershipWakeAuthority {
+            epoch: 9,
+            deadline_ms: 501,
+        };
+        let mut sleep = FirmwareOwnershipSleep::new(authority, 0).unwrap();
+        let mut transport = round_trip_fake(OwnershipState::DriverOwned);
+        assert_eq!(
+            sleep.poll(&mut transport, 8),
+            Err(DriverOwnershipWakeError::Revoked)
+        );
+        assert_eq!(transport.set_writes, 0);
+        assert_eq!(transport.reads, 0);
+        assert_eq!(
+            sleep.poll(&mut transport, 9),
+            Ok(DriverOwnershipWakeProgress::Acquired)
+        );
+        assert_eq!(transport.set_writes, 1);
+        assert_eq!(transport.reads, 1);
+        assert_eq!(transport.status, PCIE_LPCR_HOST_OWN_SYNC);
     }
 
     #[test]
@@ -14861,6 +15285,51 @@ mod tests {
     }
 
     #[test]
+    fn data_without_host_status_uses_the_reserved_linux_pid() {
+        let encode = |pid, eapol| encode_client_data_txwi(
+            64, 0x1000, 0, pid, eapol, !eapol, false, 0, 1, 12,
+        );
+        let bytes = encode(MT7921_PACKET_ID_NO_SKB, false).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 1);
+        let bytes = encode(3, false).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x403);
+        assert!(encode(MT7921_PACKET_ID_NO_SKB, true).is_err());
+        for pid in [0, 2, 127, 255] {
+            assert!(encode(pid, false).is_err());
+        }
+    }
+
+    #[test]
+    fn bss_abort_is_the_bounded_linux_ce_request() {
+        let command = encode_client_bss_abort_command(7, 0).unwrap();
+        assert_eq!(command, encode_legacy_mcu(0x17, 0, &[0; 4], 7));
+        assert!(encode_client_bss_abort_command(0, 0).is_err());
+        assert!(encode_client_bss_abort_command(16, 0).is_err());
+        assert!(encode_client_bss_abort_command(7, 1).is_err());
+    }
+
+    #[test]
+    fn beacon_loss_requires_a_complete_unsolicited_event_and_preserves_bss() {
+        let mut bytes = [0u8; 40];
+        bytes[24..26].copy_from_slice(&16u16.to_le_bytes());
+        bytes[26..28].copy_from_slice(&0xa0u16.to_le_bytes());
+        bytes[28] = 0x13;
+        for bss in [0, 1, 255] {
+            bytes[36] = bss;
+            bytes[37] = 7; // Linux treats every reason as connection loss.
+            assert_eq!(parse_client_beacon_loss(&bytes), Ok(ClientBeaconLoss { bss_index: bss, reason: 7 }));
+        }
+        for length in 0..40 {
+            assert!(parse_client_beacon_loss(&bytes[..length]).is_err());
+        }
+        bytes[29] = 1;
+        assert!(parse_client_beacon_loss(&bytes).is_err());
+        bytes[29] = 0;
+        bytes[28] = 0x0d;
+        assert_eq!(parse_client_beacon_loss(&bytes), Err(PassiveRxError::WrongEvent));
+    }
+
+    #[test]
     fn join_roc_grant_parser_preserves_fields_without_requiring_echoes() {
         let mut bytes = [0u8; 60];
         bytes[24..26].copy_from_slice(&36u16.to_le_bytes());
@@ -15618,6 +16087,8 @@ mod tests {
         let scan = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel],
             },
             3,
@@ -15639,6 +16110,8 @@ mod tests {
         assert!(
             !PassiveMcuCommand::StartScan {
                 scan_sequence: 1,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel]
             }
             .expects_response()
@@ -15665,6 +16138,8 @@ mod tests {
         let scan_5ghz = encode_passive_mcu_command(
             &PassiveMcuCommand::StartScan {
                 scan_sequence: 2,
+                min_channel_time_ns: 0,
+                max_channel_time_ns: 0,
                 channels: vec![channel_5ghz],
             },
             5,
@@ -15681,6 +16156,8 @@ mod tests {
             encode_passive_mcu_command(
                 &PassiveMcuCommand::StartScan {
                     scan_sequence: 1,
+                    min_channel_time_ns: 0,
+                    max_channel_time_ns: 0,
                     channels: vec![forbidden],
                 },
                 1,
@@ -15706,6 +16183,8 @@ mod tests {
             let bytes = encode_passive_mcu_command(
                 &PassiveMcuCommand::StartScan {
                     scan_sequence: 127,
+                    min_channel_time_ns: 0,
+                    max_channel_time_ns: 0,
                     channels: channels.clone(),
                 },
                 15,
@@ -15741,6 +16220,8 @@ mod tests {
                 encode_passive_mcu_command(
                     &PassiveMcuCommand::StartScan {
                         scan_sequence: 1,
+                        min_channel_time_ns: 0,
+                        max_channel_time_ns: 0,
                         channels: vec![channel; count]
                     },
                     1
@@ -17173,6 +17654,80 @@ mod tests {
             Firmware::parse(&image),
             Err(FirmwareError::PayloadOverlapsMetadata)
         );
+    }
+    #[test]
+    fn passive_scan_encodes_requested_dwell_in_tu_and_timeout_in_ms() {
+        let bytes = encode_passive_mcu_command(
+            &PassiveMcuCommand::StartScan {
+                scan_sequence: 1,
+                channels: vec![
+                    CandidateChannel {
+                        band: PhysicalBand::Ghz2,
+                        number: 1,
+                        frequency_mhz: 2412,
+                    },
+                    CandidateChannel {
+                        band: PhysicalBand::Ghz2,
+                        number: 6,
+                        frequency_mhz: 2437,
+                    },
+                ],
+                min_channel_time_ns: 204_800_000,
+                max_channel_time_ns: 204_800_000,
+            },
+            1,
+        )
+        .unwrap();
+        let payload = &bytes[64..];
+        assert_eq!(
+            u16::from_le_bytes(payload[154..156].try_into().unwrap()),
+            200
+        );
+        assert_eq!(
+            u16::from_le_bytes(payload[828..830].try_into().unwrap()),
+            200
+        );
+        assert_eq!(
+            u16::from_le_bytes(payload[156..158].try_into().unwrap()),
+            410
+        );
+    }
+
+    #[test]
+    fn passive_scan_rejects_unrepresentable_dwell_before_encoding() {
+        let command = |min_channel_time_ns, max_channel_time_ns| PassiveMcuCommand::StartScan {
+            scan_sequence: 1,
+            channels: vec![
+                CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 1,
+                    frequency_mhz: 2412,
+                },
+                CandidateChannel {
+                    band: PhysicalBand::Ghz2,
+                    number: 6,
+                    frequency_mhz: 2437,
+                },
+            ],
+            min_channel_time_ns,
+            max_channel_time_ns,
+        };
+        for (minimum, maximum) in [
+            (-1, 1_024_000),
+            (2_048_000, 1_024_000),
+            (1, 1),
+            (0, 40_000_000_000), // aggregate timeout exceeds firmware u16 milliseconds
+            (0, i64::MAX),
+        ] {
+            assert_eq!(
+                encode_passive_mcu_command(&command(minimum, maximum), 1),
+                Err(PassiveMcuCommandError::InvalidScanDwell),
+            );
+        }
+        let bytes = encode_passive_mcu_command(&command(1_024_001, 3_071_999), 1).unwrap();
+        let payload = &bytes[64..];
+        assert_eq!(&payload[154..156], &2u16.to_le_bytes());
+        assert_eq!(&payload[828..830], &2u16.to_le_bytes());
     }
 }
 

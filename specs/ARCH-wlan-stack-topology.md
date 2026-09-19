@@ -19,15 +19,20 @@ acknowledged firmware commands, enforces receive integrity/replay checks and
 gates protected data on the controlled port. Physical validation has exercised
 WPA3 SAE, DHCP, encrypted DNS and HTTPS through separately sandboxed Netstack3
 with kernel Internet disabled, followed by safe hardware shutdown and native
-restoration. Active scan, scan cancellation, peer removal and MAC override
-remain unavailable; sustained operation, reconnect and power-management
-acceptance remain separate from this bounded Internet proof.
+restoration. Acknowledged peer teardown now permits disconnect/reconnect
+without resetting the device, and firmware owns station power saving and
+connection monitoring. Bounded physical tests exercise power-mode changes,
+idle wake, reconnect and saved-state restart; they do not establish sustained
+production acceptance. Active scan, scan cancellation and MAC override remain
+unavailable.
 
 The policy daemon owns persistence and network intent, and drives the pinned
 Fuchsia selector/state machine over bounded, fd-free control IPC. Application
 queueing, selection scans and retries consume one policy-issued deadline.
-The Wi-Fi process retains only device authority and precreated control,
-Ethernet and runtime-reactor descriptors after lockdown. Netstack3 remains a
+The Wi-Fi process retains device authority and inherited control/reactor
+capabilities after lockdown. It may create anonymous, nonblocking Unix packet
+pairs for replacement Ethernet links; pathname sockets and Internet sockets
+remain forbidden. Netstack3 remains a
 separate process with no device/DMA capabilities, connected through the bounded
 Ethernet lifecycle seam. No-VFIO verification does not qualify physical radio
 recovery or restart.
@@ -51,9 +56,11 @@ does not wait on it. Explicit
 SoftMAC roam is reported unsupported without disturbing the current link;
 the pinned SoftMAC MLME does not implement the fullmac roam request.
 
-MT7921 radio recovery, firmware beacon-loss delivery, connection-monitor
-offload, and retry-safe per-attempt cleanup remain future work; the replacement
-does not admit those operations.
+Firmware beacon-loss reports enter the peer-scoped Fuchsia lifecycle. Terminal
+events follow asynchronous device cleanup so SME cannot revoke its authority
+prematurely. Completed peer removal drains firmware, DMA and receive work before
+certifying retry safety; uncertain partial operations still require containment.
+Automatic recovery from arbitrary radio faults remains unqualified.
 
 This document refines [ARCH-network-service](ARCH-network-service.md),
 [ARCH-hardware-isolation](ARCH-hardware-isolation.md), and [ARCH-drv](ARCH-drv.md)
@@ -63,8 +70,16 @@ for the Wi-Fi data path, and is constrained by [REQ-isolation](REQ-isolation.md)
 
 ## Process topology
 
-The immediate production boundary is three capability-scoped services: Wi-Fi,
-wlancfg policy, and networking. Separate DNS is a later refinement. Persistent
+The implemented boundary has four capability-scoped services: Wi-Fi, wlancfg
+policy, Netstack3 networking, and netcfg device introduction/observation. The
+launcher retains process and hardware-stop ownership; netcfg receives only
+interface administration, lifecycle, and read-only status capabilities. See
+[the network binding contract](ARCH-network-service.md#device-introduction-and-observation-binding).
+The netcfg process graph has host/native-build tests and bounded physical
+MT7921 KVM coverage, including repeated link replacement, application traffic
+and certified shutdown. This is not sustained host-deployment acceptance.
+The host deployment runs separate DNS for NSS and loopback UDP/TCP;
+legacy network fixtures retain an integrated resolver. Persistent
 credential storage stays out of the Wi-Fi process, and device/DMA authority
 stays out of Internet parsers. The Wi-Fi process necessarily receives active
 connection authentication material and session keys; it is not secret-free.
@@ -72,8 +87,8 @@ connection authentication material and session keys; it is not secret-free.
 | Process | Owns | fs | secrets | hardware | Internet parser | lifecycle |
 |---|---|---|---|---|---|---|
 | driver + MLME + SME + RSN | VFIO/DMA, 802.11 control, SAE, 4-way handshake, keys | no | active connection only | yes | no | ephemeral |
-| netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | ephemeral |
-| dns (later separate process) | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
+| netstack | Ethernet/ARP/NDP/IP/ICMP/UDP/TCP/routing | no | no | no | yes | provider generation; survives link replacement |
+| dns | name resolution (DoH/DoT) | no | no | no | yes (narrow) | ephemeral |
 | policy (wlancfg) | saved networks, config, credentials, connection policy | yes | yes | no | no | stateful |
 
 The netstack remains one service and is not split by DNS domain, remote address,
@@ -287,6 +302,12 @@ allowlist) then `run()`. The hard invariant: **no untrusted byte is processed
 before `lockdown()` completes** — no `accept()`, no wire read, no untrusted
 config parse. This is the crosvm model; it makes the running allowlist far
 smaller than a launch-time jail because setup-only syscalls never appear in it.
+
+Seccomp constrains syscall kinds and non-descriptor arguments, not FD numbers.
+The startup inventory still limits which capabilities survive. File access modes,
+socket types and device/endpoint implementations enforce operations on those
+objects; descriptor aliases or reuse do not change their authority. Capability
+transfer and namespace/filesystem isolation remain separate boundaries.
 
 `lockdown()` is the per-kernel portability seam (Linux `unshare`+`seccomp`+cap
 drop; FreeBSD `cap_enter`+`cap_rights_limit`; a capability microkernel needs

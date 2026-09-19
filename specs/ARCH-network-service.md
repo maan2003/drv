@@ -9,7 +9,7 @@ Linux socket-provider spike exercises a deterministic Ethernet peer, but is
 not the production frontend described below: it retains native loopback and
 uses synchronous RPC where native socket buffering and readiness are needed.
 The production-shaped frontend now owns both Internet families in a KVM
-kernel with native INET excluded. A namespace registration capability yields
+kernel with native INET and the native loopback device excluded. A namespace registration capability yields
 per-socket provider FDs with independent bounded queues and local accept queues;
 control interruption revokes only the affected socket. Its sandboxed Netstack3 binding has passed
 IPv4/IPv6 localhost TCP/UDP and provider-generation failure/replacement tests;
@@ -28,10 +28,14 @@ These tests do not establish broad socket
 compatibility, hostile-provider robustness, or dependable physical throughput. Optimized localhost tests exceed
 100 MB/s; this is not evidence of Wi-Fi deployment throughput.
 
-The service implementation lives in `drv-network-service`. Its standalone
-supervisor starts offline and replaces children across tested Ethernet
-capability generations. Continuous physical service integration and the
-restart semantics below remain destination behavior.
+The service implementation lives in `drv-network-service`. Its production
+supervisor starts one offline provider generation and uses a private,
+generation-tagged descriptor channel to detach and replace Ethernet links
+without replacing the provider process or socket namespace. Provider crash
+and restart remain a distinct, terminal generation boundary for old sockets.
+Bounded physical validation now exercises disconnect/reconnect with the same
+provider and listener processes, including renewed IPv4/IPv6 traffic and SSH.
+This does not establish continuous deployment acceptance.
 
 ## Owner-selected goal and rationale
 
@@ -67,12 +71,17 @@ One sandboxed portable network service owns Ethernet, ARP/NDP, IP,
 fragmentation, ICMP, UDP, TCP, and routing. It is not split by DNS domain,
 remote address, connection, or application frontend. SOCKS and the Linux
 socket frontend are bindings to this service, not separate network stacks.
-Wi-Fi selection and credentials belong to wlancfg. DNS currently shares
-the network process and uses Hickory 0.26.3 with native Netstack3 transport;
-the optional NSS endpoint carries lookup requests, not DNS parsing or a second
-network stack. Its C ABI pointer adapter is isolated from safe Rust lookup,
-layout and I/O code; the separate DNS service described in
-[ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md) remains a later boundary.
+Wi-Fi selection and credentials belong to wlancfg. The host deployment uses
+the separately sandboxed DNS service described in
+[ARCH-wlan-stack-topology](ARCH-wlan-stack-topology.md): one encrypted upstream
+engine serves NSS and IPv4/IPv6 loopback UDP/TCP clients through Netstack3.
+The service manager owns the NSS listener path and passes the listening
+capability to DNS; it never competes with a provider-owned NSS listener.
+Legacy standalone network fixtures retain the integrated Hickory 0.26.3
+resolver and its launcher-owned, locked Unix endpoint. Host deployments
+disable that endpoint rather than running two independent resolver policies.
+The NSS C ABI pointer adapter remains isolated from safe Rust lookup,
+layout and I/O code.
 
 The production Linux frontend owns the existing `AF_INET` and `AF_INET6`
 socket families. It uses native socket objects, local bounded queues,
@@ -80,6 +89,22 @@ readiness, errors, and lifetime machinery rather than placing a proxy behind
 Linux TCP. Netstack3 owns transport connections, retransmission, congestion
 control, and packet processing. Localhost and wildcard listeners belong to
 the same Netstack3 instance; there is no special native-loopback backend.
+
+Route metadata is another binding of the same service. Linux retains native
+AF_NETLINK transport and subscriptions; a separate namespace registration
+delegates NETLINK_ROUTE endpoints to the sandbox. The adapter publishes real
+link/address observations and lifecycle events, not a second interface-state
+database. Old endpoints cannot join a replacement provider generation, and
+provider absence never silently exposes native kernel state. The current
+adapter supports read-only link/address discovery; route queries and mutations
+remain unsupported. Other Netlink protocols retain their native owners.
+
+Seccomp restricts syscall kinds, commands, flags and other non-descriptor
+arguments, never descriptor numbers. Capability identity, access mode and
+generation are enforced by the underlying objects; duplication or slot reuse
+does not change authority. Launchers retain only the intended capabilities,
+open immutable inputs read-only, and isolate filesystem/network namespaces.
+Fixed inherited FD numbers are startup conventions only, not security labels.
 
 The kernel mediates provider authority and resource limits. A compromised
 provider cannot select arbitrary namespaces, access unrelated sockets or
@@ -111,6 +136,38 @@ complete requests from its predecessor. Applications reconnect normally.
 This avoids pretending that ephemeral transport state survived a crash and
 keeps recovery simpler than transparent connection resurrection.
 
+## Network namespace ownership
+
+Unowned Linux network namespaces acquire independent, loopback-only Netstack3
+instances lazily on first Internet/route-metadata socket or interface-control
+request. Namespace creation itself does not spawn
+a service. The generic supervisor receives global provisioning authority, passes
+a namespace-bound serving capability to a sandboxed worker, and retains only
+separate lifecycle/revocation authority. It neither enters served namespaces nor
+gives these workers Ethernet, Wi-Fi, DMA or netcfg authority. Explicitly supervised
+namespaces remain reserved for their existing supervisor across provider failure;
+lazy provisioning must not replace the machine's network policy.
+
+Application sockets and namespace handles retain native namespace lifetime.
+Service capabilities retain only safe backing memory: namespace teardown revokes
+them and causes workers to be reaped. Authority follows the socket or serving
+object across descriptor transfer and `setns`, not the caller's current namespace.
+A single namespace generation owns Internet sockets, route metadata and interface
+control; explicit and lazy launchers use the same serving object. Failure and
+replacement invalidate all three together. Old capabilities cannot mutate,
+provision or revive a replacement.
+
+Loopback administration changes actual core device state before completion is
+acknowledged. Newly isolated namespaces start with loopback down and no assigned
+addresses; address/link views reflect core observations, not invented Ethernet
+or configured-address fixtures. Interface ioctl and rtnetlink interpretation,
+authorization policy and configuration belong to the userspace wrapper, backed by
+the same core state. Linux only authenticates namespace-relative credentials,
+marshals user memory and transports bounded, revocable requests. There is no native
+loopback device or flags mirror. A replacement isolated worker starts down again;
+configuration does not survive its owning generation. Unsupported management
+operations fail explicitly.
+
 ## Validation without a production escape hatch
 
 KVM on np isolates kernel and service development from the host's management
@@ -132,6 +189,48 @@ capacity changes, readiness and core notifications. Adapt their contracts to
 Linux capabilities and the service executor; do not replace Netstack3 transport
 policy with Linux TCP policy. Linux remains the reference for the application
 socket ABI and kernel resource mechanics.
+
+## Device introduction and observation binding
+
+The launcher owns process lifetime, containment and prebound listeners. A
+separate sandboxed `netcfg-service` receives device introduction/removal and a
+private Netstack administration capability; it does not receive credentials,
+device registers, DMA mappings or process-control authority. A logical Ethernet
+interface and the Netstack socket namespace survive link loss. Frame endpoints
+are link-scoped and created as needed, so old queued frames cannot cross a new
+link and reconnect is not limited by a bootstrap pool.
+
+Core IP-device, neighbor, router-advertisement and Ethernet multicast events
+update a typed, bounded observation view. Netcfg watches coalesced snapshots,
+and the read-only `netcfg-status` endpoint exposes assignment state, lifetimes,
+neighbors, membership and the latest RA. This is not an unbounded event history:
+address/neighbor/membership observations are capped at 64 each, RA options at
+8192 bytes, and overflow explicitly marks the view incomplete. Observations
+retain scalar device identifiers, not core device ownership. Raw RA options are
+excluded from implicit debug output.
+
+The current MT7921 frame binding receives multicast without a programmable
+group-address filter. This matches pinned Linux `mt7921_configure_filter`,
+which does not implement the multicast-list argument or `FIF_ALLMULTI`.
+Netstack3's existing IPv4/IPv6 group-membership checks decide local delivery;
+the host binding must not create a second IGMP/MLD policy or invent firmware
+filter commands. Ethernet join/leave notifications also update the observation
+view. This all-multicast receive contract does not imply multicast forwarding.
+
+Watcher pressure cannot block packet processing: acknowledgements are retained,
+control intake pauses behind a blocked acknowledgement, and observations
+coalesce until writable readiness. Netcfg's accepted status clients are bounded
+and time-limited. Its frame monitor owns the received capability directly and drops it on
+revocation; there is no reserved descriptor slot. Link-down disables both IP families on the Ethernet
+device, flushing its neighbors while leaving the separate loopback device
+available. DHCP run effects, waits and DNS resolver work are cancelled on
+revocation; unchanged DNS configuration preserves pending queries and cache.
+
+These bindings have host/core tests and bounded physical MT7921 KVM coverage:
+offline sockets, NSS resolution and IPv4/IPv6 applications, repeated link
+replacement, power transitions, saved-state restart and certified hardware
+stop. This does not establish continuously deployed host operation or complete
+Linux socket-option compatibility.
 
 ## Implementation direction and open choices
 

@@ -1,0 +1,43 @@
+--- a/sshd.c
++++ b/sshd.c
+@@ -1117,6 +1117,15 @@
+ 			}
+ 		}
+ 		for (i = 0; i < num_listen_socks; i++) {
++			/*
++			 * A listener capability may be revoked while sshd is
++			 * running.  POLLHUP and POLLNVAL are terminal for a
++			 * listening descriptor; do not repeatedly call accept(2)
++			 * on it.  POLLERR alone is not sufficient because native
++			 * network stacks may report transient accept errors.
++			 */
++			if (pfd[i].revents & (POLLHUP|POLLNVAL))
++				continue;
+ 			if (!(pfd[i].revents & POLLIN))
+ 				continue;
+ 			fromlen = sizeof(from);
+@@ -1220,6 +1229,24 @@
+ 			 */
+ 			reseed_prngs();
+ 		}
++
++		/*
++		 * Retire terminal listeners after processing this poll result so
++		 * pfd[] and listen_socks[] remain aligned throughout the accept
++		 * loop.  Preserve every unaffected listener.
++		 */
++		for (i = ret = 0; i < num_listen_socks; i++) {
++			if (pfd[i].revents & (POLLHUP|POLLNVAL)) {
++				error("Listener on fd %d terminated: poll revents 0x%04x",
++				    listen_socks[i], pfd[i].revents);
++				close(listen_socks[i]);
++				continue;
++			}
++			listen_socks[ret++] = listen_socks[i];
++		}
++		num_listen_socks = ret;
++		if (num_listen_socks == 0 && !lameduck)
++			fatal("No listening sockets remain");
+ 	}
+ }
+ 

@@ -29,6 +29,7 @@ let
   patchFiles = map (name:
     ../crates/net/netstack3-port-spike/upstream-cargo/patches/${name}
   ) [
+    "tcp-passive-storage-admission-host.patch"
     "dhcp-client-core-host.patch"
     "trust-dns-workspace.patch"
     "wlan-common-host.patch"
@@ -58,6 +59,7 @@ let
     "wlan-mlme-connection-monitor-offload-host.patch"
     "wlan-mlme-async-cancel-host.patch"
     "wlan-serving-sinks-host.patch"
+    "wlan-mlme-station-lifecycle-host.patch"
   ];
   patchRows = map (file: {
     name = builtins.baseNameOf file;

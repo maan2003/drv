@@ -1,0 +1,37 @@
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -126,6 +126,9 @@
+ static __poll_t sock_poll(struct file *file,
+ 			      struct poll_table_struct *wait);
+ static long sock_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++#ifdef CONFIG_NETSTACK3_RUST
++extern int ns3_interface_ioctl(struct net *, unsigned int, unsigned long);
++#endif
+ #ifdef CONFIG_COMPAT
+ static long compat_sock_ioctl(struct file *file,
+ 			      unsigned int cmd, unsigned long arg);
+@@ -1362,6 +1365,11 @@
+ 	ops = READ_ONCE(sock->ops);
+ 	sk = sock->sk;
+ 	net = sock_net(sk);
++#ifdef CONFIG_NETSTACK3_RUST
++	err = ns3_interface_ioctl(net, cmd, arg);
++	if (err != -ENOIOCTLCMD)
++		return err;
++#endif
+ 	if (unlikely(cmd >= SIOCDEVPRIVATE && cmd <= (SIOCDEVPRIVATE + 15))) {
+ 		struct ifreq ifr;
+ 		void __user *data;
+@@ -3542,6 +3550,12 @@
+ 	struct net *net = sock_net(sk);
+ 	const struct proto_ops *ops;
+ 
++#ifdef CONFIG_NETSTACK3_RUST
++	int ret = ns3_interface_ioctl(net, cmd, (unsigned long)argp);
++	if (ret != -ENOIOCTLCMD)
++		return ret;
++#endif
++
+ 	if (cmd >= SIOCDEVPRIVATE && cmd <= (SIOCDEVPRIVATE + 15))
+ 		return sock_ioctl(file, cmd, (unsigned long)argp);
+ 

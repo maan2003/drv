@@ -10,6 +10,7 @@ pub mod ethernet_transport;
 pub mod service;
 pub mod socket_provider;
 pub mod sockets;
+pub mod interfaces;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
@@ -36,17 +37,20 @@ use netstack3_base::{
 };
 use netstack3_core::PendingDatagramSocketError;
 use netstack3_core::device::{
-    BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceId, EthernetLinkDevice,
-    EthernetWeakDeviceId, LoopbackDeviceId, LoopbackDevice, LoopbackCreationProperties, MaxEthernetFrameSize, PureIpDeviceId,
+    BatchSize, DeviceId, EthernetCreationProperties, EthernetDeviceEvent as CoreEthernetDeviceEvent,
+    EthernetDeviceId, EthernetLinkDevice, EthernetWeakDeviceId, LoopbackDeviceId, LoopbackDevice,
+    LoopbackCreationProperties, MaxEthernetFrameSize, PureIpDeviceId,
     RecvEthernetFrameMeta, TransmitQueueConfiguration, WeakDeviceId,
 };
 use netstack3_core::device_socket::{
     DeviceSocketMetadata, EthernetHeaderParams, Protocol, TargetDevice,
 };
 use netstack3_core::ip::{
-    IpDeviceConfigurationUpdate, Ipv4DeviceConfigurationUpdate, Ipv6DeviceConfigurationUpdate,
-    RouteDiscoveryConfigurationUpdate,
+    IpDeviceConfigurationUpdate, IpDeviceEvent, Ipv4DeviceConfigurationUpdate,
+    Ipv6DeviceConfiguration, Ipv6DeviceConfigurationUpdate, RouteDiscoveryConfigurationUpdate,
+    RouterAdvertisementEvent, SlaacConfigurationUpdate,
 };
+use netstack3_core::neighbor;
 use netstack3_core::routes::{AddableEntry, AddableMetric, Generation, RawMetric};
 use netstack3_core::udp::UdpRemotePort;
 use netstack3_core::{CoreTxMetadata, IpExt, StackState, StackStateBuilder, TimerId};
@@ -68,13 +72,13 @@ use netstack3_icmp_echo::{
     IcmpEchoBindingsContext, IcmpEchoBindingsTypes, IcmpEchoSettings, IcmpSocketId,
     ReceiveIcmpEchoError,
 };
-use netstack3_ip::device::IidSecret;
+use netstack3_ip::device::{AddIpAddrSubnetError, IidGenerationConfiguration, IidSecret, StableSlaacAddressConfiguration};
 use netstack3_ip::nud::{LinkResolutionContext, LinkResolutionNotifier};
 use netstack3_ip::raw::{
     RawIpSocketId, RawIpSocketsBindingsContext, RawIpSocketsBindingsTypes, ReceivePacketError,
 };
 use netstack3_ip::{
-    IpRoutingBindingsTypes, MarksBindingsContext,
+    IpLayerEvent, IpRoutingBindingsTypes, MarksBindingsContext,
     socket::{IpSockCreationError, IpSockSendError},
 };
 const MAX_DHCP_DATAGRAM_LEN: usize = 1232;
@@ -162,12 +166,18 @@ impl AtomicInstant<NativeInstant> for AtomicNativeInstant {
     }
 }
 
-/// Entropy consumed only from bytes explicitly supplied by the embedding.
-#[derive(Debug, Default)]
-pub struct InjectedEntropy(VecDeque<u8>);
+/// Entropy consumed lazily from sources explicitly supplied by the embedding.
+/// A production CSPRNG stream need not impose a finite lifetime byte budget.
+#[derive(Default)]
+pub struct InjectedEntropy(VecDeque<Box<dyn Iterator<Item = u8> + Send + Sync>>);
+impl std::fmt::Debug for InjectedEntropy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedEntropy").field("sources", &self.0.len()).finish()
+    }
+}
 impl InjectedEntropy {
-    pub fn inject(&mut self, bytes: impl IntoIterator<Item = u8>) {
-        self.0.extend(bytes)
+    pub fn inject(&mut self, bytes: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) {
+        self.0.push_back(Box::new(bytes.into_iter()));
     }
 }
 impl RngCore for InjectedEntropy {
@@ -183,10 +193,14 @@ impl RngCore for InjectedEntropy {
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
         for byte in dst {
-            *byte = self
-                .0
-                .pop_front()
-                .expect("native Netstack3 entropy exhausted")
+            loop {
+                let source = self.0.front_mut().expect("native Netstack3 entropy exhausted");
+                if let Some(value) = source.next() {
+                    *byte = value;
+                    break;
+                }
+                self.0.pop_front();
+            }
         }
     }
 }
@@ -312,6 +326,9 @@ fn udp_socket_info<A: net_types::ip::IpAddress, D>(
 struct Queues {
     tx: VecDeque<TxFrame>,
     events: VecDeque<String>,
+    // Adapted from Fuchsia bindings.rs: device IDs are downgraded before
+    // route work crosses the synchronous core/bindings boundary.
+    ipv6_route_events: VecDeque<IpLayerEvent<WeakDeviceId<NativeBindingsCtx>, Ipv6>>,
     readiness: VecDeque<ReadinessEvent>,
 }
 
@@ -329,7 +346,9 @@ pub struct NativeBindingsCtx {
     entropy: InjectedEntropy,
     socket_capacity: usize,
     queue_capacity: usize,
+    storage_budget: Arc<StorageBudget>,
     queues: Queues,
+    interfaces: interfaces::Interfaces,
     loopback_rx_ready: bool,
     udp_v4: HashMap<String, VecDeque<NativeUdpDatagram>>,
     udp_v6: HashMap<String, VecDeque<NativeUdpDatagram>>,
@@ -350,14 +369,14 @@ impl Debug for NativeBindingsCtx {
 }
 
 impl NativeBindingsCtx {
-    pub fn new(queue_capacity: usize, entropy: impl IntoIterator<Item = u8>) -> Self {
+    pub fn new(queue_capacity: usize, entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) -> Self {
         Self::new_with_capacities(queue_capacity, queue_capacity, entropy)
     }
 
     fn new_with_capacities(
         socket_capacity: usize,
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
     ) -> Self {
         let mut rng = InjectedEntropy::default();
         rng.inject(entropy);
@@ -375,7 +394,12 @@ impl NativeBindingsCtx {
             entropy: rng,
             socket_capacity,
             queue_capacity,
+            storage_budget: Arc::new(StorageBudget {
+                limit: socket_capacity.checked_mul(2).expect("storage capacity overflow"),
+                used: AtomicUsize::new(0),
+            }),
             queues: Queues::default(),
+            interfaces: interfaces::Interfaces::default(),
             loopback_rx_ready: false,
             udp_v4: HashMap::new(),
             udp_v6: HashMap::new(),
@@ -395,7 +419,7 @@ impl NativeBindingsCtx {
     pub fn advance(&mut self, by: Duration) {
         self.now = self.now.saturating_add(by);
     }
-    pub fn inject_entropy(&mut self, bytes: impl IntoIterator<Item = u8>) {
+    pub fn inject_entropy(&mut self, bytes: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>) {
         self.entropy.inject(bytes);
     }
     pub fn take_tx(&mut self) -> Option<TxFrame> {
@@ -862,6 +886,15 @@ impl TcpBindingsTypes for NativeBindingsCtx {
         let b = NativeTcpBuffers::new(s);
         (b.receive.clone(), b.send.clone(), b)
     }
+    fn try_new_passive_open_buffers(
+        &mut self,
+        sizes: BufferSizes,
+    ) -> Option<(NativeReceiveBuffer, NativeSendBuffer, NativeTcpBuffers)> {
+        let lease = self.storage_budget.reserve(1).ok()?;
+        let b = NativeTcpBuffers::new(sizes);
+        b.attach_lease(lease);
+        Some((b.receive.clone(), b.send.clone(), b))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1025,10 +1058,82 @@ impl SocketOpsFilterBindingContext<DeviceId<Self>> for NativeBindingsCtx {
     }
 }
 
-impl<T: Debug> EventContext<T> for NativeBindingsCtx {
-    fn on_event(&mut self, event: T) {
-        let event = format!("{event:?}");
-        let _ = Self::push_bounded(self.queue_capacity, &mut self.queues.events, event);
+impl NativeBindingsCtx {
+    fn record_core_event(&mut self, event: &impl Debug) {
+        let _ = Self::push_bounded(
+            self.queue_capacity,
+            &mut self.queues.events,
+            format!("{event:?}"),
+        );
+    }
+}
+
+// Adapted from Fuchsia 1e1219e3fac944c9a906aea9646939746b6062b3,
+// src/connectivity/network/netstack3/src/bindings.rs EventContext implementations.
+// Unlike Fuchsia's asynchronous route worker, this synchronous embedding drains
+// the typed queue from Runtime. Downgrade immediately so queued NDP work cannot
+// keep an otherwise-removed core device alive.
+impl EventContext<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv6>) {
+        self.record_core_event(&event);
+        let event = event.map_device(|device| device.downgrade());
+        match event {
+            IpLayerEvent::AddRoute(_) | IpLayerEvent::RemoveRoutes { .. } => {
+                self.queues.ipv6_route_events.push_back(event)
+            }
+            // Multicast forwarding has no host API in this deliberately small
+            // embedding. It remains a typed diagnostic event, not route work.
+            IpLayerEvent::MulticastForwarding(_) => {}
+        }
+    }
+}
+
+impl EventContext<IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv4>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: IpLayerEvent<DeviceId<NativeBindingsCtx>, Ipv4>) {
+        // This embedding has no IPv4 route-discovery producer. Keep the typed
+        // dispatch (including multicast-forwarding diagnostics) without
+        // inventing a second dynamic IPv4 routing state machine.
+        self.record_core_event(&event);
+    }
+}
+
+impl<I: Ip> EventContext<IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeInstant>>
+    for NativeBindingsCtx
+{
+    fn on_event(&mut self, event: IpDeviceEvent<DeviceId<NativeBindingsCtx>, I, NativeInstant>) {
+        self.record_core_event(&event);
+        self.interfaces.ip_event(event, self.queue_capacity);
+    }
+}
+
+impl<I: Ip>
+    EventContext<neighbor::Event<Mac, EthernetDeviceId<NativeBindingsCtx>, I, NativeInstant>>
+    for NativeBindingsCtx
+{
+    fn on_event(
+        &mut self,
+        event: neighbor::Event<Mac, EthernetDeviceId<NativeBindingsCtx>, I, NativeInstant>,
+    ) {
+        self.record_core_event(&event);
+        self.interfaces.neighbor_event(event, self.queue_capacity);
+    }
+}
+
+impl EventContext<RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>> for NativeBindingsCtx {
+    fn on_event(&mut self, event: RouterAdvertisementEvent<DeviceId<NativeBindingsCtx>>) {
+        self.interfaces.ra_event(event, self.now);
+    }
+}
+
+impl EventContext<CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>>
+    for NativeBindingsCtx
+{
+    fn on_event(
+        &mut self,
+        event: CoreEthernetDeviceEvent<EthernetDeviceId<NativeBindingsCtx>>,
+    ) {
+        self.record_core_event(&event);
+        self.interfaces.ethernet_event(event, self.queue_capacity);
     }
 }
 
@@ -1320,13 +1425,11 @@ struct RuntimeTcpSocket {
     id: NativeTcpV4,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
-    listener_storage: Vec<Arc<StorageLease>>,
 }
 struct RuntimeTcpSocketV6 {
     id: NativeTcpV6,
     buffers: NativeTcpBuffers,
     notifier: NativeTcpSocketData,
-    listener_storage: Vec<Arc<StorageLease>>,
 }
 
 /// Single-owner facade over one Netstack3 core and one Ethernet interface.
@@ -1339,14 +1442,15 @@ pub struct Runtime {
     udp_v6: HashMap<UdpSocketHandle, NativeUdpV6>,
     tcp: HashMap<TcpSocketHandle, RuntimeTcpSocket>,
     tcp_v6: HashMap<TcpSocketHandle, RuntimeTcpSocketV6>,
-    dhcp_socket: SocketId<NativeBindingsCtx>,
-    device: EthernetDeviceId<NativeBindingsCtx>,
+    dhcp_socket: Option<SocketId<NativeBindingsCtx>>,
+    device: Option<EthernetDeviceId<NativeBindingsCtx>>,
     loopback: Option<LoopbackDeviceId<NativeBindingsCtx>>,
     ipv4_address: Option<AddrSubnet<Ipv4Addr>>,
     ipv6_address: Option<AddrSubnet<Ipv6Addr>>,
+    dynamic_ipv6: bool,
+    ipv6_discovered_routes: Vec<AddableEntry<Ipv6Addr, WeakDeviceId<NativeBindingsCtx>>>,
     dns_servers: [Option<std::net::Ipv4Addr>; 2],
     next_socket: u64,
-    storage_budget: Arc<StorageBudget>,
     stack: StackState<NativeBindingsCtx>,
     bindings: NativeBindingsCtx,
 }
@@ -1354,11 +1458,11 @@ pub struct Runtime {
 impl Runtime {
     /// Creates and IPv4-enables one Ethernet interface with explicit identity.
     ///
-    /// IPv6 is enabled when an IPv6 address is first applied, preserving the
-    /// IPv4-only runtime's frame behavior.
+    /// IPv6 is enabled by [`Self::enable_dynamic_ipv6`] or when an explicit
+    /// IPv6 address is applied, preserving IPv4-only embeddings.
     pub fn new(
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
         interface_id: NonZeroU64,
         mac: [u8; 6],
         mtu: u32,
@@ -1377,13 +1481,13 @@ impl Runtime {
     pub fn new_with_capacities(
         socket_capacity: usize,
         queue_capacity: usize,
-        entropy: impl IntoIterator<Item = u8>,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
         interface_id: NonZeroU64,
         mac: [u8; 6],
         mtu: u32,
     ) -> Result<Self, RuntimeError> {
         let mac = UnicastAddr::new(Mac::new(mac)).ok_or(RuntimeError::InvalidMac)?;
-        if socket_capacity == 0 || queue_capacity == 0 {
+        if socket_capacity == 0 || queue_capacity == 0 || socket_capacity.checked_mul(2).is_none() {
             return Err(RuntimeError::InvalidCapacity);
         }
         if mtu > 1500 {
@@ -1391,11 +1495,9 @@ impl Runtime {
         }
         let max_frame_size =
             MaxEthernetFrameSize::from_mtu(Mtu::new(mtu)).ok_or(RuntimeError::InvalidMtu)?;
-        let mut bindings =
-            NativeBindingsCtx::new_with_capacities(socket_capacity, queue_capacity, entropy);
-        let stack = bindings.build_stack();
-        let device = stack
-            .api(&mut bindings)
+        let mut runtime = Self::new_isolated(socket_capacity, queue_capacity, entropy)?;
+        let device = runtime.stack
+            .api(&mut runtime.bindings)
             .device::<EthernetLinkDevice>()
             .add_device(
                 NativeDeviceIdentifier(interface_id),
@@ -1409,8 +1511,8 @@ impl Runtime {
                 netstack3_device::queue::BufVecU8Allocator::default(),
             );
         let device_id = device.clone().into();
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .device_ip::<Ipv4>()
             .update_configuration(
                 &device_id,
@@ -1423,46 +1525,195 @@ impl Runtime {
                 },
             )
             .expect("new Ethernet device accepts IPv4 enablement");
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .transmit_queue::<EthernetLinkDevice>()
             .set_configuration(&device, TransmitQueueConfiguration::Fifo);
-        let dhcp_socket = stack
-            .api(&mut bindings)
+        let dhcp_socket = runtime.stack
+            .api(&mut runtime.bindings)
             .device_socket()
             .create(Mutex::new(VecDeque::<(
                 WeakDeviceId<NativeBindingsCtx>,
                 Vec<u8>,
             )>::new()));
-        stack
-            .api(&mut bindings)
+        runtime.stack
+            .api(&mut runtime.bindings)
             .device_socket()
             .set_device_and_protocol(
                 &dhcp_socket,
                 TargetDevice::SpecificDevice(&device_id),
                 Protocol::Specific(NonZeroU16::new(0x0800).unwrap()),
             );
+        runtime.dhcp_socket = Some(dhcp_socket);
+        runtime.device = Some(device);
+        Ok(runtime)
+    }
+
+    /// Independent protocol/bindings state, with no Ethernet or DHCP socket.
+    /// The caller introduces loopback and its administrative state explicitly.
+    pub fn new_isolated(
+        socket_capacity: usize,
+        queue_capacity: usize,
+        entropy: impl IntoIterator<Item = u8, IntoIter: Send + Sync + 'static>,
+    ) -> Result<Self, RuntimeError> {
+        if socket_capacity == 0 || queue_capacity == 0 || socket_capacity.checked_mul(2).is_none() {
+            return Err(RuntimeError::InvalidCapacity);
+        }
+        let mut bindings =
+            NativeBindingsCtx::new_with_capacities(socket_capacity, queue_capacity, entropy);
+        let stack = bindings.build_stack();
         Ok(Self {
             udp: HashMap::new(),
             udp_v6: HashMap::new(),
             tcp: HashMap::new(),
             tcp_v6: HashMap::new(),
-            dhcp_socket,
-            device,
+            dhcp_socket: None,
+            device: None,
             loopback: None,
             ipv4_address: None,
             ipv6_address: None,
+            dynamic_ipv6: false,
+            ipv6_discovered_routes: Vec::new(),
             dns_servers: [None, None],
             next_socket: 0,
-            // Separate active and passive populations each have a capacity-sized
-            // allowance. Retained post-close storage competes for the same pool.
-            storage_budget: Arc::new(StorageBudget {
-                limit: socket_capacity.checked_mul(2).ok_or(RuntimeError::InvalidCapacity)?,
-                used: AtomicUsize::new(0),
-            }),
             stack,
             bindings,
         })
+    }
+
+    pub fn has_ethernet(&self) -> bool { self.device.is_some() }
+
+    fn dynamic_ipv6_configuration(enabled: bool) -> Ipv6DeviceConfigurationUpdate {
+        Ipv6DeviceConfigurationUpdate {
+            max_router_solicitations: Some(enabled.then_some(
+                Ipv6DeviceConfiguration::DEFAULT_MAX_RTR_SOLICITATIONS,
+            )),
+            slaac_config: SlaacConfigurationUpdate {
+                stable_address_configuration: Some(if enabled {
+                    StableSlaacAddressConfiguration::Enabled {
+                        iid_generation: IidGenerationConfiguration::Opaque {
+                            idgen_retries: StableSlaacAddressConfiguration::DEFAULT_IDGEN_RETRIES,
+                        },
+                    }
+                } else {
+                    StableSlaacAddressConfiguration::Disabled
+                }),
+                ..Default::default()
+            },
+            route_discovery_config: RouteDiscoveryConfigurationUpdate {
+                allow_default_route: Some(enabled),
+            },
+            ip_config: IpDeviceConfigurationUpdate {
+                ip_enabled: Some(enabled),
+                dad_transmits: Some(enabled.then_some(
+                    Ipv6DeviceConfiguration::DEFAULT_DUPLICATE_ADDRESS_DETECTION_TRANSMITS,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Enables IPv6 host autoconfiguration on the Ethernet interface.
+    pub fn enable_dynamic_ipv6(&mut self) {
+        if self.dynamic_ipv6 { return; }
+        self.dynamic_ipv6 = true;
+        self.set_dynamic_ipv6_link_state(true);
+    }
+
+    fn set_link_state(&mut self, up: bool) {
+        let Some(device) = self.device.clone() else { return; };
+        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
+            &device.clone().into(), Ipv4DeviceConfigurationUpdate {
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
+                ..Default::default()
+            }).expect("valid Ethernet IPv4 link state");
+        if self.dynamic_ipv6 {
+            self.set_dynamic_ipv6_link_state(up);
+        } else {
+            self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
+                &device.clone().into(), Ipv6DeviceConfigurationUpdate {
+                    ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
+                    ..Default::default()
+                }).expect("valid Ethernet IPv6 link state");
+        }
+    }
+
+    fn set_dynamic_ipv6_link_state(&mut self, up: bool) {
+        let Some(device) = self.device.clone() else { return; };
+        if !self.dynamic_ipv6 { return; }
+        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
+            &device.clone().into(), Self::dynamic_ipv6_configuration(up),
+        ).expect("Ethernet device accepts IPv6 link-state configuration");
+        self.process_ipv6_route_events();
+        if !up { self.ipv6_address = None; }
+    }
+
+    fn process_ipv6_route_events(&mut self) {
+        if self.bindings.queues.ipv6_route_events.is_empty() {
+            return;
+        }
+        while let Some(event) = self.bindings.queues.ipv6_route_events.pop_front() {
+            // CoreNdp membership is owned by dynamic IPv6. Once administrative
+            // revocation has disabled it, stale or newly queued NDP changes
+            // must not enter the explicit route set.
+            if !self.dynamic_ipv6 {
+                continue;
+            }
+            match event {
+                IpLayerEvent::AddRoute(entry) => {
+                    if !self.ipv6_discovered_routes.contains(&entry) {
+                        self.ipv6_discovered_routes.push(entry);
+                    }
+                }
+                IpLayerEvent::RemoveRoutes { subnet, device, gateway } => {
+                    self.ipv6_discovered_routes.retain(|entry| {
+                        entry.subnet != subnet
+                            || entry.device != device
+                            || entry.gateway != gateway
+                    });
+                }
+                IpLayerEvent::MulticastForwarding(_) => {}
+            }
+        }
+        if !self.dynamic_ipv6 { return; }
+        // A queued CoreNdp route whose device has since been removed is stale.
+        // Purge it instead of allowing notification work to extend device life.
+        self.ipv6_discovered_routes
+            .retain(|entry| entry.device.upgrade().is_some());
+        let mut generation = Generation::initial();
+        let routes = self.ipv6_discovered_routes.iter().filter_map(|entry| {
+            let entry = entry
+                .clone()
+                .try_map_device_id(|device| device.upgrade().ok_or(()))
+                .ok()?;
+            let route = entry.resolve_metric(RawMetric(0)).with_generation(generation);
+            generation = generation.next();
+            Some(route)
+        }).collect();
+        let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
+        let table = api.main_table_id();
+        api.set_routes(&table, routes);
+    }
+
+    fn refresh_dynamic_ipv6_address(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
+        if !self.dynamic_ipv6 { return; }
+        self.ipv6_address = self.stack.api(&mut self.bindings).device_ip::<Ipv6>()
+            .get_assigned_ip_addr_subnets(&device.clone().into())
+            .into_iter()
+            .find(|address| {
+                let bytes = address.addr().ipv6_bytes();
+                bytes[0] != 0xfe || bytes[1] & 0xc0 != 0x80
+            });
+    }
+
+    #[cfg(test)]
+    fn has_ipv6_default_route(&mut self) -> bool {
+        self.stack.api(&mut self.bindings).routes::<Ipv6>().fold_routes(
+            false,
+            |found, _table, entry| found || entry.subnet.prefix() == 0,
+        )
     }
 
     pub(crate) fn next_timer_deadline(&self) -> Option<Duration> {
@@ -1470,29 +1721,62 @@ impl Runtime {
     }
 
     /// Enables Netstack3's actual loopback device, independent of carrier/DHCP.
-    pub fn enable_loopback(&mut self) {
-        if self.loopback.is_some() { return; }
-        let device = self.stack.api(&mut self.bindings).device::<LoopbackDevice>()
-            .add_device(NativeDeviceIdentifier(NonZeroU64::new(u64::MAX).unwrap()),
-                LoopbackCreationProperties { mtu: Mtu::new(65536) },
-                RawMetric(0), NativeDeviceState,
-                netstack3_device::queue::BufVecU8Allocator::default());
+    pub fn enable_loopback(&mut self) { self.set_loopback_up(true); }
+
+    /// Introduces a real loopback device, initially without addresses when down.
+    /// Administrative changes act on core; metadata comes from the resulting events.
+    pub fn set_loopback_up(&mut self, up: bool) {
+        if self.loopback.is_none() {
+            let device = self.stack.api(&mut self.bindings).device::<LoopbackDevice>()
+                .add_device(NativeDeviceIdentifier(NonZeroU64::new(u64::MAX).unwrap()),
+                    LoopbackCreationProperties { mtu: Mtu::new(65536) },
+                    RawMetric(0), NativeDeviceState,
+                    netstack3_device::queue::BufVecU8Allocator::default());
+            self.bindings.interfaces.introduce(device.bindings_id().0.get());
+            self.loopback = Some(device);
+        }
+        let device = self.loopback.as_ref().unwrap();
         let id = device.clone().into();
         self.stack.api(&mut self.bindings).device_ip::<Ipv4>().update_configuration(
             &id, Ipv4DeviceConfigurationUpdate {
-                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                 ..Default::default()
             }).unwrap();
         self.stack.api(&mut self.bindings).device_ip::<Ipv6>().update_configuration(
             &id, Ipv6DeviceConfigurationUpdate {
-                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(true), ..Default::default() },
+                ip_config: IpDeviceConfigurationUpdate { ip_enabled: Some(up), ..Default::default() },
                 ..Default::default()
             }).unwrap();
-        self.stack.api(&mut self.bindings).device_ip::<Ipv4>().add_ip_addr_subnet(
-            &id, AddrSubnet::new(Ipv4Addr::new([127,0,0,1]), 8).unwrap()).unwrap();
-        self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
-            &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap()).unwrap();
-        self.loopback = Some(device);
+        if !up { return; }
+        // Core, not the bounded observation cache, decides whether an address
+        // already exists. Observation overflow must never duplicate protocol state.
+        let v4 = self.stack.api(&mut self.bindings).device_ip::<Ipv4>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv4Addr::new([127,0,0,1]), 8).unwrap());
+        assert!(matches!(v4, Ok(()) | Err(AddIpAddrSubnetError::Exists)));
+        let v6 = self.stack.api(&mut self.bindings).device_ip::<Ipv6>().add_ip_addr_subnet(
+            &id, AddrSubnet::new(Ipv6Addr::new([0,0,0,0,0,0,0,1]), 128).unwrap());
+        assert!(matches!(v6, Ok(()) | Err(AddIpAddrSubnetError::Exists)));
+    }
+
+    /// Current observations for this Ethernet interface. Unlike diagnostic
+    /// strings this view tracks assignment, lifetimes, neighbor and multicast
+    /// changes and is suitable for configuration/watch consumers.
+    pub fn interface_revision(&self) -> u64 { self.bindings.interfaces.revision }
+
+    pub fn interface_snapshots(&self) -> Vec<interfaces::InterfaceSnapshot> {
+        let mut snapshots = Vec::new();
+        if self.has_ethernet() { snapshots.push(self.interface_snapshot()); }
+        if let Some(loopback) = &self.loopback
+            && let Some(snapshot) = self.bindings.interfaces.snapshot(loopback.bindings_id().0.get())
+        {
+            snapshots.push(snapshot);
+        }
+        snapshots
+    }
+
+    pub fn interface_snapshot(&self) -> interfaces::InterfaceSnapshot {
+        self.bindings.interfaces.snapshot(self.device.as_ref().expect("Ethernet snapshot requires an Ethernet runtime").bindings_id().0.get())
+            .expect("Ethernet IP configuration emits the initial interface state")
     }
 
     pub fn ipv4_address(&self) -> Option<[u8; 4]> {
@@ -1510,6 +1794,7 @@ impl Runtime {
         prefix: u8,
         default_gateway: Option<[u8; 4]>,
     ) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
         let address = AddrSubnet::new(Ipv4Addr::new(address), prefix)
             .map_err(|_| RuntimeError::InvalidAddress)?;
         let gateway = default_gateway
@@ -1519,13 +1804,13 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .device_ip::<Ipv4>()
-            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .add_ip_addr_subnet(&device.clone().into(), address)
             .map_err(|_| RuntimeError::AddressInUse)?;
 
         let metric = AddableMetric::ExplicitMetric(RawMetric(0));
         let mut generation = Generation::initial();
         let mut routes = vec![
-            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+            AddableEntry::without_gateway(address.subnet(), device.clone().into(), metric)
                 .resolve_metric(RawMetric(0))
                 .with_generation(generation),
         ];
@@ -1534,7 +1819,7 @@ impl Runtime {
             routes.push(
                 AddableEntry::with_gateway(
                     Subnet::new(Ipv4Addr::new([0, 0, 0, 0]), 0).unwrap(),
-                    self.device.clone().into(),
+                    device.clone().into(),
                     gateway,
                     metric,
                 )
@@ -1551,6 +1836,7 @@ impl Runtime {
 
     /// Removes the configured IPv4 address and all IPv4 routes.
     pub fn revoke_ipv4(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
         let mut api = self.stack.api(&mut self.bindings).routes::<Ipv4>();
         let table = api.main_table_id();
         api.set_routes(&table, Vec::new());
@@ -1559,7 +1845,7 @@ impl Runtime {
                 .stack
                 .api(&mut self.bindings)
                 .device_ip::<Ipv4>()
-                .del_ip_addr(&self.device.clone().into(), address.addr());
+                .del_ip_addr(&device.clone().into(), address.addr());
         }
         self.dns_servers = [None, None];
     }
@@ -1571,6 +1857,7 @@ impl Runtime {
         prefix: u8,
         default_gateway: Option<[u8; 16]>,
     ) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
         let address = AddrSubnet::new(Ipv6Addr::from_bytes(address), prefix)
             .map_err(|_| RuntimeError::InvalidAddress)?;
         let gateway = default_gateway
@@ -1583,7 +1870,7 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_ip::<Ipv6>()
             .update_configuration(
-                &self.device.clone().into(),
+                &device.clone().into(),
                 Ipv6DeviceConfigurationUpdate {
                     max_router_solicitations: Some(None),
                     route_discovery_config: RouteDiscoveryConfigurationUpdate {
@@ -1600,13 +1887,13 @@ impl Runtime {
         self.stack
             .api(&mut self.bindings)
             .device_ip::<Ipv6>()
-            .add_ip_addr_subnet(&self.device.clone().into(), address)
+            .add_ip_addr_subnet(&device.clone().into(), address)
             .map_err(|_| RuntimeError::AddressInUse)?;
 
         let metric = AddableMetric::ExplicitMetric(RawMetric(0));
         let mut generation = Generation::initial();
         let mut routes = vec![
-            AddableEntry::without_gateway(address.subnet(), self.device.clone().into(), metric)
+            AddableEntry::without_gateway(address.subnet(), device.clone().into(), metric)
                 .resolve_metric(RawMetric(0))
                 .with_generation(generation),
         ];
@@ -1615,7 +1902,7 @@ impl Runtime {
             routes.push(
                 AddableEntry::with_gateway(
                     Subnet::new(Ipv6Addr::from_bytes([0; 16]), 0).unwrap(),
-                    self.device.clone().into(),
+                    device.clone().into(),
                     gateway,
                     metric,
                 )
@@ -1632,6 +1919,13 @@ impl Runtime {
 
     /// Removes the configured IPv6 address and all IPv6 routes.
     pub fn revoke_ipv6(&mut self) {
+        let Some(device) = self.device.clone() else { return; };
+        if self.dynamic_ipv6 {
+            self.set_dynamic_ipv6_link_state(false);
+            self.dynamic_ipv6 = false;
+        }
+        self.bindings.queues.ipv6_route_events.clear();
+        self.ipv6_discovered_routes.clear();
         let mut api = self.stack.api(&mut self.bindings).routes::<Ipv6>();
         let table = api.main_table_id();
         api.set_routes(&table, Vec::new());
@@ -1640,7 +1934,7 @@ impl Runtime {
                 .stack
                 .api(&mut self.bindings)
                 .device_ip::<Ipv6>()
-                .del_ip_addr(&self.device.clone().into(), address.addr());
+                .del_ip_addr(&device.clone().into(), address.addr());
         }
     }
 
@@ -1654,6 +1948,8 @@ impl Runtime {
 
     /// Sends an upstream DHCP core AF_PACKET payload through the private device socket.
     pub fn dhcp_packet_send(&mut self, packet: &[u8]) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
+        let dhcp_socket = self.dhcp_socket.as_ref().ok_or(RuntimeError::NetworkUnreachable)?;
         if packet.len() > 1500 {
             return Err(RuntimeError::PayloadTooLarge);
         }
@@ -1661,9 +1957,9 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_socket()
             .send_frame::<_, EthernetLinkDevice>(
-                &self.dhcp_socket,
+                dhcp_socket,
                 DeviceSocketMetadata {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     metadata: Some(EthernetHeaderParams {
                         dest_addr: Mac::BROADCAST,
                         protocol: EtherType::Ipv4,
@@ -1676,7 +1972,8 @@ impl Runtime {
 
     /// Takes one full IPv4 packet for the upstream DHCP core AF_PACKET adapter.
     pub fn dhcp_packet_receive(&mut self) -> Option<Vec<u8>> {
-        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+        let dhcp_socket = self.dhcp_socket.as_ref()?;
+        while let Some((_, frame)) = dhcp_socket.socket_state().lock().unwrap().pop_front() {
             let Some(packet) = frame.get(14..) else {
                 continue;
             };
@@ -1689,6 +1986,8 @@ impl Runtime {
 
     /// Sends a pre-lease DHCP datagram through core's private device socket.
     pub fn dhcp_send(&mut self, payload: &[u8]) -> Result<(), RuntimeError> {
+        let device = self.device.clone().ok_or(RuntimeError::NetworkUnreachable)?;
+        let dhcp_socket = self.dhcp_socket.as_ref().ok_or(RuntimeError::NetworkUnreachable)?;
         if payload.len() > MAX_DHCP_DATAGRAM_LEN {
             return Err(RuntimeError::PayloadTooLarge);
         }
@@ -1711,9 +2010,9 @@ impl Runtime {
             .api(&mut self.bindings)
             .device_socket()
             .send_frame::<_, EthernetLinkDevice>(
-                &self.dhcp_socket,
+                dhcp_socket,
                 DeviceSocketMetadata {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     metadata: Some(EthernetHeaderParams {
                         dest_addr: Mac::new([0xff; 6]),
                         protocol: EtherType::Ipv4,
@@ -1726,7 +2025,8 @@ impl Runtime {
 
     /// Takes one DHCP server datagram received by the private device socket.
     pub fn dhcp_receive(&mut self) -> Option<Vec<u8>> {
-        while let Some((_, frame)) = self.dhcp_socket.socket_state().lock().unwrap().pop_front() {
+        let dhcp_socket = self.dhcp_socket.as_ref()?;
+        while let Some((_, frame)) = dhcp_socket.socket_state().lock().unwrap().pop_front() {
             let Some(ip) = frame.get(14..) else {
                 continue;
             };
@@ -1761,19 +2061,23 @@ impl Runtime {
 
     /// Delivers one owned Ethernet frame into core.
     pub fn receive_frame(&mut self, frame: EthernetFrame) {
+        let Some(device) = self.device.clone() else { return; };
         self.stack
             .api(&mut self.bindings)
             .device::<EthernetLinkDevice>()
             .receive_frame(
                 RecvEthernetFrameMeta {
-                    device_id: self.device.clone(),
+                    device_id: device.clone(),
                     parsing_context: netstack3_base::NetworkParsingContext::default(),
                 },
                 Buf::new(frame.into_vec(), ..),
             );
+        self.process_ipv6_route_events();
+        self.refresh_dynamic_ipv6_address();
     }
 
     fn service_tx(&mut self, budget: usize) {
+        let Some(device) = self.device.clone() else { return; };
         if budget == 0 || self.bindings.queues.tx.len() >= self.bindings.queue_capacity {
             return;
         }
@@ -1782,7 +2086,7 @@ impl Runtime {
             .stack
             .api(&mut self.bindings)
             .transmit_queue::<EthernetLinkDevice>()
-            .transmit_queued_frames(&self.device, BatchSize::new_saturating(available), &mut ());
+            .transmit_queued_frames(&device, BatchSize::new_saturating(available), &mut ());
     }
 
     /// Takes one outbound frame, servicing core's TX queue as capacity opens.
@@ -1814,6 +2118,8 @@ impl Runtime {
                 work += 1;
             }
         }
+        self.process_ipv6_route_events();
+        self.refresh_dynamic_ipv6_address();
         work
     }
 
@@ -2192,7 +2498,7 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let lease = self.storage_budget.reserve(1)?;
+        let lease = self.bindings.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
@@ -2218,7 +2524,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier,
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2268,12 +2573,8 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         let socket = self.tcp.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
-        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
-        let extra = backlog.get().saturating_sub(reserved);
-        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
         self.stack.api(&mut self.bindings).tcp::<Ipv4>()
             .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
-        if let Some(lease) = lease { socket.listener_storage.push(lease); }
         Ok(())
     }
 
@@ -2309,7 +2610,6 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         if self.tcp_pending_connections(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
-        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp
             .get(&listener)
@@ -2321,7 +2621,6 @@ impl Runtime {
             .tcp::<Ipv4>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
-        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -2344,7 +2643,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier: NativeTcpSocketData::default(),
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2551,7 +2849,7 @@ impl Runtime {
         if self.socket_count() >= self.bindings.socket_capacity {
             return Err(RuntimeError::SocketLimit);
         }
-        let lease = self.storage_budget.reserve(1)?;
+        let lease = self.bindings.storage_budget.reserve(1)?;
         let socket_data = NativeTcpSocketData::buffers(BufferSizes {
             send: self.bindings.tcp_settings.send_buffer.default().get(),
             receive: self.bindings.tcp_settings.receive_buffer.default().get(),
@@ -2577,7 +2875,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier,
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2637,12 +2934,8 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         let socket = self.tcp_v6.get_mut(&handle).ok_or(RuntimeError::UnknownSocket)?;
-        let reserved: usize = socket.listener_storage.iter().map(|lease| lease.units).sum();
-        let extra = backlog.get().saturating_sub(reserved);
-        let lease = if extra != 0 { Some(self.storage_budget.reserve(extra)?) } else { None };
         self.stack.api(&mut self.bindings).tcp::<Ipv6>()
             .listen(&socket.id, backlog).map_err(map_tcp_listen_error)?;
-        if let Some(lease) = lease { socket.listener_storage.push(lease); }
         Ok(())
     }
 
@@ -2682,7 +2975,6 @@ impl Runtime {
             return Err(RuntimeError::SocketLimit);
         }
         if self.tcp_pending_connections_ipv6(listener)? == 0 { return Err(RuntimeError::WouldBlock); }
-        let lease = self.storage_budget.reserve(1)?;
         let listener = &self
             .tcp_v6
             .get(&listener)
@@ -2694,7 +2986,6 @@ impl Runtime {
             .tcp::<Ipv6>()
             .accept(listener)
             .map_err(map_tcp_accept_error)?;
-        buffers.attach_lease(lease);
         let local = match self
             .stack
             .api(&mut self.bindings)
@@ -2717,7 +3008,6 @@ impl Runtime {
                         id,
                         buffers,
                         notifier: NativeTcpSocketData::default(),
-                        listener_storage: Vec::new(),
                     }
                 )
                 .is_none()
@@ -2853,8 +3143,10 @@ impl NetworkServiceEndpoint for Runtime {
     }
 
     fn on_device_event(&mut self, event: EthernetDeviceEvent) {
-        if event == EthernetDeviceEvent::TransmitReady {
-            self.service_tx(1);
+        match event {
+            EthernetDeviceEvent::TransmitReady => self.service_tx(1),
+            EthernetDeviceEvent::ReceiveReady => {}
+            EthernetDeviceEvent::LinkStateChanged(up) => self.set_link_state(up),
         }
     }
 }
@@ -2875,6 +3167,24 @@ mod tests {
         )
         .unwrap();
         PacketFilterAdmin::replace_rules(&mut runtime, NativeFilterRules::default()).unwrap();
+    }
+
+    #[test]
+    fn entropy_sources_are_lazy_and_continue_beyond_the_old_provider_budget() {
+        let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = consumed.clone();
+        let mut entropy = InjectedEntropy::default();
+        entropy.inject((0..70_000).map(move |i| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            (i % 256) as u8
+        }));
+        entropy.inject([7, 8, 9, 10]);
+        assert_eq!(consumed.load(Ordering::Relaxed), 0);
+        let mut bytes = vec![0; 70_000];
+        entropy.fill_bytes(&mut bytes);
+        assert!(bytes.iter().enumerate().all(|(i, byte)| *byte == (i % 256) as u8));
+        assert_eq!(consumed.load(Ordering::Relaxed), bytes.len());
+        assert_eq!(entropy.next_u32(), u32::from_le_bytes([7, 8, 9, 10]));
     }
 
     #[test]
@@ -3069,6 +3379,412 @@ mod tests {
         panic!("IPv6 DAD traffic did not quiesce");
     }
 
+    fn router_advertisement(
+        router_mac: Mac,
+        router_ip: Ipv6Addr,
+        prefix: Ipv6Addr,
+        lifetime_secs: u16,
+    ) -> EthernetFrame {
+        use netstack3_base::NetworkSerializationContext;
+        use packet::Serializer as _;
+        use packet_formats::ethernet::{
+            ETHERNET_MIN_BODY_LEN_NO_TAG, EtherType, EthernetFrameBuilder,
+        };
+        use packet_formats::icmp::ndp::options::{NdpOptionBuilder, PrefixInformation};
+        use packet_formats::icmp::ndp::{OptionSequenceBuilder, RouterAdvertisement};
+        use packet_formats::icmp::{IcmpPacketBuilder, IcmpZeroCode};
+        use packet_formats::ip::Ipv6Proto;
+        use packet_formats::ipv6::Ipv6PacketBuilder;
+
+        let all_nodes = Ipv6Addr::from_bytes([
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = PrefixInformation::new(
+            64,
+            true,
+            true,
+            u32::from(lifetime_secs),
+            u32::from(lifetime_secs),
+            prefix,
+        );
+        let options = [NdpOptionBuilder::PrefixInformation(prefix)];
+        let bytes = OptionSequenceBuilder::new(options.iter())
+            .into_serializer()
+            .wrap_in(IcmpPacketBuilder::<Ipv6, _>::new(
+                router_ip,
+                all_nodes,
+                IcmpZeroCode,
+                RouterAdvertisement::new(0, false, false, lifetime_secs, 0, 0),
+            ))
+            .wrap_in(Ipv6PacketBuilder::new(
+                router_ip,
+                all_nodes,
+                255,
+                Ipv6Proto::Icmpv6,
+            ))
+            .wrap_in(EthernetFrameBuilder::new(
+                router_mac,
+                Mac::new([0x33, 0x33, 0, 0, 0, 1]),
+                EtherType::Ipv6,
+                ETHERNET_MIN_BODY_LEN_NO_TAG,
+            ))
+            .serialize_vec_outer(&mut NetworkSerializationContext::default())
+            .unwrap()
+            .unwrap_b()
+            .into_inner();
+        EthernetFrame::try_from(bytes).unwrap()
+    }
+
+    fn default_v6_route(
+        device: DeviceId<NativeBindingsCtx>,
+    ) -> AddableEntry<Ipv6Addr, DeviceId<NativeBindingsCtx>> {
+        AddableEntry::without_gateway(
+            Subnet::new(Ipv6Addr::from_bytes([0; 16]), 0).unwrap(),
+            device,
+            AddableMetric::MetricTracksInterface,
+        )
+    }
+
+    #[test]
+    fn typed_core_ndp_add_and_remove_use_discovered_membership() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_dynamic_ipv6();
+        let device: DeviceId<_> = runtime.device.clone().unwrap().into();
+        let entry = default_v6_route(device.clone());
+
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(entry.clone()),
+        );
+        runtime.process_ipv6_route_events();
+        assert!(runtime.has_ipv6_default_route());
+        assert_eq!(runtime.ipv6_discovered_routes.len(), 1);
+
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::RemoveRoutes {
+                subnet: entry.subnet,
+                device,
+                gateway: entry.gateway,
+            },
+        );
+        runtime.process_ipv6_route_events();
+        assert!(!runtime.has_ipv6_default_route());
+        assert!(runtime.ipv6_discovered_routes.is_empty());
+    }
+
+    #[test]
+    fn core_ndp_events_cannot_replace_explicit_or_revoked_routes() {
+        let mut runtime = runtime_ipv6(
+            1,
+            [2, 0, 0, 0, 0, 1],
+            CLIENT_V6,
+            64,
+            Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfe]),
+        );
+        let device: DeviceId<_> = runtime.device.clone().unwrap().into();
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device.clone())),
+        );
+        runtime.process_ipv6_route_events();
+
+        assert!(runtime.has_ipv6_default_route(), "explicit default route survives");
+        assert!(
+            runtime.ipv6_discovered_routes.is_empty(),
+            "CoreNdp membership stays disabled for explicit configuration",
+        );
+
+        runtime.revoke_ipv6();
+        EventContext::on_event(
+            &mut runtime.bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device)),
+        );
+        assert_eq!(runtime.dispatch_due(0), 0, "no core turn was dispatched");
+        assert!(!runtime.has_ipv6_default_route());
+        assert!(runtime.ipv6_discovered_routes.is_empty());
+    }
+
+    #[test]
+    fn queued_core_event_does_not_retain_removed_device() {
+        let mut bindings = NativeBindingsCtx::new(
+            8,
+            (0u8..=255).cycle().take(8192),
+        );
+        let stack = bindings.build_stack();
+        let device = stack
+            .api(&mut bindings)
+            .device::<EthernetLinkDevice>()
+            .add_device(
+                NativeDeviceIdentifier(NonZeroU64::new(7).unwrap()),
+                EthernetCreationProperties {
+                    mac: UnicastAddr::new(Mac::new([2, 0, 0, 0, 0, 7])).unwrap(),
+                    max_frame_size: MaxEthernetFrameSize::from_mtu(Mtu::new(1500)).unwrap(),
+                    tx_offload_spec: netstack3_base::ChecksumOffloadSpec::none(),
+                },
+                RawMetric(0),
+                NativeDeviceState,
+                netstack3_device::queue::BufVecU8Allocator::default(),
+            );
+        let weak = device.downgrade();
+        EventContext::on_event(
+            &mut bindings,
+            IpLayerEvent::<_, Ipv6>::AddRoute(default_v6_route(device.clone().into())),
+        );
+
+        drop(
+            stack
+                .api(&mut bindings)
+                .device::<EthernetLinkDevice>()
+                .remove_device(device),
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "queued notification work must not keep the device alive",
+        );
+        let queued = bindings.queues.ipv6_route_events.pop_front().unwrap();
+        match queued {
+            IpLayerEvent::AddRoute(entry) => assert!(entry.device.upgrade().is_none()),
+            event => panic!("unexpected queued event: {event:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_ipv6_observes_dad_lifetimes_default_route_and_link_revocation() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_loopback();
+        runtime.enable_dynamic_ipv6();
+        let snapshot = runtime.interface_snapshot();
+        assert!(snapshot.ipv6_enabled);
+        assert!(snapshot.multicast.contains(&[0x33, 0x33, 0, 0, 0, 1]));
+        assert!(snapshot.addresses.iter().any(|a| a.state == interfaces::AddressState::Tentative));
+        let router_ip = Ipv6Addr::from_bytes([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = Ipv6Addr::from_bytes([
+            0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        runtime.receive_frame(router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            4,
+        ));
+        assert_eq!(runtime.ipv6_address(), None, "SLAAC address remains tentative during DAD");
+        let advertisement = runtime.interface_snapshot().router_advertisement.unwrap();
+        assert_eq!(advertisement.source.octets(), router_ip.ipv6_bytes());
+        assert!(!advertisement.options.is_empty());
+
+        runtime.set_now(NativeInstant::from_nanos(2_000_000_000));
+        runtime.dispatch_due(64);
+        let address = runtime.ipv6_address().expect("SLAAC address assigned after DAD");
+        assert_eq!(&address[..8], &prefix.ipv6_bytes()[..8]);
+        assert!(runtime.interface_snapshot().addresses.iter().any(|a|
+            a.address == std::net::IpAddr::V6(address.into())
+                && a.state == interfaces::AddressState::Assigned));
+
+        assert!(runtime.has_ipv6_default_route(), "router lifetime installs a default route");
+
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
+        assert_eq!(runtime.ipv6_address(), None, "link loss revokes the SLAAC generation");
+        let snapshot = runtime.interface_snapshot();
+        assert!(!snapshot.ipv6_enabled);
+        assert!(!snapshot.multicast.iter().any(|mac| mac[..2] == [0x33, 0x33]));
+        assert!(!snapshot.addresses.iter().any(|a| a.address.is_ipv6()));
+        let loopback_server = runtime.udp_socket_ipv6().unwrap();
+        runtime.udp_bind_ipv6(
+            loopback_server,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            NonZeroU16::new(8053).unwrap(),
+        ).unwrap();
+        let loopback_client = runtime.udp_socket_ipv6().unwrap();
+        runtime.udp_send_to_ipv6(
+            loopback_client,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            NonZeroU16::new(8053).unwrap(),
+            b"loopback survives Ethernet loss",
+        ).unwrap();
+        runtime.dispatch_due(64);
+        assert_eq!(
+            runtime.udp_receive_ipv6(loopback_server).unwrap().as_deref(),
+            Some(&b"loopback survives Ethernet loss"[..]),
+        );
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+
+        runtime.receive_frame(router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            4,
+        ));
+        runtime.set_now(NativeInstant::from_nanos(4_000_000_000));
+        runtime.dispatch_due(64);
+        assert!(runtime.ipv6_address().is_some(), "link return starts a new SLAAC generation");
+
+        runtime.set_now(NativeInstant::from_nanos(7_000_000_001));
+        runtime.dispatch_due(64);
+        assert_eq!(runtime.ipv6_address(), None, "advertised address lifetime expires");
+        assert!(
+            !runtime.has_ipv6_default_route(),
+            "router lifetime expires the discovered default route",
+        );
+    }
+
+    #[test]
+    fn explicit_revoke_stops_dynamic_ipv6_and_does_not_restore_discovered_routes() {
+        let mut runtime = Runtime::new(
+            16,
+            (0u8..=255).cycle().take(8192),
+            NonZeroU64::new(1).unwrap(),
+            [2, 0, 0, 0, 0, 1],
+            1500,
+        )
+        .unwrap();
+        runtime.enable_dynamic_ipv6();
+        let router_ip = Ipv6Addr::from_bytes([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let prefix = Ipv6Addr::from_bytes([
+            0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let advertisement = || router_advertisement(
+            Mac::new([2, 0, 0, 0, 0, 2]),
+            router_ip,
+            prefix,
+            30,
+        );
+
+        runtime.receive_frame(advertisement());
+        runtime.set_now(NativeInstant::from_nanos(2_000_000_000));
+        runtime.dispatch_due(64);
+        assert!(runtime.ipv6_address().is_some());
+        assert!(runtime.has_ipv6_default_route());
+
+        NetworkConfigurationAdmin::revoke_ipv6(&mut runtime);
+        assert_eq!(runtime.ipv6_address(), None);
+        assert!(!runtime.has_ipv6_default_route());
+
+        runtime.receive_frame(advertisement());
+        runtime.set_now(NativeInstant::from_nanos(4_000_000_000));
+        runtime.dispatch_due(64);
+        runtime.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+        runtime.dispatch_due(64);
+        assert_eq!(runtime.ipv6_address(), None, "revocation disables SLAAC");
+        assert!(
+            !runtime.has_ipv6_default_route(),
+            "revocation cannot restore cached or newly advertised routes",
+        );
+    }
+
+    #[test]
+    fn many_idle_listeners_share_capacity_without_backlog_reservations() {
+        let mut rt = Runtime::new_isolated(32, 128, (0u8..=255).cycle().take(65536)).unwrap();
+        rt.enable_loopback();
+        for i in 0..32 {
+            let port = NonZeroU16::new(20000 + i).unwrap();
+            if i % 2 == 0 {
+                let h = rt.tcp_socket().unwrap();
+                rt.tcp_bind(h, Some([127,0,0,1]), port).unwrap();
+                rt.tcp_listen(h, NonZeroUsize::new(32).unwrap()).unwrap();
+            } else {
+                let h = rt.tcp_socket_ipv6().unwrap();
+                rt.tcp_bind_ipv6(h, Some(std::net::Ipv6Addr::LOCALHOST.octets()), port).unwrap();
+                rt.tcp_listen_ipv6(h, NonZeroUsize::new(32).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 32);
+    }
+
+    #[test]
+    fn passive_ipv4_and_ipv6_share_budget_and_retry_after_capacity_returns() {
+        let mut rt = Runtime::new_isolated(4, 128, (0u8..=255).cycle().take(65536)).unwrap();
+        rt.enable_loopback();
+        let port = NonZeroU16::new(20000).unwrap();
+        let l4 = rt.tcp_socket().unwrap();
+        let l6 = rt.tcp_socket_ipv6().unwrap();
+        rt.tcp_bind(l4, Some([127,0,0,1]), port).unwrap();
+        rt.tcp_bind_ipv6(l6, Some(std::net::Ipv6Addr::LOCALHOST.octets()), port).unwrap();
+        rt.tcp_listen(l4, NonZeroUsize::new(4).unwrap()).unwrap();
+        rt.tcp_listen_ipv6(l6, NonZeroUsize::new(4).unwrap()).unwrap();
+        let c4 = rt.tcp_socket().unwrap();
+        let c6 = rt.tcp_socket_ipv6().unwrap();
+        rt.tcp_connect(c4, [127,0,0,1], port).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.tcp_pending_connections(l4).unwrap(), 1);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 5);
+        let held = rt.bindings.storage_budget.reserve(3).unwrap();
+        rt.tcp_connect_ipv6(c6, std::net::Ipv6Addr::LOCALHOST.octets(), port).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.tcp_pending_connections_ipv6(l6).unwrap(), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 8);
+        drop(held);
+        for second in 1..=8 { rt.poll_at(Duration::from_secs(second), 128); }
+        assert_eq!(rt.tcp_pending_connections_ipv6(l6).unwrap(), 1);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn half_open_storage_is_charged_once_and_released_on_close_reset_or_timeout() {
+      for action in ["close", "reset", "timeout"] {
+        let mut client = runtime(11, [2,0,0,0,0,1], [192,0,2,11]);
+        let mut server = runtime(12, [2,0,0,0,0,2], [192,0,2,12]);
+        let port = NonZeroU16::new(20000).unwrap();
+        let listener = server.tcp_socket().unwrap();
+        server.tcp_bind(listener, None, port).unwrap();
+        server.tcp_listen(listener, NonZeroUsize::new(2).unwrap()).unwrap();
+        let conn = client.tcp_socket().unwrap();
+        client.tcp_connect(conn, [192,0,2,12], port).unwrap();
+        server.receive_frame(client.take_tx().unwrap()); // ARP request.
+        client.receive_frame(server.take_tx().unwrap()); // ARP reply.
+        let syn = client.take_tx().unwrap();
+        let duplicate = EthernetFrame::try_from(syn.as_bytes().to_vec()).unwrap();
+        server.receive_frame(syn);
+        let syn_ack = server.take_tx().unwrap(); // Withhold final ACK.
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        server.receive_frame(duplicate);
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        assert_eq!(server.tcp_pending_connections(listener).unwrap(), 0);
+        while server.take_tx().is_some() {}
+        if action == "reset" {
+            client.tcp_close(conn).unwrap();
+            client.receive_frame(syn_ack); // Closed client responds with RST, not ACK.
+            server.receive_frame(client.take_tx().unwrap());
+        }
+        if action == "timeout" {
+            for power in 0..16 {
+                server.poll_at(Duration::from_secs(1 << power), 128);
+                while server.take_tx().is_some() {} // No final ACK ever arrives.
+            }
+        }
+        if action != "close" {
+            assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
+            // A different client SYN must fit the recovered backlog and budget.
+            let next = client.tcp_socket().unwrap();
+            client.tcp_connect(next, [192,0,2,12], port).unwrap();
+            server.receive_frame(client.take_tx().unwrap());
+            assert!(server.take_tx().is_some());
+            assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 2);
+        }
+        server.tcp_close(listener).unwrap();
+        assert_eq!(server.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
+      }
+    }
+
     #[test]
     fn two_native_runtimes_resolve_arp_and_exchange_udp() {
         let mut client = runtime(1, [0x02, 0, 0, 0, 0, 1], [192, 0, 2, 1]);
@@ -3111,6 +3827,10 @@ mod tests {
             server.udp_receive(server_socket).unwrap().as_deref(),
             Some(&b"bounded native UDP"[..])
         );
+        let snapshot = client.interface_snapshot();
+        assert!(snapshot.neighbors.iter().any(|neighbor|
+            neighbor.address == std::net::IpAddr::V4([192, 0, 2, 2].into())
+                && neighbor.mac == Some([2, 0, 0, 0, 0, 2])));
 
         server
             .udp_send_to(
@@ -3132,9 +3852,48 @@ mod tests {
 
         assert!(client.udp_socket().is_ok());
         assert_eq!(client.udp_socket(), Err(RuntimeError::SocketLimit));
+        client.on_device_event(EthernetDeviceEvent::LinkStateChanged(false));
+        let offline = client.interface_snapshot();
+        assert!(!offline.ipv4_enabled);
+        assert!(offline.neighbors.is_empty(), "link loss flushes the old router's ARP identity");
+        client.on_device_event(EthernetDeviceEvent::LinkStateChanged(true));
+        assert!(client.interface_snapshot().ipv4_enabled);
+        client.revoke_ipv4();
+        assert!(client.interface_snapshot().addresses.is_empty(),
+            "removal updates the observer even when diagnostic queues are full");
+
     }
     #[test]
-    fn accept_pressure_preserves_queued_child_until_storage_release() {
+    fn isolated_runtime_has_only_real_loopback_and_no_ethernet_authority() {
+        let mut rt = Runtime::new_isolated(16, 32, (0u8..=255).cycle().take(65536)).unwrap();
+        assert!(!rt.has_ethernet());
+        assert!(rt.interface_snapshots().is_empty());
+        assert_eq!(rt.dhcp_packet_send(&[0; 20]), Err(RuntimeError::NetworkUnreachable));
+        rt.set_loopback_up(false);
+        let down = rt.interface_snapshots();
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0].id, u64::MAX);
+        assert!(!down[0].ipv4_enabled && !down[0].ipv6_enabled);
+        assert!(down[0].addresses.is_empty());
+        rt.set_loopback_up(true);
+        rt.set_loopback_up(true); // repeated native observations are idempotent
+        let up = rt.interface_snapshots();
+        assert!(up[0].ipv4_enabled && up[0].ipv6_enabled);
+        assert_eq!(up[0].addresses.len(), 2);
+        rt.set_loopback_up(false);
+        let down = rt.interface_snapshots();
+        assert!(!down[0].ipv4_enabled && !down[0].ipv6_enabled);
+        rt.set_loopback_up(true);
+        assert_eq!(rt.interface_snapshots()[0].addresses.len(), 2);
+        assert!(rt.take_tx().is_none());
+        let mut tiny = Runtime::new_isolated(4, 1, (0u8..=255).cycle().take(65536)).unwrap();
+        tiny.set_loopback_up(true);
+        tiny.set_loopback_up(true);
+        assert!(tiny.interface_snapshots()[0].incomplete);
+    }
+
+    #[test]
+    fn accept_transfers_precharged_storage_even_when_budget_is_full() {
         let mut rt = Runtime::new_with_capacities(4, 16, (0u8..=255).cycle().take(65536),
             NonZeroU64::new(1).unwrap(), [2,0,0,0,0,1], 1500).unwrap();
         rt.enable_loopback();
@@ -3150,23 +3909,32 @@ mod tests {
             retained.push(rt.tcp.get(&h).unwrap().buffers.clone());
             rt.tcp_close(h).unwrap();
         }
-        assert_eq!(rt.tcp_accept(listener), Err(RuntimeError::SocketLimit));
-        assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 1);
-        retained.pop();
+        let used = rt.bindings.storage_budget.used.load(Ordering::Relaxed);
+        assert_eq!(used, rt.bindings.storage_budget.limit);
         let child = rt.tcp_accept(listener).unwrap();
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), used);
         assert_eq!(rt.tcp_pending_connections(listener).unwrap(), 0);
         assert_eq!(rt.tcp_write(client, b"still alive").unwrap(), 11);
         for _ in 0..32 { rt.dispatch_due(128); }
         let mut bytes = [0;16];
         assert_eq!(rt.tcp_read(child, &mut bytes).unwrap(), 11);
         assert_eq!(&bytes[..11], b"still alive");
+        let child_buffers = rt.tcp.get(&child).unwrap().buffers.clone();
+        drop(retained);
+        rt.tcp_close(listener).unwrap();
+        rt.tcp_close(child).unwrap();
+        rt.tcp_close(client).unwrap();
+        for _ in 0..32 { rt.dispatch_due(128); }
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
+        drop(child_buffers);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn storage_budget_follows_buffers_after_runtime_handle_removal() {
         let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
         let mut held = Vec::new();
-        for _ in 0..rt.storage_budget.limit {
+        for _ in 0..rt.bindings.storage_budget.limit {
             let h = rt.tcp_socket().unwrap();
             held.push(rt.tcp.get(&h).unwrap().buffers.clone());
             rt.tcp_close(h).unwrap();
@@ -3177,20 +3945,20 @@ mod tests {
         let h = rt.tcp_socket().unwrap();
         rt.tcp_close(h).unwrap();
         drop(held);
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn listener_backlog_reservation_survives_failed_reconfiguration_and_releases_after_close() {
+    fn idle_listener_does_not_precharge_backlog_storage() {
         let mut rt = runtime(11, [2,0,0,0,1,1], [192,0,2,11]);
         let h = rt.tcp_socket().unwrap();
         rt.tcp_bind(h, None, None).unwrap();
         rt.tcp_listen(h, NonZeroUsize::new(2).unwrap()).unwrap();
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
         assert_eq!(rt.tcp_listen(h, NonZeroUsize::new(1).unwrap()), Err(RuntimeError::NotSupported));
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 3);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 1);
         rt.tcp_close(h).unwrap();
-        assert_eq!(rt.storage_budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(rt.bindings.storage_budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]

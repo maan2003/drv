@@ -372,6 +372,21 @@ async fn handle(
             if saved.store(id.clone(), credential).await.is_err() {
                 return Reply::Error("could not save network".into());
             }
+            if cancelled.get().is_some() {
+                return Reply::Error("connection cancelled".into());
+            }
+            // This adapter cannot scan while joined. Let the Fuchsia machine
+            // acknowledge disconnect before selection, retaining the original
+            // deadline and never treating failed teardown as quiescence.
+            let disconnected =
+                disconnect_machine(state, deadline, types::DisconnectReason::FidlConnectRequest)
+                    .await;
+            if disconnected != Reply::Ok {
+                return disconnected;
+            }
+            if cancelled.get().is_some() {
+                return Reply::Error("connection cancelled".into());
+            }
             let Some(target) = selector
                 .find_and_select_connection_candidate(
                     deadline,
@@ -387,15 +402,6 @@ async fn handle(
                 target,
                 reason: ConnectReason::FidlConnectRequest,
             };
-            if cancelled.get().is_some() {
-                return Reply::Error("connection cancelled".into());
-            }
-            let disconnected =
-                disconnect_machine(state, deadline, types::DisconnectReason::FidlConnectRequest)
-                    .await;
-            if disconnected != Reply::Ok {
-                return disconnected;
-            }
             if cancelled.get().is_some() {
                 return Reply::Error("connection cancelled".into());
             }
@@ -566,6 +572,137 @@ fn scan_security(security: sme::Protection) -> Option<Security> {
 mod tests {
     use super::*;
     use std::sync::mpsc as sync_mpsc;
+
+    #[test]
+    fn reconnect_selection_waits_for_successful_disconnect() {
+        use crate::tests::{GENERATION, receive, send_packet, sockets};
+        use std::os::fd::AsRawFd as _;
+        use wlan_control_wire::{Message, Reply as WireReply};
+
+        for disconnect_succeeds in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "wlancfg-reconnect-order-{}-{disconnect_succeeds}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            futures::executor::block_on(async {
+                let (telemetry_tx, _telemetry_rx) = mpsc::channel(100);
+                let telemetry = TelemetrySender::new(telemetry_tx);
+                let saved: Arc<dyn SavedNetworksManagerApi> = Arc::new(
+                    SavedNetworksManager::new_with_directory(
+                        File::open(&directory).unwrap(),
+                        telemetry.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let (client_fd, server_fd) = sockets();
+                let control =
+                    crate::PreparedHostControlClient::from_inherited_socket(client_fd, GENERATION)
+                        .unwrap()
+                        .spawn_parked_after_setup()
+                        .unwrap()
+                        .activate_after_persistence()
+                        .unwrap();
+                let scan = Arc::new(ControlScan {
+                    control: control.clone(),
+                });
+                let inspector = fuchsia_inspect::Inspector::default();
+                let selector = ConnectionSelector::new(
+                    saved.clone(),
+                    scan.clone(),
+                    inspector.root().create_child("selection"),
+                    telemetry.clone(),
+                );
+                let (tx, mut requests) = mpsc::channel(4);
+                let (publisher, status) = status_publisher_and_reader();
+                publisher.publish_status(state_machine::Status::Connected {
+                    channel: 6,
+                    rssi: -40,
+                    snr: 30,
+                });
+                let state = RefCell::new(PolicyState {
+                    desired: None,
+                    machine: Some(Machine {
+                        client: state_machine::Client::new(tx),
+                        status,
+                        network: network_id(b"old-peer".to_vec(), Security::Open),
+                    }),
+                });
+                let cancelled = Cell::new(None);
+                let deadline =
+                    wlan_control_wire::MonotonicDeadline::after(Duration::from_secs(30)).unwrap();
+                let mut connecting = Box::pin(handle(
+                    Request::Connect {
+                        ssid: b"new-peer".to_vec(),
+                        security: Security::Open,
+                        credential: vec![],
+                    },
+                    deadline,
+                    &control,
+                    scan.as_ref(),
+                    &selector,
+                    saved,
+                    telemetry,
+                    &state,
+                    &cancelled,
+                ));
+                assert!(connecting.as_mut().now_or_never().is_none());
+                let state_machine::ManualRequest::Disconnect((received, _, ack)) = requests
+                    .try_recv()
+                    .expect("disconnect must precede selection")
+                else {
+                    panic!("expected disconnect");
+                };
+                assert_eq!(received, deadline);
+                assert!(connecting.as_mut().now_or_never().is_none());
+                if !disconnect_succeeds {
+                    drop(ack);
+                    assert_eq!(connecting.await, Reply::Error("disconnect failed".into()));
+                    // Failure must not issue a scan or a replacement connect.
+                    let mut byte = 0u8;
+                    assert_eq!(
+                        unsafe {
+                            libc::recv(
+                                server_fd.as_raw_fd(),
+                                (&mut byte as *mut u8).cast(),
+                                1,
+                                libc::MSG_DONTWAIT,
+                            )
+                        },
+                        -1
+                    );
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                } else {
+                    publisher.publish_status(state_machine::Status::Disconnected);
+                    ack.send(()).unwrap();
+                    let peer = std::thread::spawn(move || {
+                        let packet = receive(server_fd.as_raw_fd());
+                        assert!(matches!(packet.message, Message::Scan { deadline: d, .. }
+                            if d == deadline));
+                        send_packet(
+                            server_fd.as_raw_fd(),
+                            1,
+                            Message::ScanReply(WireReply {
+                                in_reply_to: packet.request_id,
+                                result: Err(sme::ScanErrorCode::InternalError),
+                            }),
+                            &[],
+                        );
+                    });
+                    assert_eq!(
+                        connecting.await,
+                        Reply::Error("saved network is not visible".into())
+                    );
+                    peer.join().unwrap();
+                }
+            });
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
 
     #[test]
     fn status_and_disconnect_progress_without_dropping_the_active_operation() {

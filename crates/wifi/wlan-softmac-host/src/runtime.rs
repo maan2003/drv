@@ -8,7 +8,7 @@ use crate::ethernet::{
 };
 use crate::sme::client::{ConnectTransaction, Request as SmeRequest, ScanReceiver};
 use crate::{
-    ClientRuntimeDriver, OperationContext, OperationEpoch, WlanSoftmac, WlanSoftmacLifecycle,
+    ClientRuntimeDriver, OperationContext, OperationEpoch, StationOffloadSupport, WlanSoftmac, WlanSoftmacLifecycle,
     WlanSoftmacUpcalls,
 };
 use fdf::ArenaStaticBox;
@@ -30,9 +30,6 @@ use wlan_mlme::device::{DeviceOps, LinkStatus};
 
 const UPCALL_QUEUE_CAPACITY: usize = 256;
 const ETHERNET_QUEUE_CAPACITY: usize = 256;
-/// Bounded Ethernet generations created before production lockdown. Exhaustion
-/// terminates the runtime cleanly rather than creating a descriptor post-lock.
-pub const PREPARED_ETHERNET_GENERATIONS: usize = 4;
 
 pub(super) struct ScanOperation {
     pub(super) transaction_id: u64,
@@ -59,7 +56,7 @@ impl MlmeExecution {
 
 pub(super) struct HostIo {
     pub(super) ethernet: DriverEthernetPort,
-    pub(super) replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    pub(super) ethernet_queue_capacity: usize,
     pub(super) unpublished_ethernet_device: Option<HostEthernetDevice>,
     pub(super) pending_ethernet_devices: VecDeque<HostEthernetDevice>,
     pub(super) ethernet_mac_address: [u8; 6],
@@ -67,6 +64,7 @@ pub(super) struct HostIo {
 }
 
 pub(super) enum Upcall {
+    ConnectionLoss([u8; 6]),
     Recv {
         bytes: Vec<u8>,
         info: fidl_softmac::WlanRxInfo,
@@ -121,6 +119,10 @@ impl UpcallSender {
 }
 
 impl WlanSoftmacUpcalls for UpcallSender {
+    fn notify_connection_loss(&mut self, peer: [u8; 6]) {
+        self.push_control(Upcall::ConnectionLoss(peer));
+    }
+
     fn recv(&mut self, bytes: Vec<u8>, info: fidl_softmac::WlanRxInfo) {
         let mut state = self.0.lock().unwrap();
         if state.live && state.queue.len() < UPCALL_QUEUE_CAPACITY {
@@ -167,6 +169,7 @@ fn ethernet_status(error: EthernetIngressError) -> zx::Status {
 }
 
 struct HostMlmeDevice {
+    station_offload: StationOffloadSupport,
     execution: Rc<MlmeExecution>,
     driver: DriverHandle,
     io: Arc<Mutex<HostIo>>,
@@ -176,11 +179,12 @@ struct HostMlmeDevice {
 }
 
 impl HostMlmeDevice {
-    fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>) -> Self {
+    fn new(driver: DriverHandle, io: Arc<Mutex<HostIo>>, station_offload: StationOffloadSupport) -> Self {
         let (event_sink, event_stream) = mpsc::channel(UPCALL_QUEUE_CAPACITY);
         let operation =
             OperationContext::new(std::time::Instant::now() + std::time::Duration::from_secs(3));
         Self {
+            station_offload,
             execution: Rc::new(MlmeExecution {
                 operation: Arc::new(Mutex::new(operation.clone())),
                 scan: RefCell::new(None),
@@ -212,6 +216,14 @@ impl HostMlmeDevice {
 }
 
 impl DeviceOps for HostMlmeDevice {
+    fn power_save_offload(&self) -> bool {
+        self.station_offload.power_save
+    }
+
+    fn connection_monitor_offload(&self) -> bool {
+        self.station_offload.connection_monitor
+    }
+
     async fn wlan_softmac_query_response(
         &mut self,
     ) -> Result<fidl_softmac::WlanSoftmacQueryResponse, zx::Status> {
@@ -277,10 +289,12 @@ impl DeviceOps for HostMlmeDevice {
             let mut io = self.io.lock().unwrap();
             if io.ethernet.is_closed() {
                 io.pending_ethernet_devices.clear();
-                let (host, driver) = io
-                    .replacement_ethernet
-                    .pop_front()
-                    .ok_or(zx::Status::NO_RESOURCES)?;
+                // The sandbox permits anonymous packet endpoints, not ambient
+                // socket access. Bound live resources, not total reconnections.
+                let (host, mut driver) =
+                    ethernet_port(io.ethernet_mac_address, io.ethernet_queue_capacity)
+                        .map_err(|_| zx::Status::NO_RESOURCES)?;
+                driver.register_readiness().map_err(|_| zx::Status::NO_RESOURCES)?;
                 io.ethernet = driver;
                 Some(host)
             } else {
@@ -621,12 +635,12 @@ pub struct ClientRuntime<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDr
 pub struct PreparedRuntimeResources {
     ethernet_device: HostEthernetDevice,
     ethernet: DriverEthernetPort,
-    replacement_ethernet: VecDeque<(HostEthernetDevice, DriverEthernetPort)>,
+    ethernet_queue_capacity: usize,
     mac_address: [u8; 6],
 }
 
 impl PreparedRuntimeResources {
-    /// Prepare all descriptors and reactor registrations before sandbox lockdown.
+    /// Prepare the initial endpoint and register it with the owning reactor.
     /// Requires an entered Tokio runtime with I/O enabled.
     pub fn new(mac_address: [u8; 6]) -> Result<Self, anyhow::Error> {
         Self::with_ethernet_capacity(mac_address, ETHERNET_QUEUE_CAPACITY)
@@ -636,30 +650,22 @@ impl PreparedRuntimeResources {
         mac_address: [u8; 6],
         ethernet_queue_capacity: usize,
     ) -> Result<Self, anyhow::Error> {
-        let mut generations = (0..PREPARED_ETHERNET_GENERATIONS)
-            .map(|_| ethernet_port(mac_address, ethernet_queue_capacity))
-            .collect::<Result<VecDeque<_>, _>>()
-            .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
-        for (_, driver) in &mut generations {
-            driver.register_readiness()?;
-        }
-        let (ethernet_device, ethernet) = generations.pop_front().unwrap();
+        let (ethernet_device, mut ethernet) =
+            ethernet_port(mac_address, ethernet_queue_capacity)
+                .map_err(|error| anyhow::anyhow!("invalid host Ethernet endpoint: {error:?}"))?;
+        ethernet.register_readiness()?;
         Ok(Self {
             ethernet_device,
             ethernet,
-            replacement_ethernet: generations,
+            ethernet_queue_capacity,
             mac_address,
         })
     }
 
-    /// The bounded inert Ethernet generations that sandbox setup must retain.
-    /// They remain owned by this value and are never duplicated.
+    /// Initial endpoints retained through lockdown. Subsequent anonymous
+    /// endpoints are created as needed by the same bounded runtime owner.
     pub fn fd_identities(&self) -> Vec<std::os::fd::RawFd> {
-        let mut fds = vec![self.ethernet_device.raw_fd(), self.ethernet.raw_fd()];
-        for (host, driver) in &self.replacement_ethernet {
-            fds.extend([host.raw_fd(), driver.raw_fd()]);
-        }
-        fds
+        vec![self.ethernet_device.raw_fd(), self.ethernet.raw_fd()]
     }
 }
 
@@ -741,7 +747,7 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         let PreparedRuntimeResources {
             ethernet_device,
             ethernet,
-            replacement_ethernet,
+            ethernet_queue_capacity,
             mac_address,
         } = resources;
         let epoch = OperationEpoch::new();
@@ -755,14 +761,15 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
         }));
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
-            replacement_ethernet,
+            ethernet_queue_capacity,
             unpublished_ethernet_device: Some(ethernet_device),
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: mac_address,
             minstrel: None,
         }));
+        let station_offload = device.station_offload_support();
         let (mut actor, driver) = DriverActor::new(device);
-        let mut mlme_device = HostMlmeDevice::new(driver, io.clone());
+        let mut mlme_device = HostMlmeDevice::new(driver, io.clone(), station_offload);
         let mlme_events = mlme_device
             .event_stream
             .take()
@@ -1078,12 +1085,16 @@ impl<D: WlanSoftmac + WlanSoftmacLifecycle + ClientRuntimeDriver> ClientRuntime<
             }
         }
         let result = self.connect_attempt.as_ref().unwrap().result.unwrap();
-        if result.code != fidl_ieee80211::StatusCode::Success {
-            self.begin_cleanup(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)?;
-            self.cleanup.as_mut().unwrap().failed_connect = Some(ConnectError::Failed(result));
+        // MLME can report failure before its awaited peer removal completes.
+        // Keep that operation's authority live until the protocol is quiescent;
+        // begin_cleanup revokes the old epoch.
+        if !self.protocol_idle() {
             return Ok(None);
         }
-        if !self.protocol_idle() {
+        if result.code != fidl_ieee80211::StatusCode::Success {
+            eprintln!("client_connection_failed result={result:?}");
+            self.begin_cleanup(fidl_sme::UserDisconnectReason::FailedToConnect, deadline)?;
+            self.cleanup.as_mut().unwrap().failed_connect = Some(ConnectError::Failed(result));
             return Ok(None);
         }
         if !self.sme.borrow().status().is_connected()
@@ -1592,6 +1603,7 @@ mod tests {
         association_contexts: Vec<OperationContext>,
         channels: Vec<fidl_softmac::WlanSoftmacBaseSetChannelRequest>,
         simulate_ap: bool,
+        ps_polls: usize,
         suppress_auth_response: bool,
         reject_next_auth: bool,
         pending_rx: VecDeque<Vec<u8>>,
@@ -1600,6 +1612,7 @@ mod tests {
         link_failure: bool,
         scan_id: u64,
         scan_offload: bool,
+        station_offload: StationOffloadSupport,
         scan_contexts: Vec<OperationContext>,
         extra_band: Option<fidl_softmac::WlanSoftmacBandCapability>,
         empty_bands: bool,
@@ -1647,6 +1660,9 @@ mod tests {
     }
 
     impl ClientRuntimeDriver for Fake {
+        fn station_offload_support(&self) -> StationOffloadSupport {
+            self.0.lock().unwrap().station_offload
+        }
         fn poll_drive(&mut self, cx: &mut std::task::Context<'_>) -> Result<bool, zx::Status> {
             self.0.lock().unwrap().wake = Some(cx.waker().clone());
             self.drive()
@@ -1918,6 +1934,7 @@ mod tests {
                     }
                     Some(0x00) => effects.pending_rx.push_back(association_response()),
                     Some(0xc0) => {}
+                    Some(0xa4) => effects.ps_polls += 1,
                     _ => return Err(zx::Status::NOT_SUPPORTED),
                 }
             } else {
@@ -1936,13 +1953,13 @@ mod tests {
         let (_, ethernet) = ethernet_port([2, 0, 0, 0, 0, 1], 4).unwrap();
         let io = Arc::new(Mutex::new(HostIo {
             ethernet,
-            replacement_ethernet: VecDeque::new(),
+            ethernet_queue_capacity: ETHERNET_QUEUE_CAPACITY,
             unpublished_ethernet_device: None,
             pending_ethernet_devices: VecDeque::new(),
             ethernet_mac_address: [2, 0, 0, 0, 0, 1],
             minstrel: None,
         }));
-        (HostMlmeDevice::new(driver, io), actor, effects)
+        (HostMlmeDevice::new(driver, io, StationOffloadSupport::default()), actor, effects)
     }
 
     fn wlan_channel() -> fidl_ieee80211::ChannelNumber {
@@ -3064,6 +3081,47 @@ mod tests {
     }
 
     #[test]
+    fn external_ethernet_peer_must_outlive_protocol_stop() {
+        run_local_test(async {
+            for close_before_stop in [true, false] {
+                let (fake, effects) = Fake::new(0);
+                effects.lock().unwrap().simulate_ap = true;
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                runtime
+                    .connect(connect_request(), Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                let ethernet = runtime.take_ethernet_device().unwrap();
+                if !close_before_stop {
+                    // Retaining the external peer permits ordinary protocol
+                    // stop and hardware containment before network revocation.
+                    assert_eq!(runtime.shutdown().await, Ok(()));
+                    assert!(!runtime.reset_requested);
+                    drop(ethernet);
+                    continue;
+                }
+                drop(ethernet);
+                let failure = tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if let Err(error) = runtime.check_tasks() {
+                            break error;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(matches!(
+                    failure,
+                    ConnectError::Driver(DriverError::MlmeTaskFailed)
+                ));
+                assert!(runtime.reset_requested);
+                assert_eq!(runtime.shutdown().await, Err(zx::Status::INTERNAL));
+            }
+        });
+    }
+
+    #[test]
     fn terminal_shutdown_joins_mlme_without_running_queued_downcalls() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);
@@ -3834,6 +3892,125 @@ mod tests {
     }
 
     #[test]
+    fn firmware_power_save_owns_more_data_and_tim_delivery() {
+        run_local_test(async {
+            for offload in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                {
+                    let mut effects = effects.lock().unwrap();
+                    effects.simulate_ap = true;
+                    effects.retry_cleanup = true;
+                    effects.station_offload.power_save = offload;
+                }
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                runtime.connect(
+                    connect_request(), Instant::now() + Duration::from_secs(1),
+                ).await.unwrap();
+                let mut data = stale_data_frame();
+                data[1] |= 0x20; // More Data from our associated AP.
+                effects.lock().unwrap().upcalls.as_mut().unwrap().recv(data, rx_info());
+                drain_mlme(&mut runtime).await;
+                let ps_polls = effects.lock().unwrap().ps_polls;
+                assert_eq!(ps_polls, usize::from(!offload));
+
+                let peer = connect_request().bss_description.bssid;
+                let mut beacon = vec![0x80, 0, 0, 0];
+                beacon.extend_from_slice(&[0xff; 6]);
+                beacon.extend_from_slice(&peer);
+                beacon.extend_from_slice(&peer);
+                beacon.extend_from_slice(&[0; 10]); // sequence + TSF
+                beacon.extend_from_slice(&[100, 0, 1, 0]);
+                // TIM advertises buffered traffic for the fixture's AID 42.
+                beacon.extend_from_slice(&[5, 9, 0, 1, 0, 0, 0, 0, 0, 0, 4]);
+                effects.lock().unwrap().upcalls.as_mut().unwrap().recv(beacon, rx_info());
+                drain_mlme(&mut runtime).await;
+                let ps_polls = effects.lock().unwrap().ps_polls;
+                assert_eq!(ps_polls, 2 * usize::from(!offload));
+                runtime.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn ap_deauthentication_keeps_cleanup_authority_until_driver_completion() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            {
+                let mut effects = effects.lock().unwrap();
+                effects.simulate_ap = true;
+                effects.retry_cleanup = true;
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime.connect(
+                connect_request(), Instant::now() + Duration::from_secs(1),
+            ).await.unwrap();
+            let (completion, receiver) = oneshot::channel();
+            effects.lock().unwrap().clear_completion = Some(receiver);
+            let peer = connect_request().bss_description.bssid;
+            let mut deauth = vec![0xc0, 0, 0, 0];
+            deauth.extend_from_slice(&device_info().sta_addr);
+            deauth.extend_from_slice(&peer);
+            deauth.extend_from_slice(&peer);
+            deauth.extend_from_slice(&[0, 0, 3, 0]);
+            effects.lock().unwrap().upcalls.as_mut().unwrap().recv(deauth, rx_info());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !effects.lock().unwrap().calls.contains(&"clear") {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            // Give SME its turns while the real MLME is blocked on the
+            // owned device completion. No terminal event may escape yet.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            let early_event = runtime.next_connection_event().unwrap();
+            assert!(early_event.is_none(), "terminal event escaped pending peer cleanup");
+            let context = effects.lock().unwrap().association_contexts.last().unwrap().clone();
+            assert!(context.check(Instant::now()).is_ok());
+            completion.send(Ok(())).unwrap();
+            drain_mlme(&mut runtime).await;
+            assert!(matches!(
+                runtime.next_connection_event().unwrap(),
+                Some(fidl_sme::ConnectTransactionEvent::OnDisconnect { .. })
+            ));
+            runtime.disconnect(
+                fidl_sme::UserDisconnectReason::FailedToConnect,
+                Instant::now() + Duration::from_secs(1),
+            ).await.unwrap();
+            runtime.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn firmware_connection_loss_is_capability_and_peer_scoped() {
+        run_local_test(async {
+            for offload in [false, true] {
+                let (fake, effects) = Fake::new(0);
+                {
+                    let mut effects = effects.lock().unwrap();
+                    effects.simulate_ap = true;
+                    effects.retry_cleanup = true;
+                    effects.station_offload.connection_monitor = offload;
+                }
+                let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+                let peer = connect_request().bss_description.bssid;
+                runtime.connect(
+                    connect_request(), Instant::now() + Duration::from_secs(1),
+                ).await.unwrap();
+                effects.lock().unwrap().calls.clear();
+                effects.lock().unwrap().upcalls.as_mut().unwrap()
+                    .notify_connection_loss([9; 6]);
+                drain_mlme(&mut runtime).await;
+                assert!(!effects.lock().unwrap().calls.contains(&"clear"));
+                effects.lock().unwrap().upcalls.as_mut().unwrap()
+                    .notify_connection_loss(peer);
+                drain_mlme(&mut runtime).await;
+                assert_eq!(effects.lock().unwrap().calls.contains(&"clear"), offload);
+                runtime.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn successful_connection_retains_events_and_disconnects_before_reuse() {
         run_local_test(async {
             let (fake, effects) = Fake::new(0);
@@ -4207,20 +4384,17 @@ mod tests {
             let mac = [2, 0, 0, 0, 0, 1];
             let capacity = 3;
             let (old_host, ethernet) = ethernet_port(mac, capacity).unwrap();
-            let replacements = (0..2)
-                .map(|_| ethernet_port(mac, capacity).unwrap())
-                .collect();
             let (fake, effects) = Fake::new(0);
             let (mut actor, driver) = DriverActor::new(fake);
             let io = Arc::new(Mutex::new(HostIo {
                 ethernet,
-                replacement_ethernet: replacements,
+                ethernet_queue_capacity: capacity,
                 unpublished_ethernet_device: None,
                 pending_ethernet_devices: VecDeque::new(),
                 ethernet_mac_address: mac,
                 minstrel: None,
             }));
-            let mut host_device = HostMlmeDevice::new(driver, io.clone());
+            let mut host_device = HostMlmeDevice::new(driver, io.clone(), StationOffloadSupport::default());
 
             actor
                 .run_until(host_device.set_ethernet_status(LinkStatus::UP))
@@ -4267,18 +4441,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(io.lock().unwrap().pending_ethernet_devices.is_empty());
-            actor
-                .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
+            // More than the old four-generation startup pool. Every old
+            // endpoint is revoked and only one replacement can be published.
+            for _ in 0..32 {
+                actor
+                    .run_until(host_device.set_ethernet_status(LinkStatus::DOWN))
+                    .await.unwrap().unwrap();
                 actor
                     .run_until(host_device.set_ethernet_status(LinkStatus::UP))
-                    .await
-                    .unwrap(),
-                Err(zx::Status::NO_RESOURCES)
-            );
+                    .await.unwrap().unwrap();
+                let mut io = io.lock().unwrap();
+                assert_eq!(io.pending_ethernet_devices.len(), 1);
+                let endpoint = io.pending_ethernet_devices.pop_front().unwrap();
+                assert_eq!(endpoint.properties().unwrap().mac_address, mac);
+            }
         });
     }
 
@@ -4292,13 +4468,13 @@ mod tests {
                 let (actor, driver) = DriverActor::new(fake);
                 let io = Arc::new(Mutex::new(HostIo {
                     ethernet,
-                    replacement_ethernet: VecDeque::new(),
+                    ethernet_queue_capacity: ETHERNET_QUEUE_CAPACITY,
                     unpublished_ethernet_device: Some(host),
                     pending_ethernet_devices: VecDeque::new(),
                     ethernet_mac_address: mac,
                     minstrel: None,
                 }));
-                (HostMlmeDevice::new(driver, io.clone()), actor, io)
+                (HostMlmeDevice::new(driver, io.clone(), StationOffloadSupport::default()), actor, io)
             };
 
             let (mut before_up, mut before_actor, before_up_io) = make_host();
@@ -4337,6 +4513,51 @@ mod tests {
             assert!(while_pending_io.unpublished_ethernet_device.is_none());
             assert!(while_pending_io.pending_ethernet_devices.is_empty());
             assert!(while_pending_io.ethernet.is_closed());
+        });
+    }
+
+    #[test]
+    fn failed_connect_preserves_pending_peer_removal_authority() {
+        run_local_test(async {
+            let (fake, effects) = Fake::new(0);
+            let (completion, receiver) = oneshot::channel();
+            {
+                let mut state = effects.lock().unwrap();
+                state.simulate_ap = true;
+                state.reject_next_auth = true;
+                state.retry_cleanup = true;
+                state.clear_completion = Some(receiver);
+            }
+            let mut runtime = runtime_with_device_info(fake, retry_device_info()).await;
+            runtime.begin_connect(
+                connect_request(), Instant::now() + Duration::from_secs(3),
+            ).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    assert!(runtime.drive_connect_once().await.unwrap().is_none());
+                    if effects.lock().unwrap().calls.contains(&"clear")
+                        && (runtime.connect_attempt.as_ref().unwrap().result.is_some()
+                            || runtime.cleanup.is_some())
+                    {
+                        break;
+                    }
+                }
+            }).await.unwrap();
+            let context = effects.lock().unwrap().association_contexts.last().unwrap().clone();
+            assert!(context.check(Instant::now()).is_ok(),
+                "failure reporting revoked an in-flight peer removal");
+            completion.send(Ok(())).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match runtime.drive_connect_once().await {
+                        Ok(None) => {}
+                        other => break other,
+                    }
+                }
+            }).await.unwrap();
+            assert!(matches!(result, Err(ConnectError::Failed(_))));
+            assert!(!runtime.revoked);
+            runtime.shutdown().await.unwrap();
         });
     }
 

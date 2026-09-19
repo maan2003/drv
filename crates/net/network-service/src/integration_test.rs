@@ -88,7 +88,6 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
     const CLIENTS: usize = 32;
     let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 256).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -112,7 +111,7 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
         .collect();
     let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
     if filtered {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
 
@@ -148,7 +147,6 @@ fn epoll_serves_more_than_twenty_four_clients_with_isolated_failures() {
 fn idle_epoll_waits_for_deadline_without_busy_polling() {
     let (device_capability, _driver) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -156,7 +154,7 @@ fn idle_epoll_waits_for_deadline_without_busy_polling() {
     let listen = listener.local_addr().unwrap();
     let filtered = std::env::var_os("DRV_NETWORK_EPOLL_FILTER_FIXTURE").is_some();
     if filtered {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
     let before_waits = service.poller_wait_counts();
@@ -519,7 +517,6 @@ fn drive(
 fn socks_connect_relays_application_bytes_over_ethernet() {
     let (device_capability, mut sink) = ethernet_port(CLIENT_MAC, 32).unwrap();
     let frame = device_capability.into_frame_fd();
-    let frame_fd = frame.as_raw_fd();
     let device = unsafe { ServiceEthernetDevice::from_frame_fd(frame, CLIENT_MAC) };
     let mut service = Socks5Service::new(device).unwrap();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
@@ -614,7 +611,7 @@ fn socks_connect_relays_application_bytes_over_ethernet() {
         .unwrap();
     client.set_nonblocking(true).unwrap();
     if std::env::var_os("DRV_NETWORK_RELAY_FILTER_FIXTURE").is_some() {
-        crate::child::install_test_filter(frame_fd, listener.as_raw_fd(), service.poller_fd())
+        crate::child::install_test_filter()
             .unwrap();
     }
     let mut response = Vec::new();
@@ -812,6 +809,7 @@ fn kernel_provider_ethernet_guest_fixture() {
     bootstrap.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let bootstrap_pass = unsafe { libc::fcntl(bootstrap_child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     assert!(bootstrap_pass >= 10);
+    let test_netlink = std::env::var_os("DRV_KERNEL_PROVIDER_NETLINK_GUEST").is_some();
     let mut command = std::process::Command::new("/bin/netstack3-provider");
     command.args(["--ethernet-mac", "02:00:00:00:00:01", "--bootstrap", "--resolver"]);
     unsafe {
@@ -910,6 +908,19 @@ fn kernel_provider_ethernet_guest_fixture() {
     assert!(std::process::Command::new("/bin/nss-test").status().unwrap().success());
     // A configured external address must not steal localhost's source route.
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
+    let mut watcher = if test_netlink {
+        assert!(std::process::Command::new("/bin/netlink-client-test")
+            .arg("online").status().unwrap().success());
+        assert!(std::process::Command::new("/bin/netlink-go-test")
+            .arg("online").status().unwrap().success());
+        let mut watcher = std::process::Command::new("/bin/netlink-client-test")
+            .arg("watch").stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(watcher.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line, "WATCH_READY\n");
+        Some(watcher)
+    } else { None };
     println!("PASS_KERNEL_PROVIDER_LIVE_ETHERNET_LOCALHOST");
     finished.store(true, std::sync::atomic::Ordering::Release);
     ap_thread.join().unwrap();
@@ -917,6 +928,14 @@ fn kernel_provider_ethernet_guest_fixture() {
     // localhost rather than turning link loss into a process/generation reset.
     std::thread::sleep(Duration::from_millis(50));
     assert!(child.try_wait().unwrap().is_none());
+    if let Some(watcher) = watcher.as_mut() {
+        assert!(watcher.wait().unwrap().success());
+        println!("PASS_NETLINK_ADDRESS_REMOVAL_EVENT");
+        assert!(std::process::Command::new("/bin/netlink-client-test")
+            .arg("offline").status().unwrap().success());
+        assert!(std::process::Command::new("/bin/netlink-go-test")
+            .arg("offline").status().unwrap().success());
+    }
     assert!(std::process::Command::new("/bin/loopback-test").status().unwrap().success());
     assert!(std::process::Command::new("/bin/nss-test").arg("absent").status().unwrap().success());
     child.kill().unwrap();

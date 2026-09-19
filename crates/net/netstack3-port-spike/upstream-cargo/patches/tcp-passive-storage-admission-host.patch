@@ -1,0 +1,151 @@
+--- a/src/connectivity/network/netstack3/core/tcp/src/socket.rs
++++ b/src/connectivity/network/netstack3/core/tcp/src/socket.rs
+@@ -496,6 +496,15 @@
+     fn new_passive_open_buffers(
+         buffer_sizes: BufferSizes,
+     ) -> (Self::ReceiveBuffer, Self::SendBuffer, Self::ReturnedBuffers);
++
++    /// Admit storage before publishing a passive connection or sending SYN-ACK.
++    /// The returned buffers remain owned by the connection through its handshake.
++    fn try_new_passive_open_buffers(
++        &mut self,
++        buffer_sizes: BufferSizes,
++    ) -> Option<(Self::ReceiveBuffer, Self::SendBuffer, Self::ReturnedBuffers)> {
++        Some(Self::new_passive_open_buffers(buffer_sizes))
++    }
+ }
+ 
+ /// Allows passing a TCP socket to bindings, which can wait for it to
+@@ -1728,6 +1737,7 @@
+     D: WeakDeviceIdentifier,
+     BT: TcpBindingsTypes,
+ > {
++    pending_passive_buffers: Option<(BT::ReceiveBuffer, BT::SendBuffer, BT::ReturnedBuffers)>,
+     accept_queue: Option<
+         AcceptQueue<
+             TcpSocketId<SockI, D, BT>,
+@@ -3829,6 +3839,10 @@
+                                 }
+                             });
+                             let _: Option<_> = bindings_ctx.cancel_timer(timer);
++                            if let Some(accept_queue) = &conn.accept_queue {
++                                accept_queue.remove(id);
++                                conn.defunct = true;
++                            }
+ 
+                             let Closed { reason } = assert_matches!(
+                                 &conn.state, State::Closed(c) => c
+@@ -5541,6 +5555,7 @@
+ 
+         let conn = convert_back_op(
+             Connection {
++                pending_passive_buffers: None,
+                 accept_queue: None,
+                 state,
+                 ip_sock,
+@@ -6870,6 +6885,7 @@
+                         assert_matches!(
+                             conn,
+                             Connection {
++                                pending_passive_buffers: None,
+                                 accept_queue: None,
+                                 state: State::Established(_),
+                                 ip_sock: _,
+@@ -7508,6 +7524,7 @@
+                 assert_matches!(
+                     conn,
+                     Connection {
++                    pending_passive_buffers: None,
+                     accept_queue: None,
+                     state: State::Closed(Closed {
+                         reason: Some(ConnectionError::ConnectionRefused)
+--- a/src/connectivity/network/netstack3/core/tcp/src/socket/demux.rs
++++ b/src/connectivity/network/netstack3/core/tcp/src/socket/demux.rs
+@@ -756,7 +756,7 @@
+         + TcpCounterContext<SockI, CC::WeakDeviceId, BC>
+         + CoreTxMetadataContext<TcpSocketTxMetadata<SockI, CC::WeakDeviceId, BC>, BC>,
+ {
+-    let Connection { accept_queue, state, ip_sock, defunct, soft_error: _, handshake_status } =
++    let Connection { pending_passive_buffers, accept_queue, state, ip_sock, defunct, soft_error: _, handshake_status } =
+         conn;
+ 
+     // Per RFC 9293 Section 3.6.1:
+@@ -781,13 +781,14 @@
+             }
+         }
+     }
+-    let (reply, passive_open, data_acked, newly_closed) = state.on_segment::<_, BC>(
++    let (reply, passive_open, data_acked, newly_closed) = state.on_segment_with_buffers::<_, BC>(
+         &conn_id.either(),
+         &TcpCountersRefs::from_ctx(core_ctx, conn_id),
+         incoming,
+         bindings_ctx.now(),
+         socket_options,
+         *defunct,
++        |_| pending_passive_buffers.take().expect("passive handshake without admitted buffers"),
+     );
+ 
+     match data_acked {
+@@ -1157,6 +1158,10 @@
+     );
+ 
+     let result = if matches!(state, State::SynRcvd(_)) {
++        let Some(buffers) = bindings_ctx.try_new_passive_open_buffers(buffer_sizes.clone()) else {
++            // Exactly like a full backlog: admit no connection and send no SYN-ACK.
++            return ListenerIncomingSegmentDisposition::FoundSocket;
++        };
+         let poll_send_at = state.poll_send_at().expect("no retrans timer");
+         let bound_device = ip_sock.device().cloned();
+ 
+@@ -1200,6 +1205,7 @@
+             match socketmap.conns_mut().try_insert_with(addr, sharing, move |addr, sharing| {
+                 let conn = make_connection(
+                     Connection {
++                        pending_passive_buffers: Some(buffers),
+                         accept_queue: Some(accept_queue_clone),
+                         state,
+                         ip_sock,
+--- a/src/connectivity/network/netstack3/core/tcp/src/state.rs
++++ b/src/connectivity/network/netstack3/core/tcp/src/state.rs
+@@ -2571,6 +2571,24 @@
+         counters: &TcpCountersRefs<'_>,
+         incoming: Segment<P>,
+         now: I,
++        options: &SocketOptions,
++        defunct: bool,
++    ) -> (Option<Segment<()>>, Option<BP::PassiveOpen>, DataAcked, NewlyClosed)
++    where
++        BP::PassiveOpen: Debug,
++        ActiveOpen: IntoBuffers<R, S>,
++    {
++        self.on_segment_with_buffers::<P, BP>(
++            id, counters, incoming, now, options, defunct, BP::new_passive_open_buffers,
++        )
++    }
++
++    pub(crate) fn on_segment_with_buffers<P: Payload, BP: BufferProvider<R, S, ActiveOpen = ActiveOpen>>(
++        &mut self,
++        id: &impl StateMachineDebugId,
++        counters: &TcpCountersRefs<'_>,
++        incoming: Segment<P>,
++        now: I,
+         options @ SocketOptions {
+             keep_alive: _,
+             nagle_enabled: _,
+@@ -2581,6 +2599,7 @@
+             ip_options: _,
+         }: &SocketOptions,
+         defunct: bool,
++        new_passive_buffers: impl FnOnce(BufferSizes) -> (R, S, BP::PassiveOpen),
+     ) -> (Option<Segment<()>>, Option<BP::PassiveOpen>, DataAcked, NewlyClosed)
+     where
+         BP::PassiveOpen: Debug,
+@@ -2927,7 +2946,7 @@
+                             let (rcv_buffer, snd_buffer) = match simultaneous_open.take() {
+                                 None => {
+                                     let (rcv_buffer, snd_buffer, client) =
+-                                        BP::new_passive_open_buffers(*buffer_sizes);
++                                        new_passive_buffers(*buffer_sizes);
+                                     assert_matches!(passive_open.replace(client), None);
+                                     (rcv_buffer, snd_buffer)
+                                 }

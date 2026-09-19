@@ -2,11 +2,14 @@
 
 //! Sandboxed native Netstack3 service and application networking.
 
+// Optimized cross-crate Netstack3 lock-order proofs exceed rustc's default depth.
+#![recursion_limit = "256"]
+
 use netstack3_port_integration::{
     Runtime, RuntimeError, NativeSocketAddress, NativeIpAddress,
     sockets::{TcpSocket, IpVersion, Connection},
     dns_bridge::DnsLookupHandle,
-    service::{DhcpService, DhcpStatus},
+    service::DhcpService,
 };
 use netstack3_port_spike::{
     EthernetEventSource, EthernetRunner, NetworkServiceEndpoint,
@@ -23,17 +26,21 @@ use std::time::{Duration, Instant};
 
 mod child;
 mod provider;
+mod namespace;
+mod rtnetlink;
 mod socket_worker;
 mod resolver;
-pub use provider::run_provider;
+pub use provider::{run_provider, ResolverEndpoint};
 mod ethernet_device;
 mod lifecycle;
+pub mod netcfg;
+mod link_control;
 mod supervisor;
 
 pub use child::run;
 use ethernet_device::ServiceEthernetDevice;
-pub use lifecycle::{WifiLifecycleReceiver, WifiLifecycleUpdate};
-pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor};
+pub use lifecycle::{InterfaceInstaller, WifiLifecycleReceiver, WifiLifecycleUpdate};
+pub use supervisor::{NetworkServiceProcessExit, NetworkServiceSupervisor, run_namespace_supervisor};
 
 pub const SOFTMAC_ETHERNET_MTU: u16 = 1500;
 
@@ -392,10 +399,7 @@ impl Socks5Client {
 }
 
 impl Socks5Service {
-    #[cfg(test)]
-    fn poller_fd(&self) -> RawFd {
-        self.poller.raw_fd()
-    }
+
 
     #[cfg(test)]
     fn poller_wait_counts(&self) -> (usize, usize) {

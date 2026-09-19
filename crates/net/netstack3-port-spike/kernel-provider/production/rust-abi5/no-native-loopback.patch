@@ -1,0 +1,162 @@
+--- a/drivers/net/loopback.c
++++ b/drivers/net/loopback.c
+@@ -67,6 +67,7 @@
+ /* The higher levels take care of making this non-reentrant (it's
+  * called with bh's disabled).
+  */
++#ifndef CONFIG_NETSTACK3_RUST
+ static netdev_tx_t loopback_xmit(struct sk_buff *skb,
+ 				 struct net_device *dev)
+ {
+@@ -92,6 +93,8 @@
+ 
+ 	return NETDEV_TX_OK;
+ }
++
++#endif
+ 
+ void dev_lstats_read(struct net_device *dev, u64 *packets, u64 *bytes)
+ {
+@@ -117,6 +120,7 @@
+ }
+ EXPORT_SYMBOL(dev_lstats_read);
+ 
++#ifndef CONFIG_NETSTACK3_RUST
+ static void loopback_get_stats64(struct net_device *dev,
+ 				 struct rtnl_link_stats64 *stats)
+ {
+@@ -157,6 +161,8 @@
+ 	.ndo_get_stats64 = loopback_get_stats64,
+ 	.ndo_set_mac_address = eth_mac_addr,
+ };
++
++#endif
+ 
+ static void gen_lo_setup(struct net_device *dev,
+ 			 unsigned int mtu,
+@@ -194,6 +200,7 @@
+ 	netif_set_tso_max_size(dev, GSO_MAX_SIZE);
+ }
+ 
++#ifndef CONFIG_NETSTACK3_RUST
+ /* The loopback device is special. There is only one instance
+  * per network namespace.
+  */
+@@ -236,6 +243,8 @@
+ 	.init = loopback_net_init,
+ };
+ 
++#endif
++
+ /* blackhole netdevice */
+ static netdev_tx_t blackhole_netdev_xmit(struct sk_buff *skb,
+ 					 struct net_device *dev)
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -13494,8 +13494,10 @@
+ 	 * is the first device that appears and the last network device
+ 	 * that disappears.
+ 	 */
++#ifndef CONFIG_NETSTACK3_RUST
+ 	if (register_pernet_device(&loopback_net_ops))
+ 		goto out;
++#endif
+ 
+ 	if (register_pernet_device(&default_device_ops))
+ 		goto out;
+--- a/net/core/page_pool_user.c
++++ b/net/core/page_pool_user.c
+@@ -138,7 +138,8 @@
+ 		goto err_cancel_msg;
+ 
+ 	if (nla_put_uint(rsp, NETDEV_A_PAGE_POOL_ID, pool->user.id) ||
+-	    (pool->slow.netdev->ifindex != LOOPBACK_IFINDEX &&
++	    ((IS_ENABLED(CONFIG_NETSTACK3_RUST) ||
++	     pool->slow.netdev->ifindex != LOOPBACK_IFINDEX) &&
+ 	     nla_put_u32(rsp, NETDEV_A_PAGE_POOL_IFINDEX,
+ 			 pool->slow.netdev->ifindex)))
+ 		goto err_cancel_nest;
+@@ -266,7 +267,8 @@
+ 	if (nla_put_uint(rsp, NETDEV_A_PAGE_POOL_ID, pool->user.id))
+ 		goto err_cancel;
+ 
+-	if (pool->slow.netdev->ifindex != LOOPBACK_IFINDEX &&
++	if ((IS_ENABLED(CONFIG_NETSTACK3_RUST) ||
++	     pool->slow.netdev->ifindex != LOOPBACK_IFINDEX) &&
+ 	    nla_put_u32(rsp, NETDEV_A_PAGE_POOL_IFINDEX,
+ 			pool->slow.netdev->ifindex))
+ 		goto err_cancel;
+@@ -431,6 +433,7 @@
+ 	mutex_unlock(&page_pools_lock);
+ }
+ 
++#ifndef CONFIG_NETSTACK3_RUST
+ static void page_pool_unreg_netdev(struct net_device *netdev)
+ {
+ 	struct page_pool *pool, *last;
+@@ -452,6 +455,8 @@
+ 	mutex_unlock(&page_pools_lock);
+ }
+ 
++#endif
++
+ static int
+ page_pool_netdevice_event(struct notifier_block *nb,
+ 			  unsigned long event, void *ptr)
+@@ -464,9 +469,11 @@
+ 	if (hlist_empty(&netdev->page_pools))
+ 		return NOTIFY_OK;
+ 
++#ifndef CONFIG_NETSTACK3_RUST
+ 	if (netdev->ifindex != LOOPBACK_IFINDEX)
+ 		page_pool_unreg_netdev(netdev);
+ 	else
++#endif
+ 		page_pool_unreg_netdev_wipe(netdev);
+ 	return NOTIFY_OK;
+ }
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@ -1035,6 +1035,10 @@
+ int bpf_prog_test_run_skb(struct bpf_prog *prog, const union bpf_attr *kattr,
+ 			  union bpf_attr __user *uattr)
+ {
++#ifdef CONFIG_NETSTACK3_RUST
++	/* Packet test runs require the native IP loopback device. */
++	return -EOPNOTSUPP;
++#endif
+ 	bool is_l2 = false, is_direct_pkt_access = false, is_lwt = false;
+ 	u32 tailroom = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 	struct net *net = current->nsproxy->net_ns;
+@@ -1332,6 +1336,10 @@
+ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
+ 			  union bpf_attr __user *uattr)
+ {
++#ifdef CONFIG_NETSTACK3_RUST
++	/* Packet test runs require the native IP loopback device. */
++	return -EOPNOTSUPP;
++#endif
+ 	bool do_live = (kattr->test.flags & BPF_F_TEST_XDP_LIVE_FRAMES);
+ 	u32 tailroom = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 	u32 retval = 0, meta_sz = 0, duration, max_linear_sz, size;
+@@ -1777,6 +1785,10 @@
+ 			 const union bpf_attr *kattr,
+ 			 union bpf_attr __user *uattr)
+ {
++#ifdef CONFIG_NETSTACK3_RUST
++	/* Packet test runs require the native IP loopback device. */
++	return -EOPNOTSUPP;
++#endif
+ 	struct net *net = current->nsproxy->net_ns;
+ 	struct net_device *dev = net->loopback_dev;
+ 	struct nf_hook_state *user_ctx, hook_state = {
+--- a/net/mpls/Kconfig
++++ b/net/mpls/Kconfig
+@@ -25,6 +25,7 @@
+ 
+ config MPLS_ROUTING
+ 	tristate "MPLS: routing support"
++	depends on !NETSTACK3_RUST
+ 	depends on NET_IP_TUNNEL || NET_IP_TUNNEL=n
+ 	depends on SYSCTL
+ 	help

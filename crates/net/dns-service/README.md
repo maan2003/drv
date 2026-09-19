@@ -12,6 +12,8 @@ A trusted launcher starts this executable as root, single-threaded, with:
 - FD 3: read-only regular TOML configuration, at most 8 KiB.
 - FD 4: read-only regular PEM CA bundle, at most 2 MiB.
 - stdout/stderr: write-only logging pipes, not terminals or files.
+- optionally FD 5: a pre-bound listening Unix stream socket, selected by
+  `DRV_DNS_INHERIT_NSS=1`. The service manager owns its path and permissions.
 - a clean, trusted dynamic-loader environment and installed ELF dependencies.
 
 Before reading either input or accepting requests, setup binds IPv4/IPv6
@@ -32,7 +34,9 @@ restrict a compromised process.
 The launcher owns stale NSS path removal, logging, restart and CA replacement.
 Stop and reap the old daemon before unlinking its socket. The userspace provider
 may need a short teardown interval before rebinding port 53. Do not enable the
-provider's legacy `--resolver` concurrently.
+provider's legacy `--resolver` concurrently. Set `DRV_EXTERNAL_DNS=1` on
+`wlan-stack-kvm` when deploying this service; the launcher then leaves NSS
+ownership to DNS rather than the integrated fixture resolver.
 
 ```sh
 drv-dns-service 3</etc/quad9.toml 4</etc/ssl/certs/ca-certificates.crt \

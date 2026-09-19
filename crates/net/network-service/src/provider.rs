@@ -11,7 +11,7 @@ use rand::SeedableRng as _;
 use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroU64;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
 const CLAIM: libc::c_ulong = 0x8008B301;
@@ -24,36 +24,55 @@ pub(crate) fn read_control(fd: &OwnedFd, bytes: &mut [u8; 128]) -> rustix::io::R
     else { Ok(result as usize) }
 }
 
+/// Resolver endpoint provenance at the privileged process-entry boundary.
+pub enum ResolverEndpoint {
+    BindDefault,
+    Inherited,
+}
+
 pub fn run_provider(
     ethernet_mac: Option<[u8; 6]>,
     bootstrap: bool,
-    resolver: bool,
+    resolver: Option<ResolverEndpoint>,
+    link_control: bool,
+    namespace: bool,
 ) -> Result<(), String> {
+    if namespace && (ethernet_mac.is_some() || bootstrap || resolver.is_some() || link_control) {
+        return Err("namespace providers require only their serving capability".into());
+    }
     if bootstrap && ethernet_mac.is_none() {
-        return Err("bootstrap requires an Ethernet capability".into());
+        return Err("bootstrap requires an Ethernet identity".into());
+    }
+    if link_control && ethernet_mac.is_none() {
+        return Err("link control requires an Ethernet identity".into());
+    }
+    // Two views of one serving object; neither protocol can own a separate generation.
+    if unsafe { libc::dup3(3, crate::rtnetlink::REGISTRATION_FD, libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error().to_string());
     }
     // FD3 owns the socket namespace; optional FD4 owns only Ethernet frames.
     if unsafe { libc::fcntl(3, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
     let mac = ethernet_mac.unwrap_or([2, 0, 0, 0, 0, 1]);
-    let mut runtime = Runtime::new_with_capacities(
-        512,
-        1024,
-        (0..65536).map(|_| rand::random::<u8>()),
-        NonZeroU64::new(1).unwrap(),
-        mac,
-        1500,
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    runtime.enable_loopback();
+    let entropy = std::iter::repeat_with(rand::random::<u8>);
+    let mut runtime = if ethernet_mac.is_some() {
+        Runtime::new_with_capacities(512, 1024, entropy, NonZeroU64::new(1).unwrap(),
+            mac, u32::from(crate::SOFTMAC_ETHERNET_MTU))
+    } else {
+        Runtime::new_isolated(512, 1024, entropy)
+    }.map_err(|e| format!("{e:?}"))?;
+    if ethernet_mac.is_some() {
+        runtime.enable_dynamic_ipv6();
+    }
+    runtime.set_loopback_up(!namespace);
     let mut network = netstack3_port_integration::service::DhcpService::new(
         runtime,
         rand::rngs::StdRng::from_os_rng(),
         mac,
     );
     let sockets = network.sockets();
-    let mut ethernet = if ethernet_mac.is_some() {
+    let mut ethernet = if ethernet_mac.is_some() && !link_control {
         let mut kind = 0i32;
         let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
         if unsafe {
@@ -78,29 +97,66 @@ pub fn run_provider(
     };
     // Bind before empty-root/no-open sandboxing, never from the DNS engine or NSS.
     // Do not unlink an existing path: another provider may own it.
-    let resolver_listener = if resolver {
-        use std::os::unix::fs::PermissionsExt;
-        let listener = std::os::unix::net::UnixListener::bind(drv_dns_wire::PATH)
-            .map_err(|e| format!("resolver listener: {e}"))?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))
-            .map_err(|e| e.to_string())?;
-        if listener.as_raw_fd() != 7 {
-            // SAFETY: before sandbox setup, reserve the documented listener capability
-            // slot. The listener owns its original FD; the duplicate gets one owner below.
-            if unsafe { libc::dup3(listener.as_raw_fd(), 7, libc::O_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error().to_string());
+    let resolver_listener = match resolver {
+        Some(ResolverEndpoint::Inherited) => {
+            // Validate the transferred endpoint before assuming FD ownership.
+            for (option, expected) in [
+                (libc::SO_TYPE, libc::SOCK_STREAM),
+                (libc::SO_DOMAIN, libc::AF_UNIX),
+                (libc::SO_ACCEPTCONN, 1),
+            ] {
+                let mut value = 0i32;
+                let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        7, libc::SOL_SOCKET, option,
+                        (&mut value as *mut i32).cast(), &mut length,
+                    )
+                } != 0 || value != expected
+                {
+                    return Err("FD7 must be a listening Unix resolver stream".into());
+                }
             }
-            Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) })
-        } else {
+            // FD7 is transferred exclusively by the supervisor before exec.
+            let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) };
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
             Some(listener)
         }
-    } else {
-        None
+        Some(ResolverEndpoint::BindDefault) => {
+            use std::os::unix::fs::PermissionsExt;
+            let listener = std::os::unix::net::UnixListener::bind(drv_dns_wire::PATH)
+                .map_err(|e| format!("resolver listener: {e}"))?;
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            std::fs::set_permissions(drv_dns_wire::PATH, std::fs::Permissions::from_mode(0o666))
+                .map_err(|e| e.to_string())?;
+            if listener.as_raw_fd() != 7 {
+                // SAFETY: before sandbox setup, reserve the documented listener capability
+                // slot. The listener owns its original FD; the duplicate gets one owner below.
+                if unsafe { libc::dup3(listener.as_raw_fd(), 7, libc::O_CLOEXEC) } < 0 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(7) })
+            } else {
+                Some(listener)
+            }
+        }
+        None => None,
     };
-    crate::child::provider_setup(ethernet.is_some(), bootstrap, resolver)?;
+    crate::child::provider_setup(
+        ethernet.is_some(), bootstrap, resolver_listener.is_some(), link_control,
+    )?;
+    // SAFETY: setup retains this inherited descriptor exclusively for this
+    // provider. Keep its ownership explicit for every ancillary operation.
+    let link_control = link_control.then(|| unsafe {
+        OwnedFd::from_raw_fd(crate::link_control::CONTROL_FD)
+    });
     // SAFETY: provider_setup created FD6; it lives for this entire service loop.
     let poller = unsafe { std::os::fd::BorrowedFd::borrow_raw(6) };
+    let registration = unsafe { OwnedFd::from_raw_fd(crate::rtnetlink::REGISTRATION_FD) };
+    let mut route_adapter = crate::rtnetlink::Adapter::new(registration, poller)
+        .map_err(|e| e.to_string())?;
+    let mut route_revision = None;
+
     let mut resolver_server = resolver_listener
         .map(|listener| crate::resolver::ResolverServer::new(listener, poller))
         .transpose()
@@ -109,17 +165,44 @@ pub fn run_provider(
     if bootstrap {
         crate::child::provider_bootstrap_ready()?;
     }
+    if unsafe { libc::ioctl(3, crate::namespace::READY) } < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if bootstrap {
+        // Readiness certifies the initialized core, loopback, registration
+        // namespace and sandbox. Physical address acquisition is deliberately
+        // not part of provider availability.
+        crate::child::provider_bootstrap_network_ready()?;
+    }
     eprintln!(
         "netstack3_provider_sandbox_ready=true uid=65534 gid=65534 empty_root=true own_netns=true no_new_privs=true seccomp_default=kill registration_fd=3 endpoint_scope=socket native_loopback=false"
     );
     let mut event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
+        events: (libc::EPOLLIN | libc::EPOLLPRI) as u32,
         u64: 0, // Socket IDs start at one; zero names registration.
     };
     if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, 3, &mut event) } < 0 {
         return Err(io::Error::last_os_error().to_string());
     }
     const ETHERNET_TOKEN: u64 = u64::MAX;
+    const LINK_CONTROL_TOKEN: u64 = u64::MAX - 1;
+    if let Some(control) = &link_control {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+            u64: LINK_CONTROL_TOKEN,
+        };
+        if unsafe {
+            libc::epoll_ctl(
+                6,
+                libc::EPOLL_CTL_ADD,
+                control.as_raw_fd(),
+                &mut event,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
     let mut frame_events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32;
     if let Some(frame) = &ethernet {
         let mut event = libc::epoll_event {
@@ -131,9 +214,14 @@ pub fn run_provider(
         }
     }
     let mut pending_frame = None;
-    let mut ethernet_active = ethernet.is_some();
-    let mut last_network_status = None;
-    let mut bootstrap_pending = bootstrap;
+    let mut last_network_snapshot = None;
+    let mut active_link_generation = None;
+    let mut last_link_generation = 0u64;
+    let mut watch_interfaces = false;
+    let mut reported_revision = None;
+    let mut report_blocked = false;
+    let mut pending_ack = None;
+    let mut control_events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32;
     let mut workers: HashMap<u64, SocketWorker> = HashMap::new();
     let start = Instant::now();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
@@ -142,14 +230,108 @@ pub fn run_provider(
     let mut event_count = 1;
     loop {
         let mut progress = false;
+        if events[..event_count].iter().any(|event| event.u64 == 0 && event.events & libc::EPOLLPRI as u32 != 0) {
+            let online = ethernet.is_some();
+            let mut view = crate::rtnetlink::View::new(network.runtime().interface_snapshots(), online, mac);
+            progress |= crate::namespace::serve(&mut view, &mut |up| {
+                network.set_loopback_up(up);
+                Ok(crate::rtnetlink::View::new(network.runtime().interface_snapshots(), online, mac))
+            }).map_err(|e| format!("interface control: {e}"))?;
+        }
         let mut ready = Vec::with_capacity(64);
         for event in &events[..event_count] {
             if event.u64 == ETHERNET_TOKEN {
                 if let Some(frame) = &mut ethernet {
                     frame.notify_epoll(event.events);
                 }
-            } else if event.u64 != 0 && event.u64 != crate::resolver::TOKEN {
+            } else if event.u64 != 0
+                && event.u64 != crate::resolver::TOKEN
+                && event.u64 != LINK_CONTROL_TOKEN
+                && !crate::rtnetlink::Adapter::owns_token(event.u64)
+            {
                 ready.push(event.u64);
+            }
+        }
+        if let Some(control) = &link_control
+            && pending_ack.is_none()
+            && events[..event_count]
+            .iter()
+            .any(|event| event.u64 == LINK_CONTROL_TOKEN)
+        {
+            loop {
+                let Some(request) = crate::link_control::receive_request(
+                    control.as_fd(),
+                )? else {
+                    break;
+                };
+                if let crate::link_control::Request::Watch { generation } = request {
+                    watch_interfaces = true;
+                    reported_revision = None;
+                    pending_ack = Some((generation, crate::link_control::AckStatus::Applied));
+                    progress = true;
+                    break;
+                }
+                let generation = match &request {
+                    crate::link_control::Request::Attach { generation, .. }
+                    | crate::link_control::Request::Detach { generation }
+                    | crate::link_control::Request::Watch { generation } => *generation,
+                };
+                let valid = match &request {
+                    crate::link_control::Request::Watch { .. } => unreachable!(),
+                    crate::link_control::Request::Attach { generation, .. } => {
+                        *generation > last_link_generation
+                    }
+                    crate::link_control::Request::Detach { generation } => {
+                        active_link_generation == Some(*generation)
+                    }
+                };
+                if !valid {
+                    pending_ack = Some((generation, crate::link_control::AckStatus::Rejected));
+                    progress = true;
+                    break;
+                }
+
+                if let Some(old) = ethernet.take() {
+                    unsafe {
+                        libc::epoll_ctl(6, libc::EPOLL_CTL_DEL, old.raw_fd(), std::ptr::null_mut());
+                    }
+                    network.on_device_event(
+                        netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false),
+                    );
+                    pending_frame = None;
+                    drop(old);
+                }
+                match request {
+                    crate::link_control::Request::Watch { .. } => unreachable!(),
+                    crate::link_control::Request::Attach { generation, frame } => {
+                        // The trusted supervisor validates connected AF_UNIX
+                        // SOCK_SEQPACKET direction and nonblocking mode before
+                        // this capability enters the private channel.
+                        let mut installed = unsafe {
+                            crate::ServiceEthernetDevice::from_frame_fd(frame, mac)
+                        };
+                        let mut event = libc::epoll_event {
+                            events: frame_events,
+                            u64: ETHERNET_TOKEN,
+                        };
+                        if unsafe {
+                            libc::epoll_ctl(6, libc::EPOLL_CTL_ADD, installed.raw_fd(), &mut event)
+                        } < 0
+                        {
+                            return Err(io::Error::last_os_error().to_string());
+                        }
+                        installed.notify_epoll(libc::EPOLLIN as u32);
+                        ethernet = Some(installed);
+                        active_link_generation = Some(generation);
+                        last_link_generation = generation;
+                    }
+                    crate::link_control::Request::Detach { .. } => {
+                        active_link_generation = None;
+                    }
+                }
+                pending_ack = Some((generation, crate::link_control::AckStatus::Applied));
+                progress = true;
+                break;
             }
         }
         if events[..event_count].iter().any(|event| event.u64 == 0) {
@@ -194,11 +376,12 @@ pub fn run_provider(
             }
         }
 
+        let mut close_frame = false;
         if let Some(frame) = &mut ethernet {
             while let Some(event) = frame.take_event() {
                 if event == netstack3_port_spike::EthernetDeviceEvent::LinkStateChanged(false) {
                     pending_frame = None;
-                    ethernet_active = false;
+                    close_frame = true;
                     // Retain the service and localhost sockets after link loss.
                     unsafe {
                         libc::epoll_ctl(
@@ -212,7 +395,7 @@ pub fn run_provider(
                 network.on_device_event(event);
                 progress = true;
             }
-            for _ in 0..if ethernet_active { 64 } else { 0 } {
+            for _ in 0..if close_frame { 0 } else { 64 } {
                 let Some(packet) = frame.receive() else { break };
                 network
                     .receive_frame(packet)
@@ -220,9 +403,10 @@ pub fn run_provider(
                 progress = true;
             }
         }
+        if close_frame { ethernet = None; }
         progress |= network.poll_at(start.elapsed(), 64) != 0;
         if let Some(frame) = &mut ethernet {
-            for _ in 0..if ethernet_active { 64 } else { 0 } {
+            for _ in 0..64 {
                 let Some(packet) = pending_frame.take().or_else(|| network.take_transmit()) else {
                     break;
                 };
@@ -240,7 +424,7 @@ pub fn run_provider(
                 } else {
                     0
                 };
-            if ethernet_active && wanted != frame_events {
+            if wanted != frame_events {
                 let mut event = libc::epoll_event {
                     events: wanted,
                     u64: ETHERNET_TOKEN,
@@ -253,18 +437,21 @@ pub fn run_provider(
                 frame_events = wanted;
             }
             let status = network.status();
-            if last_network_status != Some(status) {
+            let snapshot = {
+                let runtime = network.runtime();
+                (
+                    status,
+                    runtime.ipv4_address(),
+                    runtime.ipv6_address(),
+                    runtime.dns_servers(),
+                )
+            };
+            if last_network_snapshot != Some(snapshot) {
                 eprintln!(
-                    "provider_network_status={status:?} ipv4={:?} dns={:?}",
-                    network.runtime().ipv4_address(),
-                    network.runtime().dns_servers()
+                    "provider_network_status={status:?} ipv4={:?} ipv6={:?} dns={:?}",
+                    snapshot.1, snapshot.2, snapshot.3,
                 );
-                last_network_status = Some(status);
-            }
-            if bootstrap_pending && status == netstack3_port_integration::service::DhcpStatus::Bound
-            {
-                crate::child::provider_bootstrap_network_ready()?;
-                bootstrap_pending = false;
+                last_network_snapshot = Some(snapshot);
             }
         }
         let listeners: Vec<_> = workers
@@ -326,13 +513,15 @@ pub fn run_provider(
             match worker.poll_data() {
                 Ok(Work::Idle) => {}
                 Ok(Work::Progress) => progress = true,
-                Ok(Work::Closed) => { remove.push(id); progress = true; }
+                Ok(Work::Closed) => { remove.push(id); progress = true; continue; }
                 Err(fault) => {
                     eprintln!("endpoint {id} retired: {fault}");
                     remove.push(id);
                     progress = true;
+                    continue;
                 }
             }
+            worker.update_poll(poller).map_err(|e| format!("endpoint readiness: {e}"))?;
         }
         for id in remove {
             workers.remove(&id);
@@ -341,6 +530,53 @@ pub fn run_provider(
             progress |= resolver
                 .poll(&mut network, poller)
                 .map_err(|e| format!("resolver: {e}"))?;
+        }
+        if let Some(control) = &link_control {
+            // ACKs are lossless and take precedence over coalesced snapshots.
+            // While an ACK is blocked, don't consume another admin request.
+            if let Some((generation, status)) = pending_ack {
+                if crate::link_control::try_send_ack(control.as_fd(), generation, status)? {
+                    pending_ack = None;
+                }
+            }
+            if watch_interfaces && pending_ack.is_none() {
+                let revision = network.runtime().interface_revision();
+                let writable = events[..event_count].iter().any(|event|
+                    event.u64 == LINK_CONTROL_TOKEN && event.events & libc::EPOLLOUT as u32 != 0);
+                if reported_revision != Some(revision) && (!report_blocked || writable) {
+                    let bytes = serde_json::to_vec(&network.runtime().interface_snapshot())
+                        .map_err(|error| format!("interface observation: {error}"))?;
+                    let sent = crate::link_control::send_interface(control.as_fd(), &bytes)?;
+                    if sent { reported_revision = Some(revision); }
+                    report_blocked = !sent;
+                }
+            }
+            let desired = (libc::EPOLLERR | libc::EPOLLHUP
+                | if pending_ack.is_none() { libc::EPOLLIN } else { 0 }
+                | if report_blocked || pending_ack.is_some() { libc::EPOLLOUT } else { 0 }) as u32;
+            if desired != control_events {
+                let mut event = libc::epoll_event { events: desired, u64: LINK_CONTROL_TOKEN };
+                if unsafe { libc::epoll_ctl(6, libc::EPOLL_CTL_MOD, control.as_raw_fd(), &mut event) } < 0 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                control_events = desired;
+            }
+        }
+        {
+            let update = {
+                let runtime = network.runtime();
+                let revision = (runtime.interface_revision(), ethernet.is_some());
+                if route_revision != Some(revision) {
+                    route_revision = Some(revision);
+                    Some(crate::rtnetlink::View::new(
+                        runtime.interface_snapshots(), revision.1, mac))
+                } else { None }
+            };
+            progress |= route_adapter.advance(poller, &events[..event_count], update, &mut |up| {
+                network.set_loopback_up(up);
+                Ok(crate::rtnetlink::View::new(network.runtime().interface_snapshots(), ethernet.is_some(), mac))
+            })
+                .map_err(|e| format!("netlink registration: {e}"))?;
         }
         let now = start.elapsed();
         // Poll even while runnable: level-triggered IPC readiness provides fair

@@ -1,0 +1,191 @@
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -23,6 +23,7 @@
+ #include <linux/bpf.h>
+ #include <linux/capability.h>
+ #include <linux/kernel.h>
++#include <linux/unaligned.h>
+ #include <linux/filter.h>
+ #include <linux/init.h>
+ #include <linux/signal.h>
+@@ -642,6 +643,28 @@
+ 	return 0;
+ }
+ 
++/* Namespace-scoped userspace endpoint; native AF_NETLINK remains transport.
++ * Only user NETLINK_ROUTE sockets use sk_user_data here. Other protocols and
++ * kernel sockets retain their original ownership and dispatch. */
++#ifdef CONFIG_NETSTACK3_RUST
++extern int ns3_nl_open(struct sock *, void **);
++bool ns3_nl_writable(void *);
++void ns3_nl_loss(void *);
++int ns3_nl_deliver(void *, const u8 *, size_t, u32);
++extern void ns3_nl_close(void *);
++extern void ns3_nl_drained(void *);
++extern int ns3_nl_send(void *, const u8 *, size_t, const u8 *, bool);
++extern __poll_t ns3_nl_poll(void *, struct file *, poll_table *);
++static void *ns3_nl_owner(struct sock *sk)
++{
++    return sk->sk_protocol == NETLINK_ROUTE && !netlink_is_kernel(sk) ?
++        rcu_access_pointer(sk->sk_user_data) : NULL;
++}
++#else
++static void *ns3_nl_owner(struct sock *sk) { return NULL; }
++#endif
++static int netlink_release(struct socket *sock);
++
+ static int netlink_create(struct net *net, struct socket *sock, int protocol,
+ 			  int kern)
+ {
+@@ -693,6 +716,17 @@
+ 	nlk->netlink_bind = bind;
+ 	nlk->netlink_unbind = unbind;
+ 	nlk->netlink_release = release;
++#ifdef CONFIG_NETSTACK3_RUST
++    if (!kern && protocol == NETLINK_ROUTE) {
++        void *owner = NULL;
++        err = ns3_nl_open(sock->sk, &owner);
++        if (err) {
++            netlink_release(sock);
++            return err;
++        }
++        rcu_assign_sk_user_data(sock->sk, owner);
++    }
++#endif
+ out:
+ 	return err;
+ 
+@@ -723,6 +757,12 @@
+ 	if (!sk)
+ 		return 0;
+ 
++#ifdef CONFIG_NETSTACK3_RUST
++    if (ns3_nl_owner(sk)) {
++        ns3_nl_close(ns3_nl_owner(sk));
++        rcu_assign_sk_user_data(sk, NULL);
++    }
++#endif
+ 	netlink_remove(sk);
+ 	sock_orphan(sk);
+ 	nlk = nlk_sk(sk);
+@@ -1427,6 +1467,8 @@
+ 	int val;
+ 
+ 	if (p->exclude_sk == sk)
++		return;
++	if (ns3_nl_owner(sk))
+ 		return;
+ 
+ 	if (nlk->portid == p->portid || p->group - 1 >= nlk->ngroups ||
+@@ -1686,7 +1728,6 @@
+ 		netlink_table_ungrab();
+ 		if (optname == NETLINK_DROP_MEMBERSHIP && nlk->netlink_unbind)
+ 			nlk->netlink_unbind(sock_net(sk), val);
+-
+ 		break;
+ 	}
+ 	case NETLINK_BROADCAST_ERROR:
+@@ -1893,6 +1934,22 @@
+ 		goto out;
+ 	}
+ 
++#ifdef CONFIG_NETSTACK3_RUST
++    if (ns3_nl_owner(sk) && !dst_portid && !dst_group) {
++        u8 context[24] = {};
++        struct user_namespace *user_ns = sock_net(sk)->user_ns;
++        NETLINK_CB(skb).sk = sk;
++        put_unaligned_le32(nlk->portid, context);
++        put_unaligned_le32(from_kuid_munged(user_ns, scm.creds.uid), context + 4);
++        put_unaligned_le32(from_kgid_munged(user_ns, scm.creds.gid), context + 8);
++        put_unaligned_le32(scm.creds.pid, context + 12);
++        put_unaligned_le32(netlink_ns_capable(skb, user_ns, CAP_NET_ADMIN), context + 16);
++        err = ns3_nl_send(ns3_nl_owner(sk), skb->data, skb->len,
++                          context, msg->msg_flags & MSG_DONTWAIT);
++        kfree_skb(skb);
++        goto out;
++    }
++#endif
+ 	if (dst_group) {
+ 		refcount_inc(&skb->users);
+ 		netlink_broadcast(sk, skb, dst_portid, dst_group, GFP_KERNEL);
+@@ -1989,6 +2046,9 @@
+ 	scm_recv(sock, msg, &scm, flags);
+ out:
+ 	netlink_rcv_wake(sk);
++#ifdef CONFIG_NETSTACK3_RUST
++    if (ns3_nl_owner(sk)) ns3_nl_drained(ns3_nl_owner(sk));
++#endif
+ 	return err ? : copied;
+ }
+ 
+@@ -2805,6 +2865,61 @@
+ }
+ EXPORT_SYMBOL(netlink_unregister_notifier);
+ 
++
++#ifdef CONFIG_NETSTACK3_RUST
++bool ns3_nl_writable(void *p)
++{
++    struct sock *sk = p;
++    return atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
++        !test_bit(NETLINK_S_CONGESTED, &nlk_sk(sk)->state);
++}
++void ns3_nl_loss(void *p) { netlink_overrun(p); }
++int ns3_nl_deliver(void *p, const u8 *bytes, size_t len, u32 group)
++{
++    struct sock *sk = p;
++    struct netlink_sock *nlk = nlk_sk(sk);
++    struct sk_buff *skb;
++    long timeo = 0;
++    int err;
++    bool subscribed;
++    if (group) {
++        netlink_lock_table();
++        subscribed = group <= nlk->ngroups && test_bit(group - 1, nlk->groups);
++        netlink_unlock_table();
++        if (!subscribed) return -ENOENT;
++    }
++    skb = netlink_alloc_large_skb(len, 0);
++    if (!skb) return -ENOMEM;
++    memcpy(skb_put(skb, len), bytes, len);
++    NETLINK_CB(skb).portid = 0;
++    NETLINK_CB(skb).dst_group = group;
++    if (sk_filter(sk, skb)) {
++        kfree_skb(skb);
++        return len;
++    }
++    sock_hold(sk);
++    /* Retain backpressure at the provider rather than flagging a dropped
++     * kernel multicast. This non-kernel sender argument prevents overrun. */
++    err = netlink_attachskb(sk, skb, &timeo, sk);
++    if (err) return err;
++    return netlink_sendskb(sk, skb);
++}
++#endif
++
++static __poll_t netlink_provider_poll(struct file *file, struct socket *sock,
++                                     poll_table *wait)
++{
++    __poll_t mask = datagram_poll(file, sock, wait);
++#ifdef CONFIG_NETSTACK3_RUST
++    void *owner = ns3_nl_owner(sock->sk);
++    if (owner) {
++        mask &= ~(EPOLLOUT | EPOLLWRNORM);
++        mask |= ns3_nl_poll(owner, file, wait);
++    }
++#endif
++    return mask;
++}
++
+ static const struct proto_ops netlink_ops = {
+ 	.family =	PF_NETLINK,
+ 	.owner =	THIS_MODULE,
+@@ -2814,7 +2929,7 @@
+ 	.socketpair =	sock_no_socketpair,
+ 	.accept =	sock_no_accept,
+ 	.getname =	netlink_getname,
+-	.poll =		datagram_poll,
++	.poll =		netlink_provider_poll,
+ 	.ioctl =	netlink_ioctl,
+ 	.listen =	sock_no_listen,
+ 	.shutdown =	sock_no_shutdown,

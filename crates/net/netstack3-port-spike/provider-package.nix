@@ -47,6 +47,7 @@ let
     chmod -R u+w "$out"
     sed -i '/\[package\]/a workspace = "../../connectivity/network/netstack3"' "$refroot/src/lib/directory-capability/Cargo.toml"
 
+    patch -d "$refroot" -p1 < ${./upstream-cargo/patches/tcp-passive-storage-admission-host.patch}
     patch -d "$refroot" -p1 < ${./upstream-cargo/patches/dhcp-client-core-host.patch}
     patch -d "$refroot" -p1 < ${./upstream-cargo/patches/trust-dns-workspace.patch}
 

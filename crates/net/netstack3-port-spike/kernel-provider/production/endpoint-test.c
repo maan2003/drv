@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -81,11 +82,41 @@ static void signal_noop(int n) { (void)n; }
 static void child_ok(pid_t p,const char *what) {
     int status; check(waitpid(p,&status,0)==p && WIFEXITED(status) && !WEXITSTATUS(status),what);
 }
+static void control_error_is_not_kernel_dispatch(int registration, int status) {
+    pid_t child = fork();
+    check(child >= 0, "control fork");
+    if (!child) {
+        close(registration);
+        int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        struct ifreq request = {};
+        strcpy(request.ifr_name, "lo");
+        check(fd >= 0, "control socket");
+        check(ioctl(fd, SIOCGIFFLAGS, &request) == -1 && errno == EPROTO,
+              "worker cannot select native ioctl fallback");
+        close(fd);
+        _exit(0);
+    }
+    struct pollfd poller = {registration, POLLPRI, 0};
+    check(poll(&poller, 1, 3000) == 1, "control pending");
+    int transaction = ioctl(registration, 0xB503);
+    unsigned char request[48];
+    check(transaction >= 0 && read(transaction, request, sizeof(request)) == sizeof(request),
+          "control transaction");
+    check(write(transaction, &status, sizeof(status)) == sizeof(status), "control error");
+    child_ok(child, "control fallback fence");
+    check(write(transaction, &status, sizeof(status)) == -1 && errno == ENOENT,
+          "transaction cannot be replied to twice");
+    close(transaction);
+}
 int main(void) {
     alarm(30); setbuf(stdout,NULL);
     dest.sin_port=htons(20001); dest.sin_addr.s_addr=htonl(0x7f000001);
     int registration=open("/dev/netstack3",O_RDWR|O_CLOEXEC);
     check(registration>=0,"registration");
+    check(ioctl(registration,0xB502)==0,"ready");
+    control_error_is_not_kernel_dispatch(registration, -515); /* ENOIOCTLCMD */
+    control_error_is_not_kernel_dispatch(registration, -512); /* ERESTARTSYS */
+    control_error_is_not_kernel_dispatch(registration, -516); /* ERESTART_RESTARTBLOCK */
     int a=app_socket(SOCK_DGRAM|SOCK_NONBLOCK);
     check(ioctl(registration,NS3_CLAIM,(void*)1)<0 && errno==EFAULT,"claim copy rollback");
     struct rlimit original, limited;

@@ -20,7 +20,8 @@ const HOST_INT_STATUS: usize = 0x200;
 const HOST_INT_ENABLE: usize = 0x204;
 const WFDMA_GLO_CFG: usize = 0x208;
 const WFDMA_RST_DTX_PTR: usize = 0x20c;
-const WFDMA_RST_DRX_PTR: usize = 0x100;
+const WFDMA_RST: usize = 0x100;
+const WFDMA_RST_DRX_PTR: usize = 0x280;
 const WFDMA_GLO_CFG_EXT0: usize = 0x2b0;
 // Pinned Linux mt792x_regs.h defines these as live engine-status bits rather
 // than writable configuration state.
@@ -295,6 +296,20 @@ struct DmashdlIo<B: Backend> {
     wfdma: MmioRegion<B>,
     dmashdl: MmioRegion<B>,
 }
+impl<B: Backend> DmashdlIo<B> {
+    fn configure(&mut self) -> Result<(), String> {
+        let invariant =
+            ensure_linux_dmashdl_invariant(self).map_err(|error| format!("{error:?}"))?;
+        if invariant.ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0
+            || invariant.control_after & DMASHDL_BYPASS == 0
+        {
+            Err("DMASHDL invariant mismatch".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl<B: Backend> DmashdlInvariantIo for DmashdlIo<B> {
     type Error = drv_hardware::Error;
     fn read_ext0(&mut self) -> Result<u32, Self::Error> {
@@ -456,33 +471,26 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
             std::thread::sleep(Duration::from_millis(1));
         }
         let reset_indices = wfdma
-            .read_u32(WFDMA_RST_DRX_PTR)
+            .read_u32(WFDMA_RST)
             .map_err(|e| format!("read RX reset: {e:?}"))?;
         if reset_indices == u32::MAX {
             return Err("WFDMA reset control returned all ones".into());
         }
         wfdma
-            .write_u32(WFDMA_RST_DRX_PTR, reset_indices & !0x30)
+            .write_u32(WFDMA_RST, reset_indices & !0x30)
             .map_err(|e| format!("clear RX reset: {e:?}"))?;
         wfdma
-            .write_u32(WFDMA_RST_DRX_PTR, reset_indices | 0x30)
+            .write_u32(WFDMA_RST, reset_indices | 0x30)
             .map_err(|e| format!("set RX reset: {e:?}"))?;
         Ok(())
     }
 
     fn configure_dmashdl(&mut self) -> Result<(), Self::Error> {
-        let invariant = ensure_linux_dmashdl_invariant(&mut DmashdlIo {
+        DmashdlIo {
             wfdma: self.region(0xd4000)?,
             dmashdl: self.region(0xd6000)?,
-        })
-        .map_err(|error| format!("{error:?}"))?;
-        if invariant.ext0_after & WFDMA_TX_DMASHDL_ENABLE != 0
-            || invariant.control_after & DMASHDL_BYPASS == 0
-        {
-            Err("DMASHDL invariant mismatch".into())
-        } else {
-            Ok(())
         }
+        .configure()
     }
 
     fn route_rings(&mut self) -> Result<(), Self::Error> {
@@ -673,8 +681,9 @@ impl<B: Backend, P: ActivationPci> TransportActivationOps for HardwareActivation
         let value = wfdma
             .read_u32(WFDMA_GLO_CFG)
             .map_err(|error| format!("read WFDMA global: {error:?}"))?;
-        verify_wfdma_global_readback(value, global, "WFDMA global")
-            .inspect(|()| self.enabled_wfdma = Some(global))
+        verify_wfdma_global_readback(value, global, "WFDMA global")?;
+        self.enabled_wfdma = Some(global);
+        mark_wfdma_initialized(&self.resources.bar0)
     }
     fn enable_host_interrupt(&mut self) -> Result<(), Self::Error> {
         let wfdma = self.region(0xd4000)?;
@@ -792,6 +801,314 @@ pub(super) fn activate<B: Backend>(
     })
 }
 
+// Linux mt792x_dma_enable marks every initialized engine, including cold
+// startup. Otherwise the first ownership wake needlessly rebuilds live rings.
+fn mark_wfdma_initialized<B: Backend>(bar: &MmioRegion<B>) -> Result<(), String> {
+    let dummy = bar
+        .read_u32(0x2120)
+        .map_err(|e| format!("read dummy: {e:?}"))?;
+    if dummy == u32::MAX {
+        return Err("WFDMA dummy returned all ones".into());
+    }
+    bar.write_u32(0x2120, dummy | (1 << 1))
+        .map_err(|e| format!("mark WFDMA healthy: {e:?}"))?;
+    readback(bar, 0x2120, dummy | (1 << 1), "WFDMA healthy")
+}
+
+/// Rebuild the live WPDMA transport after firmware reports lost ring state.
+///
+/// The caller has already acquired the HIF. No PCI, MSI, or allocation
+/// ownership changes here; any error is ambiguous and requires containment.
+pub(super) fn runtime_reinitialize<B: Backend>(
+    resources: &mut OwnedHardwareResources<B>,
+    mechanics: &mut mt7921_core::LoaderMechanics,
+    receive: &mut crate::receive::RxRouting,
+    data_rx: &mut crate::receive::DataRx,
+    tx: &mut crate::transmit::ClientTx,
+) -> Result<(), String> {
+    if mechanics.active_command_slot().is_some() || mechanics.has_pending_scatter() {
+        return Err("MCU DMA publication is still owned".into());
+    }
+    if tx.has_published() {
+        return Err("client TX DMA publication is still owned".into());
+    }
+
+    let wfdma = resources
+        .bar0
+        .slice(0xd4000, PAGE)
+        .map_err(|e| format!("slice WFDMA: {e:?}"))?;
+    let mac = resources
+        .bar0
+        .slice(0x10000, PAGE)
+        .map_err(|e| format!("slice PCIe MAC: {e:?}"))?;
+    wfdma
+        .write_u32(HOST_INT_ENABLE, 0)
+        .map_err(|e| format!("mask host IRQ: {e:?}"))?;
+    readback(&wfdma, HOST_INT_ENABLE, 0, "masked host interrupt enable")?;
+    mac.write_u32(PCIE_MAC_INT_ENABLE, 0)
+        .map_err(|e| format!("mask MAC IRQ: {e:?}"))?;
+    readback(&mac, PCIE_MAC_INT_ENABLE, 0, "masked MAC interrupt enable")?;
+
+    let initial = wfdma
+        .read_u32(WFDMA_GLO_CFG)
+        .map_err(|e| format!("read WFDMA global: {e:?}"))?;
+    if initial == u32::MAX {
+        return Err("WFDMA global returned all ones".into());
+    }
+    let disabled = initial & !((1 << 0) | (1 << 2) | (1 << 15) | (1 << 21) | (1 << 27) | (1 << 28));
+    wfdma
+        .write_u32(WFDMA_GLO_CFG, disabled)
+        .map_err(|e| format!("disable WFDMA: {e:?}"))?;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        let value = wfdma
+            .read_u32(WFDMA_GLO_CFG)
+            .map_err(|e| format!("read WFDMA idle: {e:?}"))?;
+        if value == u32::MAX {
+            return Err("WFDMA idle read returned all ones".into());
+        }
+        verify_wfdma_global_readback(value, disabled, "disabled runtime WFDMA")?;
+        if value & WFDMA_GLO_CFG_BUSY == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("WFDMA did not quiesce: {value:#010x}"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // These are our runtime rings, with no outstanding TX publication and
+    // DMA verified idle above. Like mt76_dma_queue_reset(reset_idx=true),
+    // retire their old CPU/device cursors before rebuilding descriptor storage.
+    // Cold acquisition must still reject dirty rings it does not own.
+    // DMA cursors use the TX/RX reset strobes from mt792x_regs.h,
+    // not writes to per-ring read-only status registers.
+    wfdma
+        .write_u32(WFDMA_RST_DTX_PTR, mt7921_core::MT7921_RESET_ALL_TX_INDICES)
+        .map_err(|e| format!("reset runtime TX indices: {e:?}"))?;
+    wfdma
+        .write_u32(WFDMA_RST_DRX_PTR, u32::MAX)
+        .map_err(|e| format!("reset runtime RX indices: {e:?}"))?;
+    for (base, count) in [
+        (0x300, mt7921_core::MT7921_TX_RING_SLOTS),
+        (0x500, mt7921_core::MT7921_RX_RING_SLOTS),
+    ] {
+        for index in 0..count {
+            for offset in [base + index * 0x10 + 8, base + index * 0x10 + 12] {
+                let previous = wfdma
+                    .read_u32(offset)
+                    .map_err(|e| format!("read runtime ring cursor: {e:?}"))?;
+                if previous == u32::MAX {
+                    return Err("runtime ring cursor returned all ones".into());
+                }
+                if offset % 0x10 == 8 {
+                    wfdma
+                        .write_u32(offset, 0)
+                        .map_err(|e| format!("reset runtime ring cursor: {e:?}"))?;
+                }
+                readback(
+                    &wfdma,
+                    offset,
+                    0,
+                    &format!("reset runtime ring cursor {offset:#x}"),
+                )?;
+            }
+        }
+    }
+
+    // The warm reset must establish the same scheduler bypass as cold
+    // activation (Linux mt792x_dma_disable), not assume sleep preserved it.
+    DmashdlIo {
+        wfdma: resources
+            .bar0
+            .slice(0xd4000, PAGE)
+            .map_err(|e| format!("{e:?}"))?,
+        dmashdl: resources
+            .bar0
+            .slice(0xd6000, PAGE)
+            .map_err(|e| format!("{e:?}"))?,
+    }
+    .configure()?;
+    initialize_descriptors(&mut resources.dma)
+        .map_err(|e| format!("initialize runtime descriptors: {e:?}"))?;
+
+    let tx_guard = resources
+        .dma
+        .tx_guard
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let fwdl = resources
+        .dma
+        .fwdl_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let mcu_tx = resources
+        .dma
+        .mcu_tx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let band0 = resources
+        .dma
+        .management_tx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    prepare_global_tx_rings(
+        &mut TxIo(
+            resources
+                .bar0
+                .slice(0xd4000, PAGE)
+                .map_err(|e| format!("slice TX WFDMA: {e:?}"))?,
+        ),
+        tx_guard,
+        fwdl,
+        mcu_tx,
+        band0,
+        |_| {},
+    )
+    .map_err(|e| format!("route runtime TX rings: {e:?}"))?;
+
+    let rx_guard = resources
+        .dma
+        .rx_guard
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    let wm = resources
+        .dma
+        .mcu_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits();
+    prepare_global_rx_rings(
+        &mut RxIo(
+            resources
+                .bar0
+                .slice(0xd4000, PAGE)
+                .map_err(|e| format!("slice RX WFDMA: {e:?}"))?,
+        ),
+        rx_guard,
+        wm,
+        |_| {},
+    )
+    .map_err(|e| format!("route runtime RX rings: {e:?}"))?;
+    let data = resources
+        .dma
+        .data_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits() as u32;
+    let wm2 = resources
+        .dma
+        .wa_rx_ring
+        .device_address(0)
+        .map_err(|e| format!("{e:?}"))?
+        .bits() as u32;
+    let mut rx = RxIo(
+        resources
+            .bar0
+            .slice(0xd4000, PAGE)
+            .map_err(|e| format!("slice routed WFDMA: {e:?}"))?,
+    );
+    for (index, base, count) in [
+        (2, data, MT7921_DATA_RX_RING_COUNT as u32),
+        (4, wm2, MT7921_MCU_RX_RING_COUNT as u32),
+    ] {
+        rx.write_ring_initial(index, base, count)
+            .map_err(|e| format!("route runtime RX ring {index}: {e:?}"))?;
+        rx.release_fence();
+        rx.publish_ring_cpu_index(index, count - 1)
+            .map_err(|e| format!("publish runtime RX ring {index}: {e:?}"))?;
+    }
+
+    for (offset, value) in [
+        (0x2f0, 0),
+        (0x680, 4),
+        (0x688, 0x0040_0004),
+        (0x68c, 0x0080_0004),
+        (0x690, 0x00c0_0004),
+        (0x694, 0x0100_0004),
+        (0x600, 0x0140_0004),
+        (0x604, 0x0180_0004),
+        (0x608, 0x01c0_0004),
+        (0x60c, 0x0200_0004),
+        (0x610, 0x0240_0004),
+        (0x614, 0x0280_0004),
+        (0x618, 0x02c0_0004),
+        (0x640, 0x0340_0004),
+        (0x644, 0x0380_0004),
+    ] {
+        wfdma
+            .write_u32(offset, value)
+            .map_err(|e| format!("configure runtime prefetch: {e:?}"))?;
+    }
+
+    mechanics
+        .rebase_after_wpdma_reset()
+        .map_err(|e| format!("rebase MCU: {e:?}"))?;
+    receive.rebase_after_wpdma_reset();
+    data_rx.rebase_after_wpdma_reset();
+    tx.rebase_after_wpdma_reset()
+        .map_err(|e| format!("rebase client TX: {e:?}"))?;
+
+    let global = disabled
+        | (1 << 0)
+        | (1 << 2)
+        | (3 << 4)
+        | (1 << 6)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 15)
+        | (1 << 21)
+        | (1 << 28)
+        | (1 << 30);
+    wfdma
+        .write_u32(WFDMA_GLO_CFG, global)
+        .map_err(|e| format!("enable WFDMA: {e:?}"))?;
+    let actual = wfdma
+        .read_u32(WFDMA_GLO_CFG)
+        .map_err(|e| format!("verify WFDMA: {e:?}"))?;
+    verify_wfdma_global_readback(actual, global, "runtime WFDMA global")?;
+
+    mark_wfdma_initialized(&resources.bar0)?;
+
+    let wake = resources
+        .bar0
+        .read_u32(0xd41f4)
+        .map_err(|e| format!("read wake IRQ: {e:?}"))?;
+    if wake == u32::MAX {
+        return Err("MCU wake IRQ enable returned all ones".into());
+    }
+    resources
+        .bar0
+        .write_u32(0xd41f4, wake | 1)
+        .map_err(|e| format!("enable wake IRQ: {e:?}"))?;
+    readback(&resources.bar0, 0xd41f4, wake | 1, "MCU wake IRQ enable")?;
+    let host_mask =
+        McuRxIrqTopology::firmware().mask() | mt7921_core::MT7921_DATA_RX_IRQ_BIT | (1 << 29);
+    wfdma
+        .write_u32(HOST_INT_ENABLE, host_mask)
+        .map_err(|e| format!("restore host IRQ: {e:?}"))?;
+    readback(
+        &wfdma,
+        HOST_INT_ENABLE,
+        host_mask,
+        "runtime host interrupt enable",
+    )?;
+    mac.write_u32(PCIE_MAC_INT_ENABLE, 0xff)
+        .map_err(|e| format!("restore MAC IRQ: {e:?}"))?;
+    readback(
+        &mac,
+        PCIE_MAC_INT_ENABLE,
+        0xff,
+        "runtime MAC interrupt enable",
+    )
+}
+
 pub(super) fn quiesce<B: Backend>(
     resources: &mut OwnedHardwareResources<B>,
     pci: &mut impl ActivationPci,
@@ -869,6 +1186,64 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reinit_rebuilds_rings_and_restores_exact_wake_masks() {
+        let (device, operations, _) =
+            DeterministicBackend::recording_mt7921_device_with_model(Default::default());
+        let (mut resources, _) = crate::OwnedHardwareResources::acquire(device).unwrap();
+        let mut mechanics = mt7921_core::LoaderMechanics::new(73);
+        let mut receive = crate::receive::RxRouting::default();
+        let mut data = crate::receive::DataRx::default();
+        let mut tx = crate::transmit::ClientTx::default();
+        resources
+            .bar0
+            .write_u32(0xd42b0, WFDMA_TX_DMASHDL_ENABLE)
+            .unwrap();
+        resources.bar0.write_u32(0xd6004, 0).unwrap();
+        // Real warm rings retain consumed TX indices and posted RX buffers.
+        resources.bar0.write_u32(0xd4308, 16).unwrap();
+        resources.bar0.write_u32(0xd430c, 16).unwrap();
+        resources.bar0.write_u32(0xd4508, 7).unwrap();
+        resources.bar0.write_u32(0xd450c, 3).unwrap();
+
+        let before = operations.borrow().len();
+        runtime_reinitialize(
+            &mut resources,
+            &mut mechanics,
+            &mut receive,
+            &mut data,
+            &mut tx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resources.bar0.read_u32(0xd42b0).unwrap() & WFDMA_TX_DMASHDL_ENABLE,
+            0
+        );
+        assert_eq!(
+            resources.bar0.read_u32(0xd6004).unwrap() & DMASHDL_BYPASS,
+            DMASHDL_BYPASS
+        );
+        assert!(!operations.borrow()[before..].iter().any(|operation|
+            matches!(operation, drv_hardware_backends::Operation::WriteU32 { offset, .. }
+                if (0xd430c..=0xd441c).contains(offset) && (offset - 0xd430c) % 0x10 == 0)
+        ), "TX device cursors must use the reset strobe, not ignored register writes");
+        assert_eq!(mechanics.sequence(), 73);
+        assert_eq!(mechanics.command_producer(), 0);
+        assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & (1 << 1), 1 << 1);
+        assert_eq!(resources.bar0.read_u32(0xd41f4).unwrap() & 1, 1);
+        assert_eq!(
+            resources.bar0.read_u32(0xd4204).unwrap(),
+            McuRxIrqTopology::firmware().mask() | mt7921_core::MT7921_DATA_RX_IRQ_BIT | (1 << 29)
+        );
+        assert_eq!(resources.bar0.read_u32(0x10188).unwrap(), 0xff);
+        assert_eq!(resources.bar0.read_u32(0xd4508).unwrap(), 7);
+        assert_eq!(
+            resources.bar0.read_u32(0xd4528).unwrap(),
+            (MT7921_DATA_RX_RING_COUNT - 1) as u32
+        );
+    }
+
+    #[test]
     fn wfdma_global_readback_allows_live_busy_bits_to_change() {
         let expected = 0x5030_b875;
         for value in [
@@ -907,6 +1282,7 @@ mod tests {
         let mut containment = containment();
         let mut state =
             activate(&mut resources, &mut pci, &mut acquisition, &mut containment).unwrap();
+        assert_eq!(resources.bar0.read_u32(0x2120).unwrap() & 2, 2);
         assert_eq!(
             state.interrupt,
             mt7921_core::InterruptInstallState::InstalledAndQuiet

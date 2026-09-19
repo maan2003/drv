@@ -13,6 +13,7 @@ use futures::channel::oneshot::{self, Canceled};
 use futures::{Future, FutureExt};
 use log::{error, info, warn};
 use std::pin::Pin;
+use std::io::Write as _;
 
 pub(crate) async fn serve(
     mlme_init_receiver: oneshot::Receiver<()>,
@@ -29,7 +30,12 @@ pub(crate) async fn serve(
     // JoinSet retains structured cancellation on every return path.
     let mut bridge = tokio::task::JoinSet::new();
     bridge.spawn_local(async move {
-        let _: Result<(), ()> = bridge_exit_sender.send(callbacks.await).map_err(|result| {
+        let result = callbacks.await;
+        if let Err(error) = &result {
+            let _ = writeln!(std::io::stderr().lock(),
+                "wlan_protocol_fault stage=callback_exit error={error}");
+        }
+        let _: Result<(), ()> = bridge_exit_sender.send(result).map_err(|result| {
             error!(
                 "Failed to send serve_wlan_softmac_ifc_bridge() result: {:?}",
                 result
@@ -133,7 +139,7 @@ pub(crate) async fn serve(
                             mlme_future_complete = true;
                         },
                         Err(e) => {
-                            error!("MLME shut down with error: {}", e);
+                            let _ = writeln!(std::io::stderr().lock(), "wlan_protocol_fault stage=mlme error={e}");
                             break Err(zx::Status::INTERNAL)
                         }
                     }
@@ -149,7 +155,7 @@ pub(crate) async fn serve(
                             break Err(zx::Status::INTERNAL)
                         }
                         Ok(Err(e)) => {
-                            error!("SoftmacIfcBridge server shut down with error: {}", e);
+                            let _ = writeln!(std::io::stderr().lock(), "wlan_protocol_fault stage=callbacks error={e}");
                             break Err(zx::Status::INTERNAL)
                         }
                         Ok(Ok(())) => info!("SoftmacIfcBridge server shut down gracefully"),
@@ -159,13 +165,13 @@ pub(crate) async fn serve(
                     if mlme_future_complete {
                         match sme_result {
                             Err(e) => {
-                                error!("SME shut down with error: {}", e);
+                                let _ = writeln!(std::io::stderr().lock(), "wlan_protocol_fault stage=sme error={e}");
                                 break Err(zx::Status::INTERNAL)
                             }
                             Ok(()) => info!("SME shut down gracefully"),
                         }
                     } else {
-                        error!("SME shut down before MLME: {:?}", sme_result);
+                        let _ = writeln!(std::io::stderr().lock(), "wlan_protocol_fault stage=sme_early result={sme_result:?}");
                         break Err(zx::Status::INTERNAL)
                     }
                 }
@@ -237,6 +243,7 @@ pub(crate) async fn serve_wlan_softmac_ifc_bridge(
                 callback = callback => {
                     let (epoch, upcall) = callback?;
                     let event = match upcall {
+                        Upcall::ConnectionLoss(peer) => DriverEvent::ConnectionLoss(peer),
                         Upcall::Recv { bytes, info } => DriverEvent::WlanRxEvent { bytes, rx_info: info },
                         Upcall::TxResult(tx_result) => DriverEvent::TxResultReport { tx_result },
                         Upcall::ScanComplete { status, scan_id } => DriverEvent::ScanComplete { status, scan_id },
