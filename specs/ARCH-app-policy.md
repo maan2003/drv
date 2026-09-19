@@ -371,7 +371,8 @@ an entry (a daemon, a probe) out of the app menu.
   in its `drv-access` metadata under the client id (`drv.remote`:
   `node:<id>` for a cast, `camera` for cameras), and the script lets a
   marked client's streams reach that only, destroying any other. The
-  mark goes when the client does. WirePlumber would hand every new
+  mark goes when the client does, and a cast's remotes are disconnected
+  when the cast ends. WirePlumber would hand every new
   client everything a moment later, so a WirePlumber rule keyed on the
   bridge's uid (set by PipeWire from the socket, not forgeable) gives
   the bridge's clients no default permissions and no permission
