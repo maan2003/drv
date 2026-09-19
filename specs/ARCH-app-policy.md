@@ -23,7 +23,9 @@ app menu) and `drv-portal` (the file chooser and the documents mount),
 supervisor services on `drv-ui`. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
-the fork). The NixOS module `nix/module.nix` (`services.drv`, flake
+the fork); `nix/smoke.sh` drives a fresh boot through unlock, the
+isolation probe, notification, chooser, cast, mic, OpenURI and the
+revoke and fails on missing evidence. The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
 `appd.toml`, the session bus policy and the units.
 Implements the "identity and policy" part of
