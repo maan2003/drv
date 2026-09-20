@@ -27,7 +27,11 @@ the fork); `nix/smoke.sh` drives a fresh boot through unlock, the
 isolation probe, notification, chooser, cast, mic, OpenURI and the
 revoke and fails on missing evidence; `nix/drill.sh` then kills each
 member and checks the set restarts, the apps die with it and the
-desktop comes back. The NixOS module `nix/module.nix` (`services.drv`, flake
+desktop comes back. The same two scripts (`VM_BACKEND=m2`) run against a
+crosvm guest on an Apple M2 (`nix/m2-vm.nix`, `nix/m2-vm-run.sh`), where
+the GPU process drives the real Asahi GPU through a virtio-gpu native
+context and the screen is a window on a headless host compositor served
+over noVNC. The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
 `appd.toml`, the session bus policy and the units.
 Implements the "identity and policy" part of
