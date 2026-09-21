@@ -33,7 +33,7 @@ the GPU process drives the real Asahi GPU through a virtio-gpu native
 context and the screen is a window on a headless host compositor served
 over noVNC. The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
-`appd.toml`, the session bus policy and the units.
+`appd.json`, the session bus policy and the units.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
@@ -110,7 +110,7 @@ drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid
                                            setgid, setpcap, sys_admin, chown)
   fds: listener, channel, compositor,      fd `channel` from the supervisor,
     menu                                     its only input. --range and where
-  appd.toml: every uid, exec, features,      host things live, from the command
+  appd.json: every uid, exec, features,      host things live, from the command
     globals, grants, autostart               line. Launch{name, uid, argv, env,
   Launch{app} on a launch channel ------->   network, gpu, audio, bus, jit,
     (the compositor's or the menu's) ->      closure} -> type checks, dirs,
@@ -238,7 +238,7 @@ error, `launch(app)`, `reconnect()` for another thread, 2 s timeouts;
 was handed over, not found).
 There is no mode without a daemon.
 
-## appd.toml
+## appd.json
 
 ```toml
 wayland-socket = "/run/drv-wayland/wayland"   # every app's WAYLAND_DISPLAY
