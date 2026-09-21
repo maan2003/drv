@@ -150,6 +150,13 @@ anything. The child builds the root in order of what it needs:
 4. As the app: the Landlock ruleset by path (the closure, `/etc`, HOME
    and the rest), `landlock_restrict_self`, MDWE unless `jit`, exec.
 
+The kernel's own account of the result is checked against this model, not
+assumed: `nix/kernel-state.sh` in the niri repo dumps a running app's
+mounts and flags, credentials, securebits, namespaces, MDWE and the whole
+Landlock domain with its rules as paths (the last four through a dev-only
+kernel module, `nix/kdump`) and diffs it with the checked-in expectation
+under `nix/expect`; the smoke runs it.
+
 So argv, env and the closure are touched only by a process that already
 is the app, and while the request is being decoded the process holds
 SYS_ADMIN, SETUID and SETGID with the per-UID parents in hand and
