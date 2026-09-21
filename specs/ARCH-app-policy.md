@@ -61,12 +61,12 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   (drv-bridge, uid drv-bridge) as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
-  ambient, as its whole bounding set. Every member gets the sandbox an
-  app gets (`drv_os::sandbox`, one primitive for both): a private mount
-  namespace, fresh `/tmp` and `/dev/shm`, `/proc` with hidepid, a
-  read-only `/run` holding only its `--<member>-expose` entries, and an
-  empty network namespace (the forker keeps the host's: apps with
-  `network` get it from there). Today: seatd `/run/udev`; the compositor
+  ambient, as its whole bounding set. Every member gets a sandbox on the
+  host root (`drv_os::sandbox::Sandbox`): a private mount namespace,
+  fresh `/tmp` and `/dev/shm`, `/proc` with hidepid, a read-only `/run`
+  holding only its `--<member>-expose` entries, and an empty network
+  namespace (the forker keeps the host's: apps with `network` get it
+  from there). Apps get a root of their own instead (below). Today: seatd `/run/udev`; the compositor
   `/run/udev` (libinput), its runtime and apps socket directories,
   `/run/drv`, the session bus and `/run/pipewire`; the GPU process
   `/run/opengl-driver`; the forker `/run/drv-apps` plus everything an
@@ -288,16 +288,25 @@ an entry (a daemon, a probe) out of the app menu.
   `PR_SET_NO_NEW_PRIVS`, exec with the request's environment and nothing
   else. The child inherits no fd. Children are reaped and
   their exit logged.
-- Sandbox (`drv_os::sandbox`, applied by drv-forker between fork and
-  exec with CAP_SYS_ADMIN; the supervisor applies the same one to every
-  member of the set, with its own expose list): a private mount
-  namespace; a fresh tmpfs on `/dev/shm` and, for an app, its own
-  `/tmp` bound from `/run/drv-apps/tmp/<uid>` (kept between its launches;
-  a set member gets a fresh tmpfs); `/proc` with `hidepid=invisible`; and a fresh read-only tmpfs on `/run` holding only
-  the app's own runtime directory plus the `--expose` entries (the
-  appd socket directory, the apps' Wayland socket directory, the
-  bridge socket directory, `opengl-driver`, `current-system`,
-  `/run/drv-audio` and `/run/drv-pulse` for audio apps). No system D-Bus, no services' bus, no
+- The app root (`drv_os::sandbox::Root`, DESIGN-app-namespace; planned
+  by drv-forker before the fork, applied between fork and exec with
+  CAP_SYS_ADMIN, ending in `pivot_root`): a fresh read-only tmpfs
+  holding `/nix/store` (read-only, nosuid), `/etc` (a store path built
+  per app by the module: passwd and group for its own UID, nsswitch,
+  hosts, machine-id, localtime, CA bundle and an empty `resolv.conf`
+  with the host's bound over it for `network` apps, plus the
+  `services.drv.etc` entries of the host's), `/dev` and `/sys` (the
+  host's generated views under `/run/drv-host`, written by
+  `drv-host-views.service` at boot: basic nodes and the CPU topology;
+  gpu apps also get the render nodes and their device directories), a
+  fresh tmpfs on `/dev/shm`, `/proc` with `hidepid=invisible`, its home
+  at `/var/lib/drv-apps/<uid>` and its `/tmp` from
+  `/run/drv-apps/tmp/<uid>` (kept between launches, noexec), and `/run`
+  holding only its own runtime directory plus the `--expose` entries
+  (the appd socket directory, the apps' Wayland socket directory, the
+  bridge socket directory, `opengl-driver`, `/run/drv-audio` and
+  `/run/drv-pulse` for audio apps). No host `/etc`, `/var`, `/home`,
+  `/run/current-system`. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.
