@@ -288,9 +288,10 @@ an entry (a daemon, a probe) out of the app menu.
   `PR_SET_NO_NEW_PRIVS`, exec with the request's environment and nothing
   else. The child inherits no fd. Children are reaped and
   their exit logged.
-- The app root (`drv_os::sandbox::Root`, DESIGN-app-namespace; planned
-  by drv-forker before the fork, applied between fork and exec with
-  CAP_SYS_ADMIN, ending in `pivot_root`): a fresh read-only tmpfs
+- The app root (`drv_os::approot`, DESIGN-app-namespace; built by
+  drv-forker before the fork as a detached mount tree and a Landlock
+  ruleset, two file descriptors the child enters between fork and exec
+  with CAP_SYS_ADMIN, ending in `pivot_root`): a fresh read-only tmpfs
   holding `/nix/store` (read-only, nosuid), `/etc` (a store path built
   per app by the module: passwd and group for its own UID, nsswitch,
   hosts, machine-id, localtime, CA bundle and an empty `resolv.conf`
@@ -308,17 +309,20 @@ an entry (a daemon, a probe) out of the app menu.
   `/run/drv-pulse` for audio apps). No host `/etc`, `/var`, `/home`,
   `/run/current-system`. HOME is `/home/<name>`, a 256M tmpfs of the
   run, with `/var/lib/drv-apps/<uid>` bound at `.state` inside it. The
-  forker locks the securebits, drops its capabilities and execs not the
-  app but `drv-trampoline`, as the app: it makes the manifest's `state`
-  directories under `.state` and links them from HOME, links the `files`
-  defaults from the store, applies Landlock (read and execute on the
-  closure of the manifest's command, `/etc`, the data profile and the
-  graphics drivers, from `closureInfo`; read on `/etc`, `/sys`, `/proc`
-  and the exposed `/run` entries; read, write and ioctl on `/dev`;
-  everything on HOME, `/tmp`, `/dev/shm`, its runtime directory and the
-  documents mount; abstract sockets and signals scoped to the app),
-  refuses writable-then-executable memory unless the manifest says
-  `jit`, and execs the command. No system D-Bus, no services' bus, no
+  Landlock ruleset: read and execute on the closure of the manifest's
+  command, `/etc`, the data profile and the graphics drivers (from
+  `closureInfo`; the forker only checks the list is a store path); read
+  on `/etc`, `/sys` and the exposed `/run` entries; read and write on
+  `/proc`; read, write and ioctl on `/dev`; everything on HOME, `/tmp`,
+  `/dev/shm`, its runtime directory and the documents mount; abstract
+  sockets and signals scoped to the app. The child locks the securebits,
+  switches UID, drops its capabilities, sets no_new_privs, restricts
+  itself with the ruleset, refuses writable-then-executable memory
+  unless the manifest says `jit`, and execs the command. When the
+  manifest has `state` or `files` the module puts `drv-trampoline` in
+  front of the command: as the app, it makes the `state` directories
+  under `.state`, links them from HOME, links the `files` defaults from
+  the store and execs the rest. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.

@@ -3,12 +3,11 @@
 ## Status
 
 Direction record, agreed 2026-09. Build order steps 1 and 3 are
-implemented (niri `policy`: `drv_os::sandbox::Root`,
-`drv-host-views.service`, the per-app `/etc`, `closure` and `files`
-derivations in the module, `drv-trampoline`): an app's root is a fresh
-read-only tmpfs with the four sources mounted, HOME a tmpfs with the
-declared state linked in, and Landlock limits the store to the app's
-closure. Not yet: the views check against Mesa on both GPUs (step 2),
+implemented (niri `policy`: `drv_os::approot`, `drv-host-views.service`,
+the per-app `/etc`, `closure` and `files` derivations in the module,
+`drv-trampoline`): an app's root is a fresh read-only tmpfs with the four
+sources mounted, HOME a tmpfs with the declared state linked in, and
+Landlock limits the store to the app's closure. Not yet: the views check against Mesa on both GPUs (step 2),
 seccomp and the sysctls (4), the closure lint (5), the four-sources drill
 (6). The build order at the end says how the code gets from there to
 here; [ARCH-app-policy](ARCH-app-policy.md), "Launching", describes the
@@ -48,8 +47,8 @@ the content and what may change it, which is what a reviewer needs.
 ### Store
 
 `/nix/store` is bound once, read-only and nosuid. The rest of the store
-is then cut away by Landlock in the trampoline (below): a read and execute
-rule per path of the app's closure, which Nix computes from the manifest's
+is then cut away by Landlock (below): a read and execute rule per path
+of the app's closure, which Nix computes from the manifest's
 `exec`. The store directory itself is mode 0711 on the host so that even
 the paths' names cannot be listed. A closure is the only executable thing
 in the namespace; every other mount is noexec.
@@ -99,9 +98,9 @@ size-capped, owned by the UID, mounted by the forker. Nothing in it
 survives the run unless the manifest's `state` list names it: each entry
 (`.config/BraveSoftware`, say) is a directory under
 `/var/lib/drv-apps/<uid>`, which the forker binds at a hidden fixed path
-inside HOME. The trampoline, as the app UID and with no privilege, makes
-the state directories, symlinks each declared entry from HOME into them,
-and links the HOME defaults tree from the store.
+inside HOME. The state linker (below), as the app UID and with no
+privilege, makes the state directories, symlinks each declared entry from
+HOME into them, and links the HOME defaults tree from the store.
 
 So an app is stateless unless declared otherwise; undeclared writes
 succeed and vanish; declared state persists; configuration is unwritable.
@@ -109,8 +108,8 @@ The list of what an app may keep between runs is one manifest field.
 
 Why a writable tmpfs rather than a read-only generated HOME: apps create
 undeclared dotfiles on first start (`~/.pki`, `~/.cache`, shader caches,
-GTK settings) and fail badly when they cannot. Why the trampoline and not
-the forker does the linking: the forker holds CAP_CHOWN and CAP_SYS_ADMIN
+GTK settings) and fail badly when they cannot. Why the linker and not the
+forker does the linking: the forker holds CAP_CHOWN and CAP_SYS_ADMIN
 and must never walk a directory the app controls
 ([ARCH-app-policy](ARCH-app-policy.md), Invariants).
 
@@ -124,16 +123,27 @@ mount, audio and pulse for audio apps, and the pair-link directory for
 linked apps. Landlock scoping keeps abstract sockets and signals inside
 the app's domain.
 
-## The trampoline
+## Who does what
 
-The forker execs not the app but a small unprivileged program from the
-set's own package, already as the app's UID, inside the finished mount
-namespace, with no capabilities: it makes the state directories and
-links, applies the Landlock rules (closure, HOME, network ports, scoping),
-sets MDWE and the exec securebits, then execs the manifest's `exec`.
-Everything it does is with the app's own authority, so a bug in it is
-worth exactly one app. The forker stays what it is: a list of prebuilt
-strings applied between fork and exec.
+The forker builds the root before it forks: with the new mount API the
+whole tree is a detached mount held by a file descriptor, and the
+Landlock ruleset is another. All the path handling, checks and errors
+happen in the parent as ordinary code; the child, between fork and exec,
+does a dozen syscalls on the two descriptors: unshare, attach and
+pivot_root, the cgroup, securebits, the UID switch, drop capabilities,
+no_new_privs, `landlock_restrict_self`, MDWE (unless `jit`), exec. The
+forker's checks are on the envelope, not the manifest: any store path
+may be an app's `/etc` or closure list, any listed `/run` entry may be
+exposed, any UID in the range, any listed group. Which of these an app
+gets is appd's decision; the forker makes sure that no combination of
+them breaks the isolation.
+
+The state linker (`drv-trampoline`) is part of the app's command, put in
+front of `exec` by the module when the manifest has `state` or `files`:
+a small unprivileged program from the set's own package, run as the app
+inside the finished root, that makes the state directories and links and
+execs the rest. Everything it does is with the app's own authority, so a
+bug in it is worth exactly one app; the forker does not know it exists.
 
 ## Not in the namespace
 
@@ -184,7 +194,7 @@ root cannot undo. Until then the mount flags, Landlock, MDWE and
 1. The root: fresh tmpfs, pivot_root, the four sources mounted; host
    `/etc` and `/run/current-system` gone; per-app `/etc` from Nix.
 2. The hardware views generator, checked against Mesa on both GPUs.
-3. The trampoline: HOME links, Landlock, MDWE, securebits.
+3. HOME links, Landlock, MDWE, securebits.
 4. A baseline seccomp filter for apps and the kernel sysctls.
 5. The closure lint and binary wrappers.
 6. The drill that asserts the four sources from inside an app.
