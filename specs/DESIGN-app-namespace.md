@@ -35,8 +35,10 @@ root contains the four sources and nothing else.
    run. Owner: the app's UID (its directories, made by tmpfiles at
    boot) and the services behind the sockets.
 
-Plus `/proc` with `hidepid`, which is the kernel's view of the app's own
-processes and belongs to no source.
+Plus `/proc` with `subset=pid,hidepid=invisible`, which is the kernel's
+view of the app's own processes (its own PID namespace: nothing else is
+there to see, and none of `/proc/sys`, `meminfo` or `cpuinfo`) and belongs
+to no source.
 
 Why sources rather than a path list: a path list grows by accretion and
 nobody can say why an entry is there. A source says who is responsible for
@@ -127,8 +129,9 @@ the app's domain.
 ## Who does what
 
 The forker forks before it looks at the request. The parent is one
-thread that receives a datagram, forks, and reaps; it never decodes
-anything. The child builds the root in order of what it needs:
+thread that receives a datagram, clones a child into PID, IPC and UTS
+namespaces of its own, and reaps; it never decodes anything. The child
+builds the root in order of what it needs:
 
 1. With no input: handles on everything of the host's it might place
    (the network namespace, the cgroup, detached clones of the store, the
@@ -137,18 +140,37 @@ anything. The child builds the root in order of what it needs:
    no SETPCAP, no_new_privs, a mount and a network namespace of its own,
    and a fresh tmpfs pivoted in as its root: the host's root is stacked
    beneath, where no path lookup reaches it, only the handles. The
-   fixed part goes in: the store, `/dev`, `/dev/shm`, `/proc`, the
-   `/run` entries every app has.
+   fixed part goes in: the store, `/dev`, `/dev/shm` (noexec), `/proc`
+   (`subset=pid`, of the new PID namespace), the `/run` entries every
+   app has.
 2. The request, decoded: UID (checked against the range), then what
    depends on it. `network` rejoins the host's namespace through the
    handle; `gpu` picks the views; `audio` adds its sockets; `/etc`, HOME,
    `/tmp` and the runtime directory are mounted for the UID, the last
    three cloned through the parents' handles. The handles are closed,
-   the old root detached, the root goes read-only, the cgroup is joined.
+   the old root detached, the root goes read-only, the cgroup is joined
+   and a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
 3. The switch: its own group and nothing else, `setresgid`,
    `setresuid`, every capability set emptied.
 4. As the app: the Landlock ruleset by path (the closure, `/etc`, HOME
-   and the rest), `landlock_restrict_self`, MDWE unless `jit`, exec.
+   and the rest), `landlock_restrict_self`, the seccomp denylist (below),
+   MDWE unless `jit`.
+5. As PID 1 of the namespace it stays: it forks the app and execs the
+   command in the child (a close-on-exec pipe carries an exec failure
+   back, so `Error` still reaches appd), answers `Forked`, and remains as
+   `drv-init`: it reaps orphans, passes the signals it is sent on to the
+   app, and exits with the app's status (128 + the signal for a signal
+   death: PID 1 of a namespace cannot itself die of one from inside).
+   The forker's log line is the init's status.
+
+The seccomp denylist is not the sandbox, it closes a few doors the
+sandbox does not: an executable memfd (`MFD_EXEC`; with
+`vm.memfd_noexec = 1` on the host and every writable mount noexec, the
+store is the only place code runs from), io_uring, and unless the
+manifest says `userns`, user namespaces (`unshare`, `clone` and `setns`
+with CLONE_NEWUSER refused, `clone3` absent, which libc falls back
+from). `userns` is a capability like `gpu`: the browser's own sandbox
+needs it and nothing else does. Everything else passes.
 
 The kernel's own account of the result is checked against this model, not
 assumed: `nix/kernel-state.sh` in the niri repo dumps a running app's
@@ -162,8 +184,8 @@ is the app, and while the request is being decoded the process holds
 SYS_ADMIN, SETUID and SETGID with the per-UID parents in hand and
 nothing else of the host's: what a bug there could reach is another app
 UID's state, not the host. The request is the manifest, parsed: UID,
-argv, env, the booleans `network`, `gpu`, `audio`, `jit`, and the
-closure as a list of store paths. What each boolean means on this host
+argv, env, the booleans `network`, `gpu`, `audio`, `jit`, `userns`, and
+the closure as a list of store paths. What each boolean means on this host
 is a fixed table in the forker, definition rather than policy,
 reviewable in one place. The forker never reads a file or lists a
 directory to decide anything, and makes or chowns nothing: every
@@ -234,7 +256,8 @@ root cannot undo. Until then the mount flags, Landlock, MDWE and
    `/etc` and `/run/current-system` gone; per-app `/etc` from Nix.
 2. The hardware views generator, checked against Mesa on both GPUs.
 3. HOME links, Landlock, MDWE, securebits.
-4. A baseline seccomp filter for apps and the kernel sysctls.
+4. The other namespaces (PID with an init, IPC, UTS, cgroup), the small
+   `/proc`, the seccomp denylist and `vm.memfd_noexec`.
 5. The closure lint and binary wrappers.
 6. The drill that asserts the four sources from inside an app.
 

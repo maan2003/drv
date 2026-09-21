@@ -227,8 +227,8 @@ each fd is a socket with `FD_CLOEXEC`, and unsets the variables;
 `socket(name, kind)` checks AF_UNIX, the type and that it is not
 listening, `listener(name)` the reverse; `handoff` builds the giving
 side). `forker`: the channel between drv-appd and drv-forker (fd
-`channel`): `Request::Launch(Launch)`, `Launch { name, uid, argv, env,
-network, gpu, audio, bus, jit, closure }`, `Response::{Forked { pid },
+`channel`): `Request::Launch(Launch)`, `Launch { uid, argv, env,
+network, gpu, audio, jit, userns, closure }`, `Response::{Forked,
 Error}`; `Channel` (a
 mutex around the socket; one request at a time).
 
@@ -306,7 +306,8 @@ an entry (a daemon, a probe) out of the app menu.
   host's generated views under `/run/drv-host`, written by
   `drv-host-views.service` at boot: basic nodes and the CPU topology;
   gpu apps also get the render nodes and their device directories), a
-  fresh tmpfs on `/dev/shm`, `/proc` with `hidepid=invisible`, its
+  fresh tmpfs on `/dev/shm` (noexec), `/proc` with
+  `subset=pid,hidepid=invisible` of the app's own PID namespace, its
   `/tmp` from `/run/drv-apps/tmp/<uid>` (kept between launches, noexec),
   and `/run` holding only what the app's features mean, a fixed table in
   the forker: its own runtime directory, the documents mount, the appd,
@@ -321,22 +322,27 @@ an entry (a daemon, a probe) out of the app menu.
   `/nix/store/<one entry>` by syntax, nothing more); read on `/sys`,
   `/run/host` and the read-only `/run` entries; read and write on
   `/proc`; read, write and ioctl on `/dev`; everything on `/etc`, HOME,
-  `/tmp`, `/dev/shm`, its runtime directory and the documents mount;
-  abstract sockets and signals scoped to the app. The request is the
-  parsed manifest (UID, argv, env, `network`, `gpu`, `audio`, `jit`,
-  closure): the forker's one check is the UID range; every value is
+  `/tmp`, its runtime directory and the documents mount, everything but
+  execute on `/dev/shm`; abstract sockets and signals scoped to the app.
+  The request is the parsed manifest (UID, argv, env, `network`, `gpu`,
+  `audio`, `jit`, `userns`, closure): the forker's one check is the UID range; every value is
   consumed by construction (a closure entry is a Landlock rule, no
   more), and argv, env and the closure are read only once the process
   is the app. The child locks the securebits before the request, switches
-  UID, drops its capabilities, restricts itself with the ruleset,
-  refuses writable-then-executable memory unless the manifest says
-  `jit`, and execs the command. The module puts
+  UID, drops its capabilities, restricts itself with the ruleset, puts
+  on the seccomp denylist (no executable memfd, no io_uring, no user
+  namespace unless the manifest says `userns`), refuses
+  writable-then-executable memory unless the manifest says `jit`, then
+  forks the app and stays as its init: the child of the forker is PID 1
+  of the app's PID namespace (IPC, UTS and cgroup namespaces are its own
+  too), reaps, forwards signals and exits with the app's status. The
+  module puts
   `drv-trampoline` in front of every app's command: as the app, it
   fills `/etc` from the store, makes the `state` directories under
   `.state`, links them from HOME, links the `files` defaults from the
   store and execs the rest. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
-  anywhere. Apps without `network = true` also get a new, empty network
+  except for a `userns` app (the browser). Apps without `network = true` also get a new, empty network
   namespace.
 - drv-appd runs as the `drv-appd` system user with no filesystem socket
   of its own: the supervisor binds the public socket and hands it over as
