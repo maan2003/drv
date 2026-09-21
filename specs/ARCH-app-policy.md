@@ -306,7 +306,19 @@ an entry (a daemon, a probe) out of the app menu.
   (the appd socket directory, the apps' Wayland socket directory, the
   bridge socket directory, `opengl-driver`, `/run/drv-audio` and
   `/run/drv-pulse` for audio apps). No host `/etc`, `/var`, `/home`,
-  `/run/current-system`. No system D-Bus, no services' bus, no
+  `/run/current-system`. HOME is `/home/<name>`, a 256M tmpfs of the
+  run, with `/var/lib/drv-apps/<uid>` bound at `.state` inside it. The
+  forker locks the securebits, drops its capabilities and execs not the
+  app but `drv-trampoline`, as the app: it makes the manifest's `state`
+  directories under `.state` and links them from HOME, links the `files`
+  defaults from the store, applies Landlock (read and execute on the
+  closure of the manifest's command, `/etc`, the data profile and the
+  graphics drivers, from `closureInfo`; read on `/etc`, `/sys`, `/proc`
+  and the exposed `/run` entries; read, write and ioctl on `/dev`;
+  everything on HOME, `/tmp`, `/dev/shm`, its runtime directory and the
+  documents mount; abstract sockets and signals scoped to the app),
+  refuses writable-then-executable memory unless the manifest says
+  `jit`, and execs the command. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.

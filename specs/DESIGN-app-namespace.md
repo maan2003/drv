@@ -2,16 +2,17 @@
 
 ## Status
 
-Direction record, agreed 2026-09. Build order step 1 is implemented
-(niri `policy`, `drv_os::sandbox::Root`, `drv-host-views.service`, the
-per-app `/etc` in the module): an app's root is a fresh read-only tmpfs
-with the four sources mounted and nothing of the host's `/etc`, `/var`,
-`/home` or `/run/current-system`; the whole store is still visible (the
-closure limit is step 3, the trampoline's Landlock ruleset), HOME is still
-the app's directory under `/var/lib/drv-apps`, and apps get no seccomp.
-The build order at the end says how the code gets from there to here;
-[ARCH-app-policy](ARCH-app-policy.md), "Launching", describes the code as
-it is.
+Direction record, agreed 2026-09. Build order steps 1 and 3 are
+implemented (niri `policy`: `drv_os::sandbox::Root`,
+`drv-host-views.service`, the per-app `/etc`, `closure` and `files`
+derivations in the module, `drv-trampoline`): an app's root is a fresh
+read-only tmpfs with the four sources mounted, HOME a tmpfs with the
+declared state linked in, and Landlock limits the store to the app's
+closure. Not yet: the views check against Mesa on both GPUs (step 2),
+seccomp and the sysctls (4), the closure lint (5), the four-sources drill
+(6). The build order at the end says how the code gets from there to
+here; [ARCH-app-policy](ARCH-app-policy.md), "Launching", describes the
+code as it is.
 
 Refines the app side of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md);
 applies [REQ-isolation](REQ-isolation.md) to the filesystem.
