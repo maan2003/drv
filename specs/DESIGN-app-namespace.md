@@ -2,15 +2,16 @@
 
 ## Status
 
-Direction record, agreed 2026-09. Implemented so far: none of the root
-described here. Today an app's namespace ([ARCH-app-policy](ARCH-app-policy.md),
-"Launching") is the host root with `/run` rebuilt from the expose list, a
-private `/tmp` and `/dev/shm`, and `/proc` with `hidepid`; everything else
-(the whole Nix store, the host `/etc`, `/var`, `/home`, `/dev`, `/sys`) is
-the host's, filtered only by DAC, and the default expose list includes
-`/run/current-system`, which names the entire system closure. The build
-order at the end says how the code gets from there to here; ARCH-app-policy
-describes the code as it is.
+Direction record, agreed 2026-09. Build order step 1 is implemented
+(niri `policy`, `drv_os::sandbox::Root`, `drv-host-views.service`, the
+per-app `/etc` in the module): an app's root is a fresh read-only tmpfs
+with the four sources mounted and nothing of the host's `/etc`, `/var`,
+`/home` or `/run/current-system`; the whole store is still visible (the
+closure limit is step 3, the trampoline's Landlock ruleset), HOME is still
+the app's directory under `/var/lib/drv-apps`, and apps get no seccomp.
+The build order at the end says how the code gets from there to here;
+[ARCH-app-policy](ARCH-app-policy.md), "Launching", describes the code as
+it is.
 
 Refines the app side of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md);
 applies [REQ-isolation](REQ-isolation.md) to the filesystem.
