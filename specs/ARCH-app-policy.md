@@ -103,11 +103,12 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
   again with fresh socketpairs. The forker owns `<supervisor
-  cgroup>/apps` (chowned to it; `cgroup.kill` stays the supervisor's)
-  and `--forker-dir` parents for the apps' runtime and home directories.
+  cgroup>/apps` (chowned to it; `cgroup.kill` stays the supervisor's).
+  The apps' directories (`/run/drv-apps/<uid>`, `/run/drv-apps/tmp/<uid>`,
+  `/var/lib/drv-apps/<uid>`) are tmpfiles rules, owned by each UID.
 
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
-                                           setgid, setpcap, sys_admin, chown)
+                                           setgid, setpcap, sys_admin)
   fds: listener, channel, compositor,      fd `channel` from the supervisor,
     menu                                     its only input. --range and where
   appd.json: every uid, exec, features,      host things live, from the command
@@ -281,19 +282,20 @@ an entry (a daemon, a probe) out of the app menu.
 - Lookups of other UIDs need the `lookup` grant; every UID may look up
   itself.
 - drv-forker accepts `Launch` only on the channel, only for UIDs in its
-  `--range`, names that are identifiers and closures of store paths by
-  syntax; there are no lists to be on, the request is the app's features
-  and the forker defines what each means. It creates `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and
-  `/var/lib/drv-apps/<uid>` (`HOME`, cwd), mode 0700 owned by the UID,
-  moves the child into `<supervisor cgroup>/apps/app-<uid>` (needs
-  `Delegate=yes`), then `setgroups`, `setresgid`, `setresuid`,
-  `PR_SET_NO_NEW_PRIVS`, exec with the request's environment and nothing
-  else. The child inherits no fd. Children are reaped and
-  their exit logged.
-- The app root (`drv_os::approot`, DESIGN-app-namespace; built by
-  drv-forker before the fork as a detached mount tree and a Landlock
-  ruleset, two file descriptors the child enters between fork and exec
-  with CAP_SYS_ADMIN, ending in `pivot_root`): a fresh read-only tmpfs
+  `--range`; there are no lists to be on, the request is the app's
+  features and the forker defines what each means. It forks before it
+  decodes: the parent (one thread) receives bytes, forks and reaps,
+  logging each exit; the child builds the root, moves itself into
+  `<supervisor cgroup>/apps/app-<uid>` (needs `Delegate=yes`), then
+  `setgroups`, `setresgid`, `setresuid`, `PR_SET_NO_NEW_PRIVS`, exec with
+  the request's environment plus `HOME` and `XDG_RUNTIME_DIR`. The child
+  inherits no fd but the channel, for its one reply.
+- The app root (DESIGN-app-namespace, "Who does what"; built by the
+  child in a mount namespace of its own, the fixed part before the
+  request is decoded and the UID's part after, the host's root stacked
+  out of reach beneath until then; `drv_os::mounts` is the new mount
+  API it uses):
+  a fresh read-only tmpfs
   holding `/nix/store` (read-only, nosuid), an empty `/etc` tmpfs of
   the app's own (the linker fills it from a store path built per app by
   the module: passwd and group for its own UID, nsswitch, hosts,
@@ -304,16 +306,15 @@ an entry (a daemon, a probe) out of the app menu.
   host's generated views under `/run/drv-host`, written by
   `drv-host-views.service` at boot: basic nodes and the CPU topology;
   gpu apps also get the render nodes and their device directories), a
-  fresh tmpfs on `/dev/shm`, `/proc` with `hidepid=invisible`, its home
-  at `/var/lib/drv-apps/<uid>` and its `/tmp` from
-  `/run/drv-apps/tmp/<uid>` (kept between launches, noexec), and `/run`
-  holding only what the app's features mean, a fixed table in the
-  forker: its own runtime directory and the documents mount for every
-  app, the appd and Wayland socket directories, the bridge's directory
-  for `bus`, `opengl-driver` for `gpu`, `/run/drv-audio` and
-  `/run/drv-pulse` for `audio`. No host `/etc`, `/var`, `/home`,
-  `/run/current-system`. HOME is `/home/<name>`, a 256M tmpfs of the
-  run, with `/var/lib/drv-apps/<uid>` bound at `.state` inside it. The
+  fresh tmpfs on `/dev/shm`, `/proc` with `hidepid=invisible`, its
+  `/tmp` from `/run/drv-apps/tmp/<uid>` (kept between launches, noexec),
+  and `/run` holding only what the app's features mean, a fixed table in
+  the forker: its own runtime directory, the documents mount, the appd,
+  Wayland and bridge socket directories and `opengl-driver` for every
+  app, `/run/drv-audio` and `/run/drv-pulse` for `audio`. No host
+  `/etc`, `/var`, `/home`, `/run/current-system`. HOME is `/home/app`,
+  a 256M tmpfs of the run, with `/var/lib/drv-apps/<uid>` bound at
+  `.state` inside it. The
   Landlock ruleset: read and execute on the closure of the manifest's
   command, `/etc`, the data profile and the graphics drivers (from
   `closureInfo`, sent inline as store paths; the forker checks each is
@@ -322,13 +323,14 @@ an entry (a daemon, a probe) out of the app menu.
   `/proc`; read, write and ioctl on `/dev`; everything on `/etc`, HOME,
   `/tmp`, `/dev/shm`, its runtime directory and the documents mount;
   abstract sockets and signals scoped to the app. The request is the
-  parsed manifest (name, UID, argv, env, `network`, `gpu`, `audio`,
-  `bus`, `jit`, closure): the forker's checks are the name, the UID
-  range and the store-path syntax, and every request that passes them
-  is safe by construction. The child locks the securebits, switches
-  UID, drops its capabilities, sets no_new_privs, restricts itself with
-  the ruleset, refuses writable-then-executable memory unless the
-  manifest says `jit`, and execs the command. The module puts
+  parsed manifest (UID, argv, env, `network`, `gpu`, `audio`, `jit`,
+  closure): the forker's one check is the UID range; every value is
+  consumed by construction (a closure entry is a Landlock rule, no
+  more), and argv, env and the closure are read only once the process
+  is the app. The child locks the securebits before the request, switches
+  UID, drops its capabilities, restricts itself with the ruleset,
+  refuses writable-then-executable memory unless the manifest says
+  `jit`, and execs the command. The module puts
   `drv-trampoline` in front of every app's command: as the app, it
   fills `/etc` from the store, makes the `state` directories under
   `.state`, links them from HOME, links the `files` defaults from the

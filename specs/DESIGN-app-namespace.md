@@ -32,8 +32,8 @@ root contains the four sources and nothing else.
 3. **State.** What the app may keep between runs, declared per directory.
    Owner: the app's UID, on the persist volume.
 4. **Runtime.** Sockets and scratch space that live for one boot or one
-   run. Owner: the forker (directories) and the services behind the
-   sockets.
+   run. Owner: the app's UID (its directories, made by tmpfiles at
+   boot) and the services behind the sockets.
 
 Plus `/proc` with `hidepid`, which is the kernel's view of the app's own
 processes and belongs to no source.
@@ -93,12 +93,12 @@ Configuration views are store paths (above) and need no generator.
 
 ### State
 
-HOME is `/home/<name>`: a fresh per-app tmpfs, writable, noexec,
-size-capped, owned by the UID, mounted by the forker. Nothing in it
-survives the run unless the manifest's `state` list names it: each entry
-(`.config/BraveSoftware`, say) is a directory under
-`/var/lib/drv-apps/<uid>`, which the forker binds at a hidden fixed path
-inside HOME. The state linker (below), as the app UID and with no
+HOME is `/home/app`, the same path for every app: a fresh tmpfs,
+writable, noexec, size-capped, owned by the UID, mounted by the forker.
+Nothing in it survives the run unless the manifest's `state` list names
+it: each entry (`.config/BraveSoftware`, say) is a directory under
+`/var/lib/drv-apps/<uid>`, which the forker binds at `.state` inside
+HOME. The state linker (below), as the app UID and with no
 privilege, makes the state directories, symlinks each declared entry from
 HOME into them, and links the HOME defaults tree from the store.
 
@@ -109,8 +109,8 @@ The list of what an app may keep between runs is one manifest field.
 Why a writable tmpfs rather than a read-only generated HOME: apps create
 undeclared dotfiles on first start (`~/.pki`, `~/.cache`, shader caches,
 GTK settings) and fail badly when they cannot. Why the linker and not the
-forker does the linking: the forker holds CAP_CHOWN and CAP_SYS_ADMIN
-and must never walk a directory the app controls
+forker does the linking: the forker holds CAP_SYS_ADMIN and must never
+walk a directory the app controls
 ([ARCH-app-policy](ARCH-app-policy.md), Invariants).
 
 ### Runtime
@@ -126,25 +126,41 @@ the app's domain.
 
 ## Who does what
 
-The forker builds the root before it forks: with the new mount API the
-whole tree is a detached mount held by a file descriptor, and the
-Landlock ruleset is another. All the path handling, checks and errors
-happen in the parent as ordinary code; the child, between fork and exec,
-does a dozen syscalls on the two descriptors: unshare, attach and
-pivot_root, the cgroup, securebits, the UID switch, drop capabilities,
-no_new_privs, `landlock_restrict_self`, MDWE (unless `jit`), exec.
+The forker forks before it looks at the request. The parent is one
+thread that receives a datagram, forks, and reaps; it never decodes
+anything. The child builds the root in order of what it needs:
 
-The request is the manifest, parsed: name, UID, argv, env, the booleans
-`network`, `gpu`, `audio`, `bus`, `jit`, and the closure as a list of
-store paths. The forker does not filter requests, it constructs from
-them: its only checks are types (the name is an identifier, the UID is in
-its range, each closure entry is `/nix/store/<one entry>`), and every
-value that passes is safe by construction. What each boolean means on
-this host, which `/run` entries, which device nodes, is a fixed table in
-the forker, definition rather than policy, reviewable in one place. The
-forker never reads a file or lists a directory to decide anything; its
-filesystem work is the mounts and rules it makes, from fixed paths on its
-command line and the closure list.
+1. With no input: handles on everything of the host's it might place
+   (the network namespace, the cgroup, detached clones of the store, the
+   views, `resolv.conf`, the fixed `/run` entries, and the parents of
+   the per-UID directories), then the securebits, an empty bounding set,
+   no SETPCAP, no_new_privs, a mount and a network namespace of its own,
+   and a fresh tmpfs pivoted in as its root: the host's root is stacked
+   beneath, where no path lookup reaches it, only the handles. The
+   fixed part goes in: the store, `/dev`, `/dev/shm`, `/proc`, the
+   `/run` entries every app has.
+2. The request, decoded: UID (checked against the range), then what
+   depends on it. `network` rejoins the host's namespace through the
+   handle; `gpu` picks the views; `audio` adds its sockets; `/etc`, HOME,
+   `/tmp` and the runtime directory are mounted for the UID, the last
+   three cloned through the parents' handles. The handles are closed,
+   the old root detached, the root goes read-only, the cgroup is joined.
+3. The switch: its own group and nothing else, `setresgid`,
+   `setresuid`, every capability set emptied.
+4. As the app: the Landlock ruleset by path (the closure, `/etc`, HOME
+   and the rest), `landlock_restrict_self`, MDWE unless `jit`, exec.
+
+So argv, env and the closure are touched only by a process that already
+is the app, and while the request is being decoded the process holds
+SYS_ADMIN, SETUID and SETGID with the per-UID parents in hand and
+nothing else of the host's: what a bug there could reach is another app
+UID's state, not the host. The request is the manifest, parsed: UID,
+argv, env, the booleans `network`, `gpu`, `audio`, `jit`, and the
+closure as a list of store paths. What each boolean means on this host
+is a fixed table in the forker, definition rather than policy,
+reviewable in one place. The forker never reads a file or lists a
+directory to decide anything, and makes or chowns nothing: every
+directory it binds exists, made by tmpfiles for each configured UID.
 
 Everything the app can do for itself is the linker's (`drv-trampoline`),
 which the module puts in front of every app's command: a small
