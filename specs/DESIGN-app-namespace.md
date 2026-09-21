@@ -117,10 +117,11 @@ and must never walk a directory the app controls
 
 The app's own `XDG_RUNTIME_DIR` (`/run/drv-apps/<uid>`), its `/tmp` kept
 for the boot (so a second launch finds the first's single-instance
-socket), a fresh `/dev/shm`, and under `/run` exactly the expose list:
-the appd socket, the apps' Wayland socket, the bridge, the documents
-mount, audio and pulse for audio apps, and the pair-link directory for
-linked apps. Landlock scoping keeps abstract sockets and signals inside
+socket), a fresh `/dev/shm`, and under `/run` exactly what its features
+mean: the appd socket, the apps' Wayland socket and the documents mount
+for every app, the bridge for `bus`, the driver link for `gpu`, audio
+and pulse for `audio`, and later the pair-link directory for linked
+apps. Landlock scoping keeps abstract sockets and signals inside
 the app's domain.
 
 ## Who does what
@@ -131,19 +132,31 @@ Landlock ruleset is another. All the path handling, checks and errors
 happen in the parent as ordinary code; the child, between fork and exec,
 does a dozen syscalls on the two descriptors: unshare, attach and
 pivot_root, the cgroup, securebits, the UID switch, drop capabilities,
-no_new_privs, `landlock_restrict_self`, MDWE (unless `jit`), exec. The
-forker's checks are on the envelope, not the manifest: any store path
-may be an app's `/etc` or closure list, any listed `/run` entry may be
-exposed, any UID in the range, any listed group. Which of these an app
-gets is appd's decision; the forker makes sure that no combination of
-them breaks the isolation.
+no_new_privs, `landlock_restrict_self`, MDWE (unless `jit`), exec.
 
-The state linker (`drv-trampoline`) is part of the app's command, put in
-front of `exec` by the module when the manifest has `state` or `files`:
-a small unprivileged program from the set's own package, run as the app
-inside the finished root, that makes the state directories and links and
-execs the rest. Everything it does is with the app's own authority, so a
-bug in it is worth exactly one app; the forker does not know it exists.
+The request is the manifest, parsed: name, UID, argv, env, the booleans
+`network`, `gpu`, `audio`, `bus`, `jit`, and the closure as a list of
+store paths. The forker does not filter requests, it constructs from
+them: its only checks are types (the name is an identifier, the UID is in
+its range, each closure entry is `/nix/store/<one entry>`), and every
+value that passes is safe by construction. What each boolean means on
+this host, which `/run` entries, which device nodes, is a fixed table in
+the forker, definition rather than policy, reviewable in one place. The
+forker never reads a file or lists a directory to decide anything; its
+filesystem work is the mounts and rules it makes, from fixed paths on its
+command line and the closure list.
+
+Everything the app can do for itself is the linker's (`drv-trampoline`),
+which the module puts in front of every app's command: a small
+unprivileged program from the set's own package, run as the app inside
+the finished root. It fills the empty `/etc` tmpfs the forker gave it
+from the Nix-built derivation (one link per entry; `resolv.conf` links
+to `/run/host/resolv.conf`, where the forker bound the host's live copy
+for a networked app), makes the state directories and links, links the
+HOME defaults, and execs the rest. Everything it does is with the app's
+own authority, so a bug in it is worth exactly one app; the forker does
+not know it exists. The line between the two: the forker places what
+belongs to someone else, the linker arranges what belongs to the app.
 
 ## Not in the namespace
 
@@ -159,8 +172,11 @@ by nothing but drv-appd.
 become store paths), `state` (paths under HOME that persist), `closure`
 (derived from `exec`), and later `links` (apps sharing a runtime
 directory) and a `launch:<app>` grant. `gpu` comes to mean the render
-node plus the sys view. `network`, `audio`, `bus`, `globals`, `grants`,
-`opens` and `expose` keep their meaning.
+node plus the sys view, with no group: the host's view makes the node
+openable by anyone, which is what render nodes are for. `network`,
+`audio`, `bus`, `globals`, `grants` and `opens` keep their meaning.
+`expose` and `groups` are gone: a semantic request has no place for an
+escape hatch.
 
 ## Later, on the same shape
 

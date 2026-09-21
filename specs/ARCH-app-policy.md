@@ -109,13 +109,14 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
                                            setgid, setpcap, sys_admin, chown)
   fds: listener, channel, compositor,      fd `channel` from the supervisor,
-    menu                                     its only input. --range, --group,
-  appd.toml: every uid, exec, groups,        --expose from the command line.
-    globals, grants, autostart             Launch{uid, groups, argv, env,
-  Launch{app} on a launch channel ------->   network, expose} -> range and
-    (the compositor's or the menu's) ->      group check, dirs, cgroup
-    the manifest's exec; Apps -> the         apps/app-<uid>, sandbox,
-    names with an exec                       setresuid, NNP, exec; the child
+    menu                                     its only input. --range and where
+  appd.toml: every uid, exec, features,      host things live, from the command
+    globals, grants, autostart               line. Launch{name, uid, argv, env,
+  Launch{app} on a launch channel ------->   network, gpu, audio, bus, jit,
+    (the compositor's or the menu's) ->      closure} -> type checks, dirs,
+    the manifest's exec; Apps -> the         root and ruleset built, cgroup
+    names with an exec                       apps/app-<uid>, setresuid, NNP,
+                                             Landlock, exec; the child
   Lookup{uid} on the listener: own uid,      inherits no fd at all
     or the lookup grant                    reaps children, logs their exit
   autostart once, on the compositor's
@@ -225,8 +226,9 @@ each fd is a socket with `FD_CLOEXEC`, and unsets the variables;
 `socket(name, kind)` checks AF_UNIX, the type and that it is not
 listening, `listener(name)` the reverse; `handoff` builds the giving
 side). `forker`: the channel between drv-appd and drv-forker (fd
-`channel`): `Request::Launch(Launch)`, `Launch { uid, groups, argv, env,
-network, expose }`, `Response::{Forked { pid }, Error}`; `Channel` (a
+`channel`): `Request::Launch(Launch)`, `Launch { name, uid, argv, env,
+network, gpu, audio, bus, jit, closure }`, `Response::{Forked { pid },
+Error}`; `Channel` (a
 mutex around the socket; one request at a time).
 
 `PolicyClient`: `connect(path)` does the hello now so a missing daemon
@@ -279,9 +281,9 @@ an entry (a daemon, a probe) out of the app menu.
 - Lookups of other UIDs need the `lookup` grant; every UID may look up
   itself.
 - drv-forker accepts `Launch` only on the channel, only for UIDs in its
-  `--range`, groups on its `--group` list (so drv-appd cannot hand out
-  `wheel`) and `/run` entries on its `--expose`/`--expose-optional` lists.
-  It creates `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and
+  `--range`, names that are identifiers and closures of store paths by
+  syntax; there are no lists to be on, the request is the app's features
+  and the forker defines what each means. It creates `/run/drv-apps/<uid>` (`XDG_RUNTIME_DIR`) and
   `/var/lib/drv-apps/<uid>` (`HOME`, cwd), mode 0700 owned by the UID,
   moves the child into `<supervisor cgroup>/apps/app-<uid>` (needs
   `Delegate=yes`), then `setgroups`, `setresgid`, `setresuid`,
@@ -292,37 +294,45 @@ an entry (a daemon, a probe) out of the app menu.
   drv-forker before the fork as a detached mount tree and a Landlock
   ruleset, two file descriptors the child enters between fork and exec
   with CAP_SYS_ADMIN, ending in `pivot_root`): a fresh read-only tmpfs
-  holding `/nix/store` (read-only, nosuid), `/etc` (a store path built
-  per app by the module: passwd and group for its own UID, nsswitch,
-  hosts, machine-id, localtime, CA bundle and an empty `resolv.conf`
-  with the host's bound over it for `network` apps, plus the
-  `services.drv.etc` entries of the host's), `/dev` and `/sys` (the
+  holding `/nix/store` (read-only, nosuid), an empty `/etc` tmpfs of
+  the app's own (the linker fills it from a store path built per app by
+  the module: passwd and group for its own UID, nsswitch, hosts,
+  machine-id, localtime, CA bundle, `resolv.conf` linking to
+  `/run/host/resolv.conf` where the forker bound the host's live one
+  for `network` apps, plus the `services.drv.etc` entries of the
+  host's), `/dev` and `/sys` (the
   host's generated views under `/run/drv-host`, written by
   `drv-host-views.service` at boot: basic nodes and the CPU topology;
   gpu apps also get the render nodes and their device directories), a
   fresh tmpfs on `/dev/shm`, `/proc` with `hidepid=invisible`, its home
   at `/var/lib/drv-apps/<uid>` and its `/tmp` from
   `/run/drv-apps/tmp/<uid>` (kept between launches, noexec), and `/run`
-  holding only its own runtime directory plus the `--expose` entries
-  (the appd socket directory, the apps' Wayland socket directory, the
-  bridge socket directory, `opengl-driver`, `/run/drv-audio` and
-  `/run/drv-pulse` for audio apps). No host `/etc`, `/var`, `/home`,
+  holding only what the app's features mean, a fixed table in the
+  forker: its own runtime directory and the documents mount for every
+  app, the appd and Wayland socket directories, the bridge's directory
+  for `bus`, `opengl-driver` for `gpu`, `/run/drv-audio` and
+  `/run/drv-pulse` for `audio`. No host `/etc`, `/var`, `/home`,
   `/run/current-system`. HOME is `/home/<name>`, a 256M tmpfs of the
   run, with `/var/lib/drv-apps/<uid>` bound at `.state` inside it. The
   Landlock ruleset: read and execute on the closure of the manifest's
   command, `/etc`, the data profile and the graphics drivers (from
-  `closureInfo`; the forker only checks the list is a store path); read
-  on `/etc`, `/sys` and the exposed `/run` entries; read and write on
-  `/proc`; read, write and ioctl on `/dev`; everything on HOME, `/tmp`,
-  `/dev/shm`, its runtime directory and the documents mount; abstract
-  sockets and signals scoped to the app. The child locks the securebits,
-  switches UID, drops its capabilities, sets no_new_privs, restricts
-  itself with the ruleset, refuses writable-then-executable memory
-  unless the manifest says `jit`, and execs the command. When the
-  manifest has `state` or `files` the module puts `drv-trampoline` in
-  front of the command: as the app, it makes the `state` directories
-  under `.state`, links them from HOME, links the `files` defaults from
-  the store and execs the rest. No system D-Bus, no services' bus, no
+  `closureInfo`, sent inline as store paths; the forker checks each is
+  `/nix/store/<one entry>` by syntax, nothing more); read on `/sys`,
+  `/run/host` and the read-only `/run` entries; read and write on
+  `/proc`; read, write and ioctl on `/dev`; everything on `/etc`, HOME,
+  `/tmp`, `/dev/shm`, its runtime directory and the documents mount;
+  abstract sockets and signals scoped to the app. The request is the
+  parsed manifest (name, UID, argv, env, `network`, `gpu`, `audio`,
+  `bus`, `jit`, closure): the forker's checks are the name, the UID
+  range and the store-path syntax, and every request that passes them
+  is safe by construction. The child locks the securebits, switches
+  UID, drops its capabilities, sets no_new_privs, restricts itself with
+  the ruleset, refuses writable-then-executable memory unless the
+  manifest says `jit`, and execs the command. The module puts
+  `drv-trampoline` in front of every app's command: as the app, it
+  fills `/etc` from the store, makes the `state` directories under
+  `.state`, links them from HOME, links the `files` defaults from the
+  store and execs the rest. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   anywhere. Apps without `network = true` also get a new, empty network
   namespace.
