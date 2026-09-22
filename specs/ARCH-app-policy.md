@@ -415,12 +415,17 @@ an entry (a daemon, a probe) out of the app menu.
   its private `/tmp`, and fronts it on `/run/drv-agent/agent`, which every
   app's root holds. Each connection is checked on `SO_PEERCRED` against
   the UIDs whose manifest says `agent = true` (the module passes them as
-  `--allow`; those apps get `SSH_AUTH_SOCK`) and refused at accept
-  otherwise; ssh-agent itself would refuse every foreign uid. Resident
-  keys are loaded where the authenticator is: `drv-agent load` in a
-  terminal app asks the PIN and sends it as the agent-protocol extension
-  `load-resident@drv`, which the door answers by running `ssh-add -K`
-  itself. Every other message is relayed unread.
+  `--allow name=uid`; those apps get `SSH_AUTH_SOCK`) and refused at
+  accept otherwise; ssh-agent itself would refuse every foreign uid. The
+  authenticator's PIN never passes through an app: on a list or a sign
+  request while the agent holds no keys and a hidraw node of ours is
+  present, the door asks drv-portal (fd `portal`, the same protocol as
+  the bridge's: `Pin`, answered `Pin`/`Cancelled`; `Touch`, taken down by
+  `Cancel`) naming the app, and runs `ssh-add -K` itself with the answer.
+  ssh-agent's own prompts while signing (the PIN of a verify-required
+  key, a touch) reach the door the same way: `SSH_ASKPASS` is drv-agent
+  again, which carries the prompt over a socket in the private `/tmp`.
+  Every message is relayed unread.
 - The media keys are a member too: the compositor spawns nothing, so
   `volume-up`, `volume-down`, `volume-mute`, `mic-mute`, `brightness-up`
   and `brightness-down` are actions that write a line down its `keys`
