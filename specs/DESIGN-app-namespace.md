@@ -150,8 +150,9 @@ builds the trusted set's roots with it too, from a different list):
    depends on it. `network` rejoins the host's namespace through the
    handle; `gpu` picks the views; `audio` adds its sockets; `/etc`, HOME,
    `/tmp` and the runtime directory are mounted for the UID, the last
-   three cloned through the parents' handles; the `links` (`/bin/sh`
-   into the store) are made. The handles are closed,
+   three cloned through the parents' handles; the links are made:
+   `/bin/sh` and `/usr/bin/env` for every app, as NixOS has them, plus
+   the manifest's own `links`, all into the store. The handles are closed,
    the old root detached, the root goes read-only, the cgroup is joined
    and a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
 3. The switch: its own group and nothing else, `setresgid`,
