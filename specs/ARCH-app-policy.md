@@ -20,7 +20,10 @@ verifier that unlocks the compositor), `drv-ui` (what the set's windows
 share: a connection on a supervisor fd, the toolkit boilerplate, text in
 shm buffers, sealing), `drv-lock` (the lock screen), `drv-menu` (the
 app menu) and `drv-portal` (the file chooser and the documents mount),
-supervisor services on `drv-ui`. Names are in [CONTEXT.md](../CONTEXT.md).
+supervisor services on `drv-ui`; `drv-agent` (OpenSSH's ssh-agent behind
+a door that admits the UIDs with the `agent` grant) and `drv-keys` (the
+media keys: volume through PipeWire, backlight through sysfs, on the
+compositor's word), supervisor services without a window. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork); `nix/smoke.sh` drives a fresh boot through unlock, the
@@ -59,7 +62,9 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
   drv-gpu), the compositor, the locker (drv-lock, uid drv-lock), the
   menu (drv-menu, uid drv-menu), the portal (drv-portal, uid
-  drv-portal), drv-forker (uid drv-forker), drv-appd and the bridge
+  drv-portal), the notifier, the ssh agent (drv-agent, uid drv-agent),
+  the media keys (drv-keys, uid drv-keys, groups pipewire and video, its
+  `/sys` writable), drv-forker (uid drv-forker), drv-appd and the bridge
   (drv-bridge, uid drv-bridge) as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
@@ -397,7 +402,24 @@ an entry (a daemon, a probe) out of the app menu.
   is the manifest name. An app with `bus = true` runs under
   `dbus-run-session -- drv-bridge app -- <exec>`: a private bus in its
   own UID with the shim claiming `org.freedesktop.Notifications` and
-  `org.freedesktop.portal.Desktop`. The shim terminates all of the
+  `org.freedesktop.portal.Desktop`.
+- The ssh agent is a member, not an app: `drv-agent serve` runs OpenSSH's
+  `ssh-agent` as uid drv-agent (the authenticators' hidraw nodes are that
+  group's by udev rule, `/run/udev` exposed for libfido2) on a socket in
+  its private `/tmp`, and fronts it on `/run/drv-agent/agent`, which every
+  app's root holds. Each connection is checked on `SO_PEERCRED` against
+  the UIDs whose manifest says `agent = true` (the module passes them as
+  `--allow`; those apps get `SSH_AUTH_SOCK`) and refused at accept
+  otherwise; ssh-agent itself would refuse every foreign uid. Resident
+  keys are loaded where the authenticator is: `drv-agent load` in a
+  terminal app asks the PIN and sends it as the agent-protocol extension
+  `load-resident@drv`, which the door answers by running `ssh-add -K`
+  itself. Every other message is relayed unread.
+- The media keys are a member too: the compositor spawns nothing, so
+  `volume-up`, `volume-down`, `volume-mute`, `mic-mute`, `brightness-up`
+  and `brightness-down` are actions that write a line down its `keys`
+  wire to `drv-keys`, which runs `wpctl` on the default sink or source
+  and writes the backlight's `brightness` (group video, floor 2). The shim terminates all of the
   app's D-Bus (handles, sessions, `Response` and `Closed` signals, the
   in-place answers) and speaks `drv_bridge::wire` to the server:
   postcard over SEQPACKET, a fixed set of small variants (`Choose`,
