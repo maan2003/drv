@@ -122,7 +122,7 @@ The app's own `XDG_RUNTIME_DIR` (`/run/drv-apps/<uid>`), its `/tmp` kept
 for the boot (so a second launch finds the first's single-instance
 socket), a fresh `/dev/shm`, and under `/run` exactly what its features
 mean: the appd socket, the apps' Wayland socket and the documents mount
-for every app, the bridge for `bus`, the driver link for `gpu`, audio
+for every app, the services' sockets (files, cast, shell, agent), the driver link for `gpu`, audio
 and pulse for `audio`, and later the pair-link directory for linked
 apps. Landlock scoping keeps abstract sockets and signals inside
 the app's domain.

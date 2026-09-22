@@ -10,10 +10,10 @@ not create without someone owning it first.
 
 ## Decision (2026-09, first slice built)
 
-The first shape below: drv-portal owns the tree (`services.drv.files`,
+The first shape below: drv-files owns the tree (`services.drv.files`,
 `/var/lib/drv-files`, mode 0700), is the only reader of it, shows it in
 its own chooser, and serves one file per consent to one UID through the
-documents mount `/run/drv-doc` (FUSE, served by the portal, mounted by
+documents mount `/run/drv-doc` (FUSE, served by drv-files, mounted by
 the supervisor). Open grants are read-only, Save grants writable; a set
 restart drops them all. Not built: directory grants, static slices for
 media apps, the file manager, sync and backup, what "delete" means.

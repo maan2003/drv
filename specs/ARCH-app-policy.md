@@ -14,17 +14,23 @@ minute: every start takes the VT), `drv-appd` (the launcher for untrusted things
 the `drv` CLI), `drv-forker` (drv-appd's privileged helper: the sandbox
 and the fork), `drv-os` (uid/gid lookups, the named startup fds `fds`, seccomp,
 directory helpers),
-`drv-bridge` (the UID-keyed desktop services server and the shim on each
-app's private bus: notifications and portals), `drv-seat` (`drv-seatd`,
-the seat and GPU-process parent), `drv-auth` (`drv-authd`, the PIN
-verifier that unlocks the compositor), `drv-ui` (what the set's windows
-share: a connection on a supervisor fd, the toolkit boilerplate, text in
-shm buffers, sealing), `drv-lock` (the lock screen), `drv-menu` (the
-app menu) and `drv-portal` (the file chooser and the documents mount),
-supervisor services on `drv-ui`; `drv-agent` (OpenSSH's ssh-agent behind
-a door that admits the UIDs with the `agent` grant) and `drv-keys` (the
-media keys: volume through PipeWire, backlight through sysfs, on the
-compositor's word), supervisor services without a window. Names are in [CONTEXT.md](../CONTEXT.md).
+`drv-dbus-shim` (the shim on each app's private bus: the desktop's D-Bus
+names, answered by asking the set's services over their sockets),
+`drv-seat` (`drv-seatd`, the seat and GPU-process parent), `drv-auth`
+(`drv-authd`, the PIN verifier that unlocks the compositor), `drv-ui`
+(what the set's windows share: a connection on a supervisor fd, the
+toolkit boilerplate, text in shm buffers, sealing), `drv-shell` (the
+layer above the compositor: lock screen, app menu, the person's prompts,
+notifications) and `drv-files` (the file chooser and the documents
+mount), supervisor services on `drv-ui`; `drv-cast` (screencasts,
+cameras and microphones: consent at the shell, the compositor's streams,
+PipeWire remotes), `drv-agent` (OpenSSH's ssh-agent behind a door that
+admits the UIDs whose manifest says `agent`) and `drv-keys` (the media
+keys: volume through PipeWire, backlight through sysfs, on the
+compositor's word), supervisor services without a window. Every service
+that apps reach (`drv-files`, `drv-cast`, `drv-shell`, `drv-agent`) keys
+each connection on the peer UID and drv-appd's record for it
+(`drv_policy::door`); there is no proxy between an app and a service. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork); `nix/smoke.sh` drives a fresh boot through unlock, the
@@ -37,7 +43,7 @@ the GPU process drives the real Asahi GPU through a virtio-gpu native
 context and the screen is a window on a headless host compositor served
 over noVNC. The NixOS module `nix/module.nix` (`services.drv`, flake
 output `nixosModules.default`) turns one app list into passwd entries,
-`appd.json`, the session bus policy and the units.
+`appd.json` and the units.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
@@ -61,13 +67,15 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
                 startup, then dropped for good; NoNewPrivileges; nothing here
                 is root; single-threaded, one waitid for the whole set)
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
-  drv-gpu), the compositor, the locker (drv-lock, uid drv-lock), the
-  menu (drv-menu, uid drv-menu), the portal (drv-portal, uid
-  drv-portal), the notifier, the ssh agent (drv-agent, uid drv-agent),
-  the media keys (drv-keys, uid drv-keys, groups pipewire and video, its
-  `/sys` writable), drv-forker (uid drv-forker), drv-appd and the bridge
-  (drv-bridge, uid drv-bridge) as their users, from its own
-  command line; takes input from nobody. A non-root service keeps only
+  drv-gpu), the compositor, drv-files (uid drv-files; first of the rest
+  because it serves the documents mount, which anything touching
+  `/run/drv-doc` blocks on), drv-forker (uid drv-forker), drv-appd, the
+  shell (drv-shell, uid drv-shell), drv-cast (uid drv-cast, group
+  pipewire), the ssh agent (drv-agent, uid drv-agent) and the media keys
+  (drv-keys, uid drv-keys, groups pipewire and video, its `/sys`
+  writable) as their users, from its own command line; takes input from
+  nobody. The services that ask drv-appd who their callers are connect
+  to its socket at startup and wait for it to answer. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
   ambient, as its whole bounding set. Every member gets a root of its own,
   built by the same primitive as an app's (`drv_os::root`: a fresh tmpfs
@@ -81,37 +89,45 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   (`drv_os::creds`). `nix/kernel-state.sh` checks a member the way it
   checks an app. Apps' roots differ in content, not in kind (below). Today: seatd `/run/udev`; the compositor
   `/run/udev` (libinput), its runtime and apps socket directories,
-  `/run/drv`, the session bus and `/run/pipewire`; the GPU process
-  `/run/opengl-driver`; the forker `/run/drv-apps` plus everything an
-  app may be shown; the bridge `/run/drv` and the session bus; authd,
-  the locker, the menu, the portal and drv-appd nothing.
-  Nobody has the system bus (`/run/dbus`): the compositor's logind and
-  locale1 watchers fail closed and log it.
+  `/run/drv` and `/run/pipewire`; the GPU process `/run/opengl-driver`;
+  the forker `/run/drv-apps` plus everything an app may be shown; the
+  shell, drv-files and the agent `/run/drv` (drv-appd's socket, to name
+  their callers), drv-cast `/run/drv` and `/run/pipewire`; authd and
+  drv-appd nothing. Nobody has any D-Bus: not the system bus
+  (`/run/dbus`; the compositor's logind and locale1 watchers fail closed
+  and log it), and there is no session bus on the desktop at all. D-Bus
+  exists only inside an app with `bus`, on its private daemon.
   Every link between two members is
   a socketpair the supervisor makes before the first fork; each member
   gets its ends at startup as named fds (`drv_os::fds`: the systemd
   LISTEN_FDS/LISTEN_FDNAMES convention, fds 3.. with names in order):
     seatd        compositor
-    authd        compositor, locker
+    authd        compositor, locker (the shell's)
     gpu          compositor
-    compositor   seat, auth, gpu, locker, appd, menu, menu-client,
-                 portal-client, portal (the cast line)
-    locker       compositor (its Wayland connection), auth
-    menu         compositor (a byte per show-launcher), wayland (its
-                 Wayland connection), appd (its launch channel)
-    portal       wayland (its Wayland connection), compositor (the
-                 cast line), bridge (chooser and cast requests), fuse
-                 (the /dev/fuse end of the documents mount the
-                 supervisor made at --docs, /run/drv-doc)
+    compositor   seat, auth, gpu, appd, menu (the poke line to the
+                 shell), keys, shell-client, files-client, cast (the
+                 cast line)
+    shell        wayland (its Wayland connection: session-lock and
+                 layer-shell), auth, appd (its launch channel), poke (a
+                 byte per show-launcher), cast and agent (their
+                 questions for the person), listener
+                 (/run/drv-shell/notify.sock, bound by the supervisor,
+                 0666)
+    files        wayland (its Wayland connection), fuse (the /dev/fuse
+                 end of the documents mount the supervisor made at
+                 --docs, /run/drv-doc), listener
+                 (/run/drv-files/files.sock, 0666)
+    cast         compositor (the cast line), shell, listener
+                 (/run/drv-cast/cast.sock, 0666)
+    agent        shell
+    keys         compositor
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
-                 0666), channel (to the forker), compositor and menu
+                 0666), channel (to the forker), compositor and shell
                  (the two launch channels)
-    bridge       listener (/run/drv-bridge/bridge.sock, bound by the
-                 supervisor, 0666), portal
-  seat, auth, the forker channel, the bridge listener, the bridge's
-  portal line and the portal's cast line are SEQPACKET, the rest
-  streams.
+  seat, auth, the forker channel, the cast line, the shell's lines from
+  drv-cast and the agent, and the three app-facing listeners are
+  SEQPACKET, the rest streams.
   Nothing is linked at runtime: the eleven are one set, and when any
   member exits the supervisor kills every app (writes 1 to
   `apps/cgroup.kill`) and every member (1 to `set/cgroup.kill`: each
@@ -127,52 +143,84 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
                                            setgid, setpcap, sys_admin)
   fds: listener, channel, compositor,      fd `channel` from the supervisor,
-    menu                                     its only input. --range and where
+    shell                                    its only input. --range and where
   appd.json: every uid, exec, features,      host things live, from the command
-    globals, grants, autostart               line. Launch{name, uid, argv, env,
+    globals, grants, agent, autostart        line. Launch{name, uid, argv, env,
   Launch{app} on a launch channel ------->   network, gpu, audio, bus, jit,
-    (the compositor's or the menu's) ->      closure} -> type checks, dirs,
+    (the compositor's or the shell's) ->     closure} -> type checks, dirs,
     the manifest's exec; Apps -> the         root and ruleset built, cgroup
     names with an exec                       apps/app-<uid>, setresuid, NNP,
                                              Landlock, exec; the child
   Lookup{uid} on the listener: own uid,      inherits no fd at all
-    or the lookup grant                    reaps children, logs their exit
+    or the lookup grant; Open{uri} there   reaps children, logs their exit
+    for a uid that is an app
   autostart once, on the compositor's
     Hello down its channel (its apps
     socket listens by then)
 
-drv-portal (uid drv-portal; one process, sealed like the locker with
-            file writes allowed; owns the person's files, `--files`)
-  fd `bridge`: Choose{id, app, uid, title, Open | Save{name}} and
-  Cast{id, app, uid, cursor} from the bridge, one dialog at a time on
-  a layer surface. Choose shows the tree under --files,
-  Enter descends or picks (Save: types a name; an existing one is
-  picked to overwrite), Escape cancels; Cancel{id} takes a request
-  down unanswered. Cast lists the screens and windows the compositor
-  reports (fd `compositor`: Outputs and Windows are asked with every
-  request; a window shows its app's manifest name first, its own title
-  after); Enter sends Start{cast: id, source, cursor} down that line and
-  the dialog goes down; Started{node_id, size} is answered as Cast{id,
-  node_id, source, size}, Stopped as Closed{id}; Cancel{id} on a live
-  cast sends Stop. A pick opens the file itself (O_NOFOLLOW, regular
-  files only, created for Save) and files a grant {uid, name, fd,
-  write}; the answer is Chosen{paths: ["/run/drv-doc/<id>/<name>"]}.
-  fd `fuse`: the documents mount, served in a thread (fuser): the
-  kernel reports the caller's UID on every request, a grant's directory
-  and file exist only for that UID (a stranger gets ENOENT), reads and
-  writes go through the held fd, writes and truncation only on a Save
-  grant. Apps see the mount because `/run/drv-doc` is on their expose
-  list; the forker binds it from the mount the supervisor made before
-  the set started, so a set restart drops every grant with the apps.
+drv-shell (uid drv-shell; one process, sealed after the first render;
+           the layer above the compositor)
+  The lock screen: fd `wayland` is its Wayland connection, inserted by
+  the compositor as the one client with the session-lock global (and
+  layer-shell), no lookup; it locks at start, draws the PIN screen,
+  sends Verify down fd `auth` (drv-authd's fd `locker`), and on
+  `finished` releases its surfaces and asks to lock again. The app
+  menu: fd `poke` carries a byte per show-launcher bind; Apps on fd
+  `appd` (its launch channel) fills a layer surface listing the names,
+  typed filter, Up/Down, Enter -> Launch{app}, Escape -> gone. The
+  person's prompts: fds `cast` and `agent` speak `drv_shell::ask`
+  (Confirm{what, note}, Secret{prompt}, Touch{prompt}, Pick{choices},
+  Cancel; back Yes, Secret, Picked{key}, Cancelled), each naming the
+  app and uid; one dialog at a time, the rest queued, "<app> wants to
+  <what>" as the header, Escape cancels. Notifications: fd `listener`
+  is `/run/drv-shell/notify.sock`, keyed on the peer UID and drv-appd's
+  name for it (`drv_shell::notify`: Notify{summary, body}, Close{id};
+  back Notified{id}); cards at the top right, the manifest name as the
+  sender, text clipped at 2 KiB and rendered by the shell itself (the
+  lock is the compositor's, so the shell may draw app text: a
+  compromised shell shows things, it unlocks nothing). While locked
+  the menu, the dialogs and the notes are down; a finished lock brings
+  the queue back.
 
-drv-menu (uid drv-menu; one process, no children, sealed after the first
-          render like the locker)
-  fd `compositor`: a byte per show-launcher bind; fd `wayland`: its
-  Wayland connection, which the compositor inserted as a layer-shell
-  client (no lookup, no manifest entry); fd `appd`: its launch channel.
-  On each byte: Apps -> a layer surface listing the names, typed
-  filter, Up/Down, Enter -> Launch{app}, Escape -> gone. Drawn with
-  drv-ui, like the lock screen.
+drv-files (uid drv-files; one process, sealed like the shell with file
+           writes allowed; owns the person's files, `--files`)
+  fd `listener`: `/run/drv-files/files.sock`, keyed like the shell's;
+  `drv_files::wire`: Choose{req, Open | Save{name}} and Cancel{req}
+  from the app's shim, one dialog at a time on a layer surface (fd
+  `wayland`), "<app> wants to open/save a file" as the header. Choose
+  shows the tree under --files, Enter descends or picks (Save: types a
+  name; an existing one is picked to overwrite), Escape cancels;
+  Cancel{req} takes a request down unanswered. A pick opens the file
+  itself (O_NOFOLLOW, regular files only, created for Save) and files a
+  grant {uid, name, fd, write}; the answer is Chosen{req, paths:
+  ["/run/drv-doc/<id>/<name>"]}. fd `fuse`: the documents mount, served
+  in a thread (fuser): the kernel reports the caller's UID on every
+  request, a grant's directory and file exist only for that UID (a
+  stranger gets ENOENT), reads and writes go through the held fd,
+  writes and truncation only on a Save grant. Apps see the mount
+  because `/run/drv-doc` is on their expose list; the forker binds it
+  from the mount the supervisor made before the set started, so a set
+  restart drops every grant with the apps.
+
+drv-cast (uid drv-cast, group pipewire; one process, not sealed:
+          PipeWire loads plugins as it goes)
+  fd `listener`: `/run/drv-cast/cast.sock`, keyed like the shell's;
+  `drv_cast::wire` from the app's shim: Cast{req, session, cursor,
+  screens, windows, again}, CastRemote{session}, CastClose{session},
+  Camera, CameraRemote, CameraPresent, Cancel{req}. Cast asks the
+  compositor (fd `compositor`, `drv_cast::compositor`) for Outputs and
+  Windows and the person at the shell (fd `shell`, Pick: "see your
+  screen"; a window shows its app's manifest name first, its own title
+  after); Picked sends Start{cast, source, cursor} down the compositor
+  line, Started{node_id, size} is answered as Cast{req, node_id,
+  source, size, token}, Stopped as CastClosed{session}. Camera asks
+  Confirm ("use your camera"); the microphone is asked the same way
+  when WirePlumber's `drv-access` metadata reports a capture stream
+  (`request:<uid>:<kind>`), and a yes writes `grant:<uid>`. Devices
+  {mic, camera} go down the compositor line for its indicator. Remotes
+  (CastRemote, CameraRemote) are PipeWire connections cut down to the
+  one node or the cameras and sent as fds. Revoke from the compositor
+  (Mod+Shift+Esc, locking) ends every cast and grant.
 
 drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   holds the seat (libseat builtin backend, no seatd) and udev; announces the
@@ -198,13 +246,12 @@ drv-authd (uid drv-auth, supervisor child)
   by drv-appd down its Verifiers socket, one per app launched with auth),
   Unlock{idle_timeout} goes to the one attached as Compositor; no socket
 
-drv-compositor (uid,      drv-bridge (uid)      drv-bus (uid)        app-<name> (uid each)
-    supervisor child)
-  Lookup for each client    Lookup per peer       dbus-daemon with      forked by drv-forker
-  D-Bus callers checked     notifications and     per-user own and      on drv-appd's say,
-  against grants            portals for apps      send policy           sandboxed; launch
-  no IPC socket, no                                                     only with a channel
-  device groups
+drv-compositor (uid,      drv-shell, drv-files, drv-cast,     app-<name> (uid each)
+    supervisor child)       drv-agent (uid each)
+  Lookup for each client    Lookup per peer on their own        forked by drv-forker
+  no D-Bus at all           sockets; the shim in the app         on drv-appd's say,
+  no IPC socket, no         speaks their wires; no bus, no       sandboxed; launch
+  device groups             proxy, nothing in between            only with a channel
 ```
 
 Android is the model: the zygote is privileged and forks on command from
@@ -224,22 +271,31 @@ pointer, input method, security context. Everything else
 (`wl_compositor`, `xdg_wm_base`, `wl_shm`, seats, outputs, pointer
 constraints, ...) is always advertised.
 
-`Grant` is `lookup` (ask drv-appd about other UIDs: the
-compositor, the bridge); there is no other grant.
+`Grant` is `lookup` (ask drv-appd about other UIDs: the compositor,
+the shell, drv-files, drv-cast, the agent); there is no other grant.
 
-`AppPolicy { name, gpu, globals, grants, icon }`. `allows(global)`:
+`AppPolicy { name, gpu, globals, grants, icon, agent }`. `allows(global)`:
 `gpu` grants dmabuf, otherwise the global must be listed. `has(grant)`.
+`agent` is the ssh agent's door: drv-agent checks it on every
+connection.
 `name` and `icon` are what the compositor shows the user; apps never
 supply them. `AppPolicy::unknown()` is nothing; `everything(name)` is
 every global and grant, for tests.
 
-`rpc`: `Request::{Hello, Lookup { uid }, Launch { app }}`,
-`Response::{Hello, Policy, Launched { uid }, Error}`, postcard payloads
-behind a little-endian `u32` length, 64 KiB cap, answered in order.
-`Launch` is answered only on a launch channel (`Launcher`, one per
-holder); the public socket refuses it, and a channel refuses `Lookup`.
-`daemon::Handler { lookup(peer, uid), launch(peer, app) }` gets the
-peer's UID from `SO_PEERCRED`; `serve` accepts every peer.
+`rpc`: `Request::{Hello, Lookup { uid }, Launch { app }, Apps, Open {
+uri }}`, `Response::{Hello, Policy, Launched { uid }, Apps, Error}`,
+postcard payloads behind a little-endian `u32` length, 64 KiB cap,
+answered in order. `Launch` and `Apps` are answered only on a launch
+channel (`Launcher`, one per holder); the public socket refuses them,
+and a channel refuses `Lookup`. `Open` is answered on both: on the
+public socket for a peer that is an app (the shim's OpenURI), never for
+a stranger. `daemon::Handler { lookup, launch, apps, open, hello }`
+gets the peer's UID from `SO_PEERCRED`; `serve` accepts every peer.
+`door::Door` is the app-facing services' side of it: `open()` connects
+to the public socket, `who(uid)` is the record or an error for a UID
+drv-appd does not know, `serve(listener, tag, on)` accepts, refuses
+strangers at accept and runs `on(sock, uid, policy)` per app
+connection.
 
 `seq`: the one transport for every daemon-to-daemon socket: `SOCK_SEQPACKET`,
 one postcard message per datagram (64 KiB cap) with up to 16 fds in
@@ -293,11 +349,11 @@ an entry (a daemon, a probe) out of the app menu.
 - Launch authority is an fd, never a grant and never the public socket.
   drv-appd serves `Launch { app }` only on launch channels, and a
   launch channel is a supervisor socketpair: `appd` on the compositor's
-  side (spawn key binds) and on drv-menu's (what the menu picked), each
+  side (spawn key binds) and on drv-shell's (what the menu picked), each
   a named fd on drv-appd's side. `Apps` on a channel lists the names
   `Launch` takes. Apps get no fd from anyone; something that must launch
   is a supervisor service, never an app. `/run/drv/appd.sock` (0666) answers
-  lookups only. `app` is a manifest name; arguments are the manifest's
+  lookups, and `Open` for apps. `app` is a manifest name; arguments are the manifest's
   `exec` and nothing else, so an app never receives caller-chosen
   arguments or environment. The daemon builds the environment from its
   `PATH`, `[env]`, the entry's `env` and `WAYLAND_DISPLAY`.
@@ -333,8 +389,9 @@ an entry (a daemon, a probe) out of the app menu.
   `/tmp` from `/run/drv-apps/tmp/<uid>` (kept between launches, noexec),
   and `/run` holding only what the app's features mean, a fixed table in
   the forker: its own runtime directory, the documents mount, the appd,
-  Wayland and bridge socket directories and `opengl-driver` for every
-  app, `/run/drv-audio` and `/run/drv-pulse` for `audio`. No host
+  Wayland, drv-files, drv-cast and drv-shell socket directories and
+  `opengl-driver` for every app, `/run/drv-audio` and `/run/drv-pulse`
+  for `audio`. No host
   `/etc`, `/var`, `/home`, `/run/current-system`. HOME is `/home/app`,
   a 256M tmpfs of the run, with `/var/lib/drv-apps/<uid>` bound at
   `.state` inside it. The
@@ -380,10 +437,9 @@ an entry (a daemon, a probe) out of the app menu.
   devices freely, nothing of another app's, capture only under a
   grant. A capture stream (audio, sink monitors included, is "mic";
   video is "camera") with no grant waits unlinked while the script asks
-  the bridge through the bridge's `drv-access` metadata
-  (`request:<uid>:<kind>`), the bridge asks drv-portal, drv-portal asks
-  the person; yes writes `grant:<uid>` and the stream links, no
-  destroys it. A grant lasts until the app's last connection closes or
+  drv-cast through its `drv-access` metadata (`request:<uid>:<kind>`),
+  drv-cast asks the person at the shell; yes writes `grant:<uid>` and
+  the stream links, no destroys it. A grant lasts until the app's last connection closes or
   the person revokes everything with Mod+Shift+Esc, which destroys the
   streams and disconnects camera remotes. Cameras also come the portal
   way: `org.freedesktop.portal.Camera.AccessCamera` asks the same
@@ -395,32 +451,31 @@ an entry (a daemon, a probe) out of the app menu.
 - `spawn-sh` and `spawn-at-startup` are disabled: a shell string is not
   an app name, and what starts with the desktop is `autostart` in the
   manifest, not the compositor's config.
-- Desktop services (notifications and portals) go through `drv-bridge
-  serve`, a member of the set on the services' bus (a `dbus-daemon` as
-  user `drv-bus`, socket in `/run/drv-session`, which apps never see).
-  The bus config lets the notification daemon (`services.drv.notifier`,
-  mako by default: a member of the set as uid drv-notifier, its Wayland
-  connection the supervisor's fd 3) own `org.freedesktop.Notifications`
-  and nobody else own anything; apps are never on it. The bridge socket `/run/drv-bridge/bridge.sock`
-  is bound by the supervisor (fd `listener`), mode 0666;
-  every connection is keyed on `SO_PEERCRED` plus drv-appd's
-  answer for that UID, unknown UIDs are dropped, and what the human sees
-  is the manifest name. An app with `bus = true` runs under
-  `dbus-run-session -- drv-bridge app -- <exec>`: a private bus in its
-  own UID with the shim claiming `org.freedesktop.Notifications` and
-  `org.freedesktop.portal.Desktop`.
+- Desktop services (notifications and portals) are the set's own
+  services, each on a socket the supervisor bound (mode 0666) and
+  handed over as fd `listener`: drv-files (`/run/drv-files/files.sock`),
+  drv-cast (`/run/drv-cast/cast.sock`), drv-shell
+  (`/run/drv-shell/notify.sock`). Every connection is keyed on
+  `SO_PEERCRED` plus drv-appd's answer for that UID
+  (`drv_policy::door`), unknown UIDs are refused at accept, and what
+  the human sees is the manifest name. There is no bus between apps and
+  services and no server in front of them. An app with `bus = true`
+  runs under `dbus-run-session -- drv-dbus-shim -- <exec>`: a private
+  bus in its own UID with the shim claiming
+  `org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`
+  and connecting to each service's socket on first use.
 - The ssh agent is a member, not an app: `drv-agent serve` runs OpenSSH's
   `ssh-agent` as uid drv-agent (the authenticators' hidraw nodes are that
   group's by udev rule, `/run/udev` exposed for libfido2) on a socket in
   its private `/tmp`, and fronts it on `/run/drv-agent/agent`, which every
-  app's root holds. Each connection is checked on `SO_PEERCRED` against
-  the UIDs whose manifest says `agent = true` (the module passes them as
-  `--allow name=uid`; those apps get `SSH_AUTH_SOCK`) and refused at
-  accept otherwise; ssh-agent itself would refuse every foreign uid. The
+  app's root holds. Each connection is checked on `SO_PEERCRED` plus
+  drv-appd's record for the UID (`AppPolicy.agent`, the manifest's
+  `agent = true`; those apps get `SSH_AUTH_SOCK`) and refused at accept
+  otherwise; ssh-agent itself would refuse every foreign uid. The
   authenticator's PIN never passes through an app: on a list or a sign
   request while the agent holds no keys and a hidraw node of ours is
-  present, the door asks drv-portal (fd `portal`, the same protocol as
-  the bridge's: `Pin`, answered `Pin`/`Cancelled`; `Touch`, taken down by
+  present, the door asks the shell (fd `shell`, `drv_shell::ask`:
+  `Secret`, answered `Secret`/`Cancelled`; `Touch`, taken down by
   `Cancel`) naming the app, and runs `ssh-add -K` itself with the answer.
   ssh-agent's own prompts while signing (the PIN of a verify-required
   key, a touch) reach the door the same way: `SSH_ASKPASS` is drv-agent
@@ -430,40 +485,43 @@ an entry (a daemon, a probe) out of the app menu.
   `volume-up`, `volume-down`, `volume-mute`, `mic-mute`, `brightness-up`
   and `brightness-down` are actions that write a line down its `keys`
   wire to `drv-keys`, which runs `wpctl` on the default sink or source
-  and writes the backlight's `brightness` (group video, floor 2). The shim terminates all of the
-  app's D-Bus (handles, sessions, `Response` and `Closed` signals, the
-  in-place answers) and speaks `drv_bridge::wire` to the server:
-  postcard over SEQPACKET, a fixed set of small variants (`Choose`,
-  `Cast`, `CastRemote`, `CastClose`, `Camera`, `CameraRemote`,
-  `CameraPresent`, `Open`, `Notify`, `Cancel`), texts clipped at 2 KiB,
-  file descriptors only from server to shim. The server never parses
-  D-Bus from an app. The shim is compatibility, not a boundary: it runs
-  as the app and can lie, and everything it says is checked as if the
-  app said it.
+  and writes the backlight's `brightness` (group video, floor 2).
+- The shim terminates all of the app's D-Bus (handles, sessions,
+  `Response` and `Closed` signals, the in-place answers) and speaks the
+  services' wires: postcard over SEQPACKET, a fixed set of small
+  variants per service (`drv_files::wire`: Choose, Cancel;
+  `drv_cast::wire`: Cast, CastRemote, CastClose, Camera, CameraRemote,
+  CameraPresent, Cancel; `drv_shell::notify`: Notify, Close), texts
+  clipped at 2 KiB by the receiver, file descriptors only from service
+  to shim. No service parses D-Bus. The shim is compatibility, not a
+  boundary: it runs as the app and can lie, and everything it says is
+  checked as if the app said it, because it could have.
 - Screen sharing is ours: `org.freedesktop.portal.ScreenCast` (version
   4, source types monitor and window, cursor modes
   hidden/embedded/metadata) and
   `org.freedesktop.portal.Session` on the app's bus are answered by the
-  bridge. `CreateSession` and `SelectSources` are bookkeeping there;
-  `Start` asks drv-portal (`Cast{id, app, uid, cursor, screens, windows,
-  again}`, the two flags from `SelectSources.types`), whose dialog lists
-  what the compositor reports and is the consent;
+  shim. `CreateSession` and `SelectSources` are bookkeeping there;
+  `Start` asks drv-cast (`Cast{req, session, cursor, screens, windows,
+  again}`, the two flags from `SelectSources.types`), which asks the
+  person at the shell (a `Pick` listing what the compositor reports),
+  and that dialog is the consent;
   a consent gets a token (`Response::Cast.token`), handed to the app as
   `restore_token` when it asked for any `persist_mode`, and answered
   with `persist_mode` 1: a later `Cast` with it (`again`) from the same
-  app and uid starts the same source with no dialog. drv-portal drops
-  an app's tokens when the bridge says its connection ended
-  (`Forget{app, uid}`), so a consent never outlives the app's run.
+  app and uid starts the same source with no dialog. drv-cast drops an
+  app's tokens when the shim's connection ends, so a consent never
+  outlives the app's run.
   Chromium needs this: its picker previews a screen in one session,
   then captures in a second with the first's token. The pick goes to
-  the compositor over the portal's own cast line
-  (`drv_portal::compositor`: Outputs, Windows, Start{cast, source,
-  cursor}, Stop; back Outputs, Windows, Started{cast, node_id, size},
-  Stopped), which starts the cast with no D-Bus and no grant involved,
-  the line being the authority. The node comes back as `Cast{id,
-  node_id, source, size}` and the bridge emits `Response` with `streams`
-  (`source_type` 1 or 2, `id` the connector name or the window id).
-  `OpenPipeWireRemote` is a PipeWire connection the bridge makes and
+  the compositor over drv-cast's own cast line
+  (`drv_cast::compositor`: Outputs, Windows, Start{cast, source,
+  cursor}, Stop, Devices; back Outputs, Windows, Started{cast, node_id,
+  size}, Stopped, Revoke), which starts the cast with no D-Bus and no
+  grant involved, the line being the authority. The node comes back as
+  `Cast{req, node_id, source, size, token}` and the shim emits
+  `Response` with `streams` (`source_type` 1 or 2, `id` the connector
+  name or the window id).
+  `OpenPipeWireRemote` is a PipeWire connection drv-cast makes and
   restricts before handing it over: the client's permissions are set to
   the core, the one node, and read on the client-node factory the app
   makes its own stream node through (everything else none, as
@@ -471,38 +529,40 @@ an entry (a daemon, a probe) out of the app menu.
   them, then the fd is stolen from the core and sent as the reply. The permissions live in the daemon, so they hold
   whatever the app does with the fd. Linking is WirePlumber's, not the
   app's, and would join a stream from the remote to a default source
-  the remote cannot see, so before replying the bridge marks the remote
+  the remote cannot see, so before replying drv-cast marks the remote
   in its `drv-access` metadata under the client id (`drv.remote`:
   `node:<id>` for a cast, `camera` for cameras), and the script lets a
   marked client's streams reach that only, destroying any other. The
   mark goes when the client does, and a cast's remotes are disconnected
   when the cast ends. WirePlumber would hand every new
-  client everything a moment later, so a WirePlumber rule keyed on the
-  bridge's uid (set by PipeWire from the socket, not forgeable) gives
-  the bridge's clients no default permissions and no permission
-  manager; the bridge has no other use for PipeWire. `Session.Close`, `Request.Close`
-  before consent, or the app's connection ending send `Cancel{id}`,
-  which takes the dialog down or stops the cast; the compositor ending
-  it (`stop-all-casts`, the output going away) comes back as `Stopped`,
-  then `Closed{id}`, then the `Session.Closed` signal. While any cast
+  client everything a moment later, so a WirePlumber rule keyed on
+  drv-cast's uid (set by PipeWire from the socket, not forgeable) gives
+  its clients no default permissions and no permission manager; its own
+  connection is on the manager socket. `Session.Close`, `Request.Close`
+  before consent, or the app's connection ending send `CastClose` or
+  `Cancel{req}`, which takes the dialog down or stops the cast; the
+  compositor ending it (`stop-all-casts`, the output going away) comes
+  back as `Stopped`, then `CastClosed{session}`, then the
+  `Session.Closed` signal. While any cast
   is live the compositor draws the "Screen is being shared" indicator
   above everything (never into the cast). The same indicator names the
-  apps holding the microphone and the camera: drv-portal sends
+  apps holding the microphone and the camera: drv-cast sends
   `Devices{mic, camera}` down its cast line whenever a grant starts or
   ends, and the compositor is the only one who can draw there.
 - The file chooser is ours: `org.freedesktop.portal.FileChooser`
   (`OpenFile`, `SaveFile`, `version` 4) on the app's bus is answered by
-  the bridge itself, which asks drv-portal down its supervisor link
-  (`drv_portal::protocol`, postcard over SEQPACKET) with the manifest
-  name and UID, hands the handle back at once and emits the `Response`
-  signal (`uris` as `file:///run/drv-doc/<id>/<name>`) when the person
-  has picked; `Request.Close` cancels at the portal. `directory` and
+  the shim, which asks drv-files over its socket (`drv_files::wire`;
+  drv-files names the app from the socket's UID), hands the handle back
+  at once and emits the `Response` signal (`uris` as
+  `file:///run/drv-doc/<id>/<name>`) when the person has picked;
+  `Request.Close` cancels at drv-files. `directory` and
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
   person's tree, only the file it was given, as its own UID.
 - `org.freedesktop.portal.OpenURI` (`OpenURI` only, `version` 1) the
-  bridge answers by asking drv-appd, over a launch channel of its own
-  (`Request::Open{uri}`), to start the app whose manifest `opens` the
+  shim answers by asking drv-appd on the public socket
+  (`Request::Open{uri}`, answered for a peer that is an app and logged
+  under its name) to start the app whose manifest `opens` the
   scheme with the URI as its last argument: the one argument that ever
   comes from outside the manifest, and only a well-formed absolute URI
   (`rpc::uri_scheme`: ASCII printable, RFC 3986 scheme, at most 8 KiB)
@@ -514,12 +574,12 @@ an entry (a daemon, a probe) out of the app menu.
   launch reaches the first one's single-instance socket instead of
   fighting it over the profile.
 - No other portal. `org.freedesktop.portal.Settings` (version 2:
-  `Read`, `ReadOne`, `ReadAll`) the bridge answers itself with the one
+  `Read`, `ReadOne`, `ReadAll`) the shim answers itself with the one
   look every app gets (`org.freedesktop.appearance`: `color-scheme` 1,
   dark; `contrast` 0). Every other portal call gets
   `org.freedesktop.DBus.Error.UnknownMethod`: chromium asks for
-  `Secret` and `Realtime` and goes on without them. Nothing an app says
-  reaches the services' bus; xdg-desktop-portal is not installed.
+  `Secret` and `Realtime` and goes on without them. D-Bus ends in the
+  shim; xdg-desktop-portal is not installed.
 - GPU process: PipeWire 1.6 dlopens `libspa-videoconvert` on the first
   stream connect, after the seccomp lockdown, so the GPU process loads it
   into PipeWire's plugin registry at startup.
@@ -539,7 +599,7 @@ an entry (a daemon, a probe) out of the app menu.
   and Shell screenshot services are gone, and the rest of upstream's
   (display config, screensaver, introspect, a11y) never start under the
   supervisor (not a session instance; the bus lets it own no name).
-  Casts start only down the drv-portal link (`src/screencasting`).
+  Casts start only down the drv-cast link (`src/screencasting`).
 - No IPC socket. `IpcServer` is never started: a client that can act as
   the compositor would bypass every policy. `niri msg` has nothing to
   talk to.
@@ -550,17 +610,20 @@ an entry (a daemon, a probe) out of the app menu.
 ## The lock
 
 Locked is the default; the compositor holds a lease "unlocked until T"
-that only `drv-authd` starts. The locker (`drv-lock`, uid drv-lock, a
+that only `drv-authd` starts. The shell (`drv-shell`, uid drv-shell, a
 supervisor service) draws the PIN screen. Its Wayland connection is its
-startup fd `compositor` and the compositor inserted it as the one client
+startup fd `wayland` and the compositor inserted it as the one client
 with the `session-lock` global, no lookup; its `drv-authd` connection is
 fd `auth` (the daemon's fd `locker`). `Verify` goes
 down that connection; on a match the daemon sends `Unlock{idle_timeout}`
 on the compositor's connection, which the supervisor handed both of them.
 The compositor then grants itself the lease and sends the lock client
-`finished`; the locker releases its surfaces and immediately asks to lock
+`finished`; the shell releases its surfaces and immediately asks to lock
 again, and the compositor holds that request (`LockState::Pending`) until
 the lease ends, when it becomes the lock without anything being launched.
+The shell also draws the menu, the prompts and the notifications; none
+of that bears on the lock, which is the compositor's: a shell that dies
+or lies leaves the outputs black.
 Without a lease the outputs stay black whether or not a lock client is
 there, and so is every cast, windows included.
 Input extends the lease by `idleTimeout` (module option, 300 s); a
@@ -594,8 +657,8 @@ behalf. Enrol with `drv-authd set-pin`; the dev VM enrols
   sets (a non-root forker's would otherwise survive the UID switch and,
   ambient, the exec) before `PR_SET_NO_NEW_PRIVS`.
 - The leaves are sealed. The compositor core, compositor-gpu, drv-seatd
-  (both of its processes), drv-authd, drv-appd, drv-portal, drv-menu and
-  the locker apply one seccomp allowlist (`drv_os::seccomp`: the fds they
+  (both of its processes), drv-authd, drv-appd, drv-shell and drv-files
+  apply one seccomp allowlist (`drv_os::seccomp`: the fds they
   hold, memory, threads, time, signals; never socket, exec, a new process
   or an ioctl outside the listed ones) once their fds are in place, plus
   what each needs: DRM/dma-buf/sync-file ioctls and a stat by path (Mesa
@@ -607,8 +670,10 @@ behalf. Enrol with `drv-authd set-pin`; the dev VM enrols
   screenshot to disk; opening existing nodes
   (never creating), DRM/evdev/VT ioctls and udev's database for
   drv-seatd; accept and read-only opens for drv-appd; its state
-  directory for drv-authd; read-only opens (fonts) for the locker and
-  the menu; file writes for drv-portal. A denied call fails with EPERM
+  directory for drv-authd; read-only opens (fonts), accept and
+  connecting to Unix sockets (drv-appd) for the shell; the same plus
+  file writes for drv-files. drv-cast is not sealed: PipeWire loads its
+  plugins as it goes. A denied call fails with EPERM
   and the journal names the syscall number, the path for an open or
   stat, the request for an ioctl. `DRV_SECCOMP=0` from the supervisor's
   command line is the only way to run one open.
@@ -632,19 +697,21 @@ behalf. Enrol with `drv-authd set-pin`; the dev VM enrols
   covers the VT ioctls, and DRM master needs no privilege for the process
   that opened the card.
 - Only `drv-authd` unlocks. No Wayland request, key bind or D-Bus call
-  starts a lease; the locker cannot unlock even if compromised, it can
+  starts a lease; the shell cannot unlock even if compromised, it can
   only try PINs, and the daemon slows that down.
 - Peers are handed over, never found: the auth daemon has no socket, and
   what it takes `Verify` from and pushes `Unlock` to are its startup fds
-  `locker` and `compositor`. Anything that is not the locker has no path
+  `locker` and `compositor`. Anything that is not the shell has no path
   to it.
 
 ## Not yet
 
-- The bridge forwards every other `org.freedesktop.portal.*` interface
-  alike; nothing yet narrows which portals an app may use.
-- The bridge drops notification actions, hints and close signals.
-- Files: drv-portal owns the tree and hands out single files; no
+- Nothing narrows which portals an app may use: every `bus` app may ask
+  for files, screens, cameras, notifications and URIs; the person
+  answers each time.
+- The shim drops notification actions, hints and icons; the shell has
+  no close signal back and no history.
+- Files: drv-files owns the tree and hands out single files; no
   directory grants, no multiple selection, no filters, no overwrite
   confirmation, no file manager, no sync or backup
   ([NOTES-file-ownership](NOTES-file-ownership.md)).
@@ -666,7 +733,7 @@ behalf. Enrol with `drv-authd set-pin`; the dev VM enrols
   bookkeeping, and Wayland clients do not survive a compositor restart
   anyway.
 - `OpenPipeWireRemote` timed out once in 27 tries, right after a cast
-  was closed and restarted, and never under a stress loop since; the
-  bridge names the round trip and tries once more before failing.
+  was closed and restarted, and never under a stress loop since;
+  drv-cast names the round trip and tries once more before failing.
 - Icons in the menu: reading image files an app controls needs a
   decoder in a sandbox first.

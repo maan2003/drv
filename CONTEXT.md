@@ -42,62 +42,56 @@ to and what any discussion means.
   supervisor service). DRM and Mesa. Wired to the compositor by the
   supervisor at startup; the compositor hands it the devices it opened
   through seatd, then it seals itself.
-- **locker** (`drv-lock`, uid drv-lock, a supervisor service). Draws the
-  lock screen, collects the PIN. Its Wayland connection and its authd
-  verifier are its startup fds `compositor` and `auth`; it finds no
-  socket and none finds it. Always running: after every `finished` it
-  asks to lock again and the compositor holds the request for the next
-  locking. Seccomp-sealed after its first render (fonts stay readable).
-- **menu** (`drv-menu`, uid drv-menu, a supervisor service). Holds a
-  launch channel (fd `appd`), a poke line from the compositor (fd
-  `compositor`, a byte per `show-launcher` bind) and its own Wayland
-  connection (fd `wayland`, inserted by the compositor as a layer-shell
-  client). Draws the list itself with `drv-ui`, launches the pick by
-  name. One process, sealed like the locker.
-- **portal** (`drv-portal`, uid drv-portal, a supervisor service). The
-  person's side of the portals: the file chooser with its documents
-  mount, screen sharing consent, and the microphone and camera
-  consents (it tells the compositor who holds them, for the indicator). Owns the person's files
-  (`--files`, `/var/lib/drv-files`), shows them on its own Wayland
-  connection (fd `wayland`) when the bridge asks (fd `bridge`), and
-  serves each pick to the asking UID alone at `/run/drv-doc/<id>/<name>`
-  over FUSE (fd `fuse`, mounted by the supervisor). For a screen it
-  lists the outputs and starts the cast at the compositor over its own
-  cast line (fd `compositor`).
-- **bridge** (`drv-bridge serve`, uid drv-bridge, a supervisor service).
-  The apps' desktop services, keyed on the peer UID: notifications to
-  the services' bus, the file chooser and the screencast to the portal,
-  settings answered in place, the PipeWire remotes for a cast and for
-  cameras (connections restricted to those nodes before the app gets
-  them), the microphone and camera questions WirePlumber's gate raises
-  through the bridge's `drv-access` metadata, OpenURI (drv-appd starts
-  the scheme's manifest handler over the bridge's launch channel, fd
-  `appd`), and nothing else (no xdg-desktop-portal).
-  `drv-bridge app` is the shim on an app's private bus: it terminates
-  all of the app's D-Bus in the app's UID and speaks `drv_bridge::wire`
-  (postcard over SEQPACKET) to the server, which never reads D-Bus from
-  an app.
-- **notifier** (`services.drv.notifier`, mako by default; uid drv-notifier, a
-  supervisor service). The notification daemon: a layer-shell client on fd
-  `wayland` (`WAYLAND_SOCKET=3`), the one owner of
-  `org.freedesktop.Notifications` on the services' bus. It sees every
-  notification, so it is a member of the set, never an app.
+- **shell** (`drv-shell`, uid drv-shell, a supervisor service). The layer
+  above the compositor: the lock screen (collects the PIN; its authd
+  verifier is fd `auth`; after every `finished` it asks to lock again
+  and the compositor holds the request for the next locking), the app
+  menu (a launch channel on fd `appd`, a poke line from the compositor
+  on fd `poke`, a byte per `show-launcher` bind), the person's prompts
+  for drv-cast and drv-agent (fds `cast` and `agent`, `drv_shell::ask`)
+  and the notifications (`/run/drv-shell/notify.sock`, keyed on the
+  peer UID, the manifest name as the sender). Its Wayland connection is
+  fd `wayland`, inserted by the compositor with session-lock and
+  layer-shell. The lock itself is the compositor's, so the shell may
+  render app text. Seccomp-sealed after its first render.
+- **files** (`drv-files`, uid drv-files, a supervisor service). Owns the
+  person's files (`--files`, `/var/lib/drv-files`), shows them in its
+  chooser (fd `wayland`, a layer-shell client) when an app's shim asks
+  on `/run/drv-files/files.sock` (keyed on the peer UID), and serves
+  each pick to the asking UID alone at `/run/drv-doc/<id>/<name>` over
+  FUSE (fd `fuse`, mounted by the supervisor). Sealed like the shell,
+  file writes allowed.
+- **cast** (`drv-cast`, uid drv-cast, group pipewire, a supervisor
+  service). Screen sharing, cameras and microphones for apps, on
+  `/run/drv-cast/cast.sock` (keyed on the peer UID): asks the person at
+  the shell (fd `shell`), starts and stops casts at the compositor over
+  its cast line (fd `compositor`) and tells it who holds the devices for
+  the indicator, answers WirePlumber's gate through its `drv-access`
+  metadata, hands apps PipeWire remotes restricted to the one node or
+  the cameras. Not sealed (PipeWire's plugins).
+- **shim** (`drv-dbus-shim`, in the app's UID on its private bus, for
+  apps with `bus`). Claims `org.freedesktop.Notifications` and
+  `org.freedesktop.portal.Desktop`, terminates all of the app's D-Bus
+  and speaks the services' wires (postcard over SEQPACKET) to
+  drv-files, drv-cast and drv-shell, and `Open` to drv-appd's public
+  socket for OpenURI; settings answered in place. Compatibility, never a
+  boundary: every service checks the UID itself.
 - **documents mount** (`/run/drv-doc`). Where an app finds the files it
   was given. A grant is one file for one UID; the listing shows a UID
   only its own.
 - **drv-ui** (crate). What the set's windows share: connection on a
   supervisor fd, toolkit boilerplate, Pango text in shm buffers, the
-  seccomp seal after the fonts are warm. The locker, the menu and the
-  portal are on it.
-- **the set**: the ten above (seatd, authd, compositor-gpu, compositor,
-  locker, menu, portal, forker, appd, bridge). If any member dies the
+  seccomp seal after the fonts are warm. The shell and drv-files are on
+  it.
+- **the set**: the eleven above (seatd, authd, compositor-gpu, compositor,
+  forker, appd, shell, files, cast, agent, keys). If any member dies the
   supervisor kills the apps, stops the rest and starts everything again
   with fresh sockets. There are no smaller groups.
 - **apps** (uid 100001 and up). Everything untrusted, forked by
   drv-forker on drv-appd's say.
 - **launcher**: whoever holds a launch channel, a supervisor socketpair
   to drv-appd. Only a member of the set can (the compositor for key
-  binds and the menu, each on its fd `appd`); no app is trusted, and
+  binds and the shell for the menu, each on its fd `appd`); no app is trusted, and
   `drv` only looks up.
 
 Retired words: "spawner" (meant supervisor plus forker), "identityd".

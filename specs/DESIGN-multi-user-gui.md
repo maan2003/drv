@@ -8,8 +8,8 @@ app daemon and its forker under a root supervisor, per-UID compositor policy and
 group-gated PipeWire, per-app network namespaces and a NixOS module
 ([ARCH-app-policy](ARCH-app-policy.md)), verified in a KVM dev VM with
 every process on its own UID: Chromium started from a launcher that is
-itself just an app, notifications and portals (screen share with
-per-session consent) through a UID-keyed bridge, and the lock (locked by
+itself a member of the set, notifications and portals (screen share with
+per-session consent) through UID-keyed services, and the lock (locked by
 default, a PIN daemon pushes the unlock). Not yet: sub-UID ranges, file ownership
 ([NOTES-file-ownership](NOTES-file-ownership.md)). This records the agreed direction
 and the reasoning behind each choice so later work can check itself against
@@ -60,7 +60,7 @@ as its own UID on the core's request; udev, hotplug and respawn are
 still the compositor's.
 
 **Identity daemon.** Answers `uid -> app, manifest, globals, grants`.
-The only parser of manifests. Compositor and bridge ask it and cache per
+The only parser of manifests. Compositor and services ask it and cache per
 connection; anyone may ask it to launch an app by name, so launching is
 not a privilege and does not pass through the compositor. Reason: one parser, one source of truth,
 no config-format bugs inside the compositor. Identities are static: the app
