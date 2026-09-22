@@ -52,8 +52,10 @@ UIDs) are `grants` on the same record.
 
 ```text
 drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
-                SETPCAP, CHOWN, KILL, SYS_ADMIN, SYS_TTY_CONFIG from the unit's
-                AmbientCapabilities, NoNewPrivileges; nothing here is root)
+                SETPCAP, SYS_ADMIN, SYS_TTY_CONFIG from the unit's
+                AmbientCapabilities, plus CHOWN until the apps cgroup is made at
+                startup, then dropped for good; NoNewPrivileges; nothing here
+                is root; single-threaded, one waitid for the whole set)
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
   drv-gpu), the compositor, the locker (drv-lock, uid drv-lock), the
   menu (drv-menu, uid drv-menu), the portal (drv-portal, uid
@@ -104,13 +106,17 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   seat, auth, the forker channel, the bridge listener, the bridge's
   portal line and the portal's cast line are SEQPACKET, the rest
   streams.
-  Nothing is linked at runtime: the ten are one set, and when any
+  Nothing is linked at runtime: the eleven are one set, and when any
   member exits the supervisor kills every app (writes 1 to
-  `apps/cgroup.kill`), stops the rest, waits, and starts the whole set
-  again with fresh socketpairs. The forker owns `<supervisor
-  cgroup>/apps` (chowned to it; `cgroup.kill` stays the supervisor's).
-  The apps' directories (`/run/drv-apps/<uid>`, `/run/drv-apps/tmp/<uid>`,
-  `/var/lib/drv-apps/<uid>`) are tmpfiles rules, owned by each UID.
+  `apps/cgroup.kill`) and every member (1 to `set/cgroup.kill`: each
+  member's child put itself in that cgroup before switching user, so no
+  CAP_KILL), waits, and starts the whole set again with fresh
+  socketpairs. The forker owns `<supervisor cgroup>/apps` (chowned to
+  it; both `cgroup.kill` files stay the supervisor's). The apps'
+  directories (`/run/drv-apps/<uid>`, `/run/drv-apps/tmp/<uid>`,
+  `/var/lib/drv-apps/<uid>`) and the members' (`/run/drv-compositor`,
+  `/run/drv-wayland`, the state directories) are tmpfiles rules, owned
+  by their UID: the supervisor checks owner and mode and makes nothing.
 
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
                                            setgid, setpcap, sys_admin)
