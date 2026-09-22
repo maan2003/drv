@@ -5,7 +5,7 @@
 Direction record, agreed 2026-09. Build order steps 1 and 3 are
 implemented (niri `policy`: `drv_os::approot`, `drv-host-views.service`,
 the per-app `/etc`, `closure` and `files` derivations in the module,
-`drv-trampoline`): an app's root is a fresh read-only tmpfs with the four
+`drv-init`): an app's root is a fresh read-only tmpfs with the four
 sources mounted, HOME a tmpfs with the declared state linked in, and
 Landlock limits the store to the app's closure. Not yet: the views check against Mesa on both GPUs (step 2),
 seccomp and the sysctls (4), the closure lint (5), the four-sources drill
@@ -154,14 +154,8 @@ builds the root in order of what it needs:
    `setresuid`, every capability set emptied.
 4. As the app: the Landlock ruleset by path (the closure, `/etc`, HOME
    and the rest), `landlock_restrict_self`, the seccomp denylist (below),
-   MDWE unless `jit`.
-5. As PID 1 of the namespace it stays: it forks the app and execs the
-   command in the child (a close-on-exec pipe carries an exec failure
-   back, so `Error` still reaches appd), answers `Forked`, and remains as
-   `drv-init`: it reaps orphans, passes the signals it is sent on to the
-   app, and exits with the app's status (128 + the signal for a signal
-   death: PID 1 of a namespace cannot itself die of one from inside).
-   The forker's log line is the init's status.
+   MDWE unless `jit`, `Forked` to appd, exec. What it execs is PID 1 of
+   the namespace, the linker.
 
 The seccomp denylist is not the sandbox, it closes a few doors the
 sandbox does not: an executable memfd (`MFD_EXEC`; with
@@ -191,10 +185,15 @@ reviewable in one place. The forker never reads a file or lists a
 directory to decide anything, and makes or chowns nothing: every
 directory it binds exists, made by tmpfiles for each configured UID.
 
-Everything the app can do for itself is the linker's (`drv-trampoline`),
+Everything the app can do for itself is the linker's (`drv-init`),
 which the module puts in front of every app's command: a small
 unprivileged program from the set's own package, run as the app inside
-the finished root. It fills the empty `/etc` tmpfs the forker gave it
+the finished root, and PID 1 of the app's namespace for as long as the
+app runs: once the links are made it forks the app and stays as its init,
+reaping orphans, passing the signals it is sent on to the app, and
+exiting with the app's status (128 + the signal for a signal death: PID 1
+of a namespace cannot itself die of one from inside). The forker's log
+line is the linker's status. It fills the empty `/etc` tmpfs the forker gave it
 from the Nix-built derivation (one link per entry; `resolv.conf` links
 to `/run/host/resolv.conf`, where the forker bound the host's live copy
 for a networked app), makes the state directories and links, links the

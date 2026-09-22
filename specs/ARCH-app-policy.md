@@ -332,15 +332,14 @@ an entry (a daemon, a probe) out of the app menu.
   UID, drops its capabilities, restricts itself with the ruleset, puts
   on the seccomp denylist (no executable memfd, no io_uring, no user
   namespace unless the manifest says `userns`), refuses
-  writable-then-executable memory unless the manifest says `jit`, then
-  forks the app and stays as its init: the child of the forker is PID 1
-  of the app's PID namespace (IPC, UTS and cgroup namespaces are its own
-  too), reaps, forwards signals and exits with the app's status. The
-  module puts
-  `drv-trampoline` in front of every app's command: as the app, it
+  writable-then-executable memory unless the manifest says `jit`, and
+  execs the command as PID 1 of the app's PID namespace (IPC, UTS and
+  cgroup namespaces are its own too). The module puts
+  `drv-init` in front of every app's command: as the app, it
   fills `/etc` from the store, makes the `state` directories under
   `.state`, links them from HOME, links the `files` defaults from the
-  store and execs the rest. No system D-Bus, no services' bus, no
+  store, forks the rest and stays as its init: reaps, forwards signals,
+  exits with the app's status. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   except for a `userns` app (the browser). Apps without `network = true` also get a new, empty network
   namespace.
