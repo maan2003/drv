@@ -184,7 +184,12 @@ drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
   are up). A seat daemon restart makes the compositor exit and come back. Sits on its own VT (`--vt`, default 7, above logind's
   autovt range) because agetty resets the VT it owns to 0620 and a non-root
   seatd could not open it; a udev rule makes tty0 and that tty 0660 group
-  tty. tty1 keeps its getty (ctrl-alt-f1).
+  tty. tty1 keeps its getty (ctrl-alt-f1). With `services.drv.homeVt`
+  (`DRV_HOME_VT` on the compositor) the compositor switches to that VT once
+  its outputs are up: the desktop starts in the background, beside a
+  greetd session of the host's own, and ctrl-alt-f7 brings it forward; the
+  release/acquire handshake is libseat's, answered by the compositor's
+  pause and resume.
 
 drv-authd (uid drv-auth, supervisor child)
   argon2id PIN in /var/lib/drv-auth (0700), escalating delay after 5 misses;
