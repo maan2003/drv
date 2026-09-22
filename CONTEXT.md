@@ -49,7 +49,7 @@ to and what any discussion means.
   menu (a launch channel on fd `appd`, a poke line from the compositor
   on fd `poke`, a byte per `show-launcher` bind), the person's prompts
   for drv-cast and drv-agent (fds `cast` and `agent`, `drv_shell::ask`)
-  and the notifications (`/run/drv-shell/notify.sock`, keyed on the
+  and the notifications (`/run/drv/notify.sock`, keyed on the
   peer UID, the manifest name as the sender). Its Wayland connection is
   fd `wayland`, inserted by the compositor with session-lock and
   layer-shell. The lock itself is the compositor's, so the shell may
@@ -57,13 +57,13 @@ to and what any discussion means.
 - **files** (`drv-files`, uid drv-files, a supervisor service). Owns the
   person's files (`--files`, `/var/lib/drv-files`), shows them in its
   chooser (fd `wayland`, a layer-shell client) when an app's shim asks
-  on `/run/drv-files/files.sock` (keyed on the peer UID), and serves
-  each pick to the asking UID alone at `/run/drv-doc/<id>/<name>` over
+  on `/run/drv/files.sock` (keyed on the peer UID), and serves
+  each pick to the asking UID alone at `/run/drv/doc/<id>/<name>` over
   FUSE (fd `fuse`, mounted by the supervisor). Sealed like the shell,
   file writes allowed.
 - **cast** (`drv-cast`, uid drv-cast, group pipewire, a supervisor
   service). Screen sharing, cameras and microphones for apps, on
-  `/run/drv-cast/cast.sock` (keyed on the peer UID): asks the person at
+  `/run/drv/cast.sock` (keyed on the peer UID): asks the person at
   the shell (fd `shell`), starts and stops casts at the compositor over
   its cast line (fd `compositor`) and tells it who holds the devices for
   the indicator, answers WirePlumber's gate through its `drv-access`
@@ -76,7 +76,7 @@ to and what any discussion means.
   drv-files, drv-cast and drv-shell, and `Open` to drv-appd's public
   socket for OpenURI; settings answered in place. Compatibility, never a
   boundary: every service checks the UID itself.
-- **documents mount** (`/run/drv-doc`). Where an app finds the files it
+- **documents mount** (`/run/drv/doc`). Where an app finds the files it
   was given. A grant is one file for one UID; the listing shows a UID
   only its own.
 - **drv-ui** (crate). What the set's windows share: connection on a

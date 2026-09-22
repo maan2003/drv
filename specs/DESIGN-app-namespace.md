@@ -5,9 +5,10 @@
 Direction record, agreed 2026-09. Build order steps 1 and 3 are
 implemented (niri `policy`: `drv_os::approot`, `drv-host-views.service`,
 the per-app `/etc`, `closure` and `files` derivations in the module,
-`drv-init`): an app's root is a fresh read-only tmpfs with the four
-sources mounted, HOME a tmpfs with the declared state linked in, and
-Landlock limits the store to the app's closure. Not yet: the views check against Mesa on both GPUs (step 2),
+`drv-init`): an app's root is a fresh tmpfs of its own with the four
+sources mounted, `/state` its persistent directory, HOME of the run with
+the declared state linked in (or `/state` itself), and Landlock limits
+the store to the app's closure. Not yet: the views check against Mesa on both GPUs (step 2),
 seccomp and the sysctls (4), the closure lint (5), the four-sources drill
 (6). The build order at the end says how the code gets from there to
 here; [ARCH-app-policy](ARCH-app-policy.md), "Launching", describes the
@@ -96,36 +97,40 @@ Configuration views are store paths (above) and need no generator.
 
 ### State
 
-HOME is `/home/app`, the same path for every app: a fresh tmpfs,
-writable, noexec, size-capped, owned by the UID, mounted by the forker.
-Nothing in it survives the run unless the manifest's `state` list names
-it: each entry (`.config/BraveSoftware`, say) is a directory under
-`/var/lib/drv-apps/<uid>`, which the forker binds at `.state` inside
-HOME. The state linker (below), as the app UID and with no
-privilege, makes the state directories, symlinks each declared entry from
-HOME into them, and links the HOME defaults tree from the store.
+Two places, the same for every app. `/` is the run: a tmpfs the app
+owns (noexec, size-capped, made by the forker), gone with the app;
+`/tmp`, `/etc`, `/run/app` (its `XDG_RUNTIME_DIR`) and `/home/app` are
+directories drv-init makes in it. `/state` is what persists:
+`/var/lib/drv-apps/<uid>`, bound by the forker for every app. The
+manifest's `home` says how the two meet: `run` (the default) makes HOME
+`/home/app`, with each entry of the `state` list (`.config/BraveSoftware`,
+say) a directory under `/state` linked from HOME; `persist` makes HOME
+`/state` itself, for an app that is its home (a terminal). drv-init, as
+the app UID and with no privilege, makes the directories and links and
+links the HOME defaults tree from the store.
 
 So an app is stateless unless declared otherwise; undeclared writes
 succeed and vanish; declared state persists; configuration is unwritable.
-The list of what an app may keep between runs is one manifest field.
+What an app may keep between runs is one manifest field, or one word.
 
 Why a writable tmpfs rather than a read-only generated HOME: apps create
 undeclared dotfiles on first start (`~/.pki`, `~/.cache`, shader caches,
-GTK settings) and fail badly when they cannot. Why the linker and not the
+GTK settings) and fail badly when they cannot. Why drv-init and not the
 forker does the linking: the forker holds CAP_SYS_ADMIN and must never
 walk a directory the app controls
 ([ARCH-app-policy](ARCH-app-policy.md), Invariants).
 
 ### Runtime
 
-The app's own `XDG_RUNTIME_DIR` (`/run/drv-apps/<uid>`), its `/tmp` kept
-for the boot (so a second launch finds the first's single-instance
-socket), a fresh `/dev/shm`, and under `/run` exactly what its features
-mean: the appd socket, the apps' Wayland socket and the documents mount
-for every app, the services' sockets (files, cast, shell, agent), the driver link for `gpu`, audio
-and pulse for `audio`, and later the pair-link directory for linked
-apps. Landlock scoping keeps abstract sockets and signals inside
-the app's domain.
+A fresh `/dev/shm`, and under `/run` two things: `/run/app`, its own,
+and `/run/drv`, the doors: one directory of the supervisor's, bound
+read-only into every app, holding the appd socket, the apps' Wayland
+socket, the services' sockets (files, cast, notify, agent), the documents
+mount (`doc`, writable inside), PipeWire's apps socket and the apps'
+PulseAudio sockets. Every door is the same for every app; what each
+answers is decided on the service's side from the peer UID. `/tmp` is of
+the run. Landlock scoping keeps abstract sockets and signals inside the
+app's domain.
 
 ## Who does what
 
@@ -138,29 +143,31 @@ builds the trusted set's roots with it too, from a different list):
 
 1. With no input: handles on everything of the host's it might place
    (the network namespace, the cgroup, detached clones of the store, the
-   views, `resolv.conf`, the fixed `/run` entries, and the parents of
-   the per-UID directories), then the securebits, an empty bounding set,
-   no SETPCAP, no_new_privs, a mount and a network namespace of its own,
-   and a fresh tmpfs pivoted in as its root: the host's root is stacked
-   beneath, where no path lookup reaches it, only the handles. The
-   fixed part goes in: the store, `/dev`, `/dev/shm` (noexec), `/proc`
-   (`subset=pid`, of the new PID namespace), the `/run` entries every
-   app has.
-2. The request, decoded: UID (checked against the range), then what
-   depends on it. `network` rejoins the host's namespace through the
-   handle; `gpu` picks the views; `audio` adds its sockets; `/etc`, HOME,
-   `/tmp` and the runtime directory are mounted for the UID, the last
-   three cloned through the parents' handles; the links are made:
-   `/bin/sh` and `/usr/bin/env` for every app, as NixOS has them, plus
-   the manifest's own `links`, all into the store. The handles are closed,
-   the old root detached, the root goes read-only, the cgroup is joined
-   and a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
+   views, the doors, the nix daemon's socket directory, `resolv.conf`
+   open for reading).
+2. The request, decoded: UID (checked against the range), `network`,
+   `gpu`, `nix`. Then the securebits, an empty bounding set, no SETPCAP,
+   no_new_privs, a mount namespace of its own and, unless `network`, an
+   empty network namespace; a fresh tmpfs owned by the UID pivoted in as
+   its root, the host's root stacked beneath, where no path lookup
+   reaches it, only the handles. With the UID as its effective UID (the
+   capabilities stay: SECBIT_NO_SETUID_FIXUP), so that what it makes in
+   the app's root is the app's, it mounts the store, `/dev`, `/dev/shm`
+   (noexec), `/dev/pts`, `/proc` (`subset=pid`, of the new PID
+   namespace), `/sys` and `/dev/dri` (`gpu` picks the views),
+   `/run/drv`, the daemon's socket directory for `nix`, and `/state`
+   from `/var/lib/drv-apps/<uid>`, cloned through a handle taken after
+   the unshare. The handles are closed, the old root detached, the root
+   stays writable (it is the app's) and noexec, the cgroup is joined and
+   a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
 3. The switch: its own group and nothing else, `setresgid`,
-   `setresuid`, every capability set emptied.
-4. As the app: the Landlock ruleset by path (the closure, `/etc`, HOME
-   and the rest), `landlock_restrict_self`, the seccomp denylist (below),
-   MDWE unless `jit`, `Forked` to appd, exec. What it execs is PID 1 of
-   the namespace, the linker.
+   `setresuid`, every capability set emptied. `Forked` to appd, exec of
+   the command with the resolver as fd `resolv` for a networked app.
+   What it execs is PID 1 of the namespace, drv-init.
+4. As the app, drv-init: the directories of the run, `/etc`, the links,
+   HOME, then the Landlock ruleset by path (the closure, the views, the
+   doors, its own directories), `landlock_restrict_self`, the seccomp
+   denylist (below), MDWE unless `jit`, fork, and it stays as init.
 
 The seccomp denylist is not the sandbox, it closes a few doors the
 sandbox does not: an executable memfd (`MFD_EXEC`; with
@@ -178,49 +185,55 @@ Landlock domain with its rules as paths (the last four through a dev-only
 kernel module, `nix/kdump`) and diffs it with the checked-in expectation
 under `nix/expect`; the smoke runs it.
 
-So argv, env and the closure are touched only by a process that already
-is the app, and while the request is being decoded the process holds
-SYS_ADMIN, SETUID and SETGID with the per-UID parents in hand and
-nothing else of the host's: what a bug there could reach is another app
-UID's state, not the host. The request is the manifest, parsed: UID,
-argv, env, the booleans `network`, `gpu`, `audio`, `jit`, `userns`, and
-the closure as a list of store paths. What each boolean means on this host
-is a fixed table in the forker, definition rather than policy,
+So argv and env are touched only by a process that already is the app,
+and while the request is being decoded the process holds SYS_ADMIN,
+SETUID and SETGID with the state directories' parent in hand and nothing
+else of the host's: what a bug there could reach is another app UID's
+state, not the host. The request is the manifest, parsed: UID, argv,
+env, the booleans `network`, `gpu`, `nix`. What each boolean means on
+this host is a fixed table in the forker, definition rather than policy,
 reviewable in one place. The forker never reads a file or lists a
-directory to decide anything, and makes or chowns nothing: every
-directory it binds exists, made by tmpfiles for each configured UID.
+directory to decide anything, and makes or chowns nothing on the host:
+`/var/lib/drv-apps/<uid>` exists, made by tmpfiles for each configured
+UID; what it makes in the app's root it makes as the app.
 
-Everything the app can do for itself is the linker's (`drv-init`),
-which the module puts in front of every app's command: a small
-unprivileged program from the set's own package, run as the app inside
-the finished root, and PID 1 of the app's namespace for as long as the
-app runs: once the links are made it forks the app and stays as its init,
-reaping orphans, passing the signals it is sent on to the app, and
-exiting with the app's status (128 + the signal for a signal death: PID 1
-of a namespace cannot itself die of one from inside). The forker's log
-line is the linker's status. It fills the empty `/etc` tmpfs the forker gave it
-from the Nix-built derivation (one link per entry; `resolv.conf` links
-to `/run/host/resolv.conf`, where the forker bound the host's live copy
-for a networked app), makes the state directories and links, links the
-HOME defaults, and execs the rest. Everything it does is with the app's
-own authority, so a bug in it is worth exactly one app; the forker does
-not know it exists. The line between the two: the forker places what
-belongs to someone else, the linker arranges what belongs to the app.
+Everything the app can do for itself is drv-init's, which the module
+puts in front of every app's command with everything it needs on the
+command line (`--etc`, `--state`, `--files`, `--home`, `--closure`,
+`--link`, `--jit`, `--userns`, `--nix`, `--resolv`): a small unprivileged
+program from the set's own package, run as the app inside the root the
+forker left, and PID 1 of the app's namespace for as long as the app
+runs. It makes `/tmp`, `/etc` (one link per entry of the Nix-built
+derivation, `resolv.conf` copied from fd `resolv` for a networked app),
+`/run/app`, the links at fixed places into the store (`/bin/sh`,
+`/usr/bin/env`, `/run/opengl-driver`, the manifest's own), HOME as
+`home` says (the state directories under `/state` and their links, the
+HOME defaults; a link of an earlier run into the store is remade when
+the path behind it changed), restricts itself (the closure as Landlock
+rules, the whole store for `nix`; the denylist; MDWE), forks the app and
+stays as its init, reaping orphans, passing the signals it is sent on to
+the app, and exiting with the app's status (128 + the signal for a signal
+death: PID 1 of a namespace cannot itself die of one from inside). The
+forker's log line is drv-init's status. Everything it does is with the
+app's own authority, so a bug in it is worth exactly one app; the forker
+does not know it exists. The line between the two: the forker places what
+belongs to someone else, drv-init arranges what belongs to the app.
 
 ## Not in the namespace
 
 `/usr`, `/bin`, `/home` (other than the app's), `/var` (other than its
 state), `/boot`, `/nix/var`, `/run/current-system`, the host `/etc`,
 `/dev`, `/sys`, the system D-Bus, the services' bus, other apps' runtime
-directories, the nix-daemon socket. Apps launch nothing and are launched
-by nothing but drv-appd.
+directories, the nix-daemon socket (except for a `nix` app: a client of
+the host's daemon, with the whole store readable). Apps launch nothing
+and are launched by nothing but drv-appd.
 
 ## Manifest
 
 `services.drv.apps.<name>` gains: `etc` and `files` (attribute sets that
-become store paths), `state` (paths under HOME that persist), `closure`
-(derived from `exec`), and later `links` (apps sharing a runtime
-directory) and a `launch:<app>` grant. `gpu` comes to mean the render
+become store paths), `state` (paths under HOME that persist), `home`
+(`run` or `persist`), `nix`, `closure` (derived from `exec`), and later
+`links` (apps sharing a runtime directory) and a `launch:<app>` grant. `gpu` comes to mean the render
 node plus the sys view, with no group: the host's view makes the node
 openable by anyone, which is what render nodes are for. `network`,
 `audio`, `bus`, `globals`, `grants` and `opens` keep their meaning.

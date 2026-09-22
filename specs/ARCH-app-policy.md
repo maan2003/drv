@@ -69,7 +69,7 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   starts drv-seatd, drv-authd, compositor-gpu (niri gpu-process, uid
   drv-gpu), the compositor, drv-files (uid drv-files; first of the rest
   because it serves the documents mount, which anything touching
-  `/run/drv-doc` blocks on), drv-forker (uid drv-forker), drv-appd, the
+  `/run/drv/doc` blocks on), drv-forker (uid drv-forker), drv-appd, the
   shell (drv-shell, uid drv-shell), drv-cast (uid drv-cast, group
   pipewire), the ssh agent (drv-agent, uid drv-agent) and the media keys
   (drv-keys, uid drv-keys, groups pipewire and video, its `/sys`
@@ -90,10 +90,11 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   checks an app. Apps' roots differ in content, not in kind (below). Today: seatd `/run/udev`; the compositor
   `/run/udev` (libinput), its runtime and apps socket directories,
   `/run/drv` and `/run/pipewire`; the GPU process `/run/opengl-driver`;
-  the forker `/run/drv-apps` plus everything an app may be shown; the
-  shell, drv-files and the agent `/run/drv` (drv-appd's socket, to name
-  their callers), drv-cast `/run/drv` and `/run/pipewire`; authd and
-  drv-appd nothing. Nobody has any D-Bus: not the system bus
+  the forker `/run/drv-apps` (where it builds the roots), `/run/drv-host`
+  (the views) and `/run/drv` (the doors, bound into every app) plus the
+  nix daemon's socket directory; the shell, drv-files and the agent
+  `/run/drv` (drv-appd's socket, to name their callers), drv-cast
+  `/run/drv` and `/run/pipewire`; authd and drv-appd nothing. Nobody has any D-Bus: not the system bus
   (`/run/dbus`; the compositor's logind and locale1 watchers fail closed
   and log it), and there is no session bus on the desktop at all. D-Bus
   exists only inside an app with `bus`, on its private daemon.
@@ -106,20 +107,20 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
     gpu          compositor
     compositor   seat, auth, gpu, appd, menu (the poke line to the
                  shell), keys, shell-client, files-client, cast (the
-                 cast line)
+                 cast line), apps (the apps' Wayland listener,
+                 /run/drv/wayland, 0666)
     shell        wayland (its Wayland connection: session-lock and
                  layer-shell), auth, appd (its launch channel), poke (a
                  byte per show-launcher), cast and agent (their
                  questions for the person), listener
-                 (/run/drv-shell/notify.sock, bound by the supervisor,
-                 0666)
+                 (/run/drv/notify.sock, bound by the supervisor, 0666)
     files        wayland (its Wayland connection), fuse (the /dev/fuse
                  end of the documents mount the supervisor made at
-                 --docs, /run/drv-doc), listener
-                 (/run/drv-files/files.sock, 0666)
+                 --docs, /run/drv/doc), listener
+                 (/run/drv/files.sock, 0666)
     cast         compositor (the cast line), shell, listener
-                 (/run/drv-cast/cast.sock, 0666)
-    agent        shell
+                 (/run/drv/cast.sock, 0666)
+    agent        shell, listener (/run/drv/agent, 0666, a stream)
     keys         compositor
     forker       channel
     appd         listener (/run/drv/appd.sock, bound by the supervisor,
@@ -134,11 +135,13 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   member's child put itself in that cgroup before switching user, so no
   CAP_KILL), waits, and starts the whole set again with fresh
   socketpairs. The forker owns `<supervisor cgroup>/apps` (chowned to
-  it; both `cgroup.kill` files stay the supervisor's). The apps'
-  directories (`/run/drv-apps/<uid>`, `/run/drv-apps/tmp/<uid>`,
-  `/var/lib/drv-apps/<uid>`) and the members' (`/run/drv-compositor`,
-  `/run/drv-wayland`, the state directories) are tmpfiles rules, owned
-  by their UID: the supervisor checks owner and mode and makes nothing.
+  it; both `cgroup.kill` files stay the supervisor's). The doors' directory
+  (`/run/drv`, the supervisor's, with `doc` and PipeWire's `audio`), the
+  apps' `/var/lib/drv-apps/<uid>` and the members' directories
+  (`/run/drv-compositor`, the state directories) are tmpfiles rules,
+  owned by their UID: the supervisor checks owner and mode and makes
+  nothing. Every door lives in `/run/drv` and is world-connectable; the
+  gate is on the service's side (the peer UID, drv-appd's answer).
 
 drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid,
                                            setgid, setpcap, sys_admin)
@@ -173,7 +176,7 @@ drv-shell (uid drv-shell; one process, sealed after the first render;
   Cancel; back Yes, Secret, Picked{key}, Cancelled), each naming the
   app and uid; one dialog at a time, the rest queued, "<app> wants to
   <what>" as the header, Escape cancels. Notifications: fd `listener`
-  is `/run/drv-shell/notify.sock`, keyed on the peer UID and drv-appd's
+  is `/run/drv/notify.sock`, keyed on the peer UID and drv-appd's
   name for it (`drv_shell::notify`: Notify{summary, body}, Close{id};
   back Notified{id}); cards at the top right, the manifest name as the
   sender, text clipped at 2 KiB and rendered by the shell itself (the
@@ -184,7 +187,7 @@ drv-shell (uid drv-shell; one process, sealed after the first render;
 
 drv-files (uid drv-files; one process, sealed like the shell with file
            writes allowed; owns the person's files, `--files`)
-  fd `listener`: `/run/drv-files/files.sock`, keyed like the shell's;
+  fd `listener`: `/run/drv/files.sock`, keyed like the shell's;
   `drv_files::wire`: Choose{req, Open | Save{name}} and Cancel{req}
   from the app's shim, one dialog at a time on a layer surface (fd
   `wayland`), "<app> wants to open/save a file" as the header. Choose
@@ -193,18 +196,18 @@ drv-files (uid drv-files; one process, sealed like the shell with file
   Cancel{req} takes a request down unanswered. A pick opens the file
   itself (O_NOFOLLOW, regular files only, created for Save) and files a
   grant {uid, name, fd, write}; the answer is Chosen{req, paths:
-  ["/run/drv-doc/<id>/<name>"]}. fd `fuse`: the documents mount, served
+  ["/run/drv/doc/<id>/<name>"]}. fd `fuse`: the documents mount, served
   in a thread (fuser): the kernel reports the caller's UID on every
   request, a grant's directory and file exist only for that UID (a
   stranger gets ENOENT), reads and writes go through the held fd,
   writes and truncation only on a Save grant. Apps see the mount
-  because `/run/drv-doc` is on their expose list; the forker binds it
-  from the mount the supervisor made before the set started, so a set
+  inside the doors' directory the forker binds into every root, from
+  the mount the supervisor made before the set started, so a set
   restart drops every grant with the apps.
 
 drv-cast (uid drv-cast, group pipewire; one process, not sealed:
           PipeWire loads plugins as it goes)
-  fd `listener`: `/run/drv-cast/cast.sock`, keyed like the shell's;
+  fd `listener`: `/run/drv/cast.sock`, keyed like the shell's;
   `drv_cast::wire` from the app's shim: Cast{req, session, cursor,
   screens, windows, again}, CastRemote{session}, CastClose{session},
   Camera, CameraRemote, CameraPresent, Cancel{req}. Cast asks the
@@ -306,8 +309,7 @@ each fd is a socket with `FD_CLOEXEC`, and unsets the variables;
 listening, `listener(name)` the reverse; `handoff` builds the giving
 side). `forker`: the channel between drv-appd and drv-forker (fd
 `channel`): `Request::Launch(Launch)`, `Launch { uid, argv, env,
-network, gpu, audio, jit, userns, closure, links }`, `Response::{Forked,
-Error}`; `Channel` (a
+network, gpu, nix }`, `Response::{Forked, Error}`; `Channel` (a
 mutex around the socket; one request at a time).
 
 `PolicyClient`: `connect(path)` does the hello now so a missing daemon
@@ -320,7 +322,7 @@ There is no mode without a daemon.
 ## appd.json
 
 ```toml
-wayland-socket = "/run/drv-wayland/wayland"   # every app's WAYLAND_DISPLAY
+wayland-socket = "/run/drv/wayland"           # every app's WAYLAND_DISPLAY
 
 [env]                                          # every app, from the system config
 PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
@@ -377,48 +379,43 @@ an entry (a daemon, a probe) out of the app menu.
   holding `/nix/store` (read-only, nosuid), an empty `/etc` tmpfs of
   the app's own (the linker fills it from a store path built per app by
   the module: passwd and group for its own UID, nsswitch, hosts,
-  machine-id, localtime, CA bundle, `resolv.conf` linking to
-  `/run/host/resolv.conf` where the forker bound the host's live one
-  for `network` apps, plus the `services.drv.etc` entries of the
-  host's), `/dev` and `/sys` (the
+  machine-id, localtime, CA bundle, plus the `services.drv.etc` entries
+  of the host's; `resolv.conf` is a copy of the host's live one, from
+  the fd the forker hands a `network` app), `/dev` and `/sys` (the
   host's generated views under `/run/drv-host`, written by
   `drv-host-views.service` at boot: basic nodes and the CPU topology;
   gpu apps also get the render nodes and their device directories), a
   fresh tmpfs on `/dev/shm` (noexec), `/proc` with
-  `subset=pid,hidepid=invisible` of the app's own PID namespace, its
-  `/tmp` from `/run/drv-apps/tmp/<uid>` (kept between launches, noexec),
-  and `/run` holding only what the app's features mean, a fixed table in
-  the forker: its own runtime directory, the documents mount, the appd,
-  Wayland, drv-files, drv-cast and drv-shell socket directories and
-  `opengl-driver` for every app, `/run/drv-audio` and `/run/drv-pulse`
-  for `audio`. No host
-  `/etc`, `/var`, `/home`, `/run/current-system`. HOME is `/home/app`,
-  a 256M tmpfs of the run, with `/var/lib/drv-apps/<uid>` bound at
-  `.state` inside it. The
-  Landlock ruleset: read and execute on the closure of the manifest's
-  command, `/etc`, the data profile and the graphics drivers (from
-  `closureInfo`, sent inline as store paths; the forker checks each is
-  `/nix/store/<one entry>` by syntax, nothing more); read on `/sys`,
-  `/run/host` and the read-only `/run` entries; read and write on
-  `/proc`; read, write and ioctl on `/dev`; everything on `/etc`, HOME,
-  `/tmp`, its runtime directory and the documents mount, everything but
-  execute on `/dev/shm`; abstract sockets and signals scoped to the app.
-  The request is the parsed manifest (UID, argv, env, `network`, `gpu`,
-  `audio`, `jit`, `userns`, closure, links): the forker's one check is the UID range; every value is
-  consumed by construction (a closure entry is a Landlock rule, no
-  more), and argv, env and the closure are read only once the process
-  is the app. The child locks the securebits before the request, switches
-  UID, drops its capabilities, restricts itself with the ruleset, puts
-  on the seccomp denylist (no executable memfd, no io_uring, no user
-  namespace unless the manifest says `userns`), refuses
-  writable-then-executable memory unless the manifest says `jit`, and
-  execs the command as PID 1 of the app's PID namespace (IPC, UTS and
-  cgroup namespaces are its own too). The module puts
-  `drv-init` in front of every app's command: as the app, it
-  fills `/etc` from the store, makes the `state` directories under
-  `.state`, links them from HOME, links the `files` defaults from the
-  store, forks the rest and stays as its init: reaps, forwards signals,
-  exits with the app's status. No system D-Bus, no services' bus, no
+  `subset=pid,hidepid=invisible` of the app's own PID namespace,
+  `/run/drv` (the doors, read-only, the documents mount writable
+  inside), the nix daemon's socket directory for `nix`, and `/state`
+  from `/var/lib/drv-apps/<uid>`; the root itself is a tmpfs the app
+  owns (noexec, size-capped), of the run. No host `/etc`, `/var`,
+  `/home`, `/run/current-system`. The request is the parsed manifest
+  (UID, argv, env, `network`, `gpu`, `nix`): the forker's one check is
+  the UID range; every value is consumed by construction, and argv and
+  env are read only once the process is the app. The child locks the
+  securebits before the request, mounts as the app's effective UID
+  (so what it makes is the app's), switches UID, drops its capabilities
+  and execs the command as PID 1 of the app's PID namespace (IPC, UTS
+  and cgroup namespaces are its own too). The module puts `drv-init` in
+  front of every app's command, with what it needs as arguments: as the
+  app, it makes `/tmp`, `/etc` (linked from the store, `resolv.conf`
+  copied from the forker's fd), `/run/app` (`XDG_RUNTIME_DIR`), the
+  links into the store (`/bin/sh`, `/usr/bin/env`, `/run/opengl-driver`,
+  the manifest's `links`), HOME (`home = "run"`: `/home/app`, with the
+  `state` directories under `/state` linked from it; `"persist"`:
+  `/state` itself) with the `files` defaults linked from the store; then
+  the Landlock ruleset: read and execute on the closure of the manifest's
+  command, `/etc`, the data profile and the links' targets (from
+  `closureInfo`; the whole store for `nix`); read on `/sys` and `/run`;
+  read and write on `/proc`; read, write and ioctl on `/dev`; everything
+  on `/etc`, HOME, `/tmp`, `/run/app`, `/state` and the documents mount,
+  everything but execute on `/dev/shm`; abstract sockets and signals
+  scoped to the app. Then the seccomp denylist (no executable memfd, no
+  io_uring, no user namespace unless the manifest says `userns`), MDWE
+  unless the manifest says `jit`, fork, and it stays as the app's init:
+  reaps, forwards signals, exits with the app's status. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   except for a `userns` app (the browser). Apps without `network = true` also get a new, empty network
   namespace.
@@ -429,10 +426,10 @@ an entry (a daemon, a probe) out of the app menu.
   `apps/cgroup.kill` and restarts everything, and autostart brings the
   apps back.
 - Audio is a manifest flag, `audio = true`: PipeWire runs system-wide,
-  and such an app gets the apps' socket (`/run/drv-audio/apps`; the
+  and such an app gets the apps' socket (`/run/drv/audio/apps`; the
   daemon tags every connection through it `pipewire.access = "drv-app"`
   with the uid it saw) and its own `pipewire-pulse` on it
-  (`/run/drv-pulse/<app>`), nothing else. What a tagged client sees
+  (`/run/drv/pulse/<app>`), nothing else. What a tagged client sees
   and may do is `nix/drv-access.lua` in WirePlumber: play and list
   devices freely, nothing of another app's, capture only under a
   grant. A capture stream (audio, sink monitors included, is "mic";
@@ -445,17 +442,19 @@ an entry (a daemon, a probe) out of the app menu.
   way: `org.freedesktop.portal.Camera.AccessCamera` asks the same
   question, and `OpenPipeWireRemote` hands out a connection that sees
   every camera node (browsers use that, not V4L2).
-- The compositor listens on `$DRV_APPS_SOCKET` (`/run/drv-wayland/wayland`,
-  mode 0666) besides its own runtime directory. Anyone local may connect;
-  the policy decides what they get, as with Android's binder services.
+- The compositor serves the apps' Wayland socket the supervisor bound
+  (`/run/drv/wayland`, mode 0666, fd `apps`; `$DRV_APPS_SOCKET` names a
+  path to bind without a supervisor) besides its own runtime directory.
+  Anyone local may connect; the policy decides what they get, as with
+  Android's binder services.
 - `spawn-sh` and `spawn-at-startup` are disabled: a shell string is not
   an app name, and what starts with the desktop is `autostart` in the
   manifest, not the compositor's config.
 - Desktop services (notifications and portals) are the set's own
   services, each on a socket the supervisor bound (mode 0666) and
-  handed over as fd `listener`: drv-files (`/run/drv-files/files.sock`),
-  drv-cast (`/run/drv-cast/cast.sock`), drv-shell
-  (`/run/drv-shell/notify.sock`). Every connection is keyed on
+  handed over as fd `listener`: drv-files (`/run/drv/files.sock`),
+  drv-cast (`/run/drv/cast.sock`), drv-shell (`/run/drv/notify.sock`),
+  drv-agent (`/run/drv/agent`). Every connection is keyed on
   `SO_PEERCRED` plus drv-appd's answer for that UID
   (`drv_policy::door`), unknown UIDs are refused at accept, and what
   the human sees is the manifest name. There is no bus between apps and
@@ -467,8 +466,8 @@ an entry (a daemon, a probe) out of the app menu.
 - The ssh agent is a member, not an app: `drv-agent serve` runs OpenSSH's
   `ssh-agent` as uid drv-agent (the authenticators' hidraw nodes are that
   group's by udev rule, `/run/udev` exposed for libfido2) on a socket in
-  its private `/tmp`, and fronts it on `/run/drv-agent/agent`, which every
-  app's root holds. Each connection is checked on `SO_PEERCRED` plus
+  its private `/tmp`, and fronts it on `/run/drv/agent` (fd `listener`,
+  bound by the supervisor), which every app's root holds. Each connection is checked on `SO_PEERCRED` plus
   drv-appd's record for the UID (`AppPolicy.agent`, the manifest's
   `agent = true`; those apps get `SSH_AUTH_SOCK`) and refused at accept
   otherwise; ssh-agent itself would refuse every foreign uid. The
@@ -554,7 +553,7 @@ an entry (a daemon, a probe) out of the app menu.
   the shim, which asks drv-files over its socket (`drv_files::wire`;
   drv-files names the app from the socket's UID), hands the handle back
   at once and emits the `Response` signal (`uris` as
-  `file:///run/drv-doc/<id>/<name>`) when the person has picked;
+  `file:///run/drv/doc/<id>/<name>`) when the person has picked;
   `Request.Close` cancels at drv-files. `directory` and
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
@@ -569,10 +568,10 @@ an entry (a daemon, a probe) out of the app menu.
   for a scheme some app declares; one handler per scheme. No prompt:
   the handler is what the manifest says it is. `writable`, `ask` and
   the parent window are ignored; `OpenFile` and `OpenDirectory` are
-  not offered. The forker binds an app's `/tmp` from
-  `/run/drv-apps/tmp/<uid>` (kept between launches, gone with the boot) so a second
-  launch reaches the first one's single-instance socket instead of
-  fighting it over the profile.
+  not offered. An app's `/tmp` is of the run, so a browser that keeps
+  its single-instance socket under `TMPDIR` points that at a `state`
+  directory in its manifest: a second launch then reaches the first
+  one's socket instead of fighting it over the profile.
 - No other portal. `org.freedesktop.portal.Settings` (version 2:
   `Read`, `ReadOne`, `ReadAll`) the shim answers itself with the one
   look every app gets (`org.freedesktop.appearance`: `color-scheme` 1,
