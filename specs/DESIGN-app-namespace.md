@@ -131,7 +131,9 @@ the app's domain.
 The forker forks before it looks at the request. The parent is one
 thread that receives a datagram, clones a child into PID, IPC and UTS
 namespaces of its own, and reaps; it never decodes anything. The child
-builds the root in order of what it needs:
+builds the root in order of what it needs, with the primitive every
+process of the system gets its root from (`drv_os::root`: the supervisor
+builds the trusted set's roots with it too, from a different list):
 
 1. With no input: handles on everything of the host's it might place
    (the network namespace, the cgroup, detached clones of the store, the

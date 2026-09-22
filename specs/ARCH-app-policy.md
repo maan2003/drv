@@ -61,12 +61,17 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   (drv-bridge, uid drv-bridge) as their users, from its own
   command line; takes input from nobody. A non-root service keeps only
   the capabilities listed for it (`--seatd-cap`, `--forker-cap`),
-  ambient, as its whole bounding set. Every member gets a sandbox on the
-  host root (`drv_os::sandbox::Sandbox`): a private mount namespace,
-  fresh `/tmp` and `/dev/shm`, `/proc` with hidepid, a read-only `/run`
-  holding only its `--<member>-expose` entries, and an empty network
-  namespace (the forker keeps the host's: apps with `network` get it
-  from there). Apps get a root of their own instead (below). Today: seatd `/run/udev`; the compositor
+  ambient, as its whole bounding set. Every member gets a root of its own,
+  built by the same primitive as an app's (`drv_os::root`: a fresh tmpfs
+  pivoted in, detached clones attached inside, the host's root detached):
+  the store, the real `/dev` and `/sys` (the cgroup tree writable for the
+  forker only), the host's `/etc` read-only, fresh `/tmp`, `/dev/shm` and
+  `/proc` with hidepid, under `/run` only its `--<member>-expose` entries,
+  its `--<member>-dir` directories, nothing else of the host's, and an
+  empty network namespace (the forker keeps the host's: apps with
+  `network` get it from there). The credential switch is shared too
+  (`drv_os::creds`). `nix/kernel-state.sh` checks a member the way it
+  checks an app. Apps' roots differ in content, not in kind (below). Today: seatd `/run/udev`; the compositor
   `/run/udev` (libinput), its runtime and apps socket directories,
   `/run/drv`, the session bus and `/run/pipewire`; the GPU process
   `/run/opengl-driver`; the forker `/run/drv-apps` plus everything an
