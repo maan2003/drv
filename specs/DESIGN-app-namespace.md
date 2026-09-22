@@ -80,7 +80,8 @@ render node's device directory and its bus ancestors copied from a fixed
 name list (`uevent`, `subsystem`, `vendor`, `device`, and for a platform
 GPU `of_node/compatible`) plus the cpu topology; `sys/`, the cpu topology
 alone; `dev/`, the nodes made by mknod: `null`, `zero`, `full`, `random`,
-`urandom`, `fd`; `dev-gpu/dri/`, the render nodes. The forker binds
+`urandom`, `tty`, `fd`, `ptmx` (a link to `pts/ptmx`: the forker mounts a devpts
+instance of the app's own at `pts`); `dev-gpu/dri/`, the render nodes. The forker binds
 `sys-gpu` and `dev-gpu/dri` for gpu apps only, `sys` and `dev` for
 everyone, read-only. Nothing hardware-specific is written by Nix, the forker never
 reads sysfs, and the app sees a copy, so nothing it learns is live.
@@ -149,7 +150,8 @@ builds the trusted set's roots with it too, from a different list):
    depends on it. `network` rejoins the host's namespace through the
    handle; `gpu` picks the views; `audio` adds its sockets; `/etc`, HOME,
    `/tmp` and the runtime directory are mounted for the UID, the last
-   three cloned through the parents' handles. The handles are closed,
+   three cloned through the parents' handles; the `links` (`/bin/sh`
+   into the store) are made. The handles are closed,
    the old root detached, the root goes read-only, the cgroup is joined
    and a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
 3. The switch: its own group and nothing else, `setresgid`,

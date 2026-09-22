@@ -250,7 +250,7 @@ each fd is a socket with `FD_CLOEXEC`, and unsets the variables;
 listening, `listener(name)` the reverse; `handoff` builds the giving
 side). `forker`: the channel between drv-appd and drv-forker (fd
 `channel`): `Request::Launch(Launch)`, `Launch { uid, argv, env,
-network, gpu, audio, jit, userns, closure }`, `Response::{Forked,
+network, gpu, audio, jit, userns, closure, links }`, `Response::{Forked,
 Error}`; `Channel` (a
 mutex around the socket; one request at a time).
 
@@ -347,7 +347,7 @@ an entry (a daemon, a probe) out of the app menu.
   `/tmp`, its runtime directory and the documents mount, everything but
   execute on `/dev/shm`; abstract sockets and signals scoped to the app.
   The request is the parsed manifest (UID, argv, env, `network`, `gpu`,
-  `audio`, `jit`, `userns`, closure): the forker's one check is the UID range; every value is
+  `audio`, `jit`, `userns`, closure, links): the forker's one check is the UID range; every value is
   consumed by construction (a closure entry is a Landlock rule, no
   more), and argv, env and the closure are read only once the process
   is the app. The child locks the securebits before the request, switches
