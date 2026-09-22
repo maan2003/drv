@@ -9,7 +9,8 @@ only, nothing shares a UID, and there is no "trusted" flag: what a
 process may do is its globals and grants. Crates: `drv-policy` (types,
 the SEQPACKET transport `seq`, the forker channel, the compositor
 client), `drv-supervisor` (starts the set with its sockets already made,
-restarts it whole when anything dies), `drv-appd` (the launcher for untrusted things, plus
+restarts it whole when anything dies, and gives up after five deaths in a
+minute: every start takes the VT), `drv-appd` (the launcher for untrusted things, plus
 the `drv` CLI), `drv-forker` (drv-appd's privileged helper: the sandbox
 and the fork), `drv-os` (uid/gid lookups, the named startup fds `fds`, seccomp,
 directory helpers),
