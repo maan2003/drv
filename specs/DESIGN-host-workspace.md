@@ -2,8 +2,8 @@
 
 ## Status
 
-Agreed and implemented 2026-09 (niri `policy`: `drv-supervisor` `--host-*`,
-the compositor's host listener and `match app=`; the nixos repo's module
+Agreed and implemented 2026-09 (niri `policy`: `drv-supervisor` `--host-*`
+and the compositor's `match app=`; the nixos repo's module
 `services.drv.host`). Refines [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md)
 for the one thing that is not an app: administering the host from the desktop.
 Details of the set are in [ARCH-app-policy](ARCH-app-policy.md).
@@ -26,16 +26,17 @@ credential; polkit cannot tell the host user apart from an app user for
 The host workspace is a member of the supervisor's set, not an app. The
 supervisor forks one terminal as the person's own account (`--host-user`),
 on the host's own root: no namespaces, no root of its own, the real home, the
-real system bus, so `run0` in it is plain `run0`. drv-appd never hears of it;
-it has no record, no `/run/drv` doors and no drv agent socket. It is a
+real system bus, so `run0` in it is plain `run0`. drv-appd knows its UID by
+name and can do nothing with it; it has no drv agent unless the record says so. It is a
 "better VT switch": the person's session is a workspace instead of a console.
 
-Its Wayland connection is its own socket (`/run/drv/host.sock`, mode 0600,
-owned by the person), which the compositor serves apart from the apps'
-socket: every connection on it must carry the person's UID (the supervisor
-tells the compositor which, `DRV_HOST_UID`) and gets the `host` policy, an
-ordinary GPU client with the clipboard and nothing privileged. No lookup, so
-no way for a manifest to become `host`. Window rules can match on the policy
+Its Wayland connection is the apps' socket. drv-appd's manifest has a record
+for the person's UID named `host`, with `gpu` and no exec, emitted by the
+module from `services.drv.host`: the compositor learns the name the way it
+learns every client's, and every door keys on the same record, so
+notifications and the chooser work from the terminal. Nothing can launch it:
+the record has no exec, and the forker refuses any UID outside the app range.
+Window rules can match on the policy
 name (`match app="host"`, never client-supplied), and the module pins those
 windows to a named workspace `host`. A configured bind on Ctrl+Alt+F1 wins
 over the hardcoded VT switch and focuses that workspace; nothing else can
