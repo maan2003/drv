@@ -41,9 +41,11 @@ desktop comes back. The same two scripts (`VM_BACKEND=m2`) run against a
 crosvm guest on an Apple M2 (`nix/m2-vm.nix`, `nix/m2-vm-run.sh`), where
 the GPU process drives the real Asahi GPU through a virtio-gpu native
 context and the screen is a window on a headless host compositor served
-over noVNC. The NixOS module `nix/module.nix` (`services.drv`, flake
-output `nixosModules.default`) turns one app list into passwd entries,
-`appd.json` and the units.
+over noVNC. The NixOS module (`services.drv`) lives in the nixos repo at
+`config/system/drv/module.nix`, next to the m2sh manifests; it turns one
+app list into passwd entries, `appd.json` and the units. The nixos repo
+takes the binaries prebuilt and has no niri flake input; this repo's
+development VMs import the module from the nixos repo.
 Implements the "identity and policy" part of
 [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md); sits beside
 [ARCH-gpu-process-split](ARCH-gpu-process-split.md).
