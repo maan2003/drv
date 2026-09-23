@@ -43,8 +43,9 @@ client's toplevels out of the layout altogether: they live in the host
 overlay, drawn fullscreen over the workspaces and under the lock, the way
 the lock screen is a layer and not a window. The `toggle-host` action shows
 and hides it; while shown it holds the keyboard and the pointer, so the
-shell's menu and notifications wait. A configured bind on Ctrl+Alt+F1 wins
-over the hardcoded VT switch; nothing else can launch or show it. Locking
+shell's menu and notifications wait. A bind (Mod+Grave, the drop-down
+terminal key; Ctrl-Alt-Fn stay VT switches) shows it; nothing else can launch
+or show it. Locking
 hides it. (A workspace was tried first: named workspaces sort first in niri,
 and a workspace is one more thing to scroll past.)
 
