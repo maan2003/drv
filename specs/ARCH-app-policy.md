@@ -30,7 +30,10 @@ keys: volume through PipeWire, backlight through sysfs, on the
 compositor's word), supervisor services without a window. Every service
 that apps reach (`drv-files`, `drv-cast`, `drv-shell`, `drv-agent`) keys
 each connection on the peer UID and drv-appd's record for it
-(`drv_policy::door`); there is no proxy between an app and a service. Names are in [CONTEXT.md](../CONTEXT.md).
+(`drv_policy::door`); there is no proxy between an app and a service. The
+one member that is not a service and not an app is the host workspace
+([DESIGN-host-workspace](DESIGN-host-workspace.md)): the person's own
+terminal, started by the supervisor as their account. Names are in [CONTEXT.md](../CONTEXT.md).
 Builds, passes tests, and runs
 end to end in the KVM dev VM (`nix/dev-vm.nix`, `nix/dev-vm-run.sh` in
 the fork); `nix/smoke.sh` drives a fresh boot through unlock, the

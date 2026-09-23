@@ -17,7 +17,8 @@ intent. Details (exact protocols, ioctls, daemon splits) belong in ARCH
 specs.
 
 Part of the desktop layer of [ARCH-drv](ARCH-drv.md); applies
-[REQ-isolation](REQ-isolation.md) to the GUI.
+[REQ-isolation](REQ-isolation.md) to the GUI. Administering the host from the
+desktop is [DESIGN-host-workspace](DESIGN-host-workspace.md).
 
 ## Core idea
 
