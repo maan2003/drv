@@ -27,7 +27,8 @@ The host workspace is a member of the supervisor's set, not an app. The
 supervisor forks one terminal as the person's own account (`--host-user`),
 on the host's own root: no namespaces, no root of its own, the real home, the
 real system bus, so `run0` in it is plain `run0`. drv-appd knows its UID by
-name and can do nothing with it; it has no drv agent unless the record says so. It is a
+name and can do nothing with it; the record grants it the drv agent, so ssh
+from it uses the same keys as the apps that have `agent`. It is a
 "better VT switch": the person's session is a workspace instead of a console.
 
 Its Wayland connection is the apps' socket. drv-appd's manifest has a record
@@ -36,6 +37,7 @@ module from `services.drv.host`: the compositor learns the name the way it
 learns every client's, and every door keys on the same record, so
 notifications and the chooser work from the terminal. Nothing can launch it:
 the record has no exec, and the forker refuses any UID outside the app range.
+The record says `agent`: `SSH_AUTH_SOCK` in the terminal is drv-agent's door.
 Window rules can match on the policy
 name (`match app="host"`, never client-supplied), and the module pins those
 windows to a named workspace `host`. A configured bind on Ctrl+Alt+F1 wins
