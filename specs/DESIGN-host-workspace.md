@@ -2,9 +2,9 @@
 
 ## Status
 
-Agreed and implemented 2026-09 (niri `policy`: `drv-supervisor` `--host-*`
-and the compositor's `HostOverlay` with the `toggle-host` action; the nixos
-repo's module `services.drv.host`). Refines [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md)
+Agreed and implemented 2026-09 (niri `policy`: the compositor's
+`HostOverlay` with the `toggle-host` action; the nixos repo's module
+`services.drv.host`, which makes `drv-host.service`). Refines [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md)
 for the one thing that is not an app: administering the host from the desktop.
 Details of the set are in [ARCH-app-policy](ARCH-app-policy.md).
 
@@ -23,10 +23,15 @@ credential; polkit cannot tell the host user apart from an app user for
 
 ## Core idea
 
-The host workspace is a member of the supervisor's set, not an app. The
-supervisor forks one terminal as the person's own account (`--host-user`),
-on the host's own root: no namespaces, no root of its own, the real home, the
-real system bus, so `run0` in it is plain `run0`. drv-appd knows its UID by
+The host workspace is a service of the host's own, not an app and not a
+member of the supervisor's set. systemd starts one terminal as the person's
+own account with `PAMName=`, so pam_systemd registers a logind session for it:
+the real home, the real system bus, and a session polkit can find, so `run0`
+in it is plain `run0` (its agent registers with polkit, which refuses a
+process it cannot map to a session; the supervisor's children are in none,
+which is why the first version, a terminal forked by the supervisor, could
+not run0). No new privileges all the same: run0 asks polkit, it does not
+setuid; sudo is not a goal. drv-appd knows its UID by
 name and can do nothing with it; the record grants it the drv agent, so ssh
 from it uses the same keys as the apps that have `agent`. It is a
 "better VT switch": the person's session is an overlay instead of a console.
@@ -52,9 +57,7 @@ and a workspace is one more thing to scroll past.)
 The terminal is outside the set's group: the set's cgroup kill does not reach
 it, so a compositor restart does not kill a `nixos-rebuild` in progress.
 When the compositor goes its Wayland connection dies and the terminal exits
-as any terminal would; the supervisor starts a fresh one with the next set,
-and restarts it alone when the person closes it (five starts a minute at
-most).
+as any terminal would; the unit restarts it (five starts a minute at most).
 
 ## Non-goals
 
