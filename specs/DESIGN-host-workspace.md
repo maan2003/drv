@@ -24,11 +24,13 @@ credential; polkit cannot tell the host user apart from an app user for
 ## Core idea
 
 The host workspace is a service of the host's own, not an app and not a
-member of the supervisor's set. systemd starts one terminal as the person's
-own account with `PAMName=`, through the person's login shell (`-l -c`, so
-the environment is the login's own), and pam_systemd registers a logind
-session for it:
-the real home, the real system bus, and a session polkit can find, so `run0`
+member of the supervisor's set. systemd starts one terminal as `drv-admin`,
+an account of its own (a fresh home under `/var/lib`, wheel, the person's
+password file) rather than the person's: nothing of theirs (profile, agents,
+dotfiles) is in play, and the desktop owns everything the terminal sees. It
+starts with `PAMName=` through a login shell (`-l -c`, so the environment is
+a login's), and pam_systemd registers a logind session for it:
+its own home, the real system bus, and a session polkit can find, so `run0`
 in it is plain `run0` (its agent registers with polkit, which refuses a
 process it cannot map to a session; the supervisor's children are in none,
 which is why the first version, a terminal forked by the supervisor, could
@@ -36,10 +38,10 @@ not run0). No new privileges all the same: run0 asks polkit, it does not
 setuid; sudo is not a goal. drv-appd knows its UID by
 name and can do nothing with it; the record grants it the drv agent, so ssh
 from it uses the same keys as the apps that have `agent`. It is a
-"better VT switch": the person's session is an overlay instead of a console.
+"better VT switch": an admin console as an overlay instead of a VT.
 
 Its Wayland connection is the apps' socket. drv-appd's manifest has a record
-for the person's UID named `host`, with `gpu` and no exec, emitted by the
+for drv-admin's UID named `host`, with `gpu` and no exec, emitted by the
 module from `services.drv.host`: the compositor learns the name the way it
 learns every client's, and every door keys on the same record, so
 notifications and the chooser work from the terminal. Nothing can launch it:
