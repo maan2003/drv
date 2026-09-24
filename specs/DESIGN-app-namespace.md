@@ -58,7 +58,8 @@ in the namespace; every other mount is noexec.
 
 The app's configuration is store paths too: its `/etc` (a derivation built
 from the manifest: a one-line passwd, nsswitch, localtime, CA certificates,
-fonts, drirc and the GL and Vulkan loader directories, resolv.conf only
+a fontconfig of the desktop's own fonts and default families, drirc and
+the GL and Vulkan loader directories, resolv.conf only
 when the app has the network, a machine-id derived from the app's name so
 no two apps share one and none has the host's) and its HOME defaults (a
 tree of files linked into HOME at launch).
