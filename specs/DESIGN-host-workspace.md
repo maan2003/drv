@@ -25,7 +25,9 @@ credential; polkit cannot tell the host user apart from an app user for
 
 The host workspace is a service of the host's own, not an app and not a
 member of the supervisor's set. systemd starts one terminal as the person's
-own account with `PAMName=`, so pam_systemd registers a logind session for it:
+own account with `PAMName=`, through the person's login shell (`-l -c`, so
+the environment is the login's own), and pam_systemd registers a logind
+session for it:
 the real home, the real system bus, and a session polkit can find, so `run0`
 in it is plain `run0` (its agent registers with polkit, which refuses a
 process it cannot map to a session; the supervisor's children are in none,
