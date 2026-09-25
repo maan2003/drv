@@ -215,7 +215,7 @@ drv-cast (uid drv-cast, group pipewire; one process, not sealed:
   fd `listener`: `/run/drv/cast.sock`, keyed like the shell's;
   `drv_cast::wire` from the app's shim: Cast{req, session, cursor,
   screens, windows, again}, CastRemote{session}, CastClose{session},
-  CameraRemote, CameraPresent, Cancel{req}. Cast asks the
+  CameraPresent, Cancel{req}. Cast asks the
   compositor (fd `compositor`, `drv_cast::compositor`) for Outputs and
   Windows and the person at the shell (fd `shell`, Pick: "see your
   screen"; a window shows its app's manifest name first, its own title
@@ -225,9 +225,9 @@ drv-cast (uid drv-cast, group pipewire; one process, not sealed:
   and the camera are asked (Confirm, "use your camera") when
   WirePlumber's `drv-access` metadata reports a capture stream
   (`request:<uid>:<kind>`), and a yes writes `grant:<uid>`. Devices
-  {mic, camera} go down the compositor line for its indicator. Remotes
-  (CastRemote, CameraRemote) are PipeWire connections cut down to the
-  one node or the cameras and sent as fds. Revoke from the compositor
+  {mic, camera} go down the compositor line for its indicator. A cast's
+  remote (CastRemote) is a PipeWire connection cut down to the one node,
+  sent as an fd. Revoke from the compositor
   (Mod+Shift+Esc, locking) ends every cast and grant.
 
 drv-seatd (uid drv-seat: groups video, input, tty; CAP_SYS_TTY_CONFIG)
@@ -445,11 +445,12 @@ an entry (a daemon, a probe) out of the app menu.
   the person revokes everything with Mod+Shift+Esc, which destroys the
   streams and disconnects camera remotes. Cameras also come the portal
   way: `org.freedesktop.portal.Camera.AccessCamera` is granted without
-  a question and `OpenPipeWireRemote` hands out a connection that sees
-  every camera node (browsers use that, not V4L2), because Chromium
-  asks for access to list the cameras at the first page that enumerates
-  devices, not when one captures; a remote's stream is gated like any
-  capture, so the question comes when a page captures.
+  a question, because Chromium asks for access to list the cameras at
+  the first page that enumerates devices, not when one captures; and
+  `OpenPipeWireRemote` is the shim's own connection to the apps' socket
+  (browsers use that, not V4L2), a tagged client like any, so the
+  question comes when a page captures. An app without `audio` has no
+  socket and no camera.
 - The compositor serves the apps' Wayland socket the supervisor bound
   (`/run/drv/wayland`, mode 0666, fd `apps`; `$DRV_APPS_SOCKET` names a
   path to bind without a supervisor) besides its own runtime directory.
@@ -497,8 +498,7 @@ an entry (a daemon, a probe) out of the app menu.
   `Response` and `Closed` signals, the in-place answers) and speaks the
   services' wires: postcard over SEQPACKET, a fixed set of small
   variants per service (`drv_files::wire`: Choose, Cancel;
-  `drv_cast::wire`: Cast, CastRemote, CastClose, Camera, CameraRemote,
-  CameraPresent, Cancel; `drv_shell::notify`: Notify, Close), texts
+  `drv_cast::wire`: Cast, CastRemote, CastClose, CameraPresent, Cancel; `drv_shell::notify`: Notify, Close), texts
   clipped at 2 KiB by the receiver, file descriptors only from service
   to shim. No service parses D-Bus. The shim is compatibility, not a
   boundary: it runs as the app and can lie, and everything it says is
@@ -538,7 +538,7 @@ an entry (a daemon, a probe) out of the app menu.
   app's, and would join a stream from the remote to a default source
   the remote cannot see, so before replying drv-cast marks the remote
   in its `drv-access` metadata under the client id (`drv.remote`:
-  `node:<id>` for a cast, `camera:<uid>` for cameras), and the script lets a
+  `node:<id>` for a cast), and the script lets a
   marked client's streams reach that only, destroying any other. The
   mark goes when the client does, and a cast's remotes are disconnected
   when the cast ends. WirePlumber would hand every new
