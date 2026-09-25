@@ -191,7 +191,9 @@ and while the request is being decoded the process holds SYS_ADMIN,
 SETUID and SETGID with the state directories' parent in hand and nothing
 else of the host's: what a bug there could reach is another app UID's
 state, not the host. The request is the manifest, parsed: UID, argv,
-env, the booleans `network`, `gpu`, `nix`. What each boolean means on
+env, the booleans `network`, `gpu`, `nix`, and `folders` (names under
+the person's files, each cloned and idmapped so drv-files' uid is the
+app's inside, mounted at `/files/<name>`). What each boolean means on
 this host is a fixed table in the forker, definition rather than policy,
 reviewable in one place. The forker never reads a file or lists a
 directory to decide anything, and makes or chowns nothing on the host:
@@ -200,8 +202,9 @@ UID; what it makes in the app's root it makes as the app.
 
 Everything the app can do for itself is drv-init's, which the module
 puts in front of every app's command with everything it needs on the
-command line (`--etc`, `--state`, `--files`, `--home`, `--closure`,
-`--link`, `--jit`, `--userns`, `--nix`, `--resolv`): a small unprivileged
+command line (`--etc`, `--state`, `--files`, `--folder`, `--home`,
+`--closure`, `--link`, `--jit`, `--userns`, `--nix`, `--resolv`,
+`--restart`): a small unprivileged
 program from the set's own package, run as the app inside the root the
 forker left, and PID 1 of the app's namespace for as long as the app
 runs. It makes `/tmp`, `/etc` (one link per entry of the Nix-built
@@ -233,7 +236,10 @@ and are launched by nothing but drv-appd.
 
 `services.drv.apps.<name>` gains: `etc` and `files` (attribute sets that
 become store paths), `state` (paths under HOME that persist), `home`
-(`run` or `persist`), `nix`, `closure` (derived from `exec`), and later
+(`run` or `persist`), `nix`, `folders` (directories of the person's
+files the app owns inside, [NOTES-file-ownership](NOTES-file-ownership.md)),
+`restart` (a daemon: drv-init starts it again when it exits), `closure`
+(derived from `exec`), and later
 `links` (apps sharing a runtime directory) and a `launch:<app>` grant. `gpu` comes to mean the render
 node plus the sys view, with no group: the host's view makes the node
 openable by anyone, which is what render nodes are for. `network`,

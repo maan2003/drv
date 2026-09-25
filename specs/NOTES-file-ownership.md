@@ -15,8 +15,18 @@ The first shape below: drv-files owns the tree (`services.drv.files`,
 its own chooser, and serves one file per consent to one UID through the
 documents mount `/run/drv/doc` (FUSE, served by drv-files, mounted by
 the supervisor). Open grants are read-only, Save grants writable; a set
-restart drops them all. Not built: directory grants, static slices for
-media apps, the file manager, sync and backup, what "delete" means.
+restart drops them all.
+
+Second slice (2026-09): the static slice, as the manifest's `folders`.
+A directory of the tree named there is bound into the app's root by the
+forker as an idmapped mount (`/files/<name>`, linked from `~/<name>`):
+inside, the app owns it; on disk it stays drv-files', so the chooser and
+a syncthing running as an app with the same folder see the same files.
+This is how a browser gets `Downloads`, a password manager `Passwords`,
+a games home `Games`, and how syncthing (an app with `restart`, no
+window) syncs `Personal` and `Passwords`. Not built: persistable
+chooser grants, directory grants, app-published directories, the file
+manager, send-to-app, what "delete" means.
 
 ## Direction (as it was)
 
