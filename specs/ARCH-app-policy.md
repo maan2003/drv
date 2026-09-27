@@ -205,7 +205,12 @@ drv-files (uid drv-files; one process, sealed like the shell with file
   in a thread (fuser): the kernel reports the caller's UID on every
   request, a grant's directory and file exist only for that UID (a
   stranger gets ENOENT), reads and writes go through the held fd,
-  writes and truncation only on a Save grant. Apps see the mount
+  writes and truncation only on a Save grant. A Save grant's directory
+  also takes files of the app's own under other names (a download's
+  `.crdownload`): scratch, O_TMPFILE in the document's directory on
+  disk, gone with the grant; renaming one onto the document copies its
+  contents into the document in place. The document itself cannot be
+  unlinked or renamed. Apps see the mount
   inside the doors' directory the forker binds into every root, from
   the mount the supervisor made before the set started, so a set
   restart drops every grant with the apps.
