@@ -25,10 +25,12 @@ notifications) and `drv-files` (the file chooser and the documents
 mount), supervisor services on `drv-ui`; `drv-cast` (screencasts,
 cameras and microphones: consent at the shell, the compositor's streams,
 PipeWire remotes), `drv-agent` (OpenSSH's ssh-agent behind a door that
-admits the UIDs whose manifest says `agent`) and `drv-keys` (the media
+admits the UIDs whose manifest says `agent`), `drv-fido` (WebAuthn on the
+security key for the origins the manifest lists under `fido`) and `drv-keys` (the media
 keys: volume through PipeWire, backlight through sysfs, on the
 compositor's word), supervisor services without a window. Every service
-that apps reach (`drv-files`, `drv-cast`, `drv-shell`, `drv-agent`) keys
+that apps reach (`drv-files`, `drv-cast`, `drv-shell`, `drv-agent`,
+`drv-fido`) keys
 each connection on the peer UID and drv-appd's record for it
 (`drv_policy::door`); there is no proxy between an app and a service. The
 one member that is not a service and not an app is the host workspace
@@ -76,7 +78,8 @@ drv-supervisor (the systemd unit; uid drv-supervisor with CAP_SETUID, SETGID,
   because it serves the documents mount, which anything touching
   `/run/drv/doc` blocks on), drv-forker (uid drv-forker), drv-appd, the
   shell (drv-shell, uid drv-shell), drv-cast (uid drv-cast, group
-  pipewire), the ssh agent (drv-agent, uid drv-agent) and the media keys
+  pipewire), the ssh agent (drv-agent, uid drv-agent), the FIDO door
+  (drv-fido, uid drv-fido) and the media keys
   (drv-keys, uid drv-keys, groups pipewire and video, its `/sys`
   writable) as their users, from its own command line; takes input from
   nobody. The services that ask drv-appd who their callers are connect
@@ -260,7 +263,7 @@ drv-authd (uid drv-auth, supervisor child)
   Unlock{idle_timeout} goes to the one attached as Compositor; no socket
 
 drv-compositor (uid,      drv-shell, drv-files, drv-cast,     app-<name> (uid each)
-    supervisor child)       drv-agent (uid each)
+    supervisor child)       drv-agent, drv-fido (uid each)
   Lookup for each client    Lookup per peer on their own        forked by drv-forker
   no D-Bus at all           sockets; the shim in the app         on drv-appd's say,
   no IPC socket, no         speaks their wires; no bus, no       sandboxed; launch
@@ -290,7 +293,7 @@ the shell, drv-files, drv-cast, the agent); there is no other grant.
 `AppPolicy { name, gpu, globals, grants, icon, agent, fido }`. `allows(global)`:
 `gpu` grants dmabuf, otherwise the global must be listed. `has(grant)`.
 `agent` is the ssh agent's door: drv-agent checks it on every
-connection. `fido` is the origins the app may claim at its FIDO door.
+connection. `fido` is the origins the app may claim at drv-fido's door.
 `name` and `icon` are what the compositor shows the user; apps never
 supply them. `AppPolicy::unknown()` is nothing; `everything(name)` is
 every global and grant, for tests.
@@ -478,8 +481,8 @@ an entry (a daemon, a probe) out of the app menu.
   `org.freedesktop.Notifications` and `org.freedesktop.portal.Desktop`
   and connecting to each service's socket on first use.
 - The ssh agent is a member, not an app: `drv-agent serve` runs OpenSSH's
-  `ssh-agent` as uid drv-agent (the authenticators' hidraw nodes are that
-  group's by udev rule, `/run/udev` exposed for libfido2) on a socket in
+  `ssh-agent` as uid drv-agent (the authenticators' hidraw nodes are drv-fido's
+  group's by udev rule, drv-agent a member, `/run/udev` exposed for libfido2) on a socket in
   its private `/tmp`, and fronts it on `/run/drv/agent` (fd `listener`,
   bound by the supervisor), which every app's root holds. Each connection is checked on `SO_PEERCRED` plus
   drv-appd's record for the UID (`AppPolicy.agent`, the manifest's
@@ -492,26 +495,31 @@ an entry (a daemon, a probe) out of the app menu.
   `Cancel`) naming the app, and runs `ssh-add -K` itself with the answer.
   ssh-agent's own prompts while signing (the PIN of a verify-required
   key, a touch) reach the door the same way: `SSH_ASKPASS` is drv-agent
-  again, which carries the prompt over a s- The same member has a FIDO door, `/run/drv/fido` (fd `fido`, a
-  SOCK_SEQPACKET listener bound by the supervisor): a WebAuthn ceremony
-  (`drv_agent::fido::Request::{Create, Get}` with the origin and the
-  request JSON, answered `Credential { json }` or `Failed { reason }`) run
-  by libwebauthn on the security key, one at a time, the touch and the
-  PIN asked at the shell like the ssh agent's. The manifest's `fido` lists
-  the origins the app may claim, exactly (`app:dev.rho.Gui`); an `app:`
-  origin's relying party is its labels reversed (`gui.rho.dev`), an
-  https origin's is its host, and the request's rp id must equal it. The
-  shim answers linux-credentials' portal API on the app's bus
-  (`xyz.iinuwa.credentialsd.Credentials`, `CreateCredential`/`GetCredential`
-  with the `public_key` JSON option) and forwards to the door, so an app
-  uses the same client code as under a desktop running credentialsd. rho
-  derives its iroh identity from the key's hmac-secret this way, through
-  `hmacGetSecret` rather than PRF: libwebauthn asks the key's PIN for
-  every PRF request, and the identity is meant to be touch only (the
-  fork drv-agent builds against carries `hmacGetSecret` to the key).
-  The dev VM's QEMU has a CanoKey for it (`nix/dev-vm.nix`).
-ocket in the private `/tmp`.
+  again, which carries the prompt over a socket in the private `/tmp`.
   Every message is relayed unread.
+- The FIDO door is a member of its own, drv-fido (uid drv-fido): the
+  authenticators' hidraw nodes are its group's by udev rule, drv-agent is in
+  that group for its sk keys. It parses what apps send (WebAuthn JSON) and
+  what the USB bus answers (CTAP2 CBOR, libwebauthn over hidapi), so it is
+  apart from the process that holds ssh keys: a bug there costs a restart.
+  Its door, `/run/drv/fido` (fd `listener`, a SOCK_SEQPACKET listener bound
+  by the supervisor), takes one WebAuthn ceremony per connection
+  (`drv_fido::wire::Request::{Create, Get}` with the origin and the request
+  JSON, answered `Credential { json }` or `Failed { reason }`), run by
+  libwebauthn on the security key, one at a time, the touch and the PIN asked
+  at the shell (fd `shell`, `drv_shell::ask::Client`, as the ssh agent's).
+  The manifest's `fido` lists the origins the app may claim, exactly
+  (`app:dev.rho.Gui`); an `app:` origin's relying party is its labels
+  reversed (`gui.rho.dev`), an https origin's is its host, and the request's
+  rp id must equal it. The shim answers linux-credentials' portal API on the
+  app's bus (`xyz.iinuwa.credentialsd.Credentials`,
+  `CreateCredential`/`GetCredential` with the `public_key` JSON option) and
+  forwards to the door, so an app uses the same client code as under a
+  desktop running credentialsd. rho derives its iroh identity from the key's
+  hmac-secret this way, through `hmacGetSecret` rather than PRF: libwebauthn
+  asks the key's PIN for every PRF request, and the identity is meant to be
+  touch only (the fork drv-fido builds against carries `hmacGetSecret` to
+  the key). The dev VM's QEMU has a CanoKey for it (`nix/dev-vm.nix`).
 - The media keys are a member too: the compositor spawns nothing, so
   `volume-up`, `volume-down`, `volume-mute`, `mic-mute`, `brightness-up`
   and `brightness-down` are actions that write a line down its `keys`
