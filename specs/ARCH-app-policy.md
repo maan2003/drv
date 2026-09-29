@@ -287,10 +287,10 @@ constraints, ...) is always advertised.
 `Grant` is `lookup` (ask drv-appd about other UIDs: the compositor,
 the shell, drv-files, drv-cast, the agent); there is no other grant.
 
-`AppPolicy { name, gpu, globals, grants, icon, agent }`. `allows(global)`:
+`AppPolicy { name, gpu, globals, grants, icon, agent, fido }`. `allows(global)`:
 `gpu` grants dmabuf, otherwise the global must be listed. `has(grant)`.
 `agent` is the ssh agent's door: drv-agent checks it on every
-connection.
+connection. `fido` is the origins the app may claim at its FIDO door.
 `name` and `icon` are what the compositor shows the user; apps never
 supply them. `AppPolicy::unknown()` is nothing; `everything(name)` is
 every global and grant, for tests.
@@ -492,7 +492,21 @@ an entry (a daemon, a probe) out of the app menu.
   `Cancel`) naming the app, and runs `ssh-add -K` itself with the answer.
   ssh-agent's own prompts while signing (the PIN of a verify-required
   key, a touch) reach the door the same way: `SSH_ASKPASS` is drv-agent
-  again, which carries the prompt over a socket in the private `/tmp`.
+  again, which carries the prompt over a s- The same member has a FIDO door, `/run/drv/fido` (fd `fido`, a
+  SOCK_SEQPACKET listener bound by the supervisor): a WebAuthn ceremony
+  (`drv_agent::fido::Request::{Create, Get}` with the origin and the
+  request JSON, answered `Credential { json }` or `Failed { reason }`) run
+  by libwebauthn on the security key, one at a time, the touch and the
+  PIN asked at the shell like the ssh agent's. The manifest's `fido` lists
+  the origins the app may claim, exactly (`app:dev.rho.Gui`); an `app:`
+  origin's relying party is its labels reversed (`gui.rho.dev`), an
+  https origin's is its host, and the request's rp id must equal it. The
+  shim answers linux-credentials' portal API on the app's bus
+  (`xyz.iinuwa.credentialsd.Credentials`, `CreateCredential`/`GetCredential`
+  with the `public_key` JSON option) and forwards to the door, so an app
+  uses the same client code as under a desktop running credentialsd. rho
+  derives its iroh identity from the key's hmac-secret this way.
+ocket in the private `/tmp`.
   Every message is relayed unread.
 - The media keys are a member too: the compositor spawns nothing, so
   `volume-up`, `volume-down`, `volume-mute`, `mic-mute`, `brightness-up`
