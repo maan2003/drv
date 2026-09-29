@@ -505,7 +505,11 @@ an entry (a daemon, a probe) out of the app menu.
   (`xyz.iinuwa.credentialsd.Credentials`, `CreateCredential`/`GetCredential`
   with the `public_key` JSON option) and forwards to the door, so an app
   uses the same client code as under a desktop running credentialsd. rho
-  derives its iroh identity from the key's hmac-secret this way.
+  derives its iroh identity from the key's hmac-secret this way, through
+  `hmacGetSecret` rather than PRF: libwebauthn asks the key's PIN for
+  every PRF request, and the identity is meant to be touch only (the
+  fork drv-agent builds against carries `hmacGetSecret` to the key).
+  The dev VM's QEMU has a CanoKey for it (`nix/dev-vm.nix`).
 ocket in the private `/tmp`.
   Every message is relayed unread.
 - The media keys are a member too: the compositor spawns nothing, so
