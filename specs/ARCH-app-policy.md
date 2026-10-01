@@ -157,12 +157,12 @@ drv-appd (uid drv-appd)                  drv-forker (uid drv-forker; caps setuid
   fds: listener, channel, compositor,      fd `channel` from the supervisor,
     shell                                    its only input. --range and where
   appd.json: every uid, exec, features,      host things live, from the command
-    globals, grants, agent, autostart        line. Launch{name, uid, argv, env,
-  Launch{app} on a launch channel ------->   network, gpu, audio, bus, jit,
-    (the compositor's or the shell's) ->     closure} -> type checks, dirs,
+    globals, grants, agent, autostart        line. Launch{uid, argv, env, network,
+  Launch{app} on a launch channel ------->   gpu, nix, folders, jit, userns}
+    (the compositor's or the shell's) ->     -> type checks, dirs,
     the manifest's exec; Apps -> the         root and ruleset built, cgroup
     names with an exec                       apps/app-<uid>, setresuid, NNP,
-                                             Landlock, exec; the child
+                                             seccomp, MDWE, exec; the child
   Lookup{uid} on the listener: own uid,      inherits no fd at all
     or the lookup grant; Open{uri} there   reaps children, logs their exit
     for a uid that is an app
@@ -428,9 +428,11 @@ an entry (a daemon, a probe) out of the app menu.
   read and write on `/proc`; read, write and ioctl on `/dev`; everything
   on `/etc`, HOME, `/tmp`, `/run/app`, `/state` and the documents mount,
   everything but execute on `/dev/shm`; abstract sockets and signals
-  scoped to the app. Then the seccomp denylist (no executable memfd, no
-  io_uring, no user namespace unless the run file says `userns`), MDWE
-  unless the run file says `jit`, fork, and it stays as the app's init:
+  scoped to the app. The seccomp denylist (no executable memfd, no
+  io_uring, no user namespace unless the manifest says `userns`) and MDWE
+  (unless the manifest says `jit`) are the forker's, put on after the uid
+  switch and before the exec, so drv-init runs under them too. drv-init
+  forks the app and stays as its init:
   reaps, forwards signals, exits with the app's status. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   except for a `userns` app (the browser). Apps without `network = true` also get a new, empty network

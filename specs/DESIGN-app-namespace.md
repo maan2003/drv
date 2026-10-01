@@ -163,13 +163,16 @@ builds the trusted set's roots with it too, from a different list):
    stays writable (it is the app's) and noexec, the cgroup is joined and
    a cgroup namespace opened there (`/proc/self/cgroup` says `/`).
 3. The switch: its own group and nothing else, `setresgid`,
-   `setresuid`, every capability set emptied. `Forked` to appd, exec of
-   the command with the resolver as fd `resolv` for a networked app.
-   What it execs is PID 1 of the namespace, drv-init.
+   `setresuid`, every capability set emptied. Then, already as the app
+   and with nothing, the seccomp denylist (below) and MDWE unless the
+   manifest says `jit`: both survive exec and fork, so everything that
+   follows is under them. `Forked` to appd, exec of the command (the run
+   file) with the resolver as fd `resolv` for a networked app. What it
+   execs is PID 1 of the namespace, drv-init.
 4. As the app, drv-init: the directories of the run, `/etc`, the links,
    HOME, then the Landlock ruleset by path (the closure, the views, the
-   doors, its own directories), `landlock_restrict_self`, the seccomp
-   denylist (below), MDWE unless `jit`, fork, and it stays as init.
+   doors, its own directories), `landlock_restrict_self`, fork, and it
+   stays as init.
 
 The seccomp denylist is not the sandbox, it closes a few doors the
 sandbox does not: an executable memfd (`MFD_EXEC`; with
@@ -206,7 +209,7 @@ launches is the app's run file: an executable in the store whose first
 line names drv-init as its interpreter (`#!.../bin/drv-init`) and whose
 rest is JSON saying how the app runs: the command, its `/etc`, `home`
 and `state`, the HOME defaults, the links at fixed places, the closure,
-`restart`, `jit`, `userns`, `nix`, its own environment.
+`restart`, `nix`, its own environment.
 `services.drv.mkApp` (`config/system/drv/launch.nix` in the nixos repo)
 writes it; drv-appd and the forker launch the file and know neither
 drv-init nor what it reads. drv-init is a small unprivileged program
@@ -244,14 +247,14 @@ and are launched by nothing but drv-appd.
 
 The manifest, `services.drv.apps.<name>`, is the privileged side: `uid`,
 `network`, `gpu`, `audio`, `nix` (the daemon's socket and its allowed
-users), `folders` (directories of the person's files the app owns
+users), `jit` and `userns` (the forker's two doors), `folders` (directories of the person's files the app owns
 inside, [NOTES-file-ownership](NOTES-file-ownership.md)), `agent`,
 `fido`, `grants`, `opens`, `env`, and `run`: the run file to launch.
 How the app runs is the run file's, `run = mkApp { ... }`: `exec`, `etc`
 and `files` (attribute sets that become store paths), `state` (paths
 under HOME that persist), `home` (`run` or `persist`), `restart` (a
 daemon: drv-init starts it again when it exits), `links`, `packages`,
-`shell`, `jit`, `userns`, `nix` (the whole store readable, nix on the
+`shell`, `nix` (the whole store readable, nix on the
 PATH), `bus` and `edits` (the shim), and the closure derived from all of
 it. Nothing in the run file is a privilege: drv-init, which reads it, is
 the app. Later a `launch:<app>` grant. `gpu` comes to mean the render
