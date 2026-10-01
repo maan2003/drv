@@ -14,9 +14,9 @@ The first shape below: drv-files owns the tree (`services.drv.files`,
 `/var/lib/drv-files`, mode 0700), is the only reader of it, shows it in
 its own chooser, and serves one file per consent to one UID through the
 documents mount `/run/drv/doc` (FUSE, served by drv-files, mounted by
-the supervisor). Open grants are read-only unless the manifest says the
-app `edits` (LibreOffice), Save grants writable; a set restart drops them
-all.
+the supervisor). Open grants are read-only, Edit grants (an app whose
+shim asks for files to edit, `edits` in the manifest: LibreOffice) and
+Save grants writable; the chooser says which; a set restart drops them all.
 
 Second slice (2026-09): the static slice, as the manifest's `folders`.
 A directory of the tree named there is bound into the app's root by the

@@ -594,8 +594,10 @@ an entry (a daemon, a probe) out of the app menu.
   at once and emits the `Response` signal (`uris` as
   `file:///run/drv/doc/<id>/<name>`) when the person has picked;
   `Request.Close` cancels at drv-files. An opened file is read-only
-  (the mount enforces the modes) unless the manifest says the app
-  `edits`; a saved one is writable. `directory` and
+  (the mount enforces the modes), a saved one writable; an app whose
+  shim runs with `--edits` (the manifest's `edits`) asks for files to
+  edit instead of to open, the chooser says so, and those come writable.
+  Not a privilege: the person sees what is asked and picks the file. `directory` and
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
   person's tree, only the file it was given, as its own UID.
