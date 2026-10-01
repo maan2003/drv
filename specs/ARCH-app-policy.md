@@ -593,7 +593,9 @@ an entry (a daemon, a probe) out of the app menu.
   drv-files names the app from the socket's UID), hands the handle back
   at once and emits the `Response` signal (`uris` as
   `file:///run/drv/doc/<id>/<name>`) when the person has picked;
-  `Request.Close` cancels at drv-files. `directory` and
+  `Request.Close` cancels at drv-files. An opened file is read-only
+  (the mount enforces the modes) unless the manifest says the app
+  `edits`; a saved one is writable. `directory` and
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
   this goes through xdg-desktop-portal, and no app ever sees the
   person's tree, only the file it was given, as its own UID.
