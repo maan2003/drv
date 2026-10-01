@@ -56,13 +56,14 @@ of the app's closure, which Nix computes from the manifest's
 the paths' names cannot be listed. A closure is the only executable thing
 in the namespace; every other mount is noexec.
 
-The app's configuration is store paths too: its `/etc` (a derivation built
-from the manifest: a one-line passwd, nsswitch, localtime, CA certificates,
-a fontconfig of the desktop's own fonts and default families, drirc and
-the GL and Vulkan loader directories, resolv.conf only
-when the app has the network, a machine-id derived from the app's name so
-no two apps share one and none has the host's) and its HOME defaults (a
-tree of files linked into HOME at launch).
+The app's configuration is store paths too: its `/etc` (a derivation:
+localtime, CA certificates, a fontconfig of the desktop's own fonts and
+default families, the host's /etc entries the run file names) and its
+HOME defaults (a tree of files linked into HOME at launch). What is about
+the run drv-init writes itself: a one-line passwd for the app's name and
+UID, nsswitch (DNS only when the forker handed it the resolver, so only
+when the app has the network), hosts, a machine-id of its UID so no two
+apps share one and none has the host's.
 
 A closure may not contain an interpreter (bash, dash, python, perl, or
 any `bin/` entry that starts with a shebang); the build fails otherwise.
@@ -200,21 +201,28 @@ directory to decide anything, and makes or chowns nothing on the host:
 `/var/lib/drv-apps/<uid>` exists, made by tmpfiles for each configured
 UID; what it makes in the app's root it makes as the app.
 
-Everything the app can do for itself is drv-init's, which the module
-puts in front of every app's command with everything it needs on the
-command line (`--etc`, `--state`, `--files`, `--folder`, `--home`,
-`--closure`, `--link`, `--jit`, `--userns`, `--nix`, `--resolv`,
-`--restart`): a small unprivileged
-program from the set's own package, run as the app inside the root the
-forker left, and PID 1 of the app's namespace for as long as the app
-runs. It makes `/tmp`, `/etc` (one link per entry of the Nix-built
-derivation, `resolv.conf` copied from fd `resolv` for a networked app),
-`/run/app`, the links at fixed places into the store (`/bin/sh`,
-`/usr/bin/env`, `/run/opengl-driver`, the manifest's own), HOME as
-`home` says (the state directories under `/state` and their links, the
-HOME defaults; a link of an earlier run into the store is remade when
-the path behind it changed), restricts itself (the closure as Landlock
-rules, the whole store for `nix`; the denylist; MDWE), forks the app and
+Everything the app can do for itself is drv-init's. What the manifest
+launches is the app's run file: an executable in the store whose first
+line names drv-init as its interpreter (`#!.../bin/drv-init`) and whose
+rest is JSON saying how the app runs: the command, its `/etc`, `home`
+and `state`, the HOME defaults, the links at fixed places, the closure,
+`restart`, `jit`, `userns`, `nix`, its own environment.
+`services.drv.mkApp` (`config/system/drv/launch.nix` in the nixos repo)
+writes it; drv-appd and the forker launch the file and know neither
+drv-init nor what it reads. drv-init is a small unprivileged program
+from the set's own package, run as the app inside the root the forker
+left, and PID 1 of the app's namespace for as long as the app runs. It
+makes `/tmp`, `/etc` (the account and the name service switch written
+here, one link per entry of the Nix-built derivation, `resolv.conf`
+copied from fd `resolv` when the forker handed one over), `/run/app`,
+the links at fixed places into the store (`/bin/sh`, `/usr/bin/env`,
+`/run/opengl-driver`, the run file's own), HOME as `home` says (the
+state directories under `/state` and their links, the HOME defaults; a
+link of an earlier run into the store is remade when the path behind it
+changed; every folder the forker mounted under `/files` linked from
+HOME), restricts itself (the closure as Landlock rules, the whole store
+for `nix`; the denylist; MDWE), forks the app with the file's environment
+over the manifest's and the arguments after the file (the OpenURI portal's URI) appended, and
 stays as its init, reaping orphans, passing the signals it is sent on to
 the app, and exiting with the app's status (128 + the signal for a signal
 death: PID 1 of a namespace cannot itself die of one from inside). The
@@ -232,15 +240,21 @@ directories, the nix-daemon socket (except for a `nix` app: a client of
 the host's daemon, with the whole store readable). Apps launch nothing
 and are launched by nothing but drv-appd.
 
-## Manifest
+## Manifest and run file
 
-`services.drv.apps.<name>` gains: `etc` and `files` (attribute sets that
-become store paths), `state` (paths under HOME that persist), `home`
-(`run` or `persist`), `nix`, `folders` (directories of the person's
-files the app owns inside, [NOTES-file-ownership](NOTES-file-ownership.md)),
-`restart` (a daemon: drv-init starts it again when it exits), `closure`
-(derived from `exec`), and later
-`links` (apps sharing a runtime directory) and a `launch:<app>` grant. `gpu` comes to mean the render
+The manifest, `services.drv.apps.<name>`, is the privileged side: `uid`,
+`network`, `gpu`, `audio`, `nix` (the daemon's socket and its allowed
+users), `folders` (directories of the person's files the app owns
+inside, [NOTES-file-ownership](NOTES-file-ownership.md)), `agent`,
+`fido`, `grants`, `opens`, `env`, and `run`: the run file to launch.
+How the app runs is the run file's, `run = mkApp { ... }`: `exec`, `etc`
+and `files` (attribute sets that become store paths), `state` (paths
+under HOME that persist), `home` (`run` or `persist`), `restart` (a
+daemon: drv-init starts it again when it exits), `links`, `packages`,
+`shell`, `jit`, `userns`, `nix` (the whole store readable, nix on the
+PATH), `bus` and `edits` (the shim), and the closure derived from all of
+it. Nothing in the run file is a privilege: drv-init, which reads it, is
+the app. Later a `launch:<app>` grant. `gpu` comes to mean the render
 node plus the sys view, with no group: the host's view makes the node
 openable by anyone, which is what render nodes are for. `network`,
 `audio`, `bus`, `globals`, `grants` and `opens` keep their meaning.

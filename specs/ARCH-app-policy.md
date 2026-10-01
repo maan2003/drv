@@ -48,7 +48,8 @@ the GPU process drives the real Asahi GPU through a virtio-gpu native
 context and the screen is a window on a headless host compositor served
 over noVNC. The NixOS module (`services.drv`) lives in the nixos repo at
 `config/system/drv/module.nix`, next to the m2sh manifests; it turns one
-app list into passwd entries, `appd.json` and the units. The nixos repo
+app list into passwd entries, `appd.json` and the units; `launch.nix`
+beside it makes each app's run file (`services.drv.mkApp`). The nixos repo
 takes the binaries prebuilt and has no niri flake input; this repo's
 development VMs import the module from the nixos repo.
 Implements the "identity and policy" part of
@@ -411,23 +412,25 @@ an entry (a daemon, a probe) out of the app menu.
   securebits before the request, mounts as the app's effective UID
   (so what it makes is the app's), switches UID, drops its capabilities
   and execs the command as PID 1 of the app's PID namespace (IPC, UTS
-  and cgroup namespaces are its own too). The module puts `drv-init` in
-  front of every app's command, with what it needs as arguments: as the
-  app, it makes `/tmp`, `/etc` (linked from the store, `resolv.conf`
-  copied from the forker's fd), `/run/app` (`XDG_RUNTIME_DIR`), the
+  and cgroup namespaces are its own too). The command is the app's run
+  file (`services.drv.mkApp`, launch.nix): a store file whose shebang is
+  `drv-init` and whose body is JSON saying how the app runs. As the
+  app, drv-init makes `/tmp`, `/etc` (the account written here, the rest
+  linked from the store, `resolv.conf` copied from the forker's fd),
+  `/run/app` (`XDG_RUNTIME_DIR`), the
   links into the store (`/bin/sh`, `/usr/bin/env`, `/run/opengl-driver`,
-  the manifest's `links`), HOME (`home = "run"`: `/home/app`, with the
+  the run file's `links`), HOME (`home = "run"`: `/home/app`, with the
   `state` directories under `/state` linked from it; `"persist"`:
   `/state` itself) with the `files` defaults linked from the store; then
-  the Landlock ruleset: read and execute on the closure of the manifest's
+  the Landlock ruleset: read and execute on the closure of the run file's
   command, `/etc`, the data profile and the links' targets (from
   `closureInfo`; the whole store for `nix`); read on `/sys` and `/run`;
   read and write on `/proc`; read, write and ioctl on `/dev`; everything
   on `/etc`, HOME, `/tmp`, `/run/app`, `/state` and the documents mount,
   everything but execute on `/dev/shm`; abstract sockets and signals
   scoped to the app. Then the seccomp denylist (no executable memfd, no
-  io_uring, no user namespace unless the manifest says `userns`), MDWE
-  unless the manifest says `jit`, fork, and it stays as the app's init:
+  io_uring, no user namespace unless the run file says `userns`), MDWE
+  unless the run file says `jit`, fork, and it stays as the app's init:
   reaps, forwards signals, exits with the app's status. No system D-Bus, no services' bus, no
   other app's runtime directory, no setuid wrappers. No user namespaces
   except for a `userns` app (the browser). Apps without `network = true` also get a new, empty network
@@ -595,7 +598,7 @@ an entry (a daemon, a probe) out of the app menu.
   `file:///run/drv/doc/<id>/<name>`) when the person has picked;
   `Request.Close` cancels at drv-files. An opened file is read-only
   (the mount enforces the modes), a saved one writable; an app whose
-  shim runs with `--edits` (the manifest's `edits`) asks for files to
+  shim runs with `--edits` (the run file's `edits`) asks for files to
   edit instead of to open, the chooser says so, and those come writable.
   Not a privilege: the person sees what is asked and picks the file. `directory` and
   `SaveFiles` are refused. Apps get `GTK_USE_PORTAL=1`. Nothing about
@@ -613,7 +616,7 @@ an entry (a daemon, a probe) out of the app menu.
   the parent window are ignored; `OpenFile` and `OpenDirectory` are
   not offered. An app's `/tmp` is of the run, so a browser that keeps
   its single-instance socket under `TMPDIR` points that at a `state`
-  directory in its manifest: a second launch then reaches the first
+  directory in its run file: a second launch then reaches the first
   one's socket instead of fighting it over the profile.
 - No other portal. `org.freedesktop.portal.Settings` (version 2:
   `Read`, `ReadOne`, `ReadAll`) the shim answers itself with the one
