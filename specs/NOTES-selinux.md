@@ -37,14 +37,38 @@ app at the socket (`avc: denied { write } ... tclass=sock_file`) while the
 set, in `base_t`, is untouched; relabelled back, the app connects. The
 label is part of `nix/kernel-state.sh`'s account of a process now.
 
+## Built (2026-10): the module, `u:r:<type>:<range>`
+
+`services.drv.selinux` (nixos `config/system/drv/selinux.nix`) is the
+spike as a module, on for the dev VM (enforcing) and m2sh (permissive
+first; its Asahi kernel lacks SELinux, so the module's `kernel` adds the
+config and that switch is a kernel build). The context is Android's
+shape: one user `u` and one role `r`, since they carry nothing; the type
+and the range do the work. The policy is MLS with one sensitivity and
+1024 categories (MCS): `base_t` subjects hold the whole range
+`s0-s0:c0.c1023`, objects `s0`; the forker gives an app
+`u:r:drv_app_t:s0:c<uid%256>,c<256+uid/256>`, so what it makes carries
+its pair and no other app dominates it (`mlsconstrain ... (h1 dom l2)` on
+files, directories, processes, unix sockets). Verified enforcing in the
+VM: a file made at `c1,c2` is refused to `c3,c4` and read by `c1,c2`, by
+`c1,c2,c3,c4` and by `base_t`; the smoke run has no denials.
+
+The person's tree (`services.drv.files`) is `files_t`, an
+`mlstrustedobject`: the categories are recorded but not checked there,
+because sharing is by grant (the forker's idmapped bind of a folder,
+drv-files' documents mount), the way Android keeps MCS to app-private
+data and puts shared storage behind one label and a runtime daemon.
+idmapping is invisible to SELinux (labels are xattrs, not uids).
+systemd-tmpfiles labels the directories it makes from `file_contexts`;
+what is made inside takes its directory's type.
+
 ## Where it leads
 
-The Android shape from the discussion, not built: one `store_t` for the
-whole store (xattrs set once; Nix keeps `security.selinux` on copies, a
-`type_transition` labels builds), one `drv_app` domain with an MCS
-category per uid so apps cannot see each other's objects even as root,
-the doors and the set's members typed, and constraints on what root in
-`base_t` may touch. Open: m2sh's Asahi kernel config; bind mounts and
+Not built: one `store_t` for the whole store (xattrs set once; Nix keeps
+`security.selinux` on copies, a `type_transition` labels builds), the
+doors and the set's members typed (`SELinuxContext=` in units for what
+systemd starts, the supervisor's setexeccon for the set), and constraints
+on what root in `base_t` may touch. Open: m2sh's Asahi kernel config; bind mounts and
 btrfs subvolumes carry one label per superblock, so they cannot be
 relabelled per path; CIL (secilc, to build) would replace policy.conf as
 the policy grows.
