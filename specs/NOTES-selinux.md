@@ -62,13 +62,23 @@ idmapping is invisible to SELinux (labels are xattrs, not uids).
 systemd-tmpfiles labels the directories it makes from `file_contexts`;
 what is made inside takes its directory's type.
 
+The set's members have their own domains, `drv_<member>_t`, the
+supervisor's from its unit (`SELinuxContext=`), the members' from the
+supervisor (setexeccon before each exec, named after the member).
+With that, `files_t` is reachable by drv-files, the forker (the binds)
+and the apps; `base_t`, which is root and everything untyped, may make
+and relabel its directories and write files (tmpfiles) and read nothing,
+and no domain may turn enforcement off or load a policy (`security
+{ setenforce load_policy setbool }`); the kernel's `enforcing=0` is the
+way back in. Verified in the VM: root's `cat` and `ls` of the tree and
+`setenforce 0` are refused; the smoke run passes.
+
 ## Where it leads
 
 Not built: one `store_t` for the whole store (xattrs set once; Nix keeps
 `security.selinux` on copies, a `type_transition` labels builds), the
-doors and the set's members typed (`SELinuxContext=` in units for what
-systemd starts, the supervisor's setexeccon for the set), and constraints
-on what root in `base_t` may touch. Open: m2sh's Asahi kernel config; bind mounts and
+doors typed, the services systemd starts typed (`SELinuxContext=`), and
+the members' and apps' allow-everything on `base_t` narrowed. Open: m2sh's Asahi kernel config; bind mounts and
 btrfs subvolumes carry one label per superblock, so they cannot be
 relabelled per path; CIL (secilc, to build) would replace policy.conf as
 the policy grows.
