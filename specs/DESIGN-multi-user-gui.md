@@ -157,24 +157,26 @@ and casts and screenshots of a locked session are black
 region, the secret image, the attention key; freezing is designed
 separately.
 
-Suspend is heard through the lid, not logind: the set has no system bus.
-The lease is `CLOCK_BOOTTIME`, which keeps running while asleep, so a long
-sleep expires it before the first frame after wake; closing the lid with the
-panel the only output (logind suspends on that) locks before a short one.
-`CLOCK_BOOTTIME` jumping ahead of `CLOCK_MONOTONIC` by more than 2 s also
-locks on the first check after resume (s2idle included: the tick freeze
-suspends timekeeping once every CPU is idle), which a sleep shorter than
-that escapes. What the kernel does on its own is replay
-the last framebuffer on resume before userspace runs; a kernel patch
+Suspend is heard from logind by the seat daemon, the one member with the
+system bus in its `/run`: it holds a sleep delay inhibitor, so on
+`PrepareForSleep(true)` logind waits (up to its delay limit) while the
+compositor locks and answers `ReadyToSleep`; `PrepareForSleep(false)` takes
+the next inhibitor and has the compositor draw. The lease is `CLOCK_BOOTTIME`,
+so a long sleep would expire it anyway, and `CLOCK_BOOTTIME` jumping more
+than 2 s ahead of `CLOCK_MONOTONIC` on the first check after resume (s2idle
+included: the tick freeze suspends timekeeping once every CPU is idle) locks
+even if the daemon is gone. What the kernel does on its own is replay the
+last framebuffer on resume before userspace runs; a kernel patch
 (`drm_kms_helper.blank_on_resume`, `nix/linux-drm-blank-on-resume.patch` in
 niri) makes the DRM resume helper commit that saved state with every plane
 detached, so the screen comes back black until the compositor's first
-commit, which opening the lid forces (an undamaged scene is otherwise never
+commit, which the wake forces (an undamaged scene is otherwise never
 committed, and the screen would stay black until the next input). Status:
 patched and verified in KVM on QXL (S3, plane detached after resume, relit
 by the next commit); i915's own resume path is patched but only
-build-tested; the lid lock and redraw verified in the dev VM with an
-emulated lid switch.
+build-tested; the sleep lock and wake redraw verified in the dev VM with
+`pm_test=freezer` (the inhibitor listed, the lock before the kernel's entry,
+the full redraw after its exit).
 
 ## Storage lock
 
