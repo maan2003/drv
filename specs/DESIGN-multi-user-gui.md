@@ -157,16 +157,23 @@ and casts and screenshots of a locked session are black
 region, the secret image, the attention key; freezing is designed
 separately.
 
-Suspend needs no handling of its own: the lease is `CLOCK_BOOTTIME`, which
-keeps running while asleep, so a long sleep expires it before the first frame
-after wake. A short one locks too: the compositor notices `CLOCK_BOOTTIME`
-jumping ahead of `CLOCK_MONOTONIC` on the first check after resume. What the kernel does on its own is replay the last framebuffer on
-resume before userspace runs; a kernel patch (`drm_kms_helper.blank_on_resume`,
-`nix/linux-drm-blank-on-resume.patch` in niri) makes the DRM resume helper
-commit that saved state with every plane detached, so the screen comes back
-black until the compositor's first commit. Status: patched and verified in KVM
-on QXL (S3, plane detached after resume, relit by the next commit); i915's own
-resume path is patched but only build-tested.
+Suspend is heard through the lid, not logind: the set has no system bus.
+The lease is `CLOCK_BOOTTIME`, which keeps running while asleep, so a long
+sleep expires it before the first frame after wake; closing the lid with the
+panel the only output (logind suspends on that) locks before a short one.
+`CLOCK_BOOTTIME` jumping ahead of `CLOCK_MONOTONIC` also locks on the first
+check after resume, but not under s2idle (Apple silicon), where the kernel
+keeps `CLOCK_MONOTONIC` running. What the kernel does on its own is replay
+the last framebuffer on resume before userspace runs; a kernel patch
+(`drm_kms_helper.blank_on_resume`, `nix/linux-drm-blank-on-resume.patch` in
+niri) makes the DRM resume helper commit that saved state with every plane
+detached, so the screen comes back black until the compositor's first
+commit, which opening the lid forces (an undamaged scene is otherwise never
+committed, and the screen would stay black until the next input). Status:
+patched and verified in KVM on QXL (S3, plane detached after resume, relit
+by the next commit); i915's own resume path is patched but only
+build-tested; the lid lock and redraw verified in the dev VM with an
+emulated lid switch.
 
 ## Storage lock
 

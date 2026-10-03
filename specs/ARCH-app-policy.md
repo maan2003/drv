@@ -679,14 +679,19 @@ Super+Alt+L) ends it; a compositor restart starts locked. The lease is a
 `CLOCK_BOOTTIME` deadline and `Niri::check_lease` is the one place that
 turns "expired" into "locked": it runs before every frame, before every
 input event and once a second, so nothing is drawn or delivered on a
-stale lease, and suspend needs no hook (the clock runs while asleep);
-waking locks at once regardless: the first `check_lease` after resume
-sees `CLOCK_BOOTTIME` jump ahead of `CLOCK_MONOTONIC`. The
+stale lease, and a long sleep needs no hook (the clock runs while
+asleep). A short one is covered by the lid, the laptop's sleep switch
+(the set hears no logind): closing it with the panel the only output
+locks first. The first `check_lease` after resume also locks when it sees
+`CLOCK_BOOTTIME` jump ahead of `CLOCK_MONOTONIC`, which s2idle (Apple
+silicon) does not show. The
 kernel's own replay of the last framebuffer on resume is switched off by
 `nix/linux-drm-blank-on-resume.patch` (`drm_kms_helper.blank_on_resume=1`,
 set by the module): the DRM resume helper commits the saved state with
 every plane detached, so wake shows black until the compositor's first
-commit. `nix/resume-vm.nix` plus `nix/resume-test.sh` check that on QXL.
+commit; opening the lid forces that commit (`Request::RedrawAll` resets
+every output's buffers, as an undamaged scene is never committed on its
+own). `nix/resume-vm.nix` plus `nix/resume-test.sh` check the blank on QXL.
 Locking (idle, `lock-session`, waking) also
 stops every cast and revokes every microphone and camera grant, as
 Super+Shift+Escape does: the person is gone, nothing streams on their
