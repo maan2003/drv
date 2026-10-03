@@ -683,8 +683,8 @@ stale lease, and a long sleep needs no hook (the clock runs while
 asleep). A short one is covered by the lid, the laptop's sleep switch
 (the set hears no logind): closing it with the panel the only output
 locks first. The first `check_lease` after resume also locks when it sees
-`CLOCK_BOOTTIME` jump ahead of `CLOCK_MONOTONIC`, which s2idle (Apple
-silicon) does not show. The
+`CLOCK_BOOTTIME` jump more than 2 s ahead of `CLOCK_MONOTONIC`, which a
+shorter sleep (s2idle or not) escapes. The
 kernel's own replay of the last framebuffer on resume is switched off by
 `nix/linux-drm-blank-on-resume.patch` (`drm_kms_helper.blank_on_resume=1`,
 set by the module): the DRM resume helper commits the saved state with

@@ -161,9 +161,10 @@ Suspend is heard through the lid, not logind: the set has no system bus.
 The lease is `CLOCK_BOOTTIME`, which keeps running while asleep, so a long
 sleep expires it before the first frame after wake; closing the lid with the
 panel the only output (logind suspends on that) locks before a short one.
-`CLOCK_BOOTTIME` jumping ahead of `CLOCK_MONOTONIC` also locks on the first
-check after resume, but not under s2idle (Apple silicon), where the kernel
-keeps `CLOCK_MONOTONIC` running. What the kernel does on its own is replay
+`CLOCK_BOOTTIME` jumping ahead of `CLOCK_MONOTONIC` by more than 2 s also
+locks on the first check after resume (s2idle included: the tick freeze
+suspends timekeeping once every CPU is idle), which a sleep shorter than
+that escapes. What the kernel does on its own is replay
 the last framebuffer on resume before userspace runs; a kernel patch
 (`drm_kms_helper.blank_on_resume`, `nix/linux-drm-blank-on-resume.patch` in
 niri) makes the DRM resume helper commit that saved state with every plane
