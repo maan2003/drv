@@ -2,15 +2,17 @@
 
 ## Status
 
-Implemented on the `gpu-process` branch of the niri fork at `/src/niri`
-(smithay fork at `/src/smithay`). Builds, passes the test suite under
-llvmpipe, runs on real hardware (Asahi); the sandbox is the latest step. Implements the "GPU process"
-component of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
+The niri fork at `/src/niri` now uses Vello/Vulkan instead of GLES in the
+GPU worker. The migration builds and passes software-rendering tests on Lavapipe,
+including the sealed GPU worker. Vulkan rendering and dma-buf/KMS scanout also
+run in the M2 crosvm DRM native-context guest on Honeykrisp, with the guest Mesa
+PCI-probe fix. Physical display scanout remains unverified. This
+implements the GPU-process component of [DESIGN-multi-user-gui](DESIGN-multi-user-gui.md).
 
 ## Goal
 
 The compositor core never opens `/dev/dri` for rendering and never runs
-Mesa. Everything that touches Mesa, GBM, EGL, or KMS runs in a separate
+Mesa. Everything that touches Mesa, GBM, Vulkan, or KMS runs in a separate
 process. A Mesa bug yields a process that can draw pixels and read client
 buffers, not one that routes input, holds policy, or talks to clients.
 
@@ -21,8 +23,8 @@ The protocol stays in the core. Whoever owns a client connection can send
 
 ```text
 core process                              gpu process
-  wayland clients, focus, input             GlesRenderer, shaders, blur
-  layout, animation, damage tracking        texture tables (ids -> GL)
+  wayland clients, focus, input             Vello/Vulkan renderer, effects
+  layout, animation, damage tracking        texture tables (ids -> Vulkan)
   seat daemon client, udev, libinput        DrmDevice / GbmDevice / DrmCompositor
   output policy: modes, VRR, gamma, on/off  swapchain, page flips, vblank
   screencast portal, targets, pacing        PipeWire streams and buffers
@@ -47,17 +49,18 @@ the headless backend and the unit tests run the server on a thread.
 (`src/gpu/protocol.rs`) right away. Draw calls do not: a `RemoteFrame`
 collects them into a `SceneFrame` that goes out as one
 `Command::Frame` when the frame finishes. Render elements in
-`render_helpers/` are unchanged in structure; `GlesRenderer` became
-`RemoteRenderer`. Effects that used raw GL (border, shadow, resize,
-open/close shaders, blur, framebuffer capture) became ops with the GL
-code moved to `src/gpu/gl/`.
+`render_helpers/` use `RemoteRenderer`. GPU-side Vello translates the recorded
+ops into native drawing and built-in WGSL effects on one Vulkan device.
+User-provided GLSL programs are not supported; ordinary open/close animations
+remain core-side scale/fade operations.
 
 A `SceneFrame` is `{target, size, transform, blend, clear, generation,
 cast, nodes}`. A `Node` is `{id, src, geometry, damage, opaque, kind,
 transform, capture: [Op], draw: [Op]}`; ops are `Solid`, `Texture`,
-`Shader`, `Capture`, `Captured`, and the scopes `WithTexProgram{ops}` /
-`Raw{ops}` (tex-program override for a subtree; `Raw` drops even the
-frame's blend override). One coordinate rule: everything in a frame
+`Paint`, `Capture`, and `Captured`. Built-in paints have typed border,
+shadow or resize parameters; texture draws carry typed effects and an explicit
+source encoding. There are no named shader uniforms or program scopes on the
+wire. One coordinate rule: everything in a frame
 (geometry, damage, opaque, op `dst`) is in frame coordinates, the
 untransformed buffer. Ops carry no damage. Draws outside any node (the
 offscreen helpers in `render_helpers/mod.rs`) become an anonymous node.
@@ -90,6 +93,41 @@ exposes the buffer as the element's `UnderlyingStorage`, and
 planes are allowed comes from the core each frame in `PresentFlags`
 (the old `debug` config knobs).
 
+## Compositor UI text and paint
+
+The core shapes compositor-owned UI text with Parley and records rectangles,
+circles, and positioned glyph runs with scene-local font data. It sends this
+paint description before Vello scene preparation: Vello scene construction,
+glyph preparation, Vulkan/wgpu submission, and rasterization run only in the
+GPU process. UI texture creation is acknowledged after rendering and import,
+and uses the existing remote texture lifetime.
+
+Vello draws UI and client textures into resident Vulkan render targets. There
+is no GLES renderer or UI readback/upload bridge. Explicit screenshots and
+shm screencasts still read pixels back because their consumers require CPU
+memory. Smithay retains KMS, plane selection, damage tracking and GBM buffer
+allocation; Vello imports GBM scanout/capture targets and client dma-bufs.
+
+Imported images are acquired from foreign queue ownership before tracked
+rendering and released afterward. Separate raw Vulkan acquire/release command
+buffers bracket wgpu command buffers, whose final states are restored before
+handoff. The initial synchronization path waits for input fences and render
+completion; it does not copy pixels to synchronize. Format advertisement is
+restricted to probed single-memory-plane RGB formats/modifiers. Multi-plane
+imports and asynchronous external-fence submission are not implemented.
+
+Built-in borders, clipping, shadows and blur use native Vello. Blur uses a
+Gaussian footprint rather than the former Kawase pyramid, so its appearance
+is not pixel-identical. Resize mixing, postprocessing and color conversion use
+private WGSL passes on the same Vulkan device. User-supplied GLSL is rejected;
+normal opening, closing and resizing animations remain built in.
+
+Built-in effects are mandatory renderer functionality, initialized before the
+worker seals itself. Capabilities describe hardware-dependent formats/modifiers,
+not optional shader programs.
+
+The separate shell and chooser are outside this compositor migration.
+
 ## Protocol
 
 Unix stream socketpair, length-prefixed `postcard` frames, fds via
@@ -101,9 +139,9 @@ arrive as `GpuEvent::Error`. Unsolicited `Event::Notify(GpuEvent)`
 client queues those and wakes the core loop through a calloop `Ping`.
 
 Core to GPU: `Execute{commands}` (incl. `ImportShm` + pool fd),
-`ImportDmabuf`, `ReadTexture`, `AllocateDmabuf`, `Sync` (used when a
+`ImportDmabuf`, `RenderUi`, `ReadTexture`, `AllocateDmabuf`, `Sync` (used when a
 dmabuf render target is finished, so the buffer is complete before it goes
-to PipeWire or an image-copy client), `SetCustomShader`,
+to PipeWire or an image-copy client),
 device lifecycle (`AddDevice`, `RemoveDevice`, `PauseDevices`,
 `ResumeDevices`, `RescanDevice`, `CleanupDevice`), output control
 (`EnableOutput{.., color, prefer_10bit}`, `DisableOutput`, `SetMode`,
@@ -134,7 +172,7 @@ and `CastCursor(stream)` (the cursor bitmap for metadata cursor mode).
 
 `Caps` carries what the core needs to answer clients without asking again:
 shm and dmabuf formats, dmabuf render formats (screencast, image copy),
-which shader programs compiled.
+which built-in rendering effects are available.
 
 ## Split of the old tty backend
 
@@ -153,36 +191,13 @@ allocator, one `DrmCompositor` per enabled CRTC, connector properties
 vblank forwarding, plane assignment (direct scanout, cursor plane), and
 allocating capture buffers (`AllocateDmabuf`).
 
-The GPU process owns the device model. The core has no notion of a
-primary device: it opens every card node it may use and sends
-`AddDevice { dev, path, render_node_hint }` in whatever order the seat
-daemon lists them, then scans connectors (two phases, so an output on a
-display-only device never races the rendering device). The hint is the
-configured `render-drm-device` or the seat daemon's boot VGA card, and
-may be `None`. The GPU
-probes EGL on each device and creates the renderer on the first one
-whose EGL display works and matches the hint (upstream's
-`try_initialize_gpu`); the reply `DeviceAdded { render_node, caps }`
-tells the core where rendering happens (dmabuf feedback, `set_node`).
-That is usually the GPU's own card, but on Asahi the GPU card has no KMS
-(`DrmDevice::new` fails with EOPNOTSUPP) and Mesa renders through the
-DCP display controller's node, so the renderer lives there. A device the
-GPU rejects is remembered as unusable core-side and not retried until
-the seat daemon removes it. Which device a CRTC allocates from is decided at
-`EnableOutput`: a device on the renderer's render node uses its own GBM,
-anything else is display-only and scans out linear buffers allocated on
-the rendering device. `RemoveDevice` replies
-`DeviceRemoved { renderer_dropped }` so the core knows when the renderer
-went away regardless of which node owned it.
-
-Scanout format selection is one `DrmCompositor::new_with_buffer_test`
-call (fork addition): candidate formats (10-bit first on outputs that
-asked for it, then 8-bit) are each proven by allocation plus test commit
-on the display side and by a bind-and-clear on the renderer side, so a
-format only one side supports is skipped. Dropping a smithay
-`DrmSurface` no longer touches KMS (fork change); outputs are turned off
-with the explicit `DrmSurface::disable`, so surfaces can be created and
-discarded freely.
+The GPU process owns the device model. The core opens every card it may use
+and sends the fds and an optional configured/boot-VGA render-node hint. The
+worker matches Vulkan adapters by DRM device identity, initializes rendering
+before sealing the sandbox, and reports the selected render node to the core.
+Rendering is independent of KMS: a render-only GPU can allocate buffers for a
+separate display-only device. Output creation probes both scanout and Vulkan
+renderability for the selected formats/modifiers.
 
 ## Screencasting
 
@@ -319,27 +334,24 @@ renderer or KMS:
 - Framebuffer formats: SDR outputs are 8-bit. With `prefer_10bit` (HDR
   allowed or `wide-gamut-p3`) the 10-bit formats go first and each is
   proven renderable by the compositor's buffer test.
-- Blend space: `SceneFrame.blend: Option<BlendParams>` (`HdrPq{
-  ref_lum_scale}` or `DisplayP3`) tells the GPU to install the
-  `TextureHdr` program as the frame-wide default texture override and to
-  encode solid colors on the CPU (`src/gpu/gl/blend.rs`). All GPU-side
-  shaders end in `niri_blend(color)` (`hdr.frag`); the core appends the
-  `niri_blend_mode` / `niri_ref_lum_scale` uniforms to its own shader and
-  tex-program draws from `RemoteRenderer::frame_blend`. Overrides form a
-  stack in `run_frame`, so an element override or
-  `SuspendTexProgramOverride` / `RestoreTexProgramOverride` (used by
-  `BlendSurfaceRenderElement` for content already in the blend space)
-  restores the frame-wide one. Only the output frame is recorded with a
-  blend; casts and screenshots stay SDR. A blend change resets the
-  compositor's buffers (full redraw).
+- Blend space: `SceneFrame.blend` selects encoded PQ/BT.2020 or Display P3
+  compositing. Each texture draw carries `SourceColor` independently of its
+  effect: sRGB content is converted, matching HDR/P3 content passes through,
+  and captured target pixels are never encoded again. Nonmatching descriptions
+  retain the existing SDR-conversion fallback; this is not a new tone-mapping
+  implementation. Casts and screenshots stay SDR.
+  Changing output blend space forces a full redraw. Native targets and private
+  effect passes support float/10-bit output, but stock Vello gradient tables and
+  isolated/filter layers use RGBA8 intermediates; those effects can quantize HDR.
 - Planes: while blending, the core clears the cursor and overlay plane
   flags in `Present` and allows primary scanout only for fullscreen
   content already encoded in the blend space.
 - CTM: `SetCtm{matrix}` writes the CRTC `CTM` blob (S31.32) from the GPU
   process, deferred to resume while the device is inactive.
 
-The GPU smoke test renders a PQ frame with llvmpipe and checks the CPU and
-shader encodes agree and that a suspended override passes pixels raw.
+The GPU smoke test renders a PQ frame with Lavapipe and checks the CPU and
+GPU encodes agree and that explicit target-encoded content passes pixels raw.
+Core-side draw context restoration is checked across nested calls and returned errors.
 Nothing here has run on real HDR hardware yet.
 
 ## Smithay fork
@@ -367,11 +379,15 @@ revisit once the split is stable on hardware.
 
 ## Testing
 
-llvmpipe via Mesa's surfaceless EGL platform. The dev shell does not ship
-a Mesa driver; tests need `LIBGL_ALWAYS_SOFTWARE=1` and the Mesa EGL vendor
-file on `__EGL_VENDOR_LIBRARY_FILENAMES`. `cargo test --lib gpu::` runs the
-in-process smoke test, `cargo test --test gpu_process` spawns a real
-`niri gpu-process` child and checks pixels.
+The dev shell supplies the Vulkan loader; tests also need a Vulkan ICD
+(Lavapipe for software testing). `cargo test --lib gpu::` exercises the renderer
+in-process; `cargo test --test gpu_process` exercises the sealed worker.
+The ignored `ui::paint::tests::affected_ui_visual_grid` renders actual UI scenes;
+`NIRI_UI_GRID_PNG` saves its output and `NIRI_UI_GRID_SCALE` selects a scale.
+The software suite covers transformed texture sampling, partial damage,
+premultiplied resize mixing, ordered/clipped backdrop capture, blur and explicit
+source-color isolation. Physical-device validation remains outstanding; software
+tests and earlier GLES hardware results do not establish Vulkan dma-buf correctness.
 
 ## Next
 
